@@ -1,0 +1,20 @@
+{
+  "id": "conflict_example_001",
+  "title": "示例标题",
+  "scenario": "conflict",
+  "relationship_stages": ["dating"],
+  "goals": ["repair", "communicate"],
+  "tags": ["吵架", "沟通"],
+  "question": "示例问题",
+  "query_variants": ["示例问题变体"],
+  "context": "适用场景和必要背景。",
+  "principles": ["需要遵循的原则"],
+  "recommended_actions": ["建议采取的行动"],
+  "sample_phrases": ["可以参考的表达"],
+  "avoid_actions": ["不建议采取的行为"],
+  "clarifying_questions": ["回答前需要确认的问题？"],
+  "risk_level": "normal",
+  "source_type": "synthetic_draft",
+  "source_ref": null,
+  "version": "1.0"
+}

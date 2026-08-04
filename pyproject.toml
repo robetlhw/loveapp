@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "loveapp"
+version = "0.1.0"
+description = "A relationship advice and date-planning agent."
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "aiosqlite>=0.21,<1",
+    "huggingface-hub>=0.34,<1",
+    "httpx>=0.28,<1",
+    "langgraph>=0.4,<2",
+    "modelscope>=1.25,<2",
+    "openai>=2,<3",
+    "pydantic>=2.10,<3",
+    "pydantic-settings>=2.7,<3",
+    "qdrant-client>=1.15,<2",
+    "rich>=13.9,<15",
+    "sentence-transformers>=5,<6",
+    "transformers>=4.41,<5",
+    "typer>=0.15,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<10",
+    "pytest-asyncio>=0.25,<2",
+    "ruff>=0.9,<1",
+]
+
+[project.scripts]
+loveapp = "loveapp.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/loveapp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]

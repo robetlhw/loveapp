@@ -1,0 +1,100 @@
+import pytest
+
+from loveapp.application.memory_gate import MemoryGate
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("你好，在吗？", False),
+        ("什么叫非暴力沟通？", False),
+        ("把刚才的建议压缩成两句话。", False),
+        ("我该怎么追求喜欢的女生？", False),
+        ("假设一个人总不回消息，一般应该怎么办？", False),
+        ("你刚才为什么检索了这三条文档？", False),
+        ("晚上好啊", False),
+        ("我下周准备带她去吃饭，你觉得选择消费高一些的餐厅好呢，还是低一些的", True),
+        ("我俩最近被分到了同一个课程作业小组，下周有机会一起小组讨论，我想把握这次机会", True),
+        ("下周有个社团活动，我准备参加。", True),
+        ("后天要和她一起参加课程讨论。", True),
+        ("如果下周有活动，我就去参加。", False),
+        ("以后有机会再和她聊聊吧。", False),
+        ("她不吃生食，真正喜欢的是粤菜。", True),
+        ("最近两周我们联系明显变少了。", True),
+        ("昨晚我们因为迟到吵了一架。", True),
+        ("她最近主动找我聊天，这是不是说明关系在变好？", True),
+        ("每个月最后一个周日，我们会一起复盘本月的相处。", True),
+        ("她刚说还是改到上午吧。", True),
+        ("她刚刚回我消息了，还给我道歉了。", True),
+        ("我决定先请她吃顿饭，然后再聊聊消费观。", True),
+        ("我们刚认识不久，目前还不太熟。", True),
+        ("每周都能在社团见面，接触机会很多。", True),
+        ("虽然认识很久，但平时几乎没有机会碰面。", True),
+        ("相处一阵以后，我们逐渐熟络了一些。", True),
+        ("她老家在扬州，还有一个正在读大学的弟弟。", True),
+        ("我性格比较慢热，不太擅长主动开启话题。", True),
+        ("我还不知道她是不是单身，直接问会不会太唐突？", True),
+        ("她明确告诉我自己目前单身。", True),
+        ("她刚才给我分享了一本小说，我该怎么接着聊？", True),
+        (
+            "我和她有一个课程作业小组，组里讨论时能聊上几句话，"
+            "但都是课程相关的，其他的不怎么聊。",
+            True,
+        ),
+        (
+            "对方很优秀，成绩好又漂亮，可是我就是一个普通学生，"
+            "没什么长处，我真的能追到吗？",
+            True,
+        ),
+        ("我们不怎么聊天。", True),
+        (
+            "我对象其实平时都很勤俭节约，她买衣服鞋子都是买很经济实惠的，"
+            "可能就是因为消费观念不一样造成的吧，你觉得呢",
+            True,
+        ),
+        ("我考虑到她的消费观，我还是选择了一家平价餐厅，她得知之后很开心，我俩和好了", True),
+        (
+            "听说她最近和一个男生经常一起聊天，感觉那个男孩子也在追求她，"
+            "他比我优秀，你觉得我希望大吗",
+            True,
+        ),
+    ],
+)
+def test_memory_gate(text: str, expected: bool) -> None:
+    decision = MemoryGate().evaluate(text)
+
+    assert decision.should_extract is expected
+
+
+def test_memory_gate_keeps_durable_claims_in_mixed_questions() -> None:
+    preference = MemoryGate().evaluate(
+        "我对象平时都很勤俭节约，她买东西很经济实惠，你觉得消费观不同怎么办？"
+    )
+    outcome = MemoryGate().evaluate(
+        "我考虑她的消费观选择了平价餐厅，她得知后很开心，我们也和好了。"
+    )
+
+    assert preference.should_extract is True
+    assert "preference" in preference.signals
+    assert outcome.should_extract is True
+    assert "advice_outcome" in outcome.signals
+
+
+def test_memory_gate_marks_future_events_without_dropping_shared_context() -> None:
+    decision = MemoryGate().evaluate(
+        "我俩最近被分到了同一个课程作业小组，下周有机会一起小组讨论，"
+        "我想把握这次机会，争取和她聊上几句，你有啥好方法吗"
+    )
+
+    assert decision.should_extract is True
+    assert "shared_context" in decision.signals
+    assert "planned_event" in decision.signals
+
+
+def test_memory_gate_does_not_label_habitual_weekend_contact_as_future_plan() -> None:
+    decision = MemoryGate().evaluate(
+        "平时电话里通常是我主动聊天，周末见面时她偶尔会先问候我。"
+    )
+
+    assert decision.should_extract is True
+    assert "planned_event" not in decision.signals

@@ -1,0 +1,16 @@
+{"id":"greeting","text":"你好，在吗？","should_store":false,"category":"greeting"}
+{"id":"thanks","text":"谢谢，先这样。","should_store":false,"category":"greeting"}
+{"id":"knowledge_question","text":"什么叫非暴力沟通？","should_store":false,"category":"knowledge_question"}
+{"id":"format_request","text":"把刚才的建议压缩成两句话。","should_store":false,"category":"operation"}
+{"id":"pure_consultation","text":"我该怎么追求喜欢的女生？","should_store":false,"category":"consultation"}
+{"id":"hypothetical","text":"假设一个人总不回消息，一般应该怎么办？","should_store":false,"category":"hypothetical"}
+{"id":"model_meta","text":"你刚才为什么检索了这三条文档？","should_store":false,"category":"agent_meta"}
+{"id":"temporary_instruction","text":"这次回答先不要引用记忆。","should_store":false,"category":"operation"}
+{"id":"partner_preference","text":"她不吃生食，真正喜欢的是粤菜。","should_store":true,"category":"durable_fact"}
+{"id":"interaction_pattern","text":"最近两周我们联系明显变少了。","should_store":true,"category":"interaction_pattern"}
+{"id":"interaction_event","text":"昨晚我们因为迟到吵了一架。","should_store":true,"category":"interaction_event"}
+{"id":"mixed_fact_and_question","text":"她最近开始主动找我聊天，这是不是说明关系在变好？","should_store":true,"category":"mixed"}
+{"id":"mixed_pursuit_and_goal","text":"我喜欢班上的一个女生，最近一直主动找她聊天，我该怎么进一步发展？","should_store":true,"category":"mixed"}
+{"id":"shared_context_and_future_event","text":"我俩最近被分到了同一个课程作业小组，下周有机会一起小组讨论，我想把握这次机会，争取和她聊上几句。","should_store":true,"category":"planned_event"}
+{"id":"future_activity","text":"后天要参加一个校园活动，可能会和她一起做志愿者。","should_store":true,"category":"planned_event"}
+{"id":"hypothetical_future_event","text":"如果下周有活动，我就去参加。","should_store":false,"category":"hypothetical"}

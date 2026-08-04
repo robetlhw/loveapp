@@ -1,0 +1,12 @@
+{"id":"classmate_create_contact","query":"我喜欢班上的一个女生，但平时接触很少，怎么自然创造搭话和聊天的机会？","scenario":"pursuit","goals":["initiate"],"relevant_ids":["pursuit_001","formal_v1_013"]}
+{"id":"new_contact_opening","query":"刚加上喜欢的人的联系方式，不知道第一句话怎么自然开口。","scenario":"pursuit","goals":["initiate"],"relevant_ids":["pursuit_001","formal_v1_013"]}
+{"id":"slow_reply","query":"她最近回复越来越慢，是不是对我没有兴趣？","scenario":"chat_analysis","goals":["understand"],"relevant_ids":["formal_v1_002","pursuit_002","chat_001"]}
+{"id":"confession_timing","query":"认识多久以后表白比较合适？","scenario":"pursuit","goals":["progress"],"relevant_ids":["formal_v1_003"]}
+{"id":"invitation_rejected","query":"她拒绝了一次邀约，我还可以再约吗？","scenario":"pursuit","goals":["progress","set_boundary"],"relevant_ids":["formal_v1_006"]}
+{"id":"polite_or_interested","query":"怎么判断她只是礼貌回复，还是真的愿意发展？","scenario":"chat_analysis","goals":["understand"],"relevant_ids":["formal_v1_007"]}
+{"id":"conflict_cooldown","query":"刚吵完架情绪都很激动，现在要马上说清楚吗？","scenario":"conflict","goals":["repair","communicate"],"relevant_ids":["formal_v1_021","conflict_001"]}
+{"id":"angry_no_reply","query":"她生气以后不回消息，我要不要连续发消息解释？","scenario":"conflict","goals":["repair","communicate"],"relevant_ids":["formal_v1_022","conflict_002"]}
+{"id":"future_plan_conflict","query":"我们对结婚和未来城市的规划完全不同，应该谁妥协？","scenario":"conflict","goals":["communicate","understand"],"relevant_ids":["formal_v1_036"]}
+{"id":"self_harm_threat","query":"对象用自伤威胁阻止我分手，我该怎么办？","scenario":"boundary","goals":["set_boundary","end_relationship"],"relevant_ids":["formal_v1_041"]}
+{"id":"phone_monitoring","query":"伴侣要求交出手机密码并一直查定位，这算关心吗？","scenario":"boundary","goals":["set_boundary","understand"],"relevant_ids":["formal_v1_043"]}
+{"id":"stalking_harassment","query":"分手后对方总来单位堵我、跟着我回家，应该怎么办？","scenario":"boundary","goals":["set_boundary"],"relevant_ids":["formal_v1_048"]}

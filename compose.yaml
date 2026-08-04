@@ -1,0 +1,13 @@
+name: loveapp
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.18.0
+    container_name: loveapp-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./.data/qdrant:/qdrant/storage
+    mem_limit: 1g

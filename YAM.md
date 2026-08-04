@@ -1,0 +1,763 @@
+# YAM 四机械臂 CAN 通信故障交接报告
+
+更新日期：2026-07-20
+用途：提供给 YAM 厂家维修人员，协助现场快速复现和定位。
+
+## 1. 基本环境
+
+- 主机：NVIDIA Jetson Orin AGX，L4T 36.4.x 系列。
+- 采集软件：TrainMyBot / Recording Studio `v3.18.0`。
+- CAN 驱动：Linux SocketCAN + `gs_usb`。
+- YAM CAN 波特率：`1,000,000 bit/s`。
+- 摄像头和底座：本次故障定位暂未配置，不应影响机械臂 CAN 通信。
+- 机械臂电机：标准 YAM 主臂 1--6 号电机；从臂可能另有夹爪/附加电机。
+
+## 2. 机械臂与 USB-CAN 序列号
+
+最初记录的映射如下。由于期间做过模块互换，序列号代表 USB-CAN 模块，不代表机械臂本体：
+
+| 角色 | 原始 USB-CAN 序列号 | 当前确认情况 |
+|---|---|---|
+| 左主臂 | `208C3362594E5018` | 高度怀疑模块或随模块移动的 CAN 线缆异常 |
+| 左从臂 | `207137A745465006` | 尚未完成交叉验证 |
+| 右主臂 | `20763380594E5018` | 尚未完成交叉验证 |
+| 右从臂 | `207A37AB45465006` | 低层测试曾正常，后续 TrainMyBot 测试又失败，需复现 |
+
+## 3. 现场主要现象
+
+1. 四臂同时连接时，通常只有一条机械臂能正常初始化，其余出现：
+
+   ```text
+   Fatal: Tick hung for more than 3 seconds
+   6 motor(s) did not respond
+   USB-CAN adapter ... stuck (0 frames transmitted)
+   ```
+
+2. 两条主臂长期更容易失败；从臂的“哪一条正常”会随着 USB 拔插而变化。
+3. 曾观察到右主臂对应的 CAN 模块明显发热；互换后发热程度有所变化，但异常模块仍比其他模块热。
+4. 单独连接一条机械臂时也曾出现同类错误，因此不能简单归因于四臂同时运行时的总功耗。
+5. 厂家自有遥操作程序曾能控制部分/相关机械臂，但厂家程序与 Scale AI 封装的 TrainMyBot 程序不同。
+
+## 4. 已完成的关键实验
+
+### 4.1 TrainMyBot 版本和 serial 绑定正常
+
+日志确认：
+
+```text
+Recording Studio Version: v3.18.0
+CAN socket bound to canX (serial: ...)
+```
+
+因此当前问题不是误用了旧版采集程序，也不是单纯把 CAN 编号 `can2/can3` 写死导致的。程序会按 USB-CAN serial 查找接口。
+
+### 4.2 单臂 208C 测试失败，且低层只读查询也失败
+
+在只有 `208C3362594E5018` 的单臂测试中：
+
+- serial 能被正确识别；
+- CAN 配置为 1 Mbps；
+- 6 个电机全部无响应；
+- TrainMyBot 报 USB-CAN stuck；
+- 停止采集服务后，独立只读寄存器查询同样无法得到 1--6 号电机回复；
+- 多次查询最终出现 `Transmit buffer full`。
+
+这说明故障不只存在于 TrainMyBot 的控制循环中，而是在更底层的 CAN 通信路径上。
+
+### 4.3 交叉互换实验（最重要证据）
+
+曾将：
+
+- `208C3362594E5018`（原左主臂模块）接到右从臂；
+- `207A37AB45465006`（原右从臂、之前正常的模块）接到右主臂。
+
+结果：
+
+#### `207A...` 模块接右主臂
+
+独立只读探测成功，1--6 号电机全部返回正确的 ID：
+
+```text
+motor 1 -> register value 1
+motor 2 -> register value 2
+motor 3 -> register value 3
+motor 4 -> register value 4
+motor 5 -> register value 5
+motor 6 -> register value 6
+```
+
+当时 `can3` 状态为：
+
+```text
+can state ERROR-ACTIVE
+bus-errors 0
+error-passive 0
+bus-off 0
+```
+
+这证明：在该次实验中，右主臂本体、电机供电、机械臂内部 CAN 总线和 1 Mbps 通信参数均可以正常工作。
+
+#### `208C...` 模块接右从臂
+
+请求无法得到正确的寄存器回复，`can2` 后续进入：
+
+```text
+can state ERROR-PASSIVE
+error-passive 102
+RX packets 103
+TX packets 8
+```
+
+收到的 `can_id=0x20` 错误帧与 Linux CAN 的 ACK 错误标志相符，说明发送帧没有得到总线上节点的正常确认。
+
+这使 `208C...` 模块本身，或与它一起移动的 CAN 侧线缆/接头，成为目前最高优先级的故障对象。
+
+### 4.4 后续 207A + 主臂的 TrainMyBot 复测出现矛盾结果
+
+2026-07-15 的日志显示，临时配置已经正确使用：
+
+```text
+CAN socket bound to can3 (serial: 207A37AB45465006)
+YAM arm arm_right_leader initialized
+```
+
+但 TrainMyBot 随后仍报 6 个电机无响应。测试后 `can3` 进入：
+
+```text
+can state ERROR-PASSIVE
+error-passive 15006
+TX packets 174655
+RX packets 164509
+```
+
+这与前一日 `207A...` 低层读取全部成功不一致，当前不能直接断言是软件问题。需要厂家现场在同一条机械臂、同一根 CAN 线、同一个模块和同一套电源下重复：
+
+1. 先做低层单帧读 ID；
+2. 再启动 TrainMyBot；
+3. 对比启动前后的 CAN 错误计数。
+
+可能原因包括：测试时机械臂电源或 CAN 接头状态改变、模块未真正断电复位、CAN 线接触不良、TrainMyBot 启动帧触发了错误状态，或主臂角色/固件配置不匹配。
+
+### 4.5 2026-07-20 最新四臂同时启动结果
+
+按以下最新物理映射启动四臂：
+
+| CAN 接口 | 角色 | USB-CAN serial | CAN 状态 | TrainMyBot 结果 |
+|---|---|---|---|---|
+| `can2` | 左从臂 | `207137A745465006` | `ERROR-PASSIVE`，error-pass 114 | `calibrate_gripper: failed to read starting states` |
+| `can3` | 左主臂 | `207A37AB45465006` | `ERROR-PASSIVE`，error-pass 167 | `Tick hung`，6 个电机无响应 |
+| `can4` | 右从臂 | `20763380594E5018` | `ERROR-ACTIVE`，错误计数 0 | CAN 物理层正常，但夹爪校准仍失败 |
+| `can5` | 右主臂 | `208C3362594E5018` | `ERROR-PASSIVE`，error-pass 123 | `USB-CAN adapter ... stuck (0 frames transmitted)` |
+
+重要解释：
+
+- `ERROR-ACTIVE` 是正常 CAN 控制器状态；`ERROR-PASSIVE` 表示控制器已因大量通信错误降级。
+- `can2` 和 `can5` 都只有 3 个 TX 包，却出现一百多个 RX/error-pass 事件，这些 RX 很可能主要是 CAN 控制器错误帧，不代表收到有效电机反馈。
+- `can4` 虽然 CAN 物理层健康，但应用层仍无法读取夹爪起始状态，因此当前四条机械臂没有任何一条在 TrainMyBot 中完整启动成功。
+- 本次程序启动时，`can2`、`can3`、`can5` 原本为 DOWN，由 TrainMyBot 自行拉起，因此其 `restart-ms=0`；只有 `can4` 保留 `restart-ms=100`。这不是 ERROR-PASSIVE 的根因，但说明三个接口没有经过同一次完整的 `yam-can-prepare` 初始化，现场复测时应先停止 TrainMyBot，再统一初始化四个接口。
+
+## 5. 当前原因判断
+
+### 高概率，已有直接证据
+
+1. 至少一个 USB-CAN 模块或其 CAN 侧线缆存在硬件/电气故障：`208C...` 交叉测试时出现 ACK 错误和 ERROR-PASSIVE。
+2. 右主臂本体不是必然损坏：同一条右主臂曾用 `207A...` 低层读取 1--6 号电机成功。
+3. `Tick hung` 是通信失败后的上层超时，不是根因。
+
+### 中高概率
+
+1. 四个 USB-CAN 实际经过共同 USB Hub 路径。此前内核出现过：
+
+   ```text
+   disabled by hub (EMI?), re-enabling
+   USB disconnect
+   gs_usb ... usb xmit fail
+   ```
+
+   这可以解释为什么拔插后“正常的从臂”会改变。
+2. 发热模块可能存在 CAN 收发器部分短路、总线被拉 dominant、USB 5 V 异常耗流或内部固件/硬件损坏。
+3. 返修后的模块可能与其他模块的固件、CAN 参数或电机配置不一致。
+
+### 中低概率
+
+1. TrainMyBot 同时初始化多条机械臂时，一个卡死的 CAN 适配器占满重试/控制循环，导致其他设备也被上层标记为失败。
+2. 物理交换后系统配置未及时同步，导致某个模块被当成 leader/follower 使用。serial 绑定本身没有问题，但 role 配置仍需和当前机械臂本体一致。
+
+### 目前证据不支持的解释
+
+1. Jetson 四路 USB 总供电整体不足：同一 USB 路径下 `207A...` 曾能稳定完成 1--6 号低层查询。
+2. USB 自动挂起是主要原因：此前 CAN 设备的 runtime 状态为 active，未观察到 CAN 设备被 autosuspend。
+3. 四条机械臂同时运动导致总电源不足：故障在单臂、尚未运动的初始化阶段就出现。
+
+## 6. 厂家到场时建议的最小测试顺序
+
+所有更换都应在机械臂断电、采集服务停止后进行；一次只改变一个变量。
+
+### A. 先确认已知正常基准
+
+使用 `207A37AB45465006` 和一条已确认正常的机械臂，执行：
+
+```bash
+sudo systemctl stop recording_studio.service
+ip -details -statistics link show canX
+python3 yam_can_probe.py --channel canX --motor-ids 1,2,3,4,5,6
+```
+
+应看到 1--6 号正确回复，且不能进入 `ERROR-PASSIVE`。
+
+### B. 固定机械臂，逐个替换四个 CAN 模块
+
+推荐使用已经验证过的右主臂作为固定测试对象，依次接入：
+
+```text
+207A...  已有成功记录
+208C...  高度怀疑故障
+207633... 待测
+207137... 待测
+```
+
+每个模块都执行一次低层探测。若错误跟随模块，模块或其 CAN 线缆故障；若错误始终跟随机械臂，检查机械臂电源、CAN 接头和内部线束。
+
+### C. 对通过低层测试的组合再启动 TrainMyBot
+
+启动前记录：
+
+```bash
+ip -details -statistics link show canX
+```
+
+启动失败后立即再次记录同一命令。重点比较：
+
+- `error-passive` 是否增加；
+- `bus-errors` 是否增加；
+- TX 是否持续增长而 RX 没有有效电机反馈；
+- 是否发生 USB disconnect。
+
+### D. 厂家需要提供或确认的资料
+
+1. 四个 CAN 模块的硬件型号、固件版本和是否为同一批次。
+2. 工厂遥操作程序使用的 CAN 波特率、采样参数和接口选择。
+3. 四条机械臂的电机 ID、`master_id`、timeout、固件版本。
+4. CAN-H/CAN-L/GND 针脚定义和终端电阻位置。
+5. 返修过的两条主臂是否更换过电机控制器、CAN 收发器或主控板。
+6. 工厂测试时是否使用了不同的 USB-CAN 模块、线缆或电源适配器。
+
+## 7. 需要特别提醒厂家
+
+- 发热明显的 CAN 模块不要继续长时间运行，避免把模块或 USB Hub 一起损坏。
+- 不要在 TrainMyBot 运行时重启 `yam-can-prepare.service` 或拔插 CAN 模块。
+- 当前系统曾使用过单臂临时配置，不能直接作为四臂生产配置；恢复四臂前必须重新确认每个 serial 与机械臂本体的物理对应关系。
+
+## 8. 一句话结论
+
+目前最可靠的结论是：
+**
+至少 `208C3362594E5018` 这一 CAN 通信路径存在硬件/电气故障；同时系统曾有共享 USB Hub 不稳定现象。右主臂本体已被一次低层交叉测试证明可以正常通信，但 `207A...` 后续启动 TrainMyBot 又失败，说明还必须在厂家现场用同一套物理连接重复“低层探测 -> TrainMyBot”的对照实验，才能最终区分剩余的线缆/供电问题与软件/固件兼容问题。
+**# YAM 四机械臂 CAN 通信故障交接报告
+
+更新日期：2026-07-20
+用途：提供给 YAM 厂家维修人员，协助现场快速复现和定位。
+
+## 1. 基本环境
+
+- 主机：NVIDIA Jetson Orin AGX，L4T 36.4.x 系列。
+- 采集软件：TrainMyBot / Recording Studio `v3.18.0`。
+- CAN 驱动：Linux SocketCAN + `gs_usb`。
+- YAM CAN 波特率：`1,000,000 bit/s`。
+- 摄像头和底座：本次故障定位暂未配置，不应影响机械臂 CAN 通信。
+- 机械臂电机：标准 YAM 主臂 1--6 号电机；从臂可能另有夹爪/附加电机。
+
+## 2. 机械臂与 USB-CAN 序列号
+
+最初记录的映射如下。由于期间做过模块互换，序列号代表 USB-CAN 模块，不代表机械臂本体：
+
+| 角色 | 原始 USB-CAN 序列号 | 当前确认情况 |
+|---|---|---|
+| 左主臂 | `208C3362594E5018` | 高度怀疑模块或随模块移动的 CAN 线缆异常 |
+| 左从臂 | `207137A745465006` | 尚未完成交叉验证 |
+| 右主臂 | `20763380594E5018` | 尚未完成交叉验证 |
+| 右从臂 | `207A37AB45465006` | 低层测试曾正常，后续 TrainMyBot 测试又失败，需复现 |
+
+## 3. 现场主要现象
+
+1. 四臂同时连接时，通常只有一条机械臂能正常初始化，其余出现：
+
+   ```text
+   Fatal: Tick hung for more than 3 seconds
+   6 motor(s) did not respond
+   USB-CAN adapter ... stuck (0 frames transmitted)
+   ```
+
+2. 两条主臂长期更容易失败；从臂的“哪一条正常”会随着 USB 拔插而变化。
+3. 曾观察到右主臂对应的 CAN 模块明显发热；互换后发热程度有所变化，但异常模块仍比其他模块热。
+4. 单独连接一条机械臂时也曾出现同类错误，因此不能简单归因于四臂同时运行时的总功耗。
+5. 厂家自有遥操作程序曾能控制部分/相关机械臂，但厂家程序与 Scale AI 封装的 TrainMyBot 程序不同。
+
+## 4. 已完成的关键实验
+
+### 4.1 TrainMyBot 版本和 serial 绑定正常
+
+日志确认：
+
+```text
+Recording Studio Version: v3.18.0
+CAN socket bound to canX (serial: ...)
+```
+
+因此当前问题不是误用了旧版采集程序，也不是单纯把 CAN 编号 `can2/can3` 写死导致的。程序会按 USB-CAN serial 查找接口。
+
+### 4.2 单臂 208C 测试失败，且低层只读查询也失败
+
+在只有 `208C3362594E5018` 的单臂测试中：
+
+- serial 能被正确识别；
+- CAN 配置为 1 Mbps；
+- 6 个电机全部无响应；
+- TrainMyBot 报 USB-CAN stuck；
+- 停止采集服务后，独立只读寄存器查询同样无法得到 1--6 号电机回复；
+- 多次查询最终出现 `Transmit buffer full`。
+
+这说明故障不只存在于 TrainMyBot 的控制循环中，而是在更底层的 CAN 通信路径上。
+
+### 4.3 交叉互换实验（最重要证据）
+
+曾将：
+
+- `208C3362594E5018`（原左主臂模块）接到右从臂；
+- `207A37AB45465006`（原右从臂、之前正常的模块）接到右主臂。
+
+结果：
+
+#### `207A...` 模块接右主臂
+
+独立只读探测成功，1--6 号电机全部返回正确的 ID：
+
+```text
+motor 1 -> register value 1
+motor 2 -> register value 2
+motor 3 -> register value 3
+motor 4 -> register value 4
+motor 5 -> register value 5
+motor 6 -> register value 6
+```
+
+当时 `can3` 状态为：
+
+```text
+can state ERROR-ACTIVE
+bus-errors 0
+error-passive 0
+bus-off 0
+```
+
+这证明：在该次实验中，右主臂本体、电机供电、机械臂内部 CAN 总线和 1 Mbps 通信参数均可以正常工作。
+
+#### `208C...` 模块接右从臂
+
+请求无法得到正确的寄存器回复，`can2` 后续进入：
+
+```text
+can state ERROR-PASSIVE
+error-passive 102
+RX packets 103
+TX packets 8
+```
+
+收到的 `can_id=0x20` 错误帧与 Linux CAN 的 ACK 错误标志相符，说明发送帧没有得到总线上节点的正常确认。
+
+这使 `208C...` 模块本身，或与它一起移动的 CAN 侧线缆/接头，成为目前最高优先级的故障对象。
+
+### 4.4 后续 207A + 主臂的 TrainMyBot 复测出现矛盾结果
+
+2026-07-15 的日志显示，临时配置已经正确使用：
+
+```text
+CAN socket bound to can3 (serial: 207A37AB45465006)
+YAM arm arm_right_leader initialized
+```
+
+但 TrainMyBot 随后仍报 6 个电机无响应。测试后 `can3` 进入：
+
+```text
+can state ERROR-PASSIVE
+error-passive 15006
+TX packets 174655
+RX packets 164509
+```
+
+这与前一日 `207A...` 低层读取全部成功不一致，当前不能直接断言是软件问题。需要厂家现场在同一条机械臂、同一根 CAN 线、同一个模块和同一套电源下重复：
+
+1. 先做低层单帧读 ID；
+2. 再启动 TrainMyBot；
+3. 对比启动前后的 CAN 错误计数。
+
+可能原因包括：测试时机械臂电源或 CAN 接头状态改变、模块未真正断电复位、CAN 线接触不良、TrainMyBot 启动帧触发了错误状态，或主臂角色/固件配置不匹配。
+
+### 4.5 2026-07-20 最新四臂同时启动结果
+
+按以下最新物理映射启动四臂：
+
+| CAN 接口 | 角色 | USB-CAN serial | CAN 状态 | TrainMyBot 结果 |
+|---|---|---|---|---|
+| `can2` | 左从臂 | `207137A745465006` | `ERROR-PASSIVE`，error-pass 114 | `calibrate_gripper: failed to read starting states` |
+| `can3` | 左主臂 | `207A37AB45465006` | `ERROR-PASSIVE`，error-pass 167 | `Tick hung`，6 个电机无响应 |
+| `can4` | 右从臂 | `20763380594E5018` | `ERROR-ACTIVE`，错误计数 0 | CAN 物理层正常，但夹爪校准仍失败 |
+| `can5` | 右主臂 | `208C3362594E5018` | `ERROR-PASSIVE`，error-pass 123 | `USB-CAN adapter ... stuck (0 frames transmitted)` |
+
+重要解释：
+
+- `ERROR-ACTIVE` 是正常 CAN 控制器状态；`ERROR-PASSIVE` 表示控制器已因大量通信错误降级。
+- `can2` 和 `can5` 都只有 3 个 TX 包，却出现一百多个 RX/error-pass 事件，这些 RX 很可能主要是 CAN 控制器错误帧，不代表收到有效电机反馈。
+- `can4` 虽然 CAN 物理层健康，但应用层仍无法读取夹爪起始状态，因此当前四条机械臂没有任何一条在 TrainMyBot 中完整启动成功。
+- 本次程序启动时，`can2`、`can3`、`can5` 原本为 DOWN，由 TrainMyBot 自行拉起，因此其 `restart-ms=0`；只有 `can4` 保留 `restart-ms=100`。这不是 ERROR-PASSIVE 的根因，但说明三个接口没有经过同一次完整的 `yam-can-prepare` 初始化，现场复测时应先停止 TrainMyBot，再统一初始化四个接口。
+
+## 5. 当前原因判断
+
+### 高概率，已有直接证据
+
+1. 至少一个 USB-CAN 模块或其 CAN 侧线缆存在硬件/电气故障：`208C...` 交叉测试时出现 ACK 错误和 ERROR-PASSIVE。
+2. 右主臂本体不是必然损坏：同一条右主臂曾用 `207A...` 低层读取 1--6 号电机成功。
+3. `Tick hung` 是通信失败后的上层超时，不是根因。
+
+### 中高概率
+
+1. 四个 USB-CAN 实际经过共同 USB Hub 路径。此前内核出现过：
+
+   ```text
+   disabled by hub (EMI?), re-enabling
+   USB disconnect
+   gs_usb ... usb xmit fail
+   ```
+
+   这可以解释为什么拔插后“正常的从臂”会改变。
+2. 发热模块可能存在 CAN 收发器部分短路、总线被拉 dominant、USB 5 V 异常耗流或内部固件/硬件损坏。
+3. 返修后的模块可能与其他模块的固件、CAN 参数或电机配置不一致。
+
+### 中低概率
+
+1. TrainMyBot 同时初始化多条机械臂时，一个卡死的 CAN 适配器占满重试/控制循环，导致其他设备也被上层标记为失败。
+2. 物理交换后系统配置未及时同步，导致某个模块被当成 leader/follower 使用。serial 绑定本身没有问题，但 role 配置仍需和当前机械臂本体一致。
+
+### 目前证据不支持的解释
+
+1. Jetson 四路 USB 总供电整体不足：同一 USB 路径下 `207A...` 曾能稳定完成 1--6 号低层查询。
+2. USB 自动挂起是主要原因：此前 CAN 设备的 runtime 状态为 active，未观察到 CAN 设备被 autosuspend。
+3. 四条机械臂同时运动导致总电源不足：故障在单臂、尚未运动的初始化阶段就出现。
+
+## 6. 厂家到场时建议的最小测试顺序
+
+所有更换都应在机械臂断电、采集服务停止后进行；一次只改变一个变量。
+
+### A. 先确认已知正常基准
+
+使用 `207A37AB45465006` 和一条已确认正常的机械臂，执行：
+
+```bash
+sudo systemctl stop recording_studio.service
+ip -details -statistics link show canX
+python3 yam_can_probe.py --channel canX --motor-ids 1,2,3,4,5,6
+```
+
+应看到 1--6 号正确回复，且不能进入 `ERROR-PASSIVE`。
+
+### B. 固定机械臂，逐个替换四个 CAN 模块
+
+推荐使用已经验证过的右主臂作为固定测试对象，依次接入：
+
+```text
+207A...  已有成功记录
+208C...  高度怀疑故障
+207633... 待测
+207137... 待测
+```
+
+每个模块都执行一次低层探测。若错误跟随模块，模块或其 CAN 线缆故障；若错误始终跟随机械臂，检查机械臂电源、CAN 接头和内部线束。
+
+### C. 对通过低层测试的组合再启动 TrainMyBot
+
+启动前记录：
+
+```bash
+ip -details -statistics link show canX
+```
+
+启动失败后立即再次记录同一命令。重点比较：
+
+- `error-passive` 是否增加；
+- `bus-errors` 是否增加；
+- TX 是否持续增长而 RX 没有有效电机反馈；
+- 是否发生 USB disconnect。
+
+### D. 厂家需要提供或确认的资料
+
+1. 四个 CAN 模块的硬件型号、固件版本和是否为同一批次。
+2. 工厂遥操作程序使用的 CAN 波特率、采样参数和接口选择。
+3. 四条机械臂的电机 ID、`master_id`、timeout、固件版本。
+4. CAN-H/CAN-L/GND 针脚定义和终端电阻位置。
+5. 返修过的两条主臂是否更换过电机控制器、CAN 收发器或主控板。
+6. 工厂测试时是否使用了不同的 USB-CAN 模块、线缆或电源适配器。
+
+## 7. 需要特别提醒厂家
+
+- 发热明显的 CAN 模块不要继续长时间运行，避免把模块或 USB Hub 一起损坏。
+- 不要在 TrainMyBot 运行时重启 `yam-can-prepare.service` 或拔插 CAN 模块。
+- 当前系统曾使用过单臂临时配置，不能直接作为四臂生产配置；恢复四臂前必须重新确认每个 serial 与机械臂本体的物理对应关系。
+
+## 8. 一句话结论
+
+目前最可靠的结论是：**至少 `208C3362594E5018` 这一 CAN 通信路径存在硬件/电气故障；同时系统曾有共享 USB Hub 不稳定现象。右主臂本体已被一次低层交叉测试证明可以正常通信，但 `207A...` 后续启动 TrainMyBot 又失败，说明还必须在厂家现场用同一套物理连接重复“低层探测 -> TrainMyBot”的对照实验，才能最终区分剩余的线缆/供电问题与软件/固件兼容问题。**# YAM 四机械臂 CAN 通信故障交接报告
+
+更新日期：2026-07-20
+用途：提供给 YAM 厂家维修人员，协助现场快速复现和定位。
+
+## 1. 基本环境
+
+- 主机：NVIDIA Jetson Orin AGX，L4T 36.4.x 系列。
+- 采集软件：TrainMyBot / Recording Studio `v3.18.0`。
+- CAN 驱动：Linux SocketCAN + `gs_usb`。
+- YAM CAN 波特率：`1,000,000 bit/s`。
+- 摄像头和底座：本次故障定位暂未配置，不应影响机械臂 CAN 通信。
+- 机械臂电机：标准 YAM 主臂 1--6 号电机；从臂可能另有夹爪/附加电机。
+
+## 2. 机械臂与 USB-CAN 序列号
+
+最初记录的映射如下。由于期间做过模块互换，序列号代表 USB-CAN 模块，不代表机械臂本体：
+
+| 角色 | 原始 USB-CAN 序列号 | 当前确认情况 |
+|---|---|---|
+| 左主臂 | `208C3362594E5018` | 高度怀疑模块或随模块移动的 CAN 线缆异常 |
+| 左从臂 | `207137A745465006` | 尚未完成交叉验证 |
+| 右主臂 | `20763380594E5018` | 尚未完成交叉验证 |
+| 右从臂 | `207A37AB45465006` | 低层测试曾正常，后续 TrainMyBot 测试又失败，需复现 |
+
+## 3. 现场主要现象
+
+1. 四臂同时连接时，通常只有一条机械臂能正常初始化，其余出现：
+
+   ```text
+   Fatal: Tick hung for more than 3 seconds
+   6 motor(s) did not respond
+   USB-CAN adapter ... stuck (0 frames transmitted)
+   ```
+
+2. 两条主臂长期更容易失败；从臂的“哪一条正常”会随着 USB 拔插而变化。
+3. 曾观察到右主臂对应的 CAN 模块明显发热；互换后发热程度有所变化，但异常模块仍比其他模块热。
+4. 单独连接一条机械臂时也曾出现同类错误，因此不能简单归因于四臂同时运行时的总功耗。
+5. 厂家自有遥操作程序曾能控制部分/相关机械臂，但厂家程序与 Scale AI 封装的 TrainMyBot 程序不同。
+
+## 4. 已完成的关键实验
+
+### 4.1 TrainMyBot 版本和 serial 绑定正常
+
+日志确认：
+
+```text
+Recording Studio Version: v3.18.0
+CAN socket bound to canX (serial: ...)
+```
+
+因此当前问题不是误用了旧版采集程序，也不是单纯把 CAN 编号 `can2/can3` 写死导致的。程序会按 USB-CAN serial 查找接口。
+
+### 4.2 单臂 208C 测试失败，且低层只读查询也失败
+
+在只有 `208C3362594E5018` 的单臂测试中：
+
+- serial 能被正确识别；
+- CAN 配置为 1 Mbps；
+- 6 个电机全部无响应；
+- TrainMyBot 报 USB-CAN stuck；
+- 停止采集服务后，独立只读寄存器查询同样无法得到 1--6 号电机回复；
+- 多次查询最终出现 `Transmit buffer full`。
+
+这说明故障不只存在于 TrainMyBot 的控制循环中，而是在更底层的 CAN 通信路径上。
+
+### 4.3 交叉互换实验（最重要证据）
+
+曾将：
+
+- `208C3362594E5018`（原左主臂模块）接到右从臂；
+- `207A37AB45465006`（原右从臂、之前正常的模块）接到右主臂。
+
+结果：
+
+#### `207A...` 模块接右主臂
+
+独立只读探测成功，1--6 号电机全部返回正确的 ID：
+
+```text
+motor 1 -> register value 1
+motor 2 -> register value 2
+motor 3 -> register value 3
+motor 4 -> register value 4
+motor 5 -> register value 5
+motor 6 -> register value 6
+```
+
+当时 `can3` 状态为：
+
+```text
+can state ERROR-ACTIVE
+bus-errors 0
+error-passive 0
+bus-off 0
+```
+
+这证明：在该次实验中，右主臂本体、电机供电、机械臂内部 CAN 总线和 1 Mbps 通信参数均可以正常工作。
+
+#### `208C...` 模块接右从臂
+
+请求无法得到正确的寄存器回复，`can2` 后续进入：
+
+```text
+can state ERROR-PASSIVE
+error-passive 102
+RX packets 103
+TX packets 8
+```
+
+收到的 `can_id=0x20` 错误帧与 Linux CAN 的 ACK 错误标志相符，说明发送帧没有得到总线上节点的正常确认。
+
+这使 `208C...` 模块本身，或与它一起移动的 CAN 侧线缆/接头，成为目前最高优先级的故障对象。
+
+### 4.4 后续 207A + 主臂的 TrainMyBot 复测出现矛盾结果
+
+2026-07-15 的日志显示，临时配置已经正确使用：
+
+```text
+CAN socket bound to can3 (serial: 207A37AB45465006)
+YAM arm arm_right_leader initialized
+```
+
+但 TrainMyBot 随后仍报 6 个电机无响应。测试后 `can3` 进入：
+
+```text
+can state ERROR-PASSIVE
+error-passive 15006
+TX packets 174655
+RX packets 164509
+```
+
+这与前一日 `207A...` 低层读取全部成功不一致，当前不能直接断言是软件问题。需要厂家现场在同一条机械臂、同一根 CAN 线、同一个模块和同一套电源下重复：
+
+1. 先做低层单帧读 ID；
+2. 再启动 TrainMyBot；
+3. 对比启动前后的 CAN 错误计数。
+
+可能原因包括：测试时机械臂电源或 CAN 接头状态改变、模块未真正断电复位、CAN 线接触不良、TrainMyBot 启动帧触发了错误状态，或主臂角色/固件配置不匹配。
+
+### 4.5 2026-07-20 最新四臂同时启动结果
+
+按以下最新物理映射启动四臂：
+
+| CAN 接口 | 角色 | USB-CAN serial | CAN 状态 | TrainMyBot 结果 |
+|---|---|---|---|---|
+| `can2` | 左从臂 | `207137A745465006` | `ERROR-PASSIVE`，error-pass 114 | `calibrate_gripper: failed to read starting states` |
+| `can3` | 左主臂 | `207A37AB45465006` | `ERROR-PASSIVE`，error-pass 167 | `Tick hung`，6 个电机无响应 |
+| `can4` | 右从臂 | `20763380594E5018` | `ERROR-ACTIVE`，错误计数 0 | CAN 物理层正常，但夹爪校准仍失败 |
+| `can5` | 右主臂 | `208C3362594E5018` | `ERROR-PASSIVE`，error-pass 123 | `USB-CAN adapter ... stuck (0 frames transmitted)` |
+
+重要解释：
+
+- `ERROR-ACTIVE` 是正常 CAN 控制器状态；`ERROR-PASSIVE` 表示控制器已因大量通信错误降级。
+- `can2` 和 `can5` 都只有 3 个 TX 包，却出现一百多个 RX/error-pass 事件，这些 RX 很可能主要是 CAN 控制器错误帧，不代表收到有效电机反馈。
+- `can4` 虽然 CAN 物理层健康，但应用层仍无法读取夹爪起始状态，因此当前四条机械臂没有任何一条在 TrainMyBot 中完整启动成功。
+- 本次程序启动时，`can2`、`can3`、`can5` 原本为 DOWN，由 TrainMyBot 自行拉起，因此其 `restart-ms=0`；只有 `can4` 保留 `restart-ms=100`。这不是 ERROR-PASSIVE 的根因，但说明三个接口没有经过同一次完整的 `yam-can-prepare` 初始化，现场复测时应先停止 TrainMyBot，再统一初始化四个接口。
+
+## 5. 当前原因判断
+
+### 高概率，已有直接证据
+
+1. 至少一个 USB-CAN 模块或其 CAN 侧线缆存在硬件/电气故障：`208C...` 交叉测试时出现 ACK 错误和 ERROR-PASSIVE。
+2. 右主臂本体不是必然损坏：同一条右主臂曾用 `207A...` 低层读取 1--6 号电机成功。
+3. `Tick hung` 是通信失败后的上层超时，不是根因。
+
+### 中高概率
+
+1. 四个 USB-CAN 实际经过共同 USB Hub 路径。此前内核出现过：
+
+   ```text
+   disabled by hub (EMI?), re-enabling
+   USB disconnect
+   gs_usb ... usb xmit fail
+   ```
+
+   这可以解释为什么拔插后“正常的从臂”会改变。
+2. 发热模块可能存在 CAN 收发器部分短路、总线被拉 dominant、USB 5 V 异常耗流或内部固件/硬件损坏。
+3. 返修后的模块可能与其他模块的固件、CAN 参数或电机配置不一致。
+
+### 中低概率
+
+1. TrainMyBot 同时初始化多条机械臂时，一个卡死的 CAN 适配器占满重试/控制循环，导致其他设备也被上层标记为失败。
+2. 物理交换后系统配置未及时同步，导致某个模块被当成 leader/follower 使用。serial 绑定本身没有问题，但 role 配置仍需和当前机械臂本体一致。
+
+### 目前证据不支持的解释
+
+1. Jetson 四路 USB 总供电整体不足：同一 USB 路径下 `207A...` 曾能稳定完成 1--6 号低层查询。
+2. USB 自动挂起是主要原因：此前 CAN 设备的 runtime 状态为 active，未观察到 CAN 设备被 autosuspend。
+3. 四条机械臂同时运动导致总电源不足：故障在单臂、尚未运动的初始化阶段就出现。
+
+## 6. 厂家到场时建议的最小测试顺序
+
+所有更换都应在机械臂断电、采集服务停止后进行；一次只改变一个变量。
+
+### A. 先确认已知正常基准
+
+使用 `207A37AB45465006` 和一条已确认正常的机械臂，执行：
+
+```bash
+sudo systemctl stop recording_studio.service
+ip -details -statistics link show canX
+python3 yam_can_probe.py --channel canX --motor-ids 1,2,3,4,5,6
+```
+
+应看到 1--6 号正确回复，且不能进入 `ERROR-PASSIVE`。
+
+### B. 固定机械臂，逐个替换四个 CAN 模块
+
+推荐使用已经验证过的右主臂作为固定测试对象，依次接入：
+
+```text
+207A...  已有成功记录
+208C...  高度怀疑故障
+207633... 待测
+207137... 待测
+```
+
+每个模块都执行一次低层探测。若错误跟随模块，模块或其 CAN 线缆故障；若错误始终跟随机械臂，检查机械臂电源、CAN 接头和内部线束。
+
+### C. 对通过低层测试的组合再启动 TrainMyBot
+
+启动前记录：
+
+```bash
+ip -details -statistics link show canX
+```
+
+启动失败后立即再次记录同一命令。重点比较：
+
+- `error-passive` 是否增加；
+- `bus-errors` 是否增加；
+- TX 是否持续增长而 RX 没有有效电机反馈；
+- 是否发生 USB disconnect。
+
+### D. 厂家需要提供或确认的资料
+
+1. 四个 CAN 模块的硬件型号、固件版本和是否为同一批次。
+2. 工厂遥操作程序使用的 CAN 波特率、采样参数和接口选择。
+3. 四条机械臂的电机 ID、`master_id`、timeout、固件版本。
+4. CAN-H/CAN-L/GND 针脚定义和终端电阻位置。
+5. 返修过的两条主臂是否更换过电机控制器、CAN 收发器或主控板。
+6. 工厂测试时是否使用了不同的 USB-CAN 模块、线缆或电源适配器。
+
+## 7. 需要特别提醒厂家
+
+- 发热明显的 CAN 模块不要继续长时间运行，避免把模块或 USB Hub 一起损坏。
+- 不要在 TrainMyBot 运行时重启 `yam-can-prepare.service` 或拔插 CAN 模块。
+- 当前系统曾使用过单臂临时配置，不能直接作为四臂生产配置；恢复四臂前必须重新确认每个 serial 与机械臂本体的物理对应关系。
+
+## 8. 一句话结论
+
+目前最可靠的结论是：
+**
+至少 `208C3362594E5018` 这一 CAN 通信路径存在硬件/电气故障；同时系统曾有共享 USB Hub 不稳定现象。右主臂本体已被一次低层交叉测试证明可以正常通信，但 `207A...` 后续启动 TrainMyBot 又失败，说明还必须在厂家现场用同一套物理连接重复“低层探测 -> TrainMyBot”的对照实验，才能最终区分剩余的线缆/供电问题与软件/固件兼容问题。
+**
