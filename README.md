@@ -20,6 +20,7 @@ LoveApp 是一个面向单用户的恋爱沟通与约会决策 Agent。当前版
 - 可选天气 provider；天气只作为室内/户外排序的软约束，查询失败不会阻断规划
 - SQLite 持久化的关系记忆、结构化抽取与关系隔离
 - 本地记忆 Gate、后台抽取、尝试级耗时/重试/token Trace
+- Memory V2：Canonical Predicate、按类型准入、Claim Relation、Strong 灰区校验、事务化迁移审计
 - 咨询和约会规划自动读取相关偏好、事件、趋势与建议结果
 - 可替换的知识、模型、用户记忆和地图适配器
 - Pydantic 结构化输入与输出
@@ -142,6 +143,7 @@ uv run loveapp memory remember "我们最近两周每晚都会通话。" --relat
 uv run loveapp memory list --relationship-id current-partner
 uv run loveapp memory plans --relationship-id current-partner
 uv run loveapp memory context --relationship-id current-partner
+uv run loveapp memory audits --relationship-id current-partner
 uv run loveapp memory show <memory-id>
 ```
 
@@ -155,7 +157,7 @@ uv run loveapp memory watch --user-id local-user --relationship-id current-partn
 
 记忆抽取遵循“一条可独立确认、更新或删除的信息对应一条记忆”。熟悉度、接触机会、实际联系频率、话题范围、互动渠道和主动性是不同维度；同一条输入中的独立状态或指标必须分别输出。关系状态使用注册的 `state_dimension/state_value`，同一维度的新值会将旧值标记为 `superseded`，不同维度可以同时存在。一个主事实可以携带必要的渠道、共同场景或社会关系限定，例如 `contact_frequency + channel=online` 仍是一条频率模式；本地校验只拒绝把多个不兼容的主维度合成一条 claim。证据唯一明确指向另一个注册互动维度时，错误的 `metric/predicate` 会在本地一致性修复后再校验。
 
-模型自动抽取的记忆状态为 `proposed`，明确从约会参数写入的偏好为 `confirmed`。计划事件会额外保留 `period_start/period_end` 和 `expires_at`，过期后不会进入 Agent 的有效关系上下文。两者都会进入上下文，但保留状态供模型和用户区分；可以确认、拒绝或永久删除：
+模型候选先经过 Predicate 规范化和按 `MemoryKind` 配置的准入策略，再得到 `confirmed`、`proposed`、`strong_review` 或 `reject` 决策；高风险推测状态不会因模型自报高置信度而直接确认。`proposed` 与冲突项只进入显式不确定分区，不会作为确认偏好传给约会排序。计划事件会额外保留 `period_start/period_end` 和 `expires_at`，过期后不会进入 Agent 的有效关系上下文。用户仍可确认、拒绝或永久删除：
 
 ```powershell
 uv run loveapp memory confirm <memory-id>
@@ -164,7 +166,7 @@ uv run loveapp memory delete <memory-id> --yes
 uv run loveapp memory clear --relationship-id current-partner --yes
 ```
 
-`memory list --json` 可以查看全部结构化字段，`memory plans --json` 可以查看计划 ID、活动、参与人、计划时间、状态及源记忆。需要直接检查数据库时，可使用 SQLite 客户端或 DB Browser for SQLite 打开 `.data/loveapp.db`；核心表为 `relationships`、`conversations`、`messages`、`memory_items`、`relationship_plans` 和 `date_planning_tasks`。最后一张表是短期约会工作流状态，不会混入长期关系记忆。
+`memory list --json` 可以查看全部结构化字段，`memory plans --json` 可以查看计划 ID、活动、参与人、计划时间、状态及源记忆，`memory audits --json` 可追踪准入分数、关系判断、目标记忆和迁移规则。需要直接检查数据库时，可使用 SQLite 客户端或 DB Browser for SQLite 打开 `.data/loveapp.db`；核心表为 `relationships`、`conversations`、`messages`、`memory_items`、`relationship_plans`、`memory_transition_audit` 和 `date_planning_tasks`。最后一张表是短期约会工作流状态，不会混入长期关系记忆。
 
 `memory watch` 默认按 `user_id + relationship_id` 观察该关系的活动记忆和活动计划（都只显示 `proposed/confirmed`），同时显示最近的 Gate 与抽取运行记录。增加 `--include-inactive` 后可看到计划的 `completed/cancelled/expired` 历史。它不是单个会话的视图；需要定位某次 `chat` 时传入会话 ID：
 
@@ -176,7 +178,7 @@ uv run loveapp memory runs --user-id local-user --relationship-id current-partne
 
 运行记录会区分 `skipped`、`running`、`completed`、`failed` 和 `cancelled`，并保存 Gate 原因、模型尝试耗时/token、错误信息、局部无效 claim 的校验原因、实际写入的记忆 ID 以及未写入片段的原文和原因。claim 证据与 discarded span 不允许重叠。功能上线前已经产生的历史抽取不会自动补写 discarded 明细，因此旧运行记录只保留当时的计数。
 
-记忆模型采用 Flash 优先的两级链路：Flash 请求明确关闭 DeepSeek thinking，先在本地清理代码围栏、尾逗号并补齐安全的根数组字段；无法安全修复的格式/结构错误直接丢弃。覆盖缺口会记录为诊断信号，但普通漏抽不会单独触发强模型；只有重要信息出现语义校验失败、低置信度、复杂指代、潜在冲突或高价值事实缺失时才升级。Flash 与强模型分别使用 `LOVEAPP_MEMORY_EXTRACTION_TIMEOUT_SECONDS`、`LOVEAPP_MEMORY_EXTRACTION_MAX_RETRIES`、`LOVEAPP_MEMORY_EXTRACTION_MAX_TOKENS` 和对应的 `STRONG_*` 配置；默认值分别为 `30s/0/1536` 与 `60s/1/4096`。
+记忆模型采用 Flash 优先的两级链路：Flash 请求明确关闭 DeepSeek thinking，先在本地清理代码围栏、尾逗号并补齐安全的根数组字段；无法安全修复的格式/结构错误直接丢弃。覆盖缺口会记录为诊断信号，但普通漏抽不会单独触发强模型。Strong 只处理高风险、冲突、`UNCERTAIN`、Custom 可能映射核心状态或证据蕴含不清的灰区；它只能在服务传入的少量候选 ID 中选择目标，最终写入仍由 Python Policy 决定。Flash 与强模型分别使用 `LOVEAPP_MEMORY_EXTRACTION_TIMEOUT_SECONDS`、`LOVEAPP_MEMORY_EXTRACTION_MAX_RETRIES`、`LOVEAPP_MEMORY_EXTRACTION_MAX_TOKENS` 和对应的 `STRONG_*` 配置；默认值分别为 `30s/0/1536` 与 `60s/1/4096`。
 
 普通记忆默认要求置信度不低于 `0.65`；`source_type=hearsay` 的暂定记忆允许降到 `LOVEAPP_MEMORY_TENTATIVE_MIN_CONFIDENCE`（默认 `0.5`），`user_belief` 允许降到 `LOVEAPP_MEMORY_BELIEF_MIN_CONFIDENCE`（默认 `0.4`）。它们仍以 `proposed` 状态保存，不会被当作已确认事实。
 
@@ -187,6 +189,26 @@ uv run python scripts/benchmark_memory_extraction.py
 ```
 
 脚本不会输出 API Key，也不会写入 `.data/loveapp.db`；输出包含 Flash 直成功率、本地修复次数、强模型升级次数和每轮耗时。固定的多轮记忆评测集仍保存在 `evals/memory/conversations_v1.jsonl`，不与单元测试复用语料。
+
+逐轮观察 Memory V2 的完整治理过程时，使用观察脚本：
+
+```powershell
+# 交互式多轮测试；默认使用隔离的内存 Store
+uv run python scripts/observe_memory_system.py
+
+# 按顺序执行固定输入
+uv run python scripts/observe_memory_system.py --text "她喜欢安静的咖啡馆" --text "她现在更喜欢热闹一点的地方"
+
+# 输出机器可读报告；需要持久化测试状态时显式指定测试数据库
+uv run python scripts/observe_memory_system.py --json --text "她喜欢安静的咖啡馆"
+uv run python scripts/observe_memory_system.py --database .data/memory-observer.db
+
+# 仅测试：强制越过 Gate，并只观察计划、不提交 Memory 变更
+uv run python scripts/observe_memory_system.py --force-gate --dry-run --text "这是一句测试输入"
+```
+
+每轮报告同时展示 Flash 原始 Predicate、Canonical Predicate、alias 命中、Admission 分数拆解、Relation 实际比较的旧 Memory、SAME/UPDATE/CONTRADICTION 等判断、PredicateFamily/状态维度、提交前计划动作，以及提交后的新增、证据合并、替代、过期和定时过期结果。只有显式传入 `--use-app-database` 或 `--database` 才会写入持久化数据库。
+`--force-gate` 和 `--dry-run` 只属于该测试脚本：前者会在报告中标记 `reason=forced`，后者不提交 Memory 批次；正常聊天链路不会启用它们。
 
 如果历史数据中已有重复记忆，先预览再做可逆的状态归档；命令不会物理删除记录：
 
@@ -207,9 +229,12 @@ uv run ruff check .
 ```powershell
 uv run loveapp eval baseline --output evals/baselines/current.json
 uv run loveapp eval baseline --no-live-memory --output evals/baselines/rag-only.json
+uv run loveapp eval memory-lifecycle --output evals/baselines/memory_lifecycle_v1.json
 ```
 
-报告包含路由准确率、RAG Recall@3/5 与 MRR、高风险召回率/精确率/特异度、记忆污染率、Gate 召回率/特异度和尝试级 Trace。指标只描述仓库中的固定小样例，扩充数据集后才适合设定更可靠的上线阈值。
+报告包含路由准确率、RAG Recall@3/5 与 MRR、高风险召回率/精确率/特异度、记忆污染率、Gate 召回率/特异度和尝试级 Trace。Memory Lifecycle 报告额外输出规范化、准入、关系判断、去重/更新 Precision 与 Recall、错误合并、旧状态残留、冲突泄漏、Strong 升级率、审计完整性、按场景和按 MemoryKind 汇总。指标只描述仓库中的固定小样例，扩充数据集后才适合设定更可靠的上线阈值。
+
+Memory V2 的完整现状审计、设计、迁移和限制见 [docs/Memory_System_V2.md](docs/Memory_System_V2.md)。
 
 ## 结构
 
@@ -217,8 +242,10 @@ uv run loveapp eval baseline --no-live-memory --output evals/baselines/rag-only.
 src/loveapp/
 ├── adapters/       # Qdrant、DeepSeek、高德等基础设施实现
 ├── agents/         # LangGraph 工作流
+├── application/    # 记忆准入、关系判断与用例编排
 ├── core/           # 配置
 ├── domain/         # 领域模型
+├── evaluation/     # 固定离线评测驱动器
 ├── ports/          # RAG、地图、记忆接口
 ├── resources/      # 种子知识
 ├── safety/         # 安全策略

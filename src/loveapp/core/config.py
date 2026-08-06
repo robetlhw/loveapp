@@ -67,6 +67,9 @@ class Settings(BaseSettings):
     memory_min_confidence: float = Field(default=0.65, ge=0, le=1)
     memory_tentative_min_confidence: float = Field(default=0.5, ge=0, le=1)
     memory_belief_min_confidence: float = Field(default=0.4, ge=0, le=1)
+    memory_admission_policy_overrides: dict[str, dict[str, object]] = Field(
+        default_factory=dict
+    )
     memory_context_limit: int = Field(default=20, ge=1, le=100)
     conversation_history_limit: int = Field(default=12, ge=2, le=50)
     memory_context_wait_seconds: float = Field(default=2, ge=0, le=30)

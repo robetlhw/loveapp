@@ -1,10 +1,17 @@
 import re
 import unicodedata
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 from loveapp.application.relationship_events import resolve_contextual_relationship_event
 from loveapp.domain.memory import MemoryGateDecision, MemoryGateReason, MemoryItem, StoredMessage
 from loveapp.domain.relationship_plan import has_retrospective_event_semantics
+
+
+@dataclass(frozen=True)
+class _GateMatch:
+    rule: str
+    span: str
 
 
 class MemoryGate:
@@ -20,18 +27,52 @@ class MemoryGate:
         if compact in _CASUAL_MESSAGES or any(
             pattern.fullmatch(normalized) for pattern in _CASUAL_PATTERNS
         ):
-            return _skip(MemoryGateReason.CASUAL, "exact_casual")
-        if any(pattern.search(normalized) for pattern in _HYPOTHETICAL_PATTERNS):
-            return _skip(MemoryGateReason.HYPOTHETICAL, "hypothetical framing")
-        if any(pattern.search(normalized) for pattern in _OPERATION_PATTERNS):
-            return _skip(MemoryGateReason.OPERATION, "agent operation")
-        if any(pattern.search(normalized) for pattern in _KNOWLEDGE_QUESTION_PATTERNS):
-            return _skip(MemoryGateReason.KNOWLEDGE_QUESTION, "generic knowledge")
-        if any(pattern.search(normalized) for pattern in _EXPLICIT_REMEMBER_PATTERNS):
+            return _skip(
+                MemoryGateReason.CASUAL,
+                "exact_casual",
+                matched_rule="casual_exact",
+                matched_span=normalized,
+            )
+        hypothetical = _first_match(normalized, _HYPOTHETICAL_PATTERNS, "hypothetical")
+        if hypothetical is not None:
+            return _skip(
+                MemoryGateReason.HYPOTHETICAL,
+                "hypothetical framing",
+                matched_rule=hypothetical.rule,
+                matched_span=hypothetical.span,
+            )
+        operation = _first_match(normalized, _OPERATION_PATTERNS, "operation")
+        if operation is not None:
+            return _skip(
+                MemoryGateReason.OPERATION,
+                "agent operation",
+                matched_rule=operation.rule,
+                matched_span=operation.span,
+            )
+        knowledge_question = _first_match(
+            normalized,
+            _KNOWLEDGE_QUESTION_PATTERNS,
+            "knowledge_question",
+        )
+        if knowledge_question is not None:
+            return _skip(
+                MemoryGateReason.KNOWLEDGE_QUESTION,
+                "generic knowledge",
+                matched_rule=knowledge_question.rule,
+                matched_span=knowledge_question.span,
+            )
+        explicit_remember = _first_match(
+            normalized,
+            _EXPLICIT_REMEMBER_PATTERNS,
+            "explicit_remember",
+        )
+        if explicit_remember is not None:
             return MemoryGateDecision(
                 should_extract=True,
                 reason=MemoryGateReason.EXPLICIT_REMEMBER,
                 signals=["explicit remember request"],
+                matched_rule=explicit_remember.rule,
+                matched_span=explicit_remember.span,
             )
 
         contextual_event = resolve_contextual_relationship_event(
@@ -44,6 +85,8 @@ class MemoryGate:
                 should_extract=True,
                 reason=MemoryGateReason.DURABLE_SIGNAL,
                 signals=["contextual_relationship_event", contextual_event.signal],
+                matched_rule="contextual_relationship_event",
+                matched_span=text,
             )
 
         if has_retrospective_event_semantics(text):
@@ -51,6 +94,8 @@ class MemoryGate:
                 should_extract=True,
                 reason=MemoryGateReason.DURABLE_SIGNAL,
                 signals=["retrospective_event_semantics"],
+                matched_rule="retrospective_event_semantics",
+                matched_span=text,
             )
 
         signals = [
@@ -60,15 +105,36 @@ class MemoryGate:
         ]
         if "planned_event" in signals and _is_habitual_not_future(normalized):
             signals.remove("planned_event")
+        interaction_decline = _find_interaction_decline(normalized)
+        if interaction_decline is not None and "interaction_decline" not in signals:
+            signals.append("interaction_decline")
         if signals:
+            generic_match = _first_signal_match(normalized, signals)
+            matched = interaction_decline or generic_match
             return MemoryGateDecision(
                 should_extract=True,
                 reason=MemoryGateReason.DURABLE_SIGNAL,
                 signals=signals,
+                matched_rule=matched.rule if matched is not None else None,
+                matched_span=matched.span if matched is not None else None,
             )
-        if _has_consultation_question(normalized):
-            return _skip(MemoryGateReason.CONSULTATION_ONLY, "question without durable claim")
-        return _skip(MemoryGateReason.NO_DURABLE_SIGNAL, "no durable signal")
+        consultation = _first_match(
+            normalized,
+            _CONSULTATION_PATTERNS,
+            "consultation_question",
+        )
+        if consultation is not None:
+            return _skip(
+                MemoryGateReason.CONSULTATION_ONLY,
+                "question without durable claim",
+                matched_rule=consultation.rule,
+                matched_span=consultation.span,
+            )
+        return _skip(
+            MemoryGateReason.NO_DURABLE_SIGNAL,
+            "no durable signal",
+            matched_rule="no_durable_signal",
+        )
 
 
 def _normalize(value: str) -> str:
@@ -79,8 +145,48 @@ def _compact(value: str) -> str:
     return re.sub(r"[\s,，。.!！?？~～]", "", value)
 
 
-def _skip(reason: MemoryGateReason, signal: str) -> MemoryGateDecision:
-    return MemoryGateDecision(should_extract=False, reason=reason, signals=[signal])
+def _skip(
+    reason: MemoryGateReason,
+    signal: str,
+    *,
+    matched_rule: str | None = None,
+    matched_span: str | None = None,
+) -> MemoryGateDecision:
+    return MemoryGateDecision(
+        should_extract=False,
+        reason=reason,
+        signals=[signal],
+        matched_rule=matched_rule,
+        matched_span=matched_span,
+    )
+
+
+def _first_match(
+    text: str,
+    patterns: tuple[re.Pattern[str], ...],
+    rule_prefix: str,
+) -> _GateMatch | None:
+    for index, pattern in enumerate(patterns, start=1):
+        match = pattern.search(text)
+        if match is not None:
+            return _GateMatch(f"{rule_prefix}_{index}", match.group(0))
+    return None
+
+
+def _first_signal_match(text: str, signals: list[str]) -> _GateMatch | None:
+    for signal in signals:
+        match = _first_match(text, _DURABLE_SIGNAL_PATTERNS.get(signal, ()), signal)
+        if match is not None:
+            return match
+    return None
+
+
+def _find_interaction_decline(text: str) -> _GateMatch | None:
+    for rule, pattern in _INTERACTION_DECLINE_RULES:
+        match = pattern.search(text)
+        if match is not None:
+            return _GateMatch(rule, match.group(0))
+    return None
 
 
 def _has_consultation_question(text: str) -> bool:
@@ -139,11 +245,63 @@ _EXPLICIT_REMEMBER_PATTERNS = (
     re.compile(r"记一下[：:]?"),
 )
 
+# Keep the interaction-decline vocabulary separate from the broader durable
+# signal patterns below.  This makes it possible to expand colloquial Chinese
+# without weakening unrelated Gate rules.
+_INTERACTION_TIME_MARKERS = (
+    "最近",
+    "近来",
+    "这段时间",
+    "这几天",
+    "这周",
+    "上周",
+    "过去",
+    "前阵子",
+    "一直",
+)
+_INTERACTION_SUBJECTS = ("我和她", "我和他", "我俩", "我们", "她", "他", "对方", "对象", "伴侣")
+_INTERACTION_TARGET = r"(?:我|你|他|她|人|对方|消息|信息)?"
+_INTERACTION_VERB = (
+    r"(?:理(?:睬|我|你|他|她|人|对方)?|"
+    rf"搭理{_INTERACTION_TARGET}|"
+    rf"回复{_INTERACTION_TARGET}|回(?:我|消息|信息)|"
+    rf"联系{_INTERACTION_TARGET}|聊天{_INTERACTION_TARGET}|"
+    rf"交流{_INTERACTION_TARGET}|沟通{_INTERACTION_TARGET}|互动{_INTERACTION_TARGET})"
+)
+_INTERACTION_VERB_WITH_BOUNDARY = rf"{_INTERACTION_VERB}(?:了|着|过)?(?![\u4e00-\u9fff])"
+_INTERACTION_DECLINE_PREFIX = r"(?:不怎么|不太|很少|几乎不)"
+_INTERACTION_DECLINE_TREND = (
+    r"(?:回复|联系|聊天|交流|沟通|互动)(?:明显)?"
+    r"(?:变少(?:了)?|越来越少|减少(?:了)?|下降(?:了)?|降低(?:了)?|少了)"
+    r"(?![\u4e00-\u9fff])"
+)
+_INTERACTION_DECLINE_PHRASE = (
+    rf"(?:{_INTERACTION_DECLINE_PREFIX}{_INTERACTION_VERB_WITH_BOUNDARY}|"
+    rf"爱答不理|{_INTERACTION_DECLINE_TREND})"
+)
+_INTERACTION_DECLINE_RULES = (
+    (
+        "temporal_interaction_decline",
+        re.compile(
+            rf"(?:{'|'.join(map(re.escape, _INTERACTION_TIME_MARKERS))})"
+            rf".{{0,24}}{_INTERACTION_DECLINE_PHRASE}"
+        ),
+    ),
+    (
+        "subject_interaction_decline",
+        re.compile(
+            rf"(?:{'|'.join(map(re.escape, _INTERACTION_SUBJECTS))})"
+            rf".{{0,20}}{_INTERACTION_DECLINE_PHRASE}"
+        ),
+    ),
+    ("interaction_decline", re.compile(_INTERACTION_DECLINE_PHRASE)),
+)
+
 _DURABLE_SIGNAL_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
     "preference": (
         re.compile(
             r"(?:我|她|他|对象|伴侣|我们).{0,16}"
-            r"(?:喜欢(?!的)|不喜欢|爱吃|不吃|讨厌|偏好|过敏|不能吃|想去|"
+            r"(?:喜欢(?!的)|不喜欢|爱吃|不吃|能接受|不能接受|讨厌|偏好|过敏|不能吃|想去|"
             r"勤俭节约|节俭|经济实惠|实惠|精打细算|省钱|消费观(?:念)?|消费习惯)"
         ),
     ),

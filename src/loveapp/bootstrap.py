@@ -171,6 +171,12 @@ def build_memory_container(
         history_limit=settings.conversation_history_limit,
         context_wait_seconds=settings.memory_context_wait_seconds,
         shutdown_grace_seconds=settings.memory_shutdown_grace_seconds,
+        admission_policy_overrides=settings.memory_admission_policy_overrides,
+        verifier=(
+            memory_extractor
+            if getattr(memory_extractor, "can_verify", False)
+            else None
+        ),
     )
     return MemoryContainer(
         memory_service=memory_service,

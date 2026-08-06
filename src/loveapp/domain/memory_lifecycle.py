@@ -12,6 +12,7 @@ from loveapp.domain.memory import (
     MemoryKind,
     MemoryStatus,
     TimeKind,
+    normalize_candidate_predicate,
 )
 from loveapp.domain.memory_dimensions import (
     normalize_state_dimension,
@@ -129,7 +130,7 @@ _PREDICATE_FAMILIES: tuple[PredicateFamily, ...] = (
         ),
         role=MemoryRole.CURRENT_STATE,
         state_scope="conflict_status",
-        state_value="unresolved",
+        state_value="active",
         default_ttl=timedelta(days=14),
     ),
     PredicateFamily(
@@ -223,10 +224,29 @@ def memory_predicate(memory: MemoryCandidate) -> str:
 
 
 def memory_concept(memory: MemoryCandidate) -> str:
+    normalized = normalize_candidate_predicate(memory)
+    canonical = normalized.canonical_predicate
+    state_value = normalized.state_value
+    if canonical == "contact.status" and state_value:
+        return f"contact_{state_value}"
+    if canonical == "relationship.repair_status" and state_value:
+        return {
+            "in_progress": "repair_started",
+            "completed": "relationship_repaired",
+        }.get(state_value, f"repair_{state_value}")
+    if canonical == "relationship.conflict_status" and state_value == "active":
+        return "active_conflict"
+    if canonical == "confession.status" and state_value:
+        return {
+            "intended": "confession_intent",
+            "accepted": "relationship_started",
+        }.get(state_value, f"confession_{state_value}")
+    if canonical == "relationship.stage" and state_value in {"dating", "committed"}:
+        return "relationship_started"
     state_identity = relationship_state_identity(memory)
-    state_value = relationship_state_value(memory)
-    if state_identity is not None and state_value is not None:
-        return f"state:{state_identity[1]}:{state_value}"
+    relationship_value = relationship_state_value(memory)
+    if state_identity is not None and relationship_value is not None:
+        return f"state:{state_identity[1]}:{relationship_value}"
     if _has_preference_payload(memory):
         preference = memory.payload.get("preference")
         preference_type = memory.payload.get("preference_type") or "unknown"
@@ -265,6 +285,7 @@ def normalize_memory_candidate(
     candidate: MemoryCandidate,
     reference_time: datetime,
 ) -> MemoryCandidate:
+    candidate = normalize_candidate_predicate(candidate)
     updates: dict = {}
     payload = dict(candidate.payload)
     if "relationship_evidence" in payload:
@@ -341,7 +362,8 @@ def normalize_memory_candidate(
 
     if payload != candidate.payload:
         updates["payload"] = payload
-    return candidate.model_copy(update=updates) if updates else candidate
+    normalized_candidate = candidate.model_copy(update=updates) if updates else candidate
+    return normalize_candidate_predicate(normalized_candidate)
 
 
 def plan_memory_transitions(
@@ -349,6 +371,7 @@ def plan_memory_transitions(
     active_memories: Sequence[MemoryItem],
     *,
     legacy_ordering: bool = False,
+    trigger_statuses: Sequence[MemoryStatus] | None = None,
 ) -> list[PlannedMemoryTransition]:
     plans: list[PlannedMemoryTransition] = []
     claimed_targets: set[str] = set()
@@ -362,6 +385,15 @@ def plan_memory_transitions(
                 for item in active_memories
                 if item.id not in claimed_targets
                 and memory_concept(item) in rule.closes_concepts
+                and _trigger_can_close_target(
+                    trigger,
+                    item,
+                    trigger_status=(
+                        trigger_statuses[index]
+                        if trigger_statuses is not None and index < len(trigger_statuses)
+                        else None
+                    ),
+                )
                 and (not legacy_ordering or _is_strictly_older(item, trigger))
             )
             if not targets:
@@ -386,6 +418,15 @@ def plan_memory_transitions(
             if item.id not in claimed_targets
             and relationship_state_identity(item) == identity
             and relationship_state_value(item) not in {None, value}
+            and _trigger_can_close_target(
+                trigger,
+                item,
+                trigger_status=(
+                    trigger_statuses[index]
+                    if trigger_statuses is not None and index < len(trigger_statuses)
+                    else None
+                ),
+            )
             and (not legacy_ordering or _is_strictly_older(item, trigger))
         )
         if not targets:
@@ -442,6 +483,9 @@ def semantic_duplicate_ids(active_memories: Sequence[MemoryItem]) -> set[str]:
 
 def semantic_context_key(memory: MemoryItem) -> tuple[str, str, str] | None:
     role = memory_role(memory)
+    state_identity = relationship_state_identity(memory)
+    if state_identity is not None:
+        return role.value, memory.subject.casefold(), f"state:{state_identity[1]}"
     concept = memory_concept(memory)
     if not concept or (
         role == MemoryRole.RECENT_EVENT
@@ -452,6 +496,10 @@ def semantic_context_key(memory: MemoryItem) -> tuple[str, str, str] | None:
 
 
 def relationship_state_identity(memory: MemoryCandidate) -> tuple[str, str] | None:
+    if memory.kind != MemoryKind.RELATIONSHIP_STATE:
+        return None
+    if memory.state_dimension:
+        return "relationship", memory.state_dimension
     dimension = normalize_state_dimension(memory.payload.get("state_dimension"))
     if dimension is None:
         dimension = normalize_state_dimension(memory.payload.get("uncertainty_type"))
@@ -461,6 +509,8 @@ def relationship_state_identity(memory: MemoryCandidate) -> tuple[str, str] | No
 
 
 def relationship_state_value(memory: MemoryCandidate) -> str | None:
+    if memory.state_dimension and memory.state_value:
+        return memory.state_value
     identity = relationship_state_identity(memory)
     if identity is None:
         return None
@@ -501,6 +551,20 @@ def _is_strictly_older(target: MemoryItem, trigger: MemoryCandidate) -> bool:
     target_time = target.occurred_at or target.period_end or target.updated_at
     trigger_time = trigger.occurred_at or trigger.period_end or trigger.updated_at
     return target.id != trigger.id and target_time < trigger_time
+
+
+def _trigger_can_close_target(
+    trigger: MemoryCandidate,
+    target: MemoryItem,
+    *,
+    trigger_status: MemoryStatus | None,
+) -> bool:
+    status = trigger_status
+    if status is None and isinstance(trigger, MemoryItem):
+        status = trigger.status
+    if status == MemoryStatus.PROPOSED and target.status == MemoryStatus.CONFIRMED:
+        return False
+    return status != MemoryStatus.REJECTED
 
 
 def _memory_keeper_rank(item: MemoryItem) -> tuple[int, int, float, datetime]:

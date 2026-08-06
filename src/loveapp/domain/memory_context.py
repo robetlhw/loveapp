@@ -139,6 +139,10 @@ def attach_memories(
     )
     result.active_context = []
     result.current_state = []
+    result.confirmed_current_state = []
+    result.confirmed_long_term = []
+    result.uncertain_items = []
+    result.conflicted_items = []
     result.planned_events = []
     result.action_intents = []
     result.recent_events = []
@@ -146,6 +150,10 @@ def attach_memories(
 
     for item in memories:
         context_item = MemoryContextItem.from_item(item)
+        if item.status == MemoryStatus.PROPOSED:
+            result.uncertain_items.append(context_item)
+        if item.claim_relation == "contradiction":
+            result.conflicted_items.append(context_item)
         attention_reason = memory_attention_reason(item, reference_time)
         if attention_reason is not None:
             result.active_context.append(
@@ -156,13 +164,17 @@ def attach_memories(
         role = memory_role(item)
         if role == MemoryRole.PREFERENCE:
             values = _preference_values(item)
-            if item.subject.casefold() in {"partner", "对方", "伴侣", "她", "他"}:
-                result.partner_preferences.extend(values)
-            else:
-                result.user_preferences.extend(values)
+            if item.status == MemoryStatus.CONFIRMED:
+                if item.subject.casefold() in {"partner", "对方", "伴侣", "她", "他"}:
+                    result.partner_preferences.extend(values)
+                else:
+                    result.user_preferences.extend(values)
+                result.confirmed_long_term.append(context_item)
             continue
         if role == MemoryRole.CURRENT_STATE:
             result.current_state.append(context_item)
+            if item.status == MemoryStatus.CONFIRMED:
+                result.confirmed_current_state.append(context_item)
         elif role == MemoryRole.PLANNED_EVENT:
             result.planned_events.append(context_item)
             continue
@@ -171,6 +183,11 @@ def attach_memories(
             continue
         elif role == MemoryRole.RECENT_EVENT:
             result.recent_events.append(context_item)
+        if item.status == MemoryStatus.CONFIRMED and role in {
+            MemoryRole.STABLE_PROFILE,
+            MemoryRole.PREFERENCE,
+        }:
+            result.confirmed_long_term.append(context_item)
         result.important_context.append(item.summary)
 
     result.user_preferences = list(dict.fromkeys(result.user_preferences))
@@ -250,8 +267,8 @@ def _attention_rank(
         "active": 1,
         "pending": 1,
     }.get(reason or "", 0)
-    relevance, importance, confirmed, timestamp = _context_rank(item, query)
-    return priority, relevance, importance, confirmed, timestamp
+    confirmed, relevance, importance, timestamp = _context_rank(item, query)
+    return priority, confirmed, relevance, importance, timestamp
 
 
 def _deduplicate_for_context(memories: list[MemoryItem]) -> list[MemoryItem]:
@@ -263,7 +280,22 @@ def _deduplicate_for_context(memories: list[MemoryItem]) -> list[MemoryItem]:
             ungrouped.append(item)
         else:
             grouped[key].append(item)
-    keepers = [max(items, key=_keeper_rank) for items in grouped.values()]
+    keepers: list[MemoryItem] = []
+    for key, items in grouped.items():
+        if key[2].startswith("state:"):
+            confirmed = [item for item in items if item.status == MemoryStatus.CONFIRMED]
+            if confirmed:
+                keeper = max(confirmed, key=_keeper_rank)
+                keepers.append(keeper)
+                keepers.extend(
+                    item
+                    for item in sorted(items, key=_keeper_rank, reverse=True)
+                    if item.status == MemoryStatus.PROPOSED
+                    and item.state_value != keeper.state_value
+                    and (item.lifecycle_review_required or item.claim_relation == "contradiction")
+                )
+                continue
+        keepers.append(max(items, key=_keeper_rank))
     return [*ungrouped, *keepers]
 
 
@@ -271,9 +303,9 @@ def _context_rank(item: MemoryItem, query: str | None) -> tuple[int, int, int, f
     relevance = _text_relevance(query, f"{item.summary} {item.original_text}")
     timestamp = item.occurred_at or item.period_end or item.updated_at
     return (
+        int(item.status == MemoryStatus.CONFIRMED),
         relevance,
         item.importance,
-        int(item.status == MemoryStatus.CONFIRMED),
         timestamp.timestamp(),
     )
 

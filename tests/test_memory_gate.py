@@ -98,3 +98,50 @@ def test_memory_gate_does_not_label_habitual_weekend_contact_as_future_plan() ->
 
     assert decision.should_extract is True
     assert "planned_event" not in decision.signals
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "她最近不怎么理我。",
+        "她最近不太理我。",
+        "她最近不太搭理我。",
+        "她最近很少理我。",
+        "她最近很少回复我。",
+        "她最近几乎不回复我。",
+        "她最近对我爱答不理。",
+        "她最近回复变少了。",
+        "她最近联系变少了。",
+        "她最近聊天越来越少。",
+        "但她最近不怎么理我，我也不知道我做错了啥，当然也可能是她心情不好",
+    ],
+)
+def test_memory_gate_recognizes_interaction_decline_phrases(text: str) -> None:
+    decision = MemoryGate().evaluate(text)
+
+    assert decision.should_extract is True
+    assert "interaction_decline" in decision.signals or "temporal_interaction" in decision.signals
+    assert decision.matched_rule in {
+        "temporal_interaction_decline",
+        "subject_interaction_decline",
+        "interaction_decline",
+    }
+    assert decision.matched_span
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "我最近不怎么理解她的想法。",
+        "这个方案不太理想。",
+        "我很少理解复杂概念。",
+        "最近状态不太理想。",
+        "这个解释几乎不合理。",
+    ],
+)
+def test_memory_gate_does_not_confuse_non_interaction_phrases(text: str) -> None:
+    decision = MemoryGate().evaluate(text)
+
+    assert decision.should_extract is False
+    assert decision.reason.value == "no_durable_signal"
+    assert decision.matched_rule == "no_durable_signal"

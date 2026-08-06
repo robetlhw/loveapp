@@ -1,14 +1,19 @@
 import asyncio
 import inspect
+import json
 from collections.abc import Callable
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 from loveapp.domain.advice import RelationshipContext
 from loveapp.domain.enums import RelationshipStage
 from loveapp.domain.memory import (
+    AdmissionDecision,
     AtomicExtraction,
+    ClaimRelation,
     DiscardedSpan,
+    EvidenceExplicitness,
     MemoryCandidate,
     MemoryCompactionGroup,
     MemoryCompactionResult,
@@ -22,6 +27,7 @@ from loveapp.domain.memory import (
     MemoryStatus,
     MemoryValence,
     MessageRole,
+    PredicateType,
     RelationshipImpact,
     RememberResult,
     StoredMessage,
@@ -35,9 +41,19 @@ from loveapp.domain.memory_context import (
 )
 from loveapp.domain.memory_lifecycle import (
     legacy_transition_target_ids,
+    memory_concept,
     normalize_memory_candidate,
     plan_memory_transitions,
     semantic_duplicate_ids,
+)
+from loveapp.domain.memory_predicates import CANONICAL_PREDICATES, normalize_predicate
+from loveapp.domain.memory_verification import ClaimVerification
+from loveapp.domain.memory_write import (
+    MemoryAuditDraft,
+    MemoryStatusUpdate,
+    MemoryWriteBatch,
+    MemoryWriteOperation,
+    RelationshipPlanStatusUpdate,
 )
 from loveapp.domain.relationship_evidence import (
     project_standardized_relationship_evidence,
@@ -54,16 +70,39 @@ from loveapp.domain.relationship_plan import (
     memory_with_plan,
     suppressed_plan_ids_for_text,
 )
-from loveapp.ports.memory import MemoryExtractor, MemoryStore
+from loveapp.ports.memory import MemoryExtractor, MemoryStore, StrongClaimVerifier
 from loveapp.ports.observability import TraceRecorder
 
+from .memory_admission import (
+    assess_memory_admission,
+    build_admission_policies,
+    interaction_pattern_has_frequency,
+    interaction_pattern_has_multiple_evidence,
+)
 from .memory_gate import MemoryGate
+from .memory_relations import (
+    ClaimRelationResolution,
+    has_local_conflict,
+    resolve_claim_relation,
+)
 from .relationship_events import (
     build_contextual_relationship_candidate,
     build_pending_confession_candidate,
     may_contain_contextual_relationship_event,
     resolve_contextual_relationship_event,
 )
+
+
+@dataclass(frozen=True)
+class _CandidateObservation:
+    candidate_index: int
+    alias_hit: bool
+    admission_reason: str
+    score_breakdown: dict[str, object]
+    compared_memory_ids: tuple[str, ...]
+    strong_called: bool
+    strong_compared_memory_ids: tuple[str, ...]
+    relation_target_memory_ids: tuple[str, ...]
 
 
 class MemoryService:
@@ -81,6 +120,8 @@ class MemoryService:
         gate: MemoryGate | None = None,
         shutdown_grace_seconds: float = 10,
         clock: Callable[[], datetime] = utc_now,
+        admission_policy_overrides: dict[str, dict[str, object]] | None = None,
+        verifier: StrongClaimVerifier | None = None,
     ) -> None:
         self.store = store
         self._extractor = extractor
@@ -93,6 +134,11 @@ class MemoryService:
         self._gate = gate or MemoryGate()
         self._shutdown_grace_seconds = shutdown_grace_seconds
         self._clock = clock
+        self._admission_policies = build_admission_policies(admission_policy_overrides)
+        self._verifier = verifier
+        set_store_clock = getattr(store, "set_clock", None)
+        if callable(set_store_clock):
+            set_store_clock(clock)
         self._background_tasks: set[asyncio.Task] = set()
         self._background_task_scopes: dict[asyncio.Task, tuple[str, str]] = {}
 
@@ -165,6 +211,7 @@ class MemoryService:
             conversation_history=conversation_history or [],
             existing_memories=preloaded_memories or [],
         )
+        _record_gate_trace(trace, gate_decision)
         now = self._clock()
         extraction_run = MemoryExtractionRun(
             id=str(uuid4()),
@@ -250,53 +297,8 @@ class MemoryService:
         if pending_confession is not None:
             pending_candidates.append(pending_confession)
         deterministic_candidates = [*contextual_candidates, *pending_candidates]
-        deterministic_saved = []
-        if deterministic_candidates:
-            try:
-                deterministic_saved = await self.store.save_memories(
-                    user_id=message.user_id,
-                    relationship_id=message.relationship_id,
-                    candidates=deterministic_candidates,
-                    source_message_id=message.id,
-                    status=status,
-                )
-                await self._project_relationship_stage(
-                    message.user_id,
-                    message.relationship_id,
-                    [
-                        saved.item
-                        for saved in deterministic_saved
-                        if _candidate_predicate(saved.item)
-                        in _RELATIONSHIP_STAGE_EVENT_PREDICATES
-                    ],
-                )
-                await self.store.save_extraction_run(
-                    extraction_run.model_copy(
-                        update={
-                            "saved_memory_ids": [saved.item.id for saved in deterministic_saved],
-                            "updated_at": self._clock(),
-                        }
-                    )
-                )
-            except Exception as exc:
-                await self._finish_extraction_run(
-                    extraction_run,
-                    MemoryExtractionStatus.FAILED,
-                    attempts=[],
-                    saved_memory_ids=[saved.item.id for saved in deterministic_saved],
-                    error=f"deterministic memory persistence failed: {exc}",
-                )
-                raise
-        if deterministic_saved:
-            active_ids = {item.id for item in active}
-            for saved in deterministic_saved:
-                if (
-                    saved.item.status in {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}
-                    and saved.item.id not in active_ids
-                ):
-                    active.append(saved.item)
-                    active_ids.add(saved.item.id)
         attempts: list[MemoryExtractionAttempt] = []
+        extraction_failure: Exception | None = None
         try:
             extraction_kwargs = {
                 "reference_time": self._clock(),
@@ -319,81 +321,343 @@ class MemoryService:
                 extraction_run,
                 MemoryExtractionStatus.CANCELLED,
                 attempts=attempts,
-                saved_memory_ids=[saved.item.id for saved in deterministic_saved],
                 error="memory extraction task was cancelled",
             )
             raise
         except Exception as exc:
-            if deterministic_candidates:
-                result = RememberResult(
-                    message=message,
-                    saved=list(deterministic_saved),
-                    extraction_error=str(exc),
-                    gate_decision=gate_decision,
-                    extraction_run_id=extraction_run.id,
-                )
+            if not deterministic_candidates:
                 await self._finish_extraction_run(
                     extraction_run,
                     MemoryExtractionStatus.FAILED,
                     attempts=attempts,
-                    saved_memory_ids=[saved.item.id for saved in result.saved],
                     error=str(exc),
                 )
                 if raise_on_extraction_error:
                     raise
-                return result
-            await self._finish_extraction_run(
-                extraction_run,
-                MemoryExtractionStatus.FAILED,
-                attempts=attempts,
-                error=str(exc),
-            )
-            if raise_on_extraction_error:
-                raise
-            return RememberResult(
-                message=message,
-                extraction_error=str(exc),
-                gate_decision=gate_decision,
-                extraction_run_id=extraction_run.id,
-            )
+                return RememberResult(
+                    message=message,
+                    extraction_error=str(exc),
+                    gate_decision=gate_decision,
+                    extraction_run_id=extraction_run.id,
+                )
+            extraction_failure = exc
+            extraction = AtomicExtraction()
 
         result = RememberResult(
             message=message,
-            saved=list(deterministic_saved),
+            extraction_error=(
+                str(extraction_failure) if extraction_failure is not None else None
+            ),
             discarded_spans=extraction.discarded_spans,
             gate_decision=gate_decision,
             extraction_run_id=extraction_run.id,
         )
         active_ids = {item.id for item in active}
         prepared: list[MemoryCandidate] = []
+        prepared_statuses: list[MemoryStatus] = []
+        relation_resolutions = []
+        admission_breakdowns: list[dict[str, object]] = []
+        candidate_observations: list[_CandidateObservation] = []
+        audit_only: list[MemoryAuditDraft] = []
         extracted_candidates = [claim.to_candidate() for claim in extraction.claims]
         if deterministic_candidates:
-            deterministic_predicates = {
-                _candidate_predicate(candidate) for candidate in contextual_candidates
-            }
-            deterministic_predicates.update(
-                _candidate_predicate(candidate) for candidate in pending_candidates
+            remaining_extracted = list(extracted_candidates)
+            merged_deterministic: list[MemoryCandidate] = []
+            for deterministic in deterministic_candidates:
+                key = _candidate_governance_key(deterministic)
+                match_index = next(
+                    (
+                        index
+                        for index, candidate in enumerate(remaining_extracted)
+                        if _candidate_governance_key(candidate) == key
+                    ),
+                    None,
+                )
+                if match_index is None:
+                    merged_deterministic.append(deterministic)
+                    continue
+                extracted = remaining_extracted.pop(match_index)
+                payload = dict(extracted.payload)
+                payload.update(deterministic.payload)
+                merged_deterministic.append(
+                    deterministic.model_copy(
+                        update={
+                            "payload": payload,
+                            "occurred_at": deterministic.occurred_at or extracted.occurred_at,
+                            "period_start": deterministic.period_start or extracted.period_start,
+                            "period_end": deterministic.period_end or extracted.period_end,
+                        }
+                    )
+                )
+            candidates = [*merged_deterministic, *remaining_extracted]
+        else:
+            candidates = extracted_candidates
+        for candidate_index, candidate in enumerate(atomize_candidates(candidates)):
+            predicate_normalization = normalize_predicate(
+                kind=candidate.kind,
+                raw_predicate=candidate.raw_predicate or candidate.payload.get("predicate"),
+                canonical_predicate=candidate.canonical_predicate,
+                custom_predicate=candidate.custom_predicate,
+                predicate_type=candidate.predicate_type,
+                payload=candidate.payload,
             )
-            extracted_candidates = [
-                candidate
-                for candidate in extracted_candidates
-                if _candidate_predicate(candidate) not in deterministic_predicates
-            ]
-        candidates = extracted_candidates
-        for candidate in atomize_candidates(candidates):
-            candidate = add_plan_identity(normalize_memory_candidate(candidate, now))
+            had_explicit_expiration = candidate.expires_at is not None
+            candidate = add_plan_identity(
+                normalize_memory_candidate(candidate, now),
+                identity_scope=message.id,
+            )
+            admission_policy = self._admission_policies[candidate.kind]
+            if (
+                not had_explicit_expiration
+                and admission_policy.default_ttl_days is not None
+            ):
+                candidate = candidate.model_copy(
+                    update={
+                        "expires_at": now
+                        + timedelta(days=admission_policy.default_ttl_days)
+                    }
+                )
             if candidate.confidence < self._confidence_floor(candidate):
                 result.skipped_low_confidence += 1
+                _record_candidate_observation(
+                    trace,
+                    candidate_index=candidate_index,
+                    candidate=candidate,
+                    alias_hit=predicate_normalization.alias_hit,
+                    admission_reason="below_service_confidence_floor",
+                    score_breakdown={},
+                    compared_memory_ids=[item.id for item in active],
+                    strong_called=False,
+                    strong_compared_memory_ids=[],
+                    relation=ClaimRelation.UNRELATED,
+                    relation_rule="not_evaluated",
+                    relation_reason="Candidate did not reach typed admission.",
+                    relation_target_memory_ids=[],
+                    planned_action="skip_low_confidence",
+                    planned_target_memory_ids=[],
+                    target_operation_indexes=[],
+                )
                 continue
             updates: dict = {}
-            if any(evidence not in text for evidence in candidate.evidence_spans):
+            if candidate.original_text != text:
                 updates["original_text"] = text
-                updates["evidence_spans"] = [text]
-            if candidate.supersedes_id and candidate.supersedes_id not in active_ids:
+            if candidate.supersedes_id:
+                # Extractors may describe an intended replacement, but target
+                # IDs are selected only by the local relation/lifecycle planner.
                 updates["supersedes_id"] = None
             if updates:
                 candidate = candidate.model_copy(update=updates)
+            conflict = has_local_conflict(candidate, active)
+            assessment = assess_memory_admission(
+                candidate,
+                text,
+                conflict=conflict,
+                policies=self._admission_policies,
+            )
+            decision = (
+                AdmissionDecision.CONFIRM
+                if status == MemoryStatus.CONFIRMED
+                and assessment.decision != AdmissionDecision.REJECT
+                else assessment.decision
+            )
+            incoming_status = (
+                MemoryStatus.CONFIRMED
+                if decision == AdmissionDecision.CONFIRM
+                else MemoryStatus.PROPOSED
+            )
+            verification = None
+            verification_error: str | None = None
+            strong_called = False
+            strong_compared_memory_ids: list[str] = []
+            if decision == AdmissionDecision.STRONG_REVIEW and self._verifier is not None:
+                strong_called = True
+                try:
+                    verification_memories = select_context_memories(
+                        active,
+                        query=text,
+                        limit=8,
+                        reference_time=now,
+                    )
+                    strong_compared_memory_ids = [
+                        item.id for item in verification_memories
+                    ]
+                    verifier_allowed_ids = {
+                        item.id for item in verification_memories
+                    }
+                    verification = await self._verifier.verify_claim(
+                        text,
+                        candidate=candidate,
+                        existing_memories=verification_memories,
+                        allowed_target_ids=verifier_allowed_ids,
+                        trace=trace,
+                    )
+                    _validate_claim_verification(verification, verifier_allowed_ids)
+                except Exception as exc:
+                    verification_error = f"{type(exc).__name__}: {exc}"[:500]
+                    verification = None
+                if verification is not None:
+                    payload = dict(candidate.payload)
+                    canonical = verification.canonical_predicate
+                    if canonical in CANONICAL_PREDICATES:
+                        if verification.state_dimension is not None:
+                            payload["state_dimension"] = verification.state_dimension
+                        if verification.state_value is not None:
+                            payload["state_value"] = verification.state_value
+                        candidate = normalize_memory_candidate(
+                            candidate.model_copy(
+                                update={
+                                    "payload": payload,
+                                    "predicate_type": PredicateType.CANONICAL,
+                                    "canonical_predicate": canonical,
+                                    "custom_predicate": None,
+                                    "state_dimension": verification.state_dimension,
+                                    "state_value": verification.state_value,
+                                    "verifier_model": verification.verifier_model,
+                                }
+                            ),
+                            now,
+                        )
+                    elif verification.verifier_model:
+                        candidate = candidate.model_copy(
+                            update={"verifier_model": verification.verifier_model}
+                        )
+                    if (
+                        verification.claim_supported
+                        and verification.evidence_sufficient
+                        and _verification_can_confirm(candidate)
+                    ):
+                        decision = AdmissionDecision.CONFIRM
+                        incoming_status = MemoryStatus.CONFIRMED
+                    elif (
+                        candidate.kind == MemoryKind.RELATIONSHIP_STATE
+                        and not verification.claim_supported
+                    ):
+                        decision = AdmissionDecision.REJECT
+            resolution = resolve_claim_relation(
+                candidate,
+                active,
+                incoming_status=incoming_status,
+            )
+            if verification_error is not None:
+                resolution = ClaimRelationResolution(
+                    relation=resolution.relation,
+                    target_memory_ids=resolution.target_memory_ids,
+                    rule_name="strong_verifier_fallback",
+                    reason=f"Strong verifier failed validation: {verification_error}",
+                )
+            if (
+                verification is not None
+                and verification.claim_supported
+                and verification.evidence_sufficient
+                and verification.relation != ClaimRelation.UNCERTAIN
+            ):
+                verified_targets = tuple(
+                    memory_id
+                    for memory_id in verification.target_memory_ids
+                    if memory_id in active_ids
+                )
+                verified_relation = verification.relation
+                if (
+                    incoming_status == MemoryStatus.PROPOSED
+                    and verified_relation == ClaimRelation.UPDATE
+                    and any(
+                        active_by_id.status == MemoryStatus.CONFIRMED
+                        for active_by_id in active
+                        if active_by_id.id in verified_targets
+                    )
+                ):
+                    verified_relation = ClaimRelation.CONTRADICTION
+                resolution = ClaimRelationResolution(
+                    relation=verified_relation,
+                    target_memory_ids=verified_targets,
+                    rule_name="strong_claim_verifier",
+                    reason=verification.reason,
+                )
+            if decision == AdmissionDecision.REJECT:
+                result.rejected_by_policy += 1
+                rejection_breakdown = {
+                    **assessment.score_breakdown,
+                    **(
+                        {"strong_verifier_error": verification_error}
+                        if verification_error is not None
+                        else {}
+                    ),
+                }
+                audit_only.append(
+                    MemoryAuditDraft(
+                        candidate_index=candidate_index,
+                        relation=resolution.relation,
+                        decision=decision,
+                        target_memory_ids=list(resolution.target_memory_ids),
+                        rule_name="admission_policy",
+                        admission_score=assessment.score,
+                        score_breakdown=rejection_breakdown,
+                        raw_predicate=candidate.raw_predicate,
+                        canonical_predicate=candidate.canonical_predicate,
+                        extractor_model=candidate.extractor_model,
+                        verifier_model=candidate.verifier_model,
+                        prompt_version=candidate.prompt_version,
+                        evidence=candidate.evidence_spans,
+                        reason=assessment.reason,
+                    )
+                )
+                _record_candidate_observation(
+                    trace,
+                    candidate_index=candidate_index,
+                    candidate=candidate.model_copy(
+                        update={
+                            "admission_score": assessment.score,
+                            "admission_decision": decision,
+                            "claim_relation": resolution.relation,
+                        }
+                    ),
+                    alias_hit=predicate_normalization.alias_hit,
+                    admission_reason=assessment.reason,
+                    score_breakdown=rejection_breakdown,
+                    compared_memory_ids=[item.id for item in active],
+                    strong_called=strong_called,
+                    strong_compared_memory_ids=strong_compared_memory_ids,
+                    relation=resolution.relation,
+                    relation_rule=resolution.rule_name,
+                    relation_reason=resolution.reason,
+                    relation_target_memory_ids=list(resolution.target_memory_ids),
+                    planned_action="reject",
+                    planned_target_memory_ids=[],
+                    target_operation_indexes=[],
+                )
+                continue
+            candidate = candidate.model_copy(
+                update={
+                    "admission_score": assessment.score,
+                    "admission_decision": decision,
+                    "claim_relation": resolution.relation,
+                    "lifecycle_review_required": (
+                        candidate.lifecycle_review_required
+                        or decision == AdmissionDecision.STRONG_REVIEW
+                        or resolution.relation
+                        in {ClaimRelation.CONTRADICTION, ClaimRelation.UNCERTAIN}
+                    ),
+                }
+            )
             prepared.append(candidate)
+            prepared_statuses.append(incoming_status)
+            relation_resolutions.append(resolution)
+            admission_breakdown = dict(assessment.score_breakdown)
+            if verification_error is not None:
+                admission_breakdown["strong_verifier_error"] = verification_error
+            admission_breakdowns.append(admission_breakdown)
+            candidate_observations.append(
+                _CandidateObservation(
+                    candidate_index=candidate_index,
+                    alias_hit=predicate_normalization.alias_hit,
+                    admission_reason=assessment.reason,
+                    score_breakdown=admission_breakdown,
+                    compared_memory_ids=tuple(item.id for item in active),
+                    strong_called=strong_called,
+                    strong_compared_memory_ids=tuple(strong_compared_memory_ids),
+                    relation_target_memory_ids=tuple(resolution.target_memory_ids),
+                )
+            )
         plan_transitions = match_plan_transitions(prepared, relationship_plans)
         plans_by_id = {plan.plan_id: plan for plan in relationship_plans}
         for transition in plan_transitions:
@@ -410,64 +674,156 @@ class MemoryService:
             ):
                 updates["supersedes_id"] = None
             prepared[transition.candidate_index] = candidate.model_copy(update=updates)
-        transition_plans = plan_memory_transitions(prepared, active)
-        transition_updates = {
-            memory_id: plan.target_status
-            for plan in transition_plans
-            for memory_id in plan.target_ids
-        }
+        transition_plans = plan_memory_transitions(
+            prepared,
+            active,
+            trigger_statuses=prepared_statuses,
+        )
+        lifecycle_by_candidate: dict[int, list] = {}
         for plan in transition_plans:
-            candidate = prepared[plan.trigger_index]
-            if candidate.supersedes_id is None and plan.target_ids:
-                prepared[plan.trigger_index] = candidate.model_copy(
-                    update={"supersedes_id": plan.target_ids[0]}
+            lifecycle_by_candidate.setdefault(plan.trigger_index, []).append(plan)
+        in_batch_state_targets = _plan_in_batch_state_transitions(
+            prepared,
+            prepared_statuses,
+        )
+        active_by_id = {item.id: item for item in active}
+        operations: list[MemoryWriteOperation] = []
+        for index, candidate in enumerate(prepared):
+            resolution = relation_resolutions[index]
+            relation = resolution.relation
+            target_ids = list(resolution.target_memory_ids)
+            rule_name = resolution.rule_name
+            reason = resolution.reason
+            lifecycle_rule_names: list[str] = []
+            lifecycle_targets: list[str] = []
+            for lifecycle in lifecycle_by_candidate.get(index, []):
+                eligible_targets = [
+                    memory_id
+                    for memory_id in lifecycle.target_ids
+                    if (
+                        prepared_statuses[index] == MemoryStatus.CONFIRMED
+                        or active_by_id[memory_id].status == MemoryStatus.PROPOSED
+                    )
+                ]
+                if eligible_targets:
+                    lifecycle_targets.extend(eligible_targets)
+                    lifecycle_rule_names.append(lifecycle.rule_name)
+            target_operation_indexes = in_batch_state_targets.get(index, [])
+            if lifecycle_targets or target_operation_indexes:
+                relation = ClaimRelation.UPDATE
+                target_ids = list(dict.fromkeys([*target_ids, *lifecycle_targets]))
+                rule_names = [*lifecycle_rule_names]
+                if target_operation_indexes:
+                    rule_names.append("same_state_dimension_in_batch")
+                rule_name = "+".join(dict.fromkeys(rule_names))
+                reason = "A deterministic lifecycle transition closes older working state."
+            elif _has_in_batch_state_conflict(index, prepared, prepared_statuses):
+                relation = ClaimRelation.CONTRADICTION
+                target_ids = []
+                target_operation_indexes = []
+                rule_name = "proposed_state_conflict_in_batch"
+                reason = "An unconfirmed in-batch state cannot replace a confirmed value."
+            else:
+                target_operation_indexes = []
+            if relation != ClaimRelation.UPDATE:
+                target_ids = []
+            updated_candidate = candidate.model_copy(
+                update={
+                    "claim_relation": relation,
+                    "lifecycle_review_required": (
+                        candidate.lifecycle_review_required
+                        or relation in {ClaimRelation.CONTRADICTION, ClaimRelation.UNCERTAIN}
+                    ),
+                }
+            )
+            prepared[index] = updated_candidate
+            operations.append(
+                MemoryWriteOperation(
+                    candidate=updated_candidate,
+                    status=prepared_statuses[index],
+                    relation=relation,
+                    target_memory_ids=target_ids,
+                    target_operation_indexes=target_operation_indexes,
+                    rule_name=rule_name,
+                    reason=reason,
+                    score_breakdown=admission_breakdowns[index],
                 )
+            )
+            observation = candidate_observations[index]
+            _record_candidate_observation(
+                trace,
+                candidate_index=observation.candidate_index,
+                candidate=updated_candidate,
+                alias_hit=observation.alias_hit,
+                admission_reason=observation.admission_reason,
+                score_breakdown=observation.score_breakdown,
+                compared_memory_ids=list(observation.compared_memory_ids),
+                strong_called=observation.strong_called,
+                strong_compared_memory_ids=list(
+                    observation.strong_compared_memory_ids
+                ),
+                relation=relation,
+                relation_rule=rule_name,
+                relation_reason=reason,
+                relation_target_memory_ids=list(
+                    observation.relation_target_memory_ids
+                ),
+                planned_action=_planned_memory_action(relation),
+                planned_target_memory_ids=target_ids,
+                target_operation_indexes=target_operation_indexes,
+            )
+        status_updates: list[MemoryStatusUpdate] = []
+        plan_updates: list[RelationshipPlanStatusUpdate] = []
+        for transition in plan_transitions:
+            candidate = prepared[transition.candidate_index]
+            plan_updates.append(
+                RelationshipPlanStatusUpdate(
+                    plan_id=transition.plan_id,
+                    status=transition.target_status,
+                    candidate_index=transition.candidate_index,
+                    transitioned_at=candidate.occurred_at or self._clock(),
+                )
+            )
+            if transition.target_status in {
+                PlanStatus.COMPLETED,
+                PlanStatus.CANCELLED,
+                PlanStatus.EXPIRED,
+            }:
+                matched_plan = plans_by_id.get(transition.plan_id)
+                if matched_plan is not None:
+                    for memory in active:
+                        if (
+                            memory.kind == MemoryKind.ACTION_INTENT
+                            and memory_references_plan(memory, matched_plan)
+                        ):
+                            status_updates.append(
+                                MemoryStatusUpdate(
+                                    memory_id=memory.id,
+                                    status=MemoryStatus.SUPERSEDED,
+                                    rule_name="close_linked_action_intent",
+                                    reason="The linked relationship plan reached a terminal state.",
+                                )
+                            )
         try:
             prepared_saved = []
-            if prepared:
-                prepared_saved = await self.store.save_memories(
+            if operations or audit_only:
+                committed = await self.store.commit_memory_batch(
                     user_id=message.user_id,
                     relationship_id=message.relationship_id,
-                    candidates=prepared,
-                    source_message_id=message.id,
-                    status=status,
+                    batch=MemoryWriteBatch(
+                        source_message_id=message.id,
+                        operations=operations,
+                        status_updates=status_updates,
+                        plan_updates=plan_updates,
+                        audit_only=audit_only,
+                    ),
                 )
+                prepared_saved = committed.saved
                 result.saved.extend(prepared_saved)
                 await self._project_relationship_stage(
                     message.user_id,
                     message.relationship_id,
                     [saved.item for saved in result.saved],
-                )
-            for transition in plan_transitions:
-                source_event_memory_id = (
-                    prepared_saved[transition.candidate_index].item.id
-                    if transition.candidate_index < len(prepared_saved)
-                    else None
-                )
-                transitioned = await self.store.set_relationship_plan_status(
-                    plan_id=transition.plan_id,
-                    user_id=message.user_id,
-                    status=transition.target_status,
-                    transitioned_at=(
-                        prepared[transition.candidate_index].occurred_at or self._clock()
-                    ),
-                    source_event_memory_id=source_event_memory_id,
-                )
-                if transitioned is not None and transition.target_status in {
-                    PlanStatus.COMPLETED,
-                    PlanStatus.CANCELLED,
-                    PlanStatus.EXPIRED,
-                }:
-                    await self._close_linked_action_intents(
-                        message.user_id,
-                        transitioned,
-                        active,
-                    )
-            for memory_id, target_status in transition_updates.items():
-                await self.store.set_memory_status(
-                    memory_id,
-                    message.user_id,
-                    target_status,
                 )
             await self.store.sync_relationship_plans(
                 user_id=message.user_id,
@@ -484,11 +840,18 @@ class MemoryService:
             raise
         await self._finish_extraction_run(
             extraction_run,
-            MemoryExtractionStatus.COMPLETED,
+            (
+                MemoryExtractionStatus.FAILED
+                if extraction_failure is not None
+                else MemoryExtractionStatus.COMPLETED
+            ),
             attempts=attempts,
             saved_memory_ids=[saved.item.id for saved in result.saved],
             discarded_spans=extraction.discarded_spans,
+            error=str(extraction_failure) if extraction_failure is not None else None,
         )
+        if extraction_failure is not None and raise_on_extraction_error:
+            raise extraction_failure
         return result
 
     def start_background_extraction(
@@ -527,6 +890,8 @@ class MemoryService:
                 if result.gate_decision is not None:
                     details["gate_reason"] = result.gate_decision.reason.value
                     details["gate_should_extract"] = result.gate_decision.should_extract
+                    details["matched_rule"] = result.gate_decision.matched_rule
+                    details["matched_span"] = result.gate_decision.matched_span
                 details["saved_count"] = len(result.saved)
                 return result
 
@@ -982,6 +1347,123 @@ class MemoryService:
         )
 
 
+def _planned_memory_action(relation: ClaimRelation) -> str:
+    if relation == ClaimRelation.SAME:
+        return "merge"
+    if relation == ClaimRelation.UPDATE:
+        return "replace"
+    return "add"
+
+
+def _record_candidate_observation(
+    trace: TraceRecorder | None,
+    *,
+    candidate_index: int,
+    candidate: MemoryCandidate,
+    alias_hit: bool,
+    admission_reason: str,
+    score_breakdown: dict[str, object],
+    compared_memory_ids: list[str],
+    strong_called: bool,
+    strong_compared_memory_ids: list[str],
+    relation: ClaimRelation,
+    relation_rule: str,
+    relation_reason: str,
+    relation_target_memory_ids: list[str],
+    planned_action: str,
+    planned_target_memory_ids: list[str],
+    target_operation_indexes: list[int],
+) -> None:
+    if trace is None:
+        return
+    action_targets = (
+        relation_target_memory_ids if planned_action == "merge" else planned_target_memory_ids
+    )
+    actions: list[dict[str, object]] = [
+        {
+            "action": planned_action,
+            "target_memory_ids": action_targets,
+            "target_operation_indexes": target_operation_indexes,
+        }
+    ]
+    if candidate.expires_at is not None and planned_action not in {
+        "reject",
+        "skip_low_confidence",
+    }:
+        actions.append(
+            {
+                "action": "schedule_expiration",
+                "expires_at": candidate.expires_at.isoformat(),
+            }
+        )
+    planned_status = None
+    if candidate.admission_decision is not None:
+        planned_status = (
+            MemoryStatus.CONFIRMED.value
+            if candidate.admission_decision == AdmissionDecision.CONFIRM
+            else MemoryStatus.PROPOSED.value
+        )
+    family = candidate.payload.get("canonical_concept")
+    with trace.measure("memory_candidate_governance") as details:
+        details.update(
+            {
+                "candidate_index": candidate_index,
+                "memory_kind": candidate.kind.value,
+                "summary": candidate.summary,
+                "raw_predicate": candidate.raw_predicate,
+                "predicate_type": candidate.predicate_type.value,
+                "canonical_predicate": candidate.canonical_predicate,
+                "custom_predicate": candidate.custom_predicate,
+                "alias_hit": alias_hit,
+                "predicate_family": family if isinstance(family, str) else None,
+                "state_dimension": candidate.state_dimension,
+                "state_value": candidate.state_value,
+                "admission_decision": (
+                    candidate.admission_decision.value
+                    if candidate.admission_decision is not None
+                    else None
+                ),
+                "admission_score": candidate.admission_score,
+                "admission_reason": admission_reason,
+                "score_breakdown_json": json.dumps(
+                    score_breakdown,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                ),
+                "compared_memory_ids_json": json.dumps(compared_memory_ids),
+                "strong_called": strong_called,
+                "strong_compared_memory_ids_json": json.dumps(
+                    strong_compared_memory_ids
+                ),
+                "claim_relation": relation.value,
+                "relation_rule": relation_rule,
+                "relation_reason": relation_reason,
+                "relation_target_memory_ids_json": json.dumps(
+                    relation_target_memory_ids
+                ),
+                "planned_action": planned_action,
+                "planned_status": planned_status,
+                "planned_target_memory_ids_json": json.dumps(
+                    planned_target_memory_ids
+                ),
+                "target_operation_indexes_json": json.dumps(
+                    target_operation_indexes
+                ),
+                "planned_actions_json": json.dumps(
+                    actions,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                "expires_at": (
+                    candidate.expires_at.isoformat()
+                    if candidate.expires_at is not None
+                    else None
+                ),
+            }
+        )
+
+
 class NoOpMemoryExtractor:
     async def extract(
         self,
@@ -1090,6 +1572,23 @@ def _evaluate_gate(
     return evaluate(text)
 
 
+def _record_gate_trace(
+    trace: TraceRecorder | None,
+    decision: MemoryGateDecision,
+) -> None:
+    if trace is None:
+        return
+    with trace.measure("memory_gate") as details:
+        details.update(
+            {
+                "gate_reason": decision.reason.value,
+                "gate_should_extract": decision.should_extract,
+                "matched_rule": decision.matched_rule,
+                "matched_span": decision.matched_span,
+            }
+        )
+
+
 _RELATIONSHIP_STAGE_EVENT_PREDICATES = {
     "confession_succeeded",
     "confession_accepted",
@@ -1101,6 +1600,107 @@ _RELATIONSHIP_STAGE_EVENT_PREDICATES = {
 def _candidate_predicate(candidate: MemoryCandidate) -> str:
     predicate = candidate.payload.get("predicate")
     return predicate.strip().casefold() if isinstance(predicate, str) else ""
+
+
+def _candidate_governance_key(candidate: MemoryCandidate) -> str:
+    return memory_concept(candidate) or _candidate_predicate(candidate)
+
+
+def _plan_in_batch_state_transitions(
+    candidates: list[MemoryCandidate],
+    statuses: list[MemoryStatus],
+) -> dict[int, list[int]]:
+    targets: dict[int, list[int]] = {}
+    for index, candidate in enumerate(candidates):
+        if (
+            candidate.kind != MemoryKind.RELATIONSHIP_STATE
+            or not candidate.state_dimension
+            or candidate.state_value is None
+        ):
+            continue
+        eligible: list[int] = []
+        for previous_index, previous in enumerate(candidates[:index]):
+            if (
+                previous.subject.casefold() != candidate.subject.casefold()
+                or previous.state_dimension != candidate.state_dimension
+                or previous.state_value in {None, candidate.state_value}
+            ):
+                continue
+            if (
+                statuses[index] == MemoryStatus.CONFIRMED
+                or statuses[previous_index] == MemoryStatus.PROPOSED
+            ):
+                eligible.append(previous_index)
+        if eligible:
+            targets[index] = eligible
+    return targets
+
+
+def _has_in_batch_state_conflict(
+    index: int,
+    candidates: list[MemoryCandidate],
+    statuses: list[MemoryStatus],
+) -> bool:
+    candidate = candidates[index]
+    if (
+        statuses[index] != MemoryStatus.PROPOSED
+        or candidate.kind != MemoryKind.RELATIONSHIP_STATE
+        or not candidate.state_dimension
+        or candidate.state_value is None
+    ):
+        return False
+    return any(
+        statuses[previous_index] == MemoryStatus.CONFIRMED
+        and previous.subject.casefold() == candidate.subject.casefold()
+        and previous.state_dimension == candidate.state_dimension
+        and previous.state_value not in {None, candidate.state_value}
+        for previous_index, previous in enumerate(candidates[:index])
+    )
+
+
+def _verification_can_confirm(candidate: MemoryCandidate) -> bool:
+    if candidate.predicate_type == PredicateType.CUSTOM:
+        return False
+    if candidate.explicitness == EvidenceExplicitness.SPECULATIVE:
+        return False
+    if candidate.perspective != MemoryPerspective.USER_REPORTED:
+        return False
+    if candidate.kind in {MemoryKind.RELATIONSHIP_STATE, MemoryKind.STABLE_FACT}:
+        return candidate.explicitness == EvidenceExplicitness.EXPLICIT
+    if candidate.kind == MemoryKind.INTERACTION_PATTERN:
+        return (
+            candidate.explicitness == EvidenceExplicitness.EXPLICIT
+            and (
+                interaction_pattern_has_frequency(candidate)
+                or interaction_pattern_has_multiple_evidence(candidate)
+            )
+        )
+    return candidate.explicitness in {
+        EvidenceExplicitness.EXPLICIT,
+        EvidenceExplicitness.STRONGLY_IMPLIED,
+    }
+
+
+def _validate_claim_verification(
+    verification: ClaimVerification,
+    allowed_target_ids: set[str],
+) -> None:
+    invalid_targets = set(verification.target_memory_ids) - allowed_target_ids
+    if invalid_targets:
+        raise ValueError("claim verifier returned a target outside the candidate set")
+    canonical = verification.canonical_predicate
+    if canonical is None:
+        return
+    spec = CANONICAL_PREDICATES.get(canonical)
+    if spec is None:
+        raise ValueError("claim verifier returned an unregistered canonical predicate")
+    if (
+        verification.state_dimension is not None
+        and verification.state_dimension != spec.state_dimension
+    ):
+        raise ValueError("claim verifier returned an incompatible state dimension")
+    if spec.allowed_values and verification.state_value not in spec.allowed_values:
+        raise ValueError("claim verifier returned an unsupported state value")
 
 
 def _attach_plan_metadata(

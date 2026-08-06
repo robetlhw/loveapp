@@ -16,6 +16,7 @@ from loveapp.domain.memory import (
     AtomicExtraction,
     DiscardedSpan,
     MemoryKind,
+    PredicateType,
 )
 from loveapp.domain.memory_dimensions import (
     INTERACTION_PATTERN_DIMENSIONS,
@@ -28,6 +29,7 @@ from loveapp.domain.memory_dimensions import (
     normalize_state_value,
     reconcile_interaction_metric,
 )
+from loveapp.domain.memory_predicates import CANONICAL_PREDICATES
 
 
 @dataclass(frozen=True)
@@ -235,6 +237,21 @@ def validate_memory_claim(
 ) -> None:
     if claim.claim_id in claim_ids:
         raise ValueError(f"原子声明 ID 重复：{claim.claim_id}")
+    if (
+        claim.predicate_type == PredicateType.CANONICAL
+        and claim.canonical_predicate not in CANONICAL_PREDICATES
+    ):
+        raise ValueError(
+            f"声明 {claim.claim_id} 使用了未注册的 canonical predicate："
+            f"{claim.canonical_predicate or '<missing>'}"
+        )
+    if (
+        claim.predicate_type == PredicateType.CUSTOM
+        and not (claim.custom_predicate or claim.predicate)
+    ):
+        raise ValueError(f"声明 {claim.claim_id} 的 custom predicate 为空")
+    if claim.canonical_predicate and claim.custom_predicate:
+        raise ValueError(f"声明 {claim.claim_id} 不能同时提供 canonical 和 custom predicate")
     if source_text is not None:
         for evidence in claim.evidence_spans:
             if evidence not in source_text:
@@ -508,6 +525,11 @@ def _normalize_claim_semantics(payload: dict[str, object]) -> list[str]:
         claim = dict(raw_claim)
         raw_payload = claim.get("payload")
         claim_payload = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+        for field in ("state_dimension", "state_value"):
+            if claim.get(field) is not None:
+                claim_payload.setdefault(field, claim[field])
+        if claim_payload and claim.get("payload") != claim_payload:
+            claim["payload"] = claim_payload
         kind = _enum_key(claim.get("kind"))
         if kind == MemoryKind.STABLE_FACT.value and claim_payload.get("preference"):
             claim["kind"] = MemoryKind.PREFERENCE.value

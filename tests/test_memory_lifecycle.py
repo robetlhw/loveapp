@@ -91,7 +91,7 @@ async def test_apology_supersedes_contact_outage_but_keeps_conflict_history() ->
     by_predicate = {item.payload.get("predicate"): item for item in memories}
     assert by_predicate["ignoring_user"].status == MemoryStatus.SUPERSEDED
     assert by_predicate["had_conflict"].status == MemoryStatus.PROPOSED
-    assert by_predicate["partner_apologized"].status == MemoryStatus.PROPOSED
+    assert by_predicate["partner_apologized"].status == MemoryStatus.CONFIRMED
 
     context = await service.get_context(
         "lifecycle-user",
@@ -160,7 +160,8 @@ async def test_get_context_reconciles_legacy_transition_and_preference_shape() -
 
     stale = await store.get_memory(unavailable.item.id, "legacy-user")
     assert stale is not None and stale.status == MemoryStatus.SUPERSEDED
-    assert context.partner_preferences == ["节俭"]
+    assert context.partner_preferences == []
+    assert any(item.summary == "对方比较节俭" for item in context.uncertain_items)
     assert all(item.id != unavailable.item.id for item in context.remembered_items)
 
 

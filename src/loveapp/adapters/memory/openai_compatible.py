@@ -1,5 +1,6 @@
 import json
 from contextlib import nullcontext
+from dataclasses import replace
 from datetime import datetime
 from time import perf_counter
 from typing import Any, Literal
@@ -17,12 +18,17 @@ from loveapp.application.memory_upgrade import MemoryUpgradeDecision, assess_mem
 from loveapp.domain.memory import (
     AtomicExtraction,
     MemoryAttemptStatus,
+    MemoryCandidate,
     MemoryExtractionAttempt,
     MemoryItem,
     StoredMessage,
 )
+from loveapp.domain.memory_predicates import CANONICAL_PREDICATES
+from loveapp.domain.memory_verification import ClaimVerification
 from loveapp.ports.memory import MemoryAttemptCallback
 from loveapp.ports.observability import TraceRecorder
+
+_MEMORY_PROMPT_VERSION = "memory-v2.1"
 
 
 class OpenAICompatibleMemoryExtractor:
@@ -136,6 +142,25 @@ class OpenAICompatibleMemoryExtractor:
                     # record the parse category before re-raising.
                     details["failure_category"] = exc.category
                     raise
+                parsed = replace(
+                    parsed,
+                    extraction=parsed.extraction.model_copy(
+                        update={
+                            "claims": [
+                                claim.model_copy(
+                                    update={
+                                        "raw_predicate": (
+                                            claim.raw_predicate or claim.predicate
+                                        ),
+                                        "prompt_version": _MEMORY_PROMPT_VERSION,
+                                        "extractor_model": self._model,
+                                    }
+                                )
+                                for claim in parsed.extraction.claims
+                            ]
+                        }
+                    ),
+                )
                 details["repair_status"] = parsed.repair_status
                 details["claim_count"] = len(parsed.extraction.claims)
                 details["original_claim_count"] = parsed.original_claim_count
@@ -145,6 +170,17 @@ class OpenAICompatibleMemoryExtractor:
                 details["claim_confidences"] = ",".join(
                     f"{claim.claim_id}:{claim.confidence:.2f}"
                     for claim in parsed.extraction.claims
+                )
+                details["claim_predicates_json"] = json.dumps(
+                    [
+                        {
+                            "claim_id": claim.claim_id,
+                            "raw_predicate": claim.raw_predicate or claim.predicate,
+                        }
+                        for claim in parsed.extraction.claims
+                    ],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
                 )
                 if parsed.repair_steps:
                     details["repair_steps"] = parsed.repair_steps
@@ -192,6 +228,55 @@ class OpenAICompatibleMemoryExtractor:
     async def aclose(self) -> None:
         await self._client.close()
 
+    async def verify_claim(
+        self,
+        text: str,
+        *,
+        candidate: MemoryCandidate,
+        existing_memories: list[MemoryItem],
+        allowed_target_ids: set[str],
+        trace: TraceRecorder | None = None,
+    ) -> ClaimVerification:
+        messages = [
+            {"role": "system", "content": _VERIFIER_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": _build_verifier_prompt(text, candidate, existing_memories),
+            },
+        ]
+        measure = trace.measure("memory_claim_verifier") if trace else nullcontext({})
+        with measure as details:
+            details["model"] = self._model
+            details["tier"] = self._tier
+            completion = await self._client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+                response_format={"type": "json_object"},
+                temperature=0,
+                max_tokens=min(self._max_tokens, 1200),
+                **(
+                    {"extra_body": {"thinking": {"type": self._thinking}}}
+                    if self._thinking is not None
+                    else {}
+                ),
+            )
+            _capture_usage(details, getattr(completion, "usage", None))
+            verification = _parse_claim_verification(
+                completion.choices[0].message.content
+            ).model_copy(update={"verifier_model": self._model})
+            invalid_targets = set(verification.target_memory_ids) - allowed_target_ids
+            if invalid_targets:
+                raise ValueError("claim verifier returned a target outside the candidate set")
+            if (
+                verification.canonical_predicate is not None
+                and verification.canonical_predicate not in CANONICAL_PREDICATES
+            ):
+                raise ValueError("claim verifier returned an unregistered canonical predicate")
+            details["relation"] = verification.relation.value
+            details["claim_supported"] = verification.claim_supported
+            details["evidence_sufficient"] = verification.evidence_sufficient
+            return verification
+
 
 class TieredMemoryExtractor:
     """Run Flash first and use a strong model only for important uncertainty."""
@@ -206,6 +291,33 @@ class TieredMemoryExtractor:
         self._flash = flash
         self._strong = strong
         self._upgrade_min_importance = upgrade_min_importance
+
+    @property
+    def can_verify(self) -> bool:
+        return self._strong is not None
+
+    @property
+    def verifier_model(self) -> str | None:
+        return self._strong._model if self._strong is not None else None
+
+    async def verify_claim(
+        self,
+        text: str,
+        *,
+        candidate: MemoryCandidate,
+        existing_memories: list[MemoryItem],
+        allowed_target_ids: set[str],
+        trace: TraceRecorder | None = None,
+    ) -> ClaimVerification:
+        if self._strong is None:
+            raise RuntimeError("strong claim verifier is not configured")
+        return await self._strong.verify_claim(
+            text,
+            candidate=candidate,
+            existing_memories=existing_memories,
+            allowed_target_ids=allowed_target_ids,
+            trace=trace,
+        )
 
     async def extract(
         self,
@@ -426,12 +538,67 @@ def _build_prompt(
                 "expires_at": item.expires_at.isoformat() if item.expires_at else None,
                 "perspective": item.perspective.value,
                 "status": item.status.value,
+                "predicate_type": item.predicate_type.value,
+                "canonical_predicate": item.canonical_predicate,
+                "custom_predicate": item.custom_predicate,
+                "state_dimension": item.state_dimension,
+                "state_value": item.state_value,
+                "admission_decision": (
+                    item.admission_decision.value if item.admission_decision else None
+                ),
                 "payload": item.payload,
             }
             for item in existing_memories[:20]
         ],
     }
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _build_verifier_prompt(
+    text: str,
+    candidate: MemoryCandidate,
+    existing_memories: list[MemoryItem],
+) -> str:
+    payload = {
+        "user_message": text,
+        "candidate_claim": candidate.model_dump(mode="json"),
+        "existing_memory_candidates": [
+            {
+                "id": item.id,
+                "kind": item.kind.value,
+                "subject": item.subject,
+                "summary": item.summary,
+                "status": item.status.value,
+                "canonical_predicate": item.canonical_predicate,
+                "custom_predicate": item.custom_predicate,
+                "state_dimension": item.state_dimension,
+                "state_value": item.state_value,
+                "evidence_spans": item.evidence_spans,
+                "payload": item.payload,
+            }
+            for item in existing_memories[:8]
+        ],
+        "canonical_predicates": list(CANONICAL_PREDICATES),
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _parse_claim_verification(content: str | None) -> ClaimVerification:
+    if not content or not content.strip():
+        raise ValueError("claim verifier returned an empty response")
+    raw = content.strip().lstrip("\ufeff")
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        raw = "\n".join(lines).strip()
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("claim verifier response is not a JSON object")
+    return ClaimVerification.model_validate(json.loads(raw[start : end + 1]))
 
 
 def _parse_response(content: str | None) -> AtomicExtraction:
@@ -551,6 +718,19 @@ def _flush_attempts(
         _safe_notify(callback, attempt)
 
 
+_VERIFIER_SYSTEM_PROMPT = """
+你是 LoveApp 的高风险记忆声明验证器。只输出一个 JSON 对象，字段固定为：
+claim_supported、relation、canonical_predicate、state_dimension、state_value、
+target_memory_ids、reason、evidence_sufficient。
+
+relation 只能是 same、complementary、update、contradiction、unrelated、uncertain。
+只判断 user_message 是否支持 candidate_claim，不得补充原文没有的事实。target_memory_ids 只能从
+existing_memory_candidates 中选择；不确定时返回空数组。canonical_predicate 只能从传入的
+canonical_predicates 选择，无法可靠映射时为 null。证据不足时 claim_supported 或
+evidence_sufficient 必须为 false，不能把推测验证成事实。你只提供判断信号，不执行数据库操作。
+""".strip()
+
+
 _SYSTEM_PROMPT = """
 你是 LoveApp 的关系记忆原子声明抽取器，只输出一个合法 JSON 对象：
 {"claims": [...], "discarded_spans": [...]}。
@@ -558,6 +738,25 @@ _SYSTEM_PROMPT = """
 只记录未来咨询或约会规划中仍可能有用的用户信息。没有值得记录的内容时 claims 返回空数组。
 允许的 kind 只有：stable_fact、preference、interaction_event、
    interaction_pattern、advice_outcome、planned_event、action_intent、relationship_state。
+
+每条 claim 必须额外提供 Predicate 治理字段：
+- predicate_type 只能是 canonical 或 custom。
+- 核心状态优先使用 canonical_predicate，且只能从以下受控词表选择：
+  contact.status、relationship.stage、relationship.repair_status、confession.status、
+  relationship.familiarity、relationship.contact_opportunity、relationship.conflict_status、
+  relationship.interaction_reciprocity、partner.relationship_status、
+  interaction.contact_frequency、interaction.topic_scope、interaction.channel、
+  interaction.initiation_balance、interaction.response_engagement、
+  interaction.emotional_disclosure、preference.general、preference.food.cuisine、
+  preference.food.spiciness、preference.environment.noise、preference.activity.type、
+  preference.budget.range。
+- 无法可靠映射时必须使用 predicate_type=custom、custom_predicate=<英文 snake_case>，
+  canonical_predicate 必须为 null；不得伪造新的 canonical 值。
+- raw_predicate 保留你最初识别的英文谓词；predicate 继续输出该原始谓词以兼容旧结构。
+- explicitness 只能是 explicit、strongly_implied、weakly_inferred、speculative。
+- requires_inference 表示该声明是否需要跨句、指代或因果推断。
+- 状态型记忆将 state_dimension/state_value 直接放在 claim 中；payload 中也保留同名字段。
+- 不得决定数据库操作，不得输出或猜测 supersedes_id；Python 生命周期策略会选择目标。
 
 核心规则：
 1. interaction_event 只表示已经发生的一次有边界的具体互动，不等于低重要性或短期保留。
@@ -633,14 +832,15 @@ _SYSTEM_PROMPT = """
     不得用 context、summary 或长 evidence 把第二个独立指标藏进同一 claim。渠道、共同场景或
     社会关系可以作为一个主事实的必要限定，例如“线上联系频率提高”的主 metric 是
     contact_frequency、channel 是 online；限定信息不改变该 claim 只有一个可更新主维度。
-16. 仅当新陈述明确纠正、更新或否定一条既有记忆时，supersedes_id 才填写对应 ID；否则为 null。
-    一次开心互动不能替代“过去一个月互动减少”这样的趋势。
+16. supersedes_id 始终为 null 或省略。一次开心互动不能自动替代“过去一个月互动减少”这样的
+    趋势；是否更新旧状态完全由 Python 生命周期策略决定。
 17. recent_conversation 只用于理解指代和上下文，不得把 Assistant 的话当成用户确认的事实。
 18. discarded_spans 每项包含 text 和 reason；reason 只能是 consultation_question、
     consultation_goal、ephemeral、no_durable_memory。text 必须逐字来自 user_message。
     discarded_spans 不得与任何 claim 的 evidence_spans 重叠；一个片段只要支持已保存声明，
     就不能同时标记为未写入。当前熟悉度和接触机会不是 ephemeral。
-19. 每条 claim 必须包含 claim_id、kind、subject、predicate、summary、evidence_spans。
+19. 每条 claim 必须包含 claim_id、kind、subject、predicate、predicate_type、summary、
+    evidence_spans、explicitness、requires_inference。
     object、时间、情绪、影响、置信度、payload 和 supersedes_id 等字段仅在有信息时提供，
     未提供时由结构模型使用默认值。时间字段必须直接放在 claim 中，禁止创建 temporal 等嵌套对象。
     输出紧凑 JSON，不要缩进或重复解释字段含义。

@@ -43,6 +43,10 @@ class RelationshipContext(BaseModel):
     action_intents: list[MemoryContextItem] = Field(default_factory=list)
     recent_events: list[MemoryContextItem] = Field(default_factory=list)
     remembered_items: list[MemoryContextItem] = Field(default_factory=list)
+    confirmed_current_state: list[MemoryContextItem] = Field(default_factory=list)
+    confirmed_long_term: list[MemoryContextItem] = Field(default_factory=list)
+    uncertain_items: list[MemoryContextItem] = Field(default_factory=list)
+    conflicted_items: list[MemoryContextItem] = Field(default_factory=list)
 
 
 class KnowledgeReference(BaseModel):

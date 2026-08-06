@@ -446,6 +446,48 @@ async def test_memory_extractor_uses_one_flash_call_for_invalid_json() -> None:
     await extractor.aclose()
 
 
+async def test_flash_trace_keeps_raw_predicate_before_canonicalization() -> None:
+    source_text = (
+        "\u6700\u8fd1\u4e24\u5468\u6211\u4eec\u8054\u7cfb"
+        "\u660e\u663e\u53d8\u5c11\u4e86\u3002"
+    )
+    response = _claim_response(
+        claim_id="contact-trend",
+        kind="interaction_pattern",
+        subject="relationship",
+        predicate="contact_frequency_declined",
+        summary=(
+            "\u6700\u8fd1\u4e24\u5468\u53cc\u65b9\u8054\u7cfb"
+            "\u660e\u663e\u53d8\u5c11"
+        ),
+        evidence=source_text,
+        extra='"confidence":0.9,"payload":{"metric":"contact_frequency"}',
+    )
+    extractor = _build_tiered_extractor(_FakeCompletions([response]), None)
+    trace = ExecutionTrace()
+
+    await extractor.extract(
+        source_text,
+        reference_time=datetime(2026, 7, 18, tzinfo=UTC),
+        existing_memories=[],
+        conversation_history=[],
+        trace=trace,
+    )
+
+    flash_record = next(
+        record for record in trace.snapshot() if record.name == "memory_model_attempt_1"
+    )
+    assert "claim_predicates_json" in flash_record.details, flash_record.details
+    predicates = json.loads(str(flash_record.details["claim_predicates_json"]))
+    assert predicates == [
+        {
+            "claim_id": "contact-trend",
+            "raw_predicate": "contact_frequency_declined",
+        }
+    ]
+    await extractor.aclose()
+
+
 async def test_local_repair_handles_fence_trailing_comma_and_defaults() -> None:
     flash_completions = _FakeCompletions(["```json\n{\"claims\": [],}\n```"])
     extractor = _build_tiered_extractor(flash_completions, None)

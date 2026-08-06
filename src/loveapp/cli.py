@@ -47,10 +47,15 @@ from loveapp.domain.memory import (
     RememberResult,
 )
 from loveapp.domain.memory_context import memory_attention_reason
+from loveapp.domain.memory_write import MemoryTransitionAudit
 from loveapp.domain.observability import StepTiming, TimingEvent, TimingStatus
 from loveapp.domain.relationship_plan import PlanStatus, RelationshipPlan
 from loveapp.domain.routing import RouteResult
-from loveapp.evaluation import evaluate_routing_conversations, run_baseline
+from loveapp.evaluation import (
+    evaluate_memory_lifecycle,
+    evaluate_routing_conversations,
+    run_baseline,
+)
 
 app = typer.Typer(
     name="loveapp",
@@ -143,6 +148,39 @@ def routing_eval(
     for key, value in report.items():
         if key == "cases" or isinstance(value, (dict, list)):
             continue
+        table.add_row(key, str(value))
+    console.print(table)
+
+
+@eval_app.command("memory-lifecycle")
+def memory_lifecycle_eval(
+    dataset: Annotated[
+        Path,
+        typer.Option("--dataset", help="确定性记忆生命周期评测集路径。"),
+    ] = Path("evals/memory/lifecycle_v1.jsonl"),
+    output: Annotated[
+        Path,
+        typer.Option("--output", help="记忆生命周期评测报告保存路径。"),
+    ] = Path("evals/baselines/memory_lifecycle_v1.json"),
+) -> None:
+    """运行不调用真实模型的记忆治理与生命周期评测。"""
+    try:
+        report = asyncio.run(evaluate_memory_lifecycle(dataset))
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        console.print(f"[red]记忆生命周期评测失败：[/red]{exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]记忆生命周期评测已保存：[/green]{output}")
+    table = Table(title="Memory Lifecycle 指标")
+    table.add_column("指标")
+    table.add_column("值", justify="right")
+    table.add_row("case_count", str(report["case_count"]))
+    table.add_row("passed_case_count", str(report["passed_case_count"]))
+    for key, value in report["metrics"].items():
         table.add_row(key, str(value))
     console.print(table)
 
@@ -436,6 +474,32 @@ def list_memory_runs(
         console.print_json(data=[run.model_dump(mode="json") for run in runs])
         return
     console.print(_build_extraction_runs_table(runs))
+
+
+@memory_app.command("audits")
+def list_memory_audits(
+    user_id: Annotated[str, typer.Option("--user-id")] = "local-user",
+    relationship_id: Annotated[str, typer.Option("--relationship-id")] = "primary",
+    source_message_id: Annotated[
+        str | None,
+        typer.Option("--source-message-id"),
+    ] = None,
+    limit: Annotated[int, typer.Option("--limit", min=1, max=500)] = 100,
+    json_output: Annotated[bool, typer.Option("--json", help="输出 JSON。")]=False,
+) -> None:
+    """查看记忆准入、关系判断和生命周期迁移审计。"""
+    audits = asyncio.run(
+        _list_transition_audits(
+            user_id=user_id,
+            relationship_id=relationship_id,
+            source_message_id=source_message_id,
+            limit=limit,
+        )
+    )
+    if json_output:
+        console.print_json(data=[audit.model_dump(mode="json") for audit in audits])
+        return
+    console.print(_build_transition_audit_table(audits))
 
 
 @memory_app.command("watch")
@@ -1130,6 +1194,7 @@ _TIMING_LABELS = {
     "memory_model_attempt_1": "记忆模型尝试 1",
     "memory_model_attempt_2": "记忆模型尝试 2",
     "memory_model_strong_attempt_2": "强模型升级尝试",
+    "memory_claim_verifier": "高风险声明验证",
     "memory_extraction_upgrade_gate": "记忆升级判定",
     "answer_generation": "模型生成回答",
     "policy_enforcement": "执行硬约束",
@@ -1379,6 +1444,25 @@ async def _list_memory_runs(
         await container.aclose()
 
 
+async def _list_transition_audits(
+    *,
+    user_id: str,
+    relationship_id: str,
+    source_message_id: str | None,
+    limit: int,
+) -> list[MemoryTransitionAudit]:
+    container = build_memory_container(enable_extraction=False)
+    try:
+        return await container.memory_store.list_transition_audits(
+            user_id=user_id,
+            relationship_id=relationship_id,
+            source_message_id=source_message_id,
+            limit=limit,
+        )
+    finally:
+        await container.aclose()
+
+
 async def _get_memory(memory_id: str, user_id: str) -> MemoryItem | None:
     container = build_memory_container(enable_extraction=False)
     try:
@@ -1553,6 +1637,30 @@ def _build_extraction_runs_table(runs: list[MemoryExtractionRun]) -> Table:
             discarded,
             run.error or "-",
             run.updated_at.astimezone().strftime("%m-%d %H:%M:%S"),
+        )
+    return table
+
+
+def _build_transition_audit_table(audits: list[MemoryTransitionAudit]) -> Table:
+    table = Table(title=f"记忆生命周期审计（{len(audits)} 条）")
+    table.add_column("时间")
+    table.add_column("关系")
+    table.add_column("决策")
+    table.add_column("关系判断")
+    table.add_column("规则")
+    table.add_column("谓词")
+    table.add_column("目标")
+    table.add_column("原因")
+    for audit in audits:
+        table.add_row(
+            audit.created_at.astimezone().strftime("%m-%d %H:%M:%S"),
+            _short_id(audit.relationship_id),
+            audit.decision.value,
+            audit.relation.value,
+            audit.rule_name,
+            audit.canonical_predicate or audit.raw_predicate or "-",
+            ", ".join(_short_id(value) for value in audit.target_memory_ids) or "-",
+            audit.reason,
         )
     return table
 

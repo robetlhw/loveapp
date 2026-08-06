@@ -196,8 +196,6 @@ def build_contextual_relationship_candidate(
     reference_time: datetime,
 ) -> MemoryCandidate:
     evidence = [event.source_text]
-    if event.antecedent is not None and event.antecedent.content not in evidence:
-        evidence.append(event.antecedent.content[:2000])
     return MemoryCandidate(
         kind=MemoryKind.INTERACTION_EVENT,
         subject="relationship",
@@ -218,8 +216,18 @@ def build_contextual_relationship_candidate(
             "event_status": "completed",
             "contextual_bridge": True,
             "context_signal": event.signal,
+            "event_id": (
+                f"confession-accepted:{event.antecedent.id}"
+                if event.antecedent is not None
+                else None
+            ),
             "antecedent_message_id": (
                 event.antecedent.id if event.antecedent is not None else None
+            ),
+            "antecedent_excerpt": (
+                event.antecedent.content[:2000]
+                if event.antecedent is not None
+                else None
             ),
         },
         supersedes_id=event.supersedes_id,

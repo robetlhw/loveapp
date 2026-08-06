@@ -205,11 +205,25 @@ def _build_user_prompt(
 
 
 def _compact_relationship_context(context: RelationshipContext) -> dict:
+    governed_partitions_present = bool(
+        context.confirmed_current_state
+        or context.confirmed_long_term
+        or context.uncertain_items
+        or context.conflicted_items
+    )
     return {
         "relationship_stage": context.relationship_stage.value,
         "relationship_evidence": context.relationship_evidence.model_dump(mode="json"),
-        "user_preferences": context.user_preferences,
-        "partner_preferences": context.partner_preferences,
+        "user_preferences": (
+            _confirmed_preference_values(context, partner=False)
+            if governed_partitions_present
+            else context.user_preferences
+        ),
+        "partner_preferences": (
+            _confirmed_preference_values(context, partner=True)
+            if governed_partitions_present
+            else context.partner_preferences
+        ),
         "active_plans": [
             {
                 "plan_id": plan.plan_id,
@@ -226,12 +240,49 @@ def _compact_relationship_context(context: RelationshipContext) -> dict:
             for plan in context.active_plans
         ],
         "active_context": [_compact_memory_item(item) for item in context.active_context],
-        "current_state": [_compact_memory_item(item) for item in context.current_state],
+        "current_state": [
+            _compact_memory_item(item) for item in context.confirmed_current_state
+        ],
+        "confirmed_current_state": [
+            _compact_memory_item(item) for item in context.confirmed_current_state
+        ],
+        "confirmed_long_term": [
+            _compact_memory_item(item) for item in context.confirmed_long_term
+        ],
+        "uncertain_items": [_compact_memory_item(item) for item in context.uncertain_items],
+        "conflicted_items": [
+            _compact_memory_item(item) for item in context.conflicted_items
+        ],
         "action_intents": [_compact_memory_item(item) for item in context.action_intents],
         "planned_events": [_compact_memory_item(item) for item in context.planned_events],
         "recent_events": [_compact_memory_item(item) for item in context.recent_events],
-        "relevant_context": context.important_context,
+        "relevant_context": (
+            [] if governed_partitions_present else context.important_context
+        ),
     }
+
+
+def _confirmed_preference_values(
+    context: RelationshipContext,
+    *,
+    partner: bool,
+) -> list[str]:
+    partner_subjects = {"partner", "对方", "伴侣", "她", "他"}
+    values: list[str] = []
+    for item in context.confirmed_long_term:
+        if item.kind.value != "preference":
+            continue
+        is_partner = item.subject.casefold() in partner_subjects
+        if is_partner != partner:
+            continue
+        preference = item.payload.get("preference")
+        if isinstance(preference, list):
+            values.extend(str(value).strip() for value in preference if str(value).strip())
+        elif preference is not None and str(preference).strip():
+            values.append(str(preference).strip())
+        else:
+            values.append(item.summary)
+    return list(dict.fromkeys(values))
 
 
 def _compact_memory_item(item) -> dict:
@@ -246,6 +297,16 @@ def _compact_memory_item(item) -> dict:
         "perspective": item.perspective.value,
         "confidence": item.confidence,
         "importance": item.importance,
+        "status": item.status.value,
+        "predicate_type": item.predicate_type.value,
+        "canonical_predicate": item.canonical_predicate,
+        "custom_predicate": item.custom_predicate,
+        "state_dimension": item.state_dimension,
+        "state_value": item.state_value,
+        "admission_decision": (
+            item.admission_decision.value if item.admission_decision else None
+        ),
+        "lifecycle_review_required": item.lifecycle_review_required,
         "attention_reason": item.attention_reason,
         "payload": item.payload,
     }
@@ -410,6 +471,10 @@ _SYSTEM_PROMPT = """
    用户暂未补充时继续给出带条件的建议，不能自行补全为事实。
    relationship_context.active_plans 只包含 proposed/confirmed 的未结束计划。completed、cancelled、
    expired 计划不会出现在这里；不得从 recent_conversation 的已发生事件反推它仍是未来安排。
+   confirmed_current_state 和 confirmed_long_term 是可作为当前事实使用的确认信息；
+   uncertain_items 只能作为“不确定/待确认”线索，conflicted_items 不得同时断言为两个确定事实。
+   custom predicate 按描述性记忆处理，不能自行推导状态迁移。status、admission_decision、
+   lifecycle_review_required 的治理字段优先于 summary 的措辞。
 2. 给出具体、温和、可执行的建议，尊重双方同意、拒绝和关系边界。
 3. 不鼓励操控、跟踪、骚扰、威胁、报复、强迫或制造情绪依赖。
 4. 不进行心理、医疗或法律诊断。信息不足时通过 clarifying_questions 提问。

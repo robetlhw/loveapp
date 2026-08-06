@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sqlite3
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -10,6 +11,8 @@ import aiosqlite
 from loveapp.domain.advice import RelationshipContext
 from loveapp.domain.enums import RelationshipStage
 from loveapp.domain.memory import (
+    AdmissionDecision,
+    ClaimRelation,
     MemoryCandidate,
     MemoryExtractionRun,
     MemoryItem,
@@ -19,9 +22,17 @@ from loveapp.domain.memory import (
     MessageRole,
     StoredMessage,
     memory_dedupe_key,
+    normalize_candidate_predicate,
     utc_now,
 )
 from loveapp.domain.memory_context import attach_memories, select_context_memories
+from loveapp.domain.memory_predicates import normalize_predicate
+from loveapp.domain.memory_write import (
+    MemoryTransitionAudit,
+    MemoryWriteBatch,
+    MemoryWriteBatchResult,
+    resolve_operation_target_ids,
+)
 from loveapp.domain.relationship_plan import (
     PlanStatus,
     RelationshipPlan,
@@ -32,10 +43,19 @@ from loveapp.domain.relationship_plan import (
 
 
 class SQLiteMemoryStore:
-    def __init__(self, database_path: Path) -> None:
+    def __init__(
+        self,
+        database_path: Path,
+        *,
+        clock: Callable[[], datetime] = utc_now,
+    ) -> None:
         self._database_path = database_path
+        self._clock = clock
         self._initialized = False
         self._initialize_lock = asyncio.Lock()
+
+    def set_clock(self, clock: Callable[[], datetime]) -> None:
+        self._clock = clock
 
     @property
     def database_path(self) -> Path:
@@ -51,9 +71,12 @@ class SQLiteMemoryStore:
             connection = await self._open_connection(initialize=False)
             try:
                 await connection.execute("PRAGMA journal_mode = WAL")
-                await connection.executescript(_SCHEMA)
+                await connection.executescript(f"BEGIN IMMEDIATE;\n{_SCHEMA}")
                 await _migrate_schema(connection)
                 await connection.commit()
+            except Exception:
+                await connection.rollback()
+                raise
             finally:
                 await connection.close()
             self._initialized = True
@@ -68,7 +91,7 @@ class SQLiteMemoryStore:
         conversation_id: str | None = None,
     ) -> StoredMessage:
         await self.initialize()
-        now = utc_now()
+        now = self._clock()
         message_id = str(uuid4())
         conversation_id = conversation_id or str(uuid4())
         connection = await self._open_connection()
@@ -199,7 +222,8 @@ class SQLiteMemoryStore:
         if not candidates:
             return []
         await self.initialize()
-        now = utc_now()
+        now = self._clock()
+        candidates = [normalize_candidate_predicate(candidate) for candidate in candidates]
         connection = await self._open_connection()
         try:
             await _ensure_scope(connection, user_id, relationship_id, now)
@@ -230,6 +254,211 @@ class SQLiteMemoryStore:
                 results[index] = result.model_copy(update={"item": _row_to_memory(refreshed)})
             await connection.commit()
             return results
+        except Exception:
+            await connection.rollback()
+            raise
+        finally:
+            await connection.close()
+
+    async def commit_memory_batch(
+        self,
+        *,
+        user_id: str,
+        relationship_id: str,
+        batch: MemoryWriteBatch,
+    ) -> MemoryWriteBatchResult:
+        await self.initialize()
+        now = self._clock()
+        connection = await self._open_connection()
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            await _ensure_scope(connection, user_id, relationship_id, now)
+            await _expire_due_memories(connection, now)
+            results: list[MemorySaveResult] = []
+            for operation in batch.operations:
+                candidate = normalize_candidate_predicate(operation.candidate).model_copy(
+                    update={"supersedes_id": None}
+                )
+                result = await _save_memory_in_transaction(
+                    connection=connection,
+                    user_id=user_id,
+                    relationship_id=relationship_id,
+                    candidate=candidate,
+                    source_message_id=batch.source_message_id,
+                    status=operation.status,
+                    now=now,
+                )
+                results.append(result)
+                if result.item.kind == MemoryKind.PLANNED_EVENT:
+                    await _ensure_plan_for_memory_in_transaction(connection, result.item)
+
+            for update in batch.plan_updates:
+                source_event_memory_id = (
+                    results[update.candidate_index].item.id
+                    if update.candidate_index is not None
+                    and update.candidate_index < len(results)
+                    else None
+                )
+                await _set_plan_status_in_transaction(
+                    connection,
+                    plan_id=update.plan_id,
+                    user_id=user_id,
+                    relationship_id=relationship_id,
+                    status=update.status,
+                    transitioned_at=update.transitioned_at or now,
+                    source_event_memory_id=source_event_memory_id,
+                )
+
+            saved_memory_ids = [result.item.id for result in results]
+            resolved_targets: list[list[str]] = []
+            implicit_audits: list[MemoryTransitionAudit] = []
+            for index, operation in enumerate(batch.operations):
+                operation_targets = resolve_operation_target_ids(
+                    operation,
+                    saved_memory_ids,
+                    operation_index=index,
+                )
+                resolved_targets.append(operation_targets)
+                transition_targets = (
+                    operation_targets
+                    if operation.relation == ClaimRelation.UPDATE
+                    else []
+                )
+                for memory_id in transition_targets:
+                    if memory_id == results[index].item.id:
+                        continue
+                    target = await _fetchone(
+                        connection,
+                        "SELECT status FROM memory_items WHERE id = ?",
+                        (memory_id,),
+                    )
+                    if (
+                        operation.status == MemoryStatus.PROPOSED
+                        and target is not None
+                        and target["status"] == MemoryStatus.CONFIRMED.value
+                    ):
+                        raise ValueError(
+                            "a proposed memory cannot supersede a confirmed memory"
+                        )
+                    implicit_audits.extend(
+                        await _set_memory_status_in_transaction(
+                            connection,
+                            memory_id=memory_id,
+                            user_id=user_id,
+                            relationship_id=relationship_id,
+                            status=operation.target_status,
+                            now=now,
+                        )
+                    )
+                if transition_targets:
+                    await connection.execute(
+                        "UPDATE memory_items SET supersedes_id = ? WHERE id = ?",
+                        (transition_targets[0], results[index].item.id),
+                    )
+
+            for update in batch.status_updates:
+                implicit_audits.extend(
+                    await _set_memory_status_in_transaction(
+                        connection,
+                        memory_id=update.memory_id,
+                        user_id=user_id,
+                        relationship_id=relationship_id,
+                        status=update.status,
+                        now=now,
+                    )
+                )
+
+            audits: list[MemoryTransitionAudit] = list(implicit_audits)
+            for index, operation in enumerate(batch.operations):
+                candidate = normalize_candidate_predicate(operation.candidate)
+                audit = MemoryTransitionAudit(
+                    user_id=user_id,
+                    relationship_id=relationship_id,
+                    source_message_id=batch.source_message_id,
+                    incoming_memory_id=results[index].item.id,
+                    target_memory_ids=resolved_targets[index],
+                    relation=operation.relation,
+                    decision=(
+                        candidate.admission_decision or AdmissionDecision.PROPOSE
+                    ),
+                    rule_name=operation.rule_name,
+                    admission_score=candidate.admission_score,
+                    score_breakdown=operation.score_breakdown,
+                    raw_predicate=candidate.raw_predicate,
+                    canonical_predicate=candidate.canonical_predicate,
+                    extractor_model=candidate.extractor_model,
+                    verifier_model=candidate.verifier_model,
+                    prompt_version=candidate.prompt_version,
+                    evidence=candidate.evidence_spans,
+                    reason=operation.reason,
+                    created_at=now,
+                )
+                await _insert_transition_audit(connection, audit)
+                audits.append(audit)
+            for draft in batch.audit_only:
+                audit = MemoryTransitionAudit(
+                    user_id=user_id,
+                    relationship_id=relationship_id,
+                    source_message_id=batch.source_message_id,
+                    target_memory_ids=draft.target_memory_ids,
+                    relation=draft.relation,
+                    decision=draft.decision,
+                    rule_name=draft.rule_name,
+                    admission_score=draft.admission_score,
+                    score_breakdown=draft.score_breakdown,
+                    raw_predicate=draft.raw_predicate,
+                    canonical_predicate=draft.canonical_predicate,
+                    extractor_model=draft.extractor_model,
+                    verifier_model=draft.verifier_model,
+                    prompt_version=draft.prompt_version,
+                    evidence=draft.evidence,
+                    reason=draft.reason,
+                    created_at=now,
+                )
+                await _insert_transition_audit(connection, audit)
+                audits.append(audit)
+            for update in batch.status_updates:
+                audit = await _insert_memory_lifecycle_audit(
+                    connection,
+                    memory_id=update.memory_id,
+                    user_id=user_id,
+                    relationship_id=relationship_id,
+                    target_status=update.status,
+                    rule_name=update.rule_name,
+                    reason=update.reason,
+                    created_at=now,
+                )
+                audits.append(audit)
+            for update in batch.plan_updates:
+                source_event_memory_id = (
+                    results[update.candidate_index].item.id
+                    if update.candidate_index is not None
+                    and update.candidate_index < len(results)
+                    else None
+                )
+                audit = await _insert_plan_lifecycle_audit(
+                    connection,
+                    plan_id=update.plan_id,
+                    user_id=user_id,
+                    relationship_id=relationship_id,
+                    incoming_memory_id=source_event_memory_id,
+                    rule_name=f"relationship_plan_{update.status.value}",
+                    reason="The relationship plan changed status in the atomic memory batch.",
+                    created_at=now,
+                )
+                audits.append(audit)
+            await connection.commit()
+            refreshed = []
+            for result in results:
+                row = await _fetchone(
+                    connection,
+                    "SELECT * FROM memory_items WHERE id = ?",
+                    (result.item.id,),
+                )
+                if row is None:
+                    raise RuntimeError("memory disappeared after committing its write batch")
+                refreshed.append(result.model_copy(update={"item": _row_to_memory(row)}))
+            return MemoryWriteBatchResult(saved=refreshed, audits=audits)
         except Exception:
             await connection.rollback()
             raise
@@ -281,7 +510,7 @@ class SQLiteMemoryStore:
         """
         connection = await self._open_connection()
         try:
-            now = utc_now()
+            now = self._clock()
             await _expire_due_memories(connection, now)
             await connection.commit()
             cursor = await connection.execute(query, values)
@@ -300,7 +529,14 @@ class SQLiteMemoryStore:
         await self.initialize()
         connection = await self._open_connection()
         try:
-            now = utc_now()
+            now = self._clock()
+            existing = await _fetchone(
+                connection,
+                "SELECT * FROM memory_items WHERE id = ? AND user_id = ?",
+                (memory_id, user_id),
+            )
+            if existing is None:
+                return None
             try:
                 cursor = await connection.execute(
                     """
@@ -316,11 +552,22 @@ class SQLiteMemoryStore:
                 await connection.rollback()
                 return None
             target_plan_status: PlanStatus | None = None
+            transitioned_plan_ids: list[str] = []
             if status == MemoryStatus.EXPIRED:
                 target_plan_status = PlanStatus.EXPIRED
             elif status in {MemoryStatus.REJECTED, MemoryStatus.SUPERSEDED}:
                 target_plan_status = PlanStatus.CANCELLED
             if target_plan_status is not None:
+                cursor = await connection.execute(
+                    """
+                    SELECT plan_id FROM relationship_plans
+                    WHERE source_memory_id = ? AND user_id = ?
+                      AND status IN ('proposed', 'confirmed')
+                    """,
+                    (memory_id, user_id),
+                )
+                transitioned_plan_ids = [row["plan_id"] for row in await cursor.fetchall()]
+                await cursor.close()
                 timestamp = _dump_datetime(now)
                 await connection.execute(
                     """
@@ -338,6 +585,29 @@ class SQLiteMemoryStore:
                         memory_id,
                         user_id,
                     ),
+                )
+                for plan_id in transitioned_plan_ids:
+                    await _insert_plan_lifecycle_audit(
+                        connection,
+                        plan_id=plan_id,
+                        user_id=user_id,
+                        relationship_id=existing["relationship_id"],
+                        rule_name="plan_source_memory_status_changed",
+                        reason=(
+                            "The source planned-event memory left its active lifecycle state."
+                        ),
+                        created_at=now,
+                    )
+            if existing["status"] != status.value:
+                await _insert_memory_lifecycle_audit(
+                    connection,
+                    memory_id=memory_id,
+                    user_id=user_id,
+                    relationship_id=existing["relationship_id"],
+                    target_status=status,
+                    rule_name="set_memory_status",
+                    reason="The memory status was changed through the store lifecycle API.",
+                    created_at=now,
                 )
             await connection.commit()
             row = await _fetchone(
@@ -435,7 +705,7 @@ class SQLiteMemoryStore:
         await self.initialize()
         connection = await self._open_connection()
         try:
-            now = utc_now()
+            now = self._clock()
             await _expire_due_memories(connection, now)
             await _sync_relationship_plans_in_transaction(
                 connection,
@@ -466,7 +736,7 @@ class SQLiteMemoryStore:
                          created_at DESC
                 LIMIT ?
                 """,
-                (user_id, relationship_id, _dump_datetime(utc_now()), fetch_limit),
+                (user_id, relationship_id, _dump_datetime(self._clock()), fetch_limit),
             )
             rows = await cursor.fetchall()
             await cursor.close()
@@ -500,7 +770,7 @@ class SQLiteMemoryStore:
                 or memory.id in active_plan_memory_ids
             ]
             if memories:
-                last_used_at = _dump_datetime(utc_now())
+                last_used_at = _dump_datetime(self._clock())
                 await connection.executemany(
                     "UPDATE memory_items SET last_used_at = ? WHERE id = ?",
                     [(last_used_at, item.id) for item in memories],
@@ -524,7 +794,7 @@ class SQLiteMemoryStore:
         await self.initialize()
         connection = await self._open_connection()
         try:
-            now = utc_now()
+            now = self._clock()
             await _ensure_scope(
                 connection,
                 context.user_id,
@@ -646,7 +916,7 @@ class SQLiteMemoryStore:
             current = PlanStatus(row["status"])
             if not can_transition_plan_status(current, status):
                 raise ValueError(f"invalid relationship plan transition: {current} -> {status}")
-            now = transitioned_at or utc_now()
+            now = transitioned_at or self._clock()
             payload = json.loads(row["payload_json"])
             if source_event_memory_id is not None:
                 payload["terminal_event_memory_id"] = source_event_memory_id
@@ -707,6 +977,17 @@ class SQLiteMemoryStore:
                                 source_memory_id,
                             ),
                         )
+            if current != status:
+                await _insert_plan_lifecycle_audit(
+                    connection,
+                    plan_id=plan_id,
+                    user_id=user_id,
+                    relationship_id=row["relationship_id"],
+                    incoming_memory_id=source_event_memory_id,
+                    rule_name=f"set_relationship_plan_status:{status.value}",
+                    reason="The plan status was changed through the store lifecycle API.",
+                    created_at=now,
+                )
             await connection.commit()
             updated = await _fetchone(
                 connection,
@@ -733,7 +1014,7 @@ class SQLiteMemoryStore:
                 connection,
                 user_id=user_id,
                 relationship_id=relationship_id,
-                now=utc_now(),
+                now=self._clock(),
             )
             await connection.commit()
             return plans
@@ -822,6 +1103,38 @@ class SQLiteMemoryStore:
         finally:
             await connection.close()
 
+    async def list_transition_audits(
+        self,
+        *,
+        user_id: str,
+        relationship_id: str,
+        source_message_id: str | None = None,
+        limit: int = 100,
+    ) -> list[MemoryTransitionAudit]:
+        await self.initialize()
+        clauses = ["user_id = ?", "relationship_id = ?"]
+        values: list[str | int] = [user_id, relationship_id]
+        if source_message_id is not None:
+            clauses.append("source_message_id = ?")
+            values.append(source_message_id)
+        values.append(limit)
+        connection = await self._open_connection()
+        try:
+            cursor = await connection.execute(
+                f"""
+                SELECT * FROM memory_transition_audit
+                WHERE {" AND ".join(clauses)}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                values,
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            return [_row_to_transition_audit(row) for row in rows]
+        finally:
+            await connection.close()
+
     async def aclose(self) -> None:
         return None
 
@@ -880,6 +1193,21 @@ async def _expire_due_memories(
     connection: aiosqlite.Connection,
     now: datetime,
 ) -> None:
+    cursor = await connection.execute(
+        """
+        SELECT * FROM memory_items
+        WHERE status IN (?, ?)
+          AND expires_at IS NOT NULL
+          AND expires_at <= ?
+        """,
+        (
+            MemoryStatus.PROPOSED.value,
+            MemoryStatus.CONFIRMED.value,
+            _dump_datetime(now),
+        ),
+    )
+    due_rows = await cursor.fetchall()
+    await cursor.close()
     await connection.execute(
         """
         UPDATE memory_items
@@ -896,6 +1224,23 @@ async def _expire_due_memories(
             _dump_datetime(now),
         ),
     )
+    cursor = await connection.execute(
+        """
+        SELECT plan_id, user_id, relationship_id
+        FROM relationship_plans
+        WHERE status IN (?, ?)
+          AND source_memory_id IN (
+              SELECT id FROM memory_items WHERE status = ?
+          )
+        """,
+        (
+            PlanStatus.PROPOSED.value,
+            PlanStatus.CONFIRMED.value,
+            MemoryStatus.EXPIRED.value,
+        ),
+    )
+    due_plan_rows = await cursor.fetchall()
+    await cursor.close()
     await connection.execute(
         """
         UPDATE relationship_plans
@@ -913,6 +1258,27 @@ async def _expire_due_memories(
             MemoryStatus.EXPIRED.value,
         ),
     )
+    for row in due_rows:
+        await _insert_memory_lifecycle_audit(
+            connection,
+            memory_id=row["id"],
+            user_id=row["user_id"],
+            relationship_id=row["relationship_id"],
+            target_status=MemoryStatus.EXPIRED,
+            rule_name="ttl_expired",
+            reason="The memory reached its configured expiration time.",
+            created_at=now,
+        )
+    for row in due_plan_rows:
+        await _insert_plan_lifecycle_audit(
+            connection,
+            plan_id=row["plan_id"],
+            user_id=row["user_id"],
+            relationship_id=row["relationship_id"],
+            rule_name="plan_source_memory_expired",
+            reason="The source planned-event memory expired.",
+            created_at=now,
+        )
 
 
 async def _expire_due_relationship_plans(
@@ -921,7 +1287,8 @@ async def _expire_due_relationship_plans(
 ) -> None:
     cursor = await connection.execute(
         """
-        SELECT plan_id, source_memory_id FROM relationship_plans
+        SELECT plan_id, source_memory_id, user_id, relationship_id
+        FROM relationship_plans
         WHERE status IN ('proposed', 'confirmed')
           AND expires_at IS NOT NULL
           AND expires_at <= ?
@@ -948,6 +1315,33 @@ async def _expire_due_relationship_plans(
             "AND status IN ('proposed', 'confirmed')",
             (MemoryStatus.EXPIRED.value, _dump_datetime(now), *source_ids),
         )
+    for row in rows:
+        await _insert_plan_lifecycle_audit(
+            connection,
+            plan_id=row["plan_id"],
+            user_id=row["user_id"],
+            relationship_id=row["relationship_id"],
+            rule_name="plan_ttl_expired",
+            reason="The relationship plan reached its configured expiration time.",
+            created_at=now,
+        )
+        if row["source_memory_id"] is not None:
+            source = await _fetchone(
+                connection,
+                "SELECT status FROM memory_items WHERE id = ?",
+                (row["source_memory_id"],),
+            )
+            if source is not None and source["status"] == MemoryStatus.EXPIRED.value:
+                await _insert_memory_lifecycle_audit(
+                    connection,
+                    memory_id=row["source_memory_id"],
+                    user_id=row["user_id"],
+                    relationship_id=row["relationship_id"],
+                    target_status=MemoryStatus.EXPIRED,
+                    rule_name="plan_ttl_expired",
+                    reason="The linked relationship plan expired.",
+                    created_at=now,
+                )
 
 
 async def _sync_relationship_plans_in_transaction(
@@ -1064,6 +1458,304 @@ async def _upsert_relationship_plan(
     )
 
 
+async def _set_memory_status_in_transaction(
+    connection: aiosqlite.Connection,
+    *,
+    memory_id: str,
+    user_id: str,
+    relationship_id: str,
+    status: MemoryStatus,
+    now: datetime,
+) -> list[MemoryTransitionAudit]:
+    row = await _fetchone(
+        connection,
+        """
+        SELECT id, kind, status FROM memory_items
+        WHERE id = ? AND user_id = ? AND relationship_id = ?
+        """,
+        (memory_id, user_id, relationship_id),
+    )
+    if row is None:
+        raise ValueError("memory transition target is outside the current relationship scope")
+    if row["status"] == status.value:
+        return []
+    if row["status"] not in {MemoryStatus.PROPOSED.value, MemoryStatus.CONFIRMED.value}:
+        raise ValueError("memory transition target is no longer active")
+    await connection.execute(
+        "UPDATE memory_items SET status = ?, updated_at = ? WHERE id = ?",
+        (status.value, _dump_datetime(now), memory_id),
+    )
+    if row["kind"] != MemoryKind.PLANNED_EVENT.value:
+        return []
+    plan_status = None
+    if status == MemoryStatus.EXPIRED:
+        plan_status = PlanStatus.EXPIRED
+    elif status in {MemoryStatus.REJECTED, MemoryStatus.SUPERSEDED}:
+        plan_status = PlanStatus.CANCELLED
+    if plan_status is not None:
+        cursor = await connection.execute(
+            """
+            SELECT plan_id FROM relationship_plans
+            WHERE source_memory_id = ? AND user_id = ? AND relationship_id = ?
+              AND status IN ('proposed', 'confirmed')
+            """,
+            (memory_id, user_id, relationship_id),
+        )
+        plan_rows = await cursor.fetchall()
+        await cursor.close()
+        await connection.execute(
+            """
+            UPDATE relationship_plans
+            SET status = ?, updated_at = ?,
+                cancelled_at = CASE WHEN ? = 'cancelled' THEN ? ELSE cancelled_at END
+            WHERE source_memory_id = ? AND user_id = ? AND relationship_id = ?
+              AND status IN ('proposed', 'confirmed')
+            """,
+            (
+                plan_status.value,
+                _dump_datetime(now),
+                plan_status.value,
+                _dump_datetime(now),
+                memory_id,
+                user_id,
+                relationship_id,
+            ),
+        )
+        return [
+            await _insert_plan_lifecycle_audit(
+                connection,
+                plan_id=plan_row["plan_id"],
+                user_id=user_id,
+                relationship_id=relationship_id,
+                rule_name="plan_source_memory_status_changed",
+                reason="The source planned-event memory left its active lifecycle state.",
+                created_at=now,
+            )
+            for plan_row in plan_rows
+        ]
+    return []
+
+
+async def _set_plan_status_in_transaction(
+    connection: aiosqlite.Connection,
+    *,
+    plan_id: str,
+    user_id: str,
+    relationship_id: str,
+    status: PlanStatus,
+    transitioned_at: datetime,
+    source_event_memory_id: str | None,
+) -> None:
+    row = await _fetchone(
+        connection,
+        """
+        SELECT * FROM relationship_plans
+        WHERE plan_id = ? AND user_id = ? AND relationship_id = ?
+        """,
+        (plan_id, user_id, relationship_id),
+    )
+    if row is None:
+        raise ValueError("relationship plan transition target is outside the current scope")
+    current = PlanStatus(row["status"])
+    if current != status and not can_transition_plan_status(current, status):
+        raise ValueError(f"invalid relationship plan transition: {current} -> {status}")
+    payload = json.loads(row["payload_json"])
+    if source_event_memory_id is not None:
+        payload["terminal_event_memory_id"] = source_event_memory_id
+    completed_at = transitioned_at if status == PlanStatus.COMPLETED else None
+    cancelled_at = transitioned_at if status == PlanStatus.CANCELLED else None
+    await connection.execute(
+        """
+        UPDATE relationship_plans
+        SET status = ?, updated_at = ?,
+            completed_at = COALESCE(?, completed_at),
+            cancelled_at = COALESCE(?, cancelled_at),
+            payload_json = ?
+        WHERE plan_id = ?
+        """,
+        (
+            status.value,
+            _dump_datetime(transitioned_at),
+            _dump_datetime(completed_at),
+            _dump_datetime(cancelled_at),
+            _dump_json(payload),
+            plan_id,
+        ),
+    )
+    source_memory_id = row["source_memory_id"]
+    if source_memory_id is None:
+        return
+    source = await _fetchone(
+        connection,
+        "SELECT payload_json, status FROM memory_items WHERE id = ?",
+        (source_memory_id,),
+    )
+    if source is None:
+        return
+    source_payload = json.loads(source["payload_json"])
+    source_payload["plan_status"] = status.value
+    memory_status = source["status"]
+    if status in {PlanStatus.COMPLETED, PlanStatus.CANCELLED}:
+        memory_status = MemoryStatus.SUPERSEDED.value
+    elif status == PlanStatus.EXPIRED:
+        memory_status = MemoryStatus.EXPIRED.value
+    await connection.execute(
+        """
+        UPDATE memory_items
+        SET payload_json = ?, status = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            _dump_json(source_payload),
+            memory_status,
+            _dump_datetime(transitioned_at),
+            source_memory_id,
+        ),
+    )
+
+
+async def _insert_transition_audit(
+    connection: aiosqlite.Connection,
+    audit: MemoryTransitionAudit,
+) -> None:
+    await connection.execute(
+        """
+        INSERT INTO memory_transition_audit (
+            id, user_id, relationship_id, source_message_id, incoming_memory_id,
+            target_memory_ids_json, relation, decision, rule_name, admission_score,
+            score_breakdown_json, raw_predicate, canonical_predicate, extractor_model,
+            verifier_model, prompt_version, evidence_json, reason, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            audit.id,
+            audit.user_id,
+            audit.relationship_id,
+            audit.source_message_id,
+            audit.incoming_memory_id,
+            _dump_json(audit.target_memory_ids),
+            audit.relation.value,
+            audit.decision.value,
+            audit.rule_name,
+            audit.admission_score,
+            _dump_json(audit.score_breakdown),
+            audit.raw_predicate,
+            audit.canonical_predicate,
+            audit.extractor_model,
+            audit.verifier_model,
+            audit.prompt_version,
+            _dump_json(audit.evidence),
+            audit.reason,
+            _dump_datetime(audit.created_at),
+        ),
+    )
+
+
+async def _insert_memory_lifecycle_audit(
+    connection: aiosqlite.Connection,
+    *,
+    memory_id: str,
+    user_id: str,
+    relationship_id: str,
+    target_status: MemoryStatus,
+    rule_name: str,
+    reason: str,
+    created_at: datetime,
+) -> MemoryTransitionAudit:
+    row = await _fetchone(
+        connection,
+        """
+        SELECT * FROM memory_items
+        WHERE id = ? AND user_id = ? AND relationship_id = ?
+        """,
+        (memory_id, user_id, relationship_id),
+    )
+    if row is None:
+        raise ValueError("memory audit target is outside the current relationship scope")
+    item = _row_to_memory(row)
+    audit = MemoryTransitionAudit(
+        user_id=user_id,
+        relationship_id=relationship_id,
+        source_message_id=item.source_message_id,
+        target_memory_ids=[memory_id],
+        relation=ClaimRelation.UPDATE,
+        decision=item.admission_decision or AdmissionDecision.PROPOSE,
+        rule_name=rule_name,
+        admission_score=item.admission_score,
+        score_breakdown={"target_memory_status": target_status.value},
+        raw_predicate=item.raw_predicate,
+        canonical_predicate=item.canonical_predicate,
+        extractor_model=item.extractor_model,
+        verifier_model=item.verifier_model,
+        prompt_version=item.prompt_version,
+        evidence=item.evidence_spans,
+        reason=reason,
+        created_at=created_at,
+    )
+    await _insert_transition_audit(connection, audit)
+    return audit
+
+
+async def _insert_plan_lifecycle_audit(
+    connection: aiosqlite.Connection,
+    *,
+    plan_id: str,
+    user_id: str,
+    relationship_id: str,
+    rule_name: str,
+    reason: str,
+    created_at: datetime,
+    incoming_memory_id: str | None = None,
+) -> MemoryTransitionAudit:
+    row = await _fetchone(
+        connection,
+        """
+        SELECT * FROM relationship_plans
+        WHERE plan_id = ? AND user_id = ? AND relationship_id = ?
+        """,
+        (plan_id, user_id, relationship_id),
+    )
+    if row is None:
+        raise ValueError("plan audit target is outside the current relationship scope")
+    source_row = None
+    if row["source_memory_id"] is not None:
+        source_row = await _fetchone(
+            connection,
+            "SELECT * FROM memory_items WHERE id = ?",
+            (row["source_memory_id"],),
+        )
+    source = _row_to_memory(source_row) if source_row is not None else None
+    audit = MemoryTransitionAudit(
+        user_id=user_id,
+        relationship_id=relationship_id,
+        source_message_id=row["source_message_id"],
+        incoming_memory_id=incoming_memory_id,
+        target_memory_ids=[source.id] if source is not None else [],
+        relation=ClaimRelation.UPDATE,
+        decision=(
+            source.admission_decision
+            if source is not None and source.admission_decision is not None
+            else AdmissionDecision.PROPOSE
+        ),
+        rule_name=rule_name,
+        admission_score=source.admission_score if source is not None else None,
+        score_breakdown={
+            "plan_id": plan_id,
+            "target_plan_status": row["status"],
+        },
+        raw_predicate="plan.status",
+        canonical_predicate="plan.status",
+        extractor_model=source.extractor_model if source is not None else None,
+        verifier_model=source.verifier_model if source is not None else None,
+        prompt_version=source.prompt_version if source is not None else None,
+        evidence=source.evidence_spans if source is not None else [],
+        reason=reason,
+        created_at=created_at,
+    )
+    await _insert_transition_audit(connection, audit)
+    return audit
+
+
 async def _save_memory_in_transaction(
     *,
     connection: aiosqlite.Connection,
@@ -1075,6 +1767,17 @@ async def _save_memory_in_transaction(
     now: datetime,
 ) -> MemorySaveResult:
     dedupe_key = memory_dedupe_key(candidate)
+    if source_message_id is not None:
+        idempotent = await _fetchone(
+            connection,
+            """
+            SELECT * FROM memory_items
+            WHERE source_message_id = ? AND dedupe_key = ?
+            """,
+            (source_message_id, dedupe_key),
+        )
+        if idempotent is not None:
+            return MemorySaveResult(item=_row_to_memory(idempotent), created=False)
     cursor = await connection.execute(
         """
         SELECT * FROM memory_items
@@ -1109,11 +1812,34 @@ async def _save_memory_in_transaction(
             if status == MemoryStatus.CONFIRMED
             else MemoryStatus(duplicate["status"])
         )
+        existing_evidence = json.loads(duplicate["evidence_spans_json"])
+        merged_evidence = list(
+            dict.fromkeys([*existing_evidence, *candidate.evidence_spans])
+        )[:8]
+        explicitness = max(
+            (str(duplicate["explicitness"]), candidate.explicitness.value),
+            key=_explicitness_rank,
+        )
         await connection.execute(
             """
             UPDATE memory_items
             SET status = ?, confidence = MAX(confidence, ?),
-                importance = MAX(importance, ?), updated_at = ?, dedupe_key = ?
+                importance = MAX(importance, ?), updated_at = ?, last_seen_at = ?,
+                evidence_spans_json = ?, dedupe_key = ?,
+                canonical_predicate = COALESCE(canonical_predicate, ?),
+                raw_predicate = COALESCE(raw_predicate, ?),
+                predicate_type = CASE WHEN ? = 'canonical' THEN ? ELSE predicate_type END,
+                custom_predicate = CASE WHEN ? = 'canonical' THEN NULL
+                                        ELSE COALESCE(custom_predicate, ?) END,
+                state_dimension = COALESCE(state_dimension, ?),
+                state_value = COALESCE(state_value, ?),
+                explicitness = ?,
+                admission_score = MAX(COALESCE(admission_score, 0), COALESCE(?, 0)),
+                admission_decision = COALESCE(?, admission_decision),
+                claim_relation = COALESCE(?, claim_relation),
+                prompt_version = COALESCE(?, prompt_version),
+                extractor_model = COALESCE(?, extractor_model),
+                verifier_model = COALESCE(?, verifier_model)
             WHERE id = ?
             """,
             (
@@ -1121,7 +1847,28 @@ async def _save_memory_in_transaction(
                 candidate.confidence,
                 candidate.importance,
                 _dump_datetime(now),
+                _dump_datetime(now),
+                _dump_json(merged_evidence),
                 dedupe_key,
+                candidate.canonical_predicate,
+                candidate.raw_predicate,
+                candidate.predicate_type.value,
+                candidate.predicate_type.value,
+                candidate.predicate_type.value,
+                candidate.custom_predicate,
+                candidate.state_dimension,
+                candidate.state_value,
+                explicitness,
+                candidate.admission_score,
+                (
+                    candidate.admission_decision.value
+                    if candidate.admission_decision is not None
+                    else None
+                ),
+                candidate.claim_relation.value if candidate.claim_relation else None,
+                candidate.prompt_version,
+                candidate.extractor_model,
+                candidate.verifier_model,
                 duplicate["id"],
             ),
         )
@@ -1190,11 +1937,16 @@ async def _save_memory_in_transaction(
             id, user_id, relationship_id, kind, subject, summary, original_text,
             evidence_spans_json, time_kind, occurred_at, period_start, period_end,
             temporal_precision, valence, relationship_impact, intensity, emotions_json,
-            importance, perspective, confidence, status, payload_json, source_message_id,
+            importance, perspective, confidence, status, payload_json,
+            canonical_predicate, raw_predicate, predicate_type, custom_predicate,
+            state_dimension, state_value, explicitness, requires_inference,
+            admission_score, admission_decision, claim_relation,
+            lifecycle_review_required, last_seen_at, prompt_version, extractor_model,
+            verifier_model, source_message_id,
             created_at, updated_at, expires_at, last_used_at, supersedes_id, dedupe_key
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         """,
         _memory_values(
@@ -1225,6 +1977,15 @@ def _memory_row_keeper_rank(row: aiosqlite.Row) -> tuple[int, int, float, str]:
         float(row["confidence"]),
         str(row["updated_at"]),
     )
+
+
+def _explicitness_rank(value: str) -> int:
+    return {
+        "speculative": 0,
+        "weakly_inferred": 1,
+        "strongly_implied": 2,
+        "explicit": 3,
+    }.get(str(value), 0)
 
 
 def _memory_values(
@@ -1261,6 +2022,26 @@ def _memory_values(
         candidate.confidence,
         status.value,
         _dump_json(candidate.payload),
+        candidate.canonical_predicate,
+        candidate.raw_predicate,
+        candidate.predicate_type.value,
+        candidate.custom_predicate,
+        candidate.state_dimension,
+        candidate.state_value,
+        candidate.explicitness.value,
+        int(candidate.requires_inference),
+        candidate.admission_score,
+        (
+            candidate.admission_decision.value
+            if candidate.admission_decision is not None
+            else None
+        ),
+        candidate.claim_relation.value if candidate.claim_relation is not None else None,
+        int(candidate.lifecycle_review_required),
+        _dump_datetime(now),
+        candidate.prompt_version,
+        candidate.extractor_model,
+        candidate.verifier_model,
         source_message_id,
         _dump_datetime(now),
         _dump_datetime(now),
@@ -1272,7 +2053,7 @@ def _memory_values(
 
 
 def _row_to_memory(row: aiosqlite.Row) -> MemoryItem:
-    return MemoryItem(
+    item = MemoryItem(
         id=row["id"],
         user_id=row["user_id"],
         relationship_id=row["relationship_id"],
@@ -1295,14 +2076,31 @@ def _row_to_memory(row: aiosqlite.Row) -> MemoryItem:
         confidence=row["confidence"],
         status=row["status"],
         payload=json.loads(row["payload_json"]),
+        canonical_predicate=row["canonical_predicate"],
+        raw_predicate=row["raw_predicate"],
+        predicate_type=row["predicate_type"],
+        custom_predicate=row["custom_predicate"],
+        state_dimension=row["state_dimension"],
+        state_value=row["state_value"],
+        explicitness=row["explicitness"],
+        requires_inference=bool(row["requires_inference"]),
+        admission_score=row["admission_score"],
+        admission_decision=row["admission_decision"],
+        claim_relation=row["claim_relation"],
+        lifecycle_review_required=bool(row["lifecycle_review_required"]),
+        prompt_version=row["prompt_version"],
+        extractor_model=row["extractor_model"],
+        verifier_model=row["verifier_model"],
         source_message_id=row["source_message_id"],
         created_at=_load_datetime(row["created_at"]),
         updated_at=_load_datetime(row["updated_at"]),
         expires_at=_load_datetime(row["expires_at"]),
         last_used_at=_load_datetime(row["last_used_at"]),
+        last_seen_at=_load_datetime(row["last_seen_at"]),
         supersedes_id=row["supersedes_id"],
         dedupe_key=row["dedupe_key"],
     )
+    return normalize_candidate_predicate(item)
 
 
 def _row_to_relationship_plan(row: aiosqlite.Row) -> RelationshipPlan:
@@ -1351,6 +2149,30 @@ def _row_to_extraction_run(row: aiosqlite.Row) -> MemoryExtractionRun:
     )
 
 
+def _row_to_transition_audit(row: aiosqlite.Row) -> MemoryTransitionAudit:
+    return MemoryTransitionAudit(
+        id=row["id"],
+        user_id=row["user_id"],
+        relationship_id=row["relationship_id"],
+        source_message_id=row["source_message_id"],
+        incoming_memory_id=row["incoming_memory_id"],
+        target_memory_ids=json.loads(row["target_memory_ids_json"]),
+        relation=row["relation"],
+        decision=row["decision"],
+        rule_name=row["rule_name"],
+        admission_score=row["admission_score"],
+        score_breakdown=json.loads(row["score_breakdown_json"]),
+        raw_predicate=row["raw_predicate"],
+        canonical_predicate=row["canonical_predicate"],
+        extractor_model=row["extractor_model"],
+        verifier_model=row["verifier_model"],
+        prompt_version=row["prompt_version"],
+        evidence=json.loads(row["evidence_json"]),
+        reason=row["reason"],
+        created_at=_load_datetime(row["created_at"]),
+    )
+
+
 def _dump_datetime(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
@@ -1381,6 +2203,74 @@ async def _migrate_schema(connection: aiosqlite.Connection) -> None:
             "UPDATE memory_items SET evidence_spans_json = ? WHERE id = ?",
             [(_dump_json([row["original_text"]]), row["id"]) for row in rows],
         )
+    memory_v2_columns = {
+        "canonical_predicate": "TEXT",
+        "raw_predicate": "TEXT",
+        "predicate_type": "TEXT NOT NULL DEFAULT 'custom'",
+        "custom_predicate": "TEXT",
+        "state_dimension": "TEXT",
+        "state_value": "TEXT",
+        "explicitness": "TEXT NOT NULL DEFAULT 'strongly_implied'",
+        "requires_inference": "INTEGER NOT NULL DEFAULT 0",
+        "admission_score": "REAL",
+        "admission_decision": "TEXT",
+        "claim_relation": "TEXT",
+        "lifecycle_review_required": "INTEGER NOT NULL DEFAULT 0",
+        "last_seen_at": "TEXT",
+        "prompt_version": "TEXT",
+        "extractor_model": "TEXT",
+        "verifier_model": "TEXT",
+    }
+    for column, declaration in memory_v2_columns.items():
+        if column not in columns:
+            await connection.execute(
+                f"ALTER TABLE memory_items ADD COLUMN {column} {declaration}"
+            )
+    cursor = await connection.execute(
+        """
+        SELECT id, kind, payload_json, raw_predicate, canonical_predicate,
+               custom_predicate, predicate_type
+        FROM memory_items
+        """
+    )
+    memory_rows = await cursor.fetchall()
+    await cursor.close()
+    normalization_updates = []
+    for row in memory_rows:
+        payload = json.loads(row["payload_json"])
+        normalized = normalize_predicate(
+            kind=row["kind"],
+            raw_predicate=row["raw_predicate"] or payload.get("predicate"),
+            canonical_predicate=row["canonical_predicate"],
+            custom_predicate=row["custom_predicate"],
+            predicate_type=row["predicate_type"],
+            payload=payload,
+        )
+        normalization_updates.append(
+            (
+                normalized.raw_predicate,
+                normalized.predicate_type,
+                normalized.canonical_predicate,
+                normalized.custom_predicate,
+                normalized.state_dimension,
+                normalized.state_value,
+                int(normalized.predicate_type == "custom"),
+                row["id"],
+            )
+        )
+    if normalization_updates:
+        await connection.executemany(
+            """
+            UPDATE memory_items
+            SET raw_predicate = ?, predicate_type = ?, canonical_predicate = ?,
+                custom_predicate = ?, state_dimension = ?, state_value = ?,
+                lifecycle_review_required = CASE
+                    WHEN lifecycle_review_required = 1 THEN 1 ELSE ? END,
+                last_seen_at = COALESCE(last_seen_at, updated_at)
+            WHERE id = ?
+            """,
+            normalization_updates,
+        )
     await connection.execute(
         "UPDATE memory_items SET kind = ? WHERE kind = ?",
         (MemoryKind.INTERACTION_EVENT.value, "interaction_episode"),
@@ -1399,7 +2289,7 @@ async def _migrate_schema(connection: aiosqlite.Connection) -> None:
             ADD COLUMN discarded_spans_json TEXT NOT NULL DEFAULT '[]'
             """
         )
-    await connection.execute("PRAGMA user_version = 5")
+    await connection.execute("PRAGMA user_version = 6")
 
 
 _SCHEMA = """
@@ -1465,6 +2355,22 @@ CREATE TABLE IF NOT EXISTS memory_items (
     confidence REAL NOT NULL,
     status TEXT NOT NULL,
     payload_json TEXT NOT NULL DEFAULT '{}',
+    canonical_predicate TEXT,
+    raw_predicate TEXT,
+    predicate_type TEXT NOT NULL DEFAULT 'custom',
+    custom_predicate TEXT,
+    state_dimension TEXT,
+    state_value TEXT,
+    explicitness TEXT NOT NULL DEFAULT 'strongly_implied',
+    requires_inference INTEGER NOT NULL DEFAULT 0,
+    admission_score REAL,
+    admission_decision TEXT,
+    claim_relation TEXT,
+    lifecycle_review_required INTEGER NOT NULL DEFAULT 0,
+    last_seen_at TEXT,
+    prompt_version TEXT,
+    extractor_model TEXT,
+    verifier_model TEXT,
     source_message_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -1528,6 +2434,32 @@ CREATE TABLE IF NOT EXISTS memory_extraction_runs (
     FOREIGN KEY (source_message_id) REFERENCES messages(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS memory_transition_audit (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    relationship_id TEXT NOT NULL,
+    source_message_id TEXT,
+    incoming_memory_id TEXT,
+    target_memory_ids_json TEXT NOT NULL DEFAULT '[]',
+    relation TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    rule_name TEXT NOT NULL,
+    admission_score REAL,
+    score_breakdown_json TEXT NOT NULL DEFAULT '{}',
+    raw_predicate TEXT,
+    canonical_predicate TEXT,
+    extractor_model TEXT,
+    verifier_model TEXT,
+    prompt_version TEXT,
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (user_id, relationship_id)
+        REFERENCES relationships(user_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (source_message_id) REFERENCES messages(id) ON DELETE SET NULL,
+    FOREIGN KEY (incoming_memory_id) REFERENCES memory_items(id) ON DELETE SET NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_memory_scope_status
     ON memory_items(user_id, relationship_id, status);
 CREATE INDEX IF NOT EXISTS idx_memory_kind
@@ -1541,11 +2473,17 @@ CREATE INDEX IF NOT EXISTS idx_relationship_plans_schedule
 CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_active_dedupe
     ON memory_items(user_id, relationship_id, dedupe_key)
     WHERE status IN ('proposed', 'confirmed');
+CREATE INDEX IF NOT EXISTS idx_memory_message_identity
+    ON memory_items(source_message_id, dedupe_key)
+    WHERE source_message_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_messages_scope
     ON messages(user_id, relationship_id, created_at);
 
 CREATE INDEX IF NOT EXISTS idx_memory_extraction_runs_scope
     ON memory_extraction_runs(user_id, relationship_id, updated_at);
 
-PRAGMA user_version = 5;
+CREATE INDEX IF NOT EXISTS idx_memory_transition_audit_scope
+    ON memory_transition_audit(user_id, relationship_id, created_at);
+
+PRAGMA user_version = 6;
 """

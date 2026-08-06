@@ -8,6 +8,14 @@
 
 `gate_v1.jsonl` 另行评估抽取前 Gate。`should_store=false` 的样例若产生任何持久化候选，就计入记忆污染；同时统计 Gate 召回率和特异度，防止只靠“全部跳过”获得低污染率。
 
+`lifecycle_v1.jsonl` 使用固定的 scripted claims，不调用真实模型，专门回归 Predicate 规范化、typed admission、六类 ClaimRelation、状态/计划迁移、错误合并、冲突泄漏和 transition audit。运行方式：
+
+```powershell
+uv run loveapp eval memory-lifecycle --output evals/baselines/memory_lifecycle_v1.json
+```
+
+该报告按 tag 和 `MemoryKind` 汇总，并包含失败 case 明细和数据集 SHA-256。Strong 升级率是确定性 Policy 指标；真实模型延迟、费用和未标注的 Strong Review Precision 不在离线数据中估算。
+
 ## 使用约定
 
 - 每一行是一个完全独立的评测案例，不共享数据库。

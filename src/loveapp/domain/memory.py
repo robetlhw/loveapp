@@ -7,6 +7,11 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from loveapp.domain.memory_predicates import (
+    normalize_predicate,
+    normalize_preference_value,
+)
+
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
@@ -74,6 +79,34 @@ class MemoryStatus(StrEnum):
     SUPERSEDED = "superseded"
 
 
+class PredicateType(StrEnum):
+    CANONICAL = "canonical"
+    CUSTOM = "custom"
+
+
+class EvidenceExplicitness(StrEnum):
+    EXPLICIT = "explicit"
+    STRONGLY_IMPLIED = "strongly_implied"
+    WEAKLY_INFERRED = "weakly_inferred"
+    SPECULATIVE = "speculative"
+
+
+class AdmissionDecision(StrEnum):
+    CONFIRM = "confirm"
+    PROPOSE = "propose"
+    STRONG_REVIEW = "strong_review"
+    REJECT = "reject"
+
+
+class ClaimRelation(StrEnum):
+    SAME = "same"
+    COMPLEMENTARY = "complementary"
+    UPDATE = "update"
+    CONTRADICTION = "contradiction"
+    UNRELATED = "unrelated"
+    UNCERTAIN = "uncertain"
+
+
 class MessageRole(StrEnum):
     USER = "user"
     ASSISTANT = "assistant"
@@ -97,6 +130,7 @@ class DiscardedSpan(BaseModel):
 class MemoryGateReason(StrEnum):
     DURABLE_SIGNAL = "durable_signal"
     EXPLICIT_REMEMBER = "explicit_remember"
+    FORCED = "forced"
     CASUAL = "casual"
     KNOWLEDGE_QUESTION = "knowledge_question"
     OPERATION = "operation"
@@ -109,6 +143,8 @@ class MemoryGateDecision(BaseModel):
     should_extract: bool
     reason: MemoryGateReason
     signals: list[str] = Field(default_factory=list)
+    matched_rule: str | None = None
+    matched_span: str | None = None
 
 
 class MemoryExtractionStatus(StrEnum):
@@ -251,7 +287,9 @@ def _normalize_memory_input(value: object) -> object:
         "completes_plan_id",
     ):
         if key in normalized:
-            payload.setdefault(key, normalized.pop(key))
+            payload.setdefault(key, normalized[key])
+            if key not in {"state_dimension", "state_value"}:
+                normalized.pop(key)
     if temporal_expression_alias:
         payload.setdefault("temporal_expression", temporal_expression_alias)
     if payload or raw_payload is not None:
@@ -307,6 +345,21 @@ class MemoryCandidate(BaseModel):
     confidence: float = Field(default=0.8, ge=0, le=1)
     payload: dict[str, Any] = Field(default_factory=dict)
     supersedes_id: str | None = None
+    raw_predicate: str | None = Field(default=None, max_length=120)
+    predicate_type: PredicateType = PredicateType.CUSTOM
+    canonical_predicate: str | None = Field(default=None, max_length=120)
+    custom_predicate: str | None = Field(default=None, max_length=120)
+    state_dimension: str | None = Field(default=None, max_length=120)
+    state_value: str | None = Field(default=None, max_length=120)
+    explicitness: EvidenceExplicitness = EvidenceExplicitness.STRONGLY_IMPLIED
+    requires_inference: bool = False
+    admission_score: float | None = Field(default=None, ge=0, le=1)
+    admission_decision: AdmissionDecision | None = None
+    claim_relation: ClaimRelation | None = None
+    lifecycle_review_required: bool = False
+    prompt_version: str | None = Field(default=None, max_length=80)
+    extractor_model: str | None = Field(default=None, max_length=160)
+    verifier_model: str | None = Field(default=None, max_length=160)
 
     @model_validator(mode="before")
     @classmethod
@@ -328,7 +381,7 @@ class AtomicClaim(BaseModel):
     claim_id: str = Field(min_length=1, max_length=80)
     kind: MemoryKind
     subject: str = Field(min_length=1, max_length=80)
-    predicate: str = Field(min_length=1, max_length=120)
+    predicate: str = Field(default="", max_length=120)
     object: str | None = Field(default=None, max_length=200)
     summary: str = Field(min_length=1, max_length=500)
     evidence_spans: list[str] = Field(min_length=1, max_length=8)
@@ -347,6 +400,17 @@ class AtomicClaim(BaseModel):
     confidence: float = Field(default=0.8, ge=0, le=1)
     payload: dict[str, Any] = Field(default_factory=dict)
     supersedes_id: str | None = None
+    raw_predicate: str | None = Field(default=None, max_length=120)
+    predicate_type: PredicateType = PredicateType.CUSTOM
+    canonical_predicate: str | None = Field(default=None, max_length=120)
+    custom_predicate: str | None = Field(default=None, max_length=120)
+    state_dimension: str | None = Field(default=None, max_length=120)
+    state_value: str | None = Field(default=None, max_length=120)
+    explicitness: EvidenceExplicitness = EvidenceExplicitness.STRONGLY_IMPLIED
+    requires_inference: bool = False
+    prompt_version: str | None = Field(default=None, max_length=80)
+    extractor_model: str | None = Field(default=None, max_length=160)
+    verifier_model: str | None = Field(default=None, max_length=160)
 
     @model_validator(mode="before")
     @classmethod
@@ -357,6 +421,11 @@ class AtomicClaim(BaseModel):
     def validate_time_shape(self) -> "AtomicClaim":
         if self.period_start and self.period_end and self.period_start > self.period_end:
             raise ValueError("period_start cannot be later than period_end")
+        if not self.predicate:
+            replacement = self.canonical_predicate or self.custom_predicate
+            if not replacement:
+                raise ValueError("predicate or canonical/custom predicate is required")
+            self.predicate = replacement
         return self
 
     def to_candidate(self) -> MemoryCandidate:
@@ -385,6 +454,17 @@ class AtomicClaim(BaseModel):
             confidence=self.confidence,
             payload=payload,
             supersedes_id=self.supersedes_id,
+            raw_predicate=self.raw_predicate or self.predicate,
+            predicate_type=self.predicate_type,
+            canonical_predicate=self.canonical_predicate,
+            custom_predicate=self.custom_predicate,
+            state_dimension=self.state_dimension,
+            state_value=self.state_value,
+            explicitness=self.explicitness,
+            requires_inference=self.requires_inference,
+            prompt_version=self.prompt_version,
+            extractor_model=self.extractor_model,
+            verifier_model=self.verifier_model,
         )
 
 
@@ -404,6 +484,7 @@ class MemoryItem(MemoryCandidate):
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
     last_used_at: datetime | None = None
+    last_seen_at: datetime | None = None
     dedupe_key: str
 
 
@@ -426,6 +507,16 @@ class MemoryContextItem(BaseModel):
     status: MemoryStatus
     payload: dict[str, Any] = Field(default_factory=dict)
     attention_reason: str | None = None
+    predicate_type: PredicateType = PredicateType.CUSTOM
+    canonical_predicate: str | None = None
+    custom_predicate: str | None = None
+    state_dimension: str | None = None
+    state_value: str | None = None
+    explicitness: EvidenceExplicitness = EvidenceExplicitness.STRONGLY_IMPLIED
+    admission_score: float | None = None
+    admission_decision: AdmissionDecision | None = None
+    claim_relation: ClaimRelation | None = None
+    lifecycle_review_required: bool = False
 
     @classmethod
     def from_item(cls, item: MemoryItem) -> "MemoryContextItem":
@@ -449,6 +540,16 @@ class MemoryContextItem(BaseModel):
                     "confidence",
                     "status",
                     "payload",
+                    "predicate_type",
+                    "canonical_predicate",
+                    "custom_predicate",
+                    "state_dimension",
+                    "state_value",
+                    "explicitness",
+                    "admission_score",
+                    "admission_decision",
+                    "claim_relation",
+                    "lifecycle_review_required",
                 }
             )
         )
@@ -474,6 +575,7 @@ class RememberResult(BaseModel):
     saved: list[MemorySaveResult] = Field(default_factory=list)
     discarded_spans: list[DiscardedSpan] = Field(default_factory=list)
     skipped_low_confidence: int = 0
+    rejected_by_policy: int = 0
     extraction_error: str | None = None
     gate_decision: MemoryGateDecision | None = None
     pending: bool = False
@@ -492,78 +594,116 @@ class MemoryCompactionResult(BaseModel):
     applied_count: int = 0
 
 
+def normalize_candidate_predicate(candidate: MemoryCandidate) -> MemoryCandidate:
+    normalized = normalize_predicate(
+        kind=candidate.kind,
+        raw_predicate=candidate.raw_predicate or candidate.payload.get("predicate"),
+        canonical_predicate=candidate.canonical_predicate,
+        custom_predicate=candidate.custom_predicate,
+        predicate_type=candidate.predicate_type,
+        payload=candidate.payload,
+    )
+    updates: dict[str, Any] = {
+        "raw_predicate": normalized.raw_predicate,
+        "predicate_type": PredicateType(normalized.predicate_type),
+        "canonical_predicate": normalized.canonical_predicate,
+        "custom_predicate": normalized.custom_predicate,
+        "state_dimension": normalized.state_dimension,
+        "state_value": normalized.state_value,
+    }
+    if normalized.predicate_type == PredicateType.CUSTOM.value:
+        updates["lifecycle_review_required"] = True
+    return candidate.model_copy(update=updates)
+
+
 def memory_dedupe_key(candidate: MemoryCandidate) -> str:
-    parts = _memory_identity_parts(candidate)
-    normalized = "|".join(_normalize_key_part(part) for part in parts)
+    normalized = memory_dedupe_identity(candidate)
     return sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def memory_dedupe_identity(candidate: MemoryCandidate) -> str:
+    parts = _memory_identity_parts(candidate)
+    return "|".join(_normalize_key_part(part) for part in parts)
 
 
 def _memory_identity_parts(candidate: MemoryCandidate) -> tuple[str, ...]:
     kind = candidate.kind.value
     subject = candidate.subject
     payload = candidate.payload
-    predicate = _canonical_predicate(payload.get("predicate"))
+    predicate = normalize_predicate(
+        kind=candidate.kind,
+        raw_predicate=candidate.raw_predicate or payload.get("predicate"),
+        canonical_predicate=candidate.canonical_predicate,
+        custom_predicate=candidate.custom_predicate,
+        predicate_type=candidate.predicate_type,
+        payload=payload,
+    )
+    predicate_name = predicate.canonical_predicate or f"custom:{predicate.custom_predicate}"
 
     if candidate.kind == MemoryKind.PREFERENCE:
         preference = payload.get("preference")
         preference_type = payload.get("preference_type")
         if isinstance(preference, str):
-            return (kind, subject, "preference", str(preference_type or "unknown"), preference)
+            polarity = (
+                "negative"
+                if str(preference_type or "").casefold()
+                in {"avoid", "allergy", "restriction", "dislike", "forbid"}
+                else "positive"
+            )
+            return (
+                kind,
+                subject,
+                predicate_name,
+                normalize_preference_value(preference),
+                polarity,
+            )
 
     if candidate.kind == MemoryKind.INTERACTION_PATTERN:
         metric = payload.get("metric")
         if isinstance(metric, str):
             state = _canonical_pattern_state(payload)
-            return (kind, subject, "metric", metric, state)
+            return (kind, subject, predicate_name, state)
 
     if candidate.kind == MemoryKind.RELATIONSHIP_STATE:
-        dimension = payload.get("state_dimension")
-        value = payload.get("state_value")
+        dimension = candidate.state_dimension or predicate.state_dimension
+        value = candidate.state_value or predicate.state_value
         if isinstance(dimension, str) and isinstance(value, str):
             return (kind, subject, "state", dimension, value)
 
-    if predicate:
+    if predicate_name:
         object_value = _canonical_object(
             payload.get("object"),
             kind=candidate.kind,
             subject=subject,
-            predicate=predicate,
+            predicate=predicate_name,
         )
         if candidate.kind == MemoryKind.PLANNED_EVENT:
             temporal_key = _temporal_identity(candidate)
-            return (kind, subject, predicate, object_value, temporal_key)
+            plan_id = (
+                ""
+                if payload.get("plan_id_generated") is True
+                else str(payload.get("plan_id") or "")
+            )
+            return (kind, subject, predicate_name, object_value, plan_id, temporal_key)
         if candidate.kind == MemoryKind.ACTION_INTENT:
-            return (kind, subject, predicate, object_value)
+            return (kind, subject, predicate_name, object_value)
         if candidate.kind in {MemoryKind.INTERACTION_EVENT, MemoryKind.ADVICE_OUTCOME}:
-            if predicate in {
-                "confession_succeeded",
-                "confession_accepted",
-                "relationship_started",
-                "relationship_confirmed",
-            }:
-                # Relationship-state events are durable facts for one
-                # relationship, not separate episodes each time the user
-                # refers to the same transition.
-                return (kind, subject, predicate, object_value)
             temporal_key = _temporal_identity(candidate)
             evidence_key = "|".join(candidate.evidence_spans)
-            return (kind, subject, predicate, object_value, temporal_key, evidence_key)
-        return (kind, subject, predicate, object_value)
+            event_id = str(payload.get("event_id") or "")
+            if event_id:
+                return (kind, subject, predicate_name, object_value, event_id)
+            return (
+                kind,
+                subject,
+                predicate_name,
+                object_value,
+                temporal_key,
+                evidence_key,
+            )
+        return (kind, subject, predicate_name, object_value)
 
     return (kind, subject, candidate.summary)
-
-
-def _canonical_predicate(value: object) -> str:
-    if not isinstance(value, str):
-        return ""
-    normalized = _normalize_key_part(value).replace(" ", "_")
-    aliases = {
-        "has_crush_on": "likes",
-        "likes_person": "likes",
-        "is_attracted_to": "likes",
-        "low_interaction_frequency": "has_low_interaction",
-    }
-    return aliases.get(normalized, normalized)
 
 
 def _canonical_object(
@@ -574,7 +714,11 @@ def _canonical_object(
     predicate: str,
 ) -> str:
     normalized = _normalize_key_part(str(value or "unknown")).replace(" ", "_")
-    if kind == MemoryKind.STABLE_FACT and subject.casefold() == "user" and predicate == "likes":
+    if (
+        kind == MemoryKind.STABLE_FACT
+        and subject.casefold() == "user"
+        and predicate in {"likes", "relationship.romantic_interest"}
+    ):
         partner_aliases = (
             "partner",
             "a_girl",

@@ -150,7 +150,7 @@ async def test_contextual_acceptance_saves_event_updates_stage_and_supersedes_pl
         user_id="u1",
         relationship_id="r1",
         kind=MemoryKind.INTERACTION_EVENT,
-        status=MemoryStatus.PROPOSED,
+        status=MemoryStatus.CONFIRMED,
     )
     assert (
         len(

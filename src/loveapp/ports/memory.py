@@ -15,6 +15,12 @@ from loveapp.domain.memory import (
     MessageRole,
     StoredMessage,
 )
+from loveapp.domain.memory_verification import ClaimVerification
+from loveapp.domain.memory_write import (
+    MemoryTransitionAudit,
+    MemoryWriteBatch,
+    MemoryWriteBatchResult,
+)
 from loveapp.domain.relationship_plan import PlanStatus, RelationshipPlan
 from loveapp.ports.observability import TraceRecorder
 
@@ -60,6 +66,14 @@ class MemoryStore(Protocol):
         source_message_id: str | None = None,
         status: MemoryStatus = MemoryStatus.PROPOSED,
     ) -> list[MemorySaveResult]: ...
+
+    async def commit_memory_batch(
+        self,
+        *,
+        user_id: str,
+        relationship_id: str,
+        batch: MemoryWriteBatch,
+    ) -> MemoryWriteBatchResult: ...
 
     async def get_memory(self, memory_id: str, user_id: str) -> MemoryItem | None: ...
 
@@ -138,6 +152,15 @@ class MemoryStore(Protocol):
         limit: int = 20,
     ) -> list[MemoryExtractionRun]: ...
 
+    async def list_transition_audits(
+        self,
+        *,
+        user_id: str,
+        relationship_id: str,
+        source_message_id: str | None = None,
+        limit: int = 100,
+    ) -> list[MemoryTransitionAudit]: ...
+
     async def aclose(self) -> None: ...
 
 
@@ -152,3 +175,15 @@ class MemoryExtractor(Protocol):
         trace: TraceRecorder | None = None,
         attempt_callback: MemoryAttemptCallback | None = None,
     ) -> AtomicExtraction: ...
+
+
+class StrongClaimVerifier(Protocol):
+    async def verify_claim(
+        self,
+        text: str,
+        *,
+        candidate: MemoryCandidate,
+        existing_memories: list[MemoryItem],
+        allowed_target_ids: set[str],
+        trace: TraceRecorder | None = None,
+    ) -> ClaimVerification: ...

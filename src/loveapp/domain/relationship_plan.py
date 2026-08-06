@@ -8,7 +8,13 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from loveapp.domain.memory import MemoryCandidate, MemoryItem, MemoryKind, utc_now
+from loveapp.domain.memory import (
+    MemoryCandidate,
+    MemoryItem,
+    MemoryKind,
+    memory_dedupe_identity,
+    utc_now,
+)
 
 
 class PlanStatus(StrEnum):
@@ -68,11 +74,26 @@ class PlanTransition(BaseModel):
     reason: str
 
 
-def add_plan_identity(candidate: MemoryCandidate) -> MemoryCandidate:
+def add_plan_identity(
+    candidate: MemoryCandidate,
+    *,
+    identity_scope: str | None = None,
+) -> MemoryCandidate:
     if candidate.kind != MemoryKind.PLANNED_EVENT:
         return candidate
     payload = dict(candidate.payload)
-    payload.setdefault("plan_id", str(uuid4()))
+    if "plan_id" not in payload:
+        payload["plan_id"] = (
+            str(
+                uuid5(
+                    NAMESPACE_URL,
+                    f"loveapp-plan:{identity_scope}:{memory_dedupe_identity(candidate)}",
+                )
+            )
+            if identity_scope is not None
+            else str(uuid4())
+        )
+        payload["plan_id_generated"] = True
     activity_type = _first_text(payload, "activity_type", "activity", "event_type", "object")
     if activity_type is not None:
         payload.setdefault("activity_type", activity_type)

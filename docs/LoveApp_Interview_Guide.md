@@ -3,6 +3,8 @@
 > 目标岗位：Python Agent 开发、LLM 应用开发、LangGraph、RAG、Memory、工具集成与后端工程。  
 > 事实基线：2026-08-03 仓库审计。本文以当前源码为准，`docs/LoveApp_Project_Audit.md`、测试、SQLite 快照、评测集和历史 baseline 作为交叉证据。  
 > 状态标记：`[已实现]` 表示当前有可执行代码和调用路径；`[部分实现]` 表示主路径存在但覆盖、评测或产品化不完整；`[设计中]` 表示尚无可执行实现；`[尚未验证]` 表示缺少当前环境、日志或有效评测证据。
+>
+> 2026-08-06 Memory V2 更新：本文中关于“记忆写入不是整条链路原子”“没有一等 transition audit”“Predicate 可能自由漂移”的旧描述是改造前结论。当前实现与可用于面试的准确表述见 [Memory_System_V2.md](Memory_System_V2.md)。
 
 ## 0. 面试事实红线
 

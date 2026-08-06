@@ -145,7 +145,7 @@ async def test_memory_service_filters_low_confidence_and_preserves_source_text()
         original_text="模型改写的句子",
         confidence=0.92,
         supersedes_id="hallucinated-id",
-    )
+    ).model_copy(update={"evidence_spans": [statement]})
     low_confidence = _candidate(
         summary="双方可能会写复盘笔记",
         original_text=statement,

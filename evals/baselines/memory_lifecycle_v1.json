@@ -1,0 +1,1165 @@
+{
+  "dataset": "evals\\memory\\lifecycle_v1.jsonl",
+  "dataset_sha256": "7c5be854d251695c99cac47e4fa9effb521ff4f20b32e6b6846e728515085e4c",
+  "version": "memory-lifecycle-v1",
+  "case_count": 10,
+  "step_count": 20,
+  "passed_case_count": 10,
+  "metrics": {
+    "canonicalization_accuracy": 1.0,
+    "alias_hit_rate": 1.0,
+    "unknown_predicate_rate": 0.2632,
+    "admission_accuracy": 1.0,
+    "relation_accuracy": 1.0,
+    "duplicate_precision": 1.0,
+    "duplicate_recall": 1.0,
+    "update_precision": 1.0,
+    "update_recall": 1.0,
+    "contradiction_detection_accuracy": 1.0,
+    "wrong_merge_rate": 0.0,
+    "stale_active_memory_rate": 0.0,
+    "conflict_leakage_rate": 0.0,
+    "transition_audit_completeness": 1.0,
+    "strong_escalation_rate": 0.35,
+    "strong_review_precision": "not_labeled_offline",
+    "strong_fixture_coverage": 0.2857,
+    "strong_verification_support_rate": 0.2857,
+    "average_memory_processing_latency_ms": "not_applicable_offline",
+    "p50_latency_ms": "not_applicable_offline",
+    "p95_latency_ms": "not_applicable_offline",
+    "average_model_cost_per_message": "not_applicable_offline"
+  },
+  "relation_confusion_matrix": {
+    "complementary": {
+      "complementary": 1
+    },
+    "contradiction": {
+      "contradiction": 1
+    },
+    "same": {
+      "same": 1
+    },
+    "uncertain": {
+      "uncertain": 1
+    },
+    "unrelated": {
+      "unrelated": 3
+    },
+    "update": {
+      "update": 2
+    }
+  },
+  "by_memory_kind": {
+    "interaction_event": {
+      "observed_count": 5,
+      "canonicalization_accuracy": 1.0,
+      "admission_accuracy": 1.0,
+      "relation_accuracy": 1.0,
+      "unknown_predicate_rate": 0.6
+    },
+    "planned_event": {
+      "observed_count": 2,
+      "canonicalization_accuracy": 1.0,
+      "admission_accuracy": 1.0,
+      "relation_accuracy": 0.0,
+      "unknown_predicate_rate": 0.5
+    },
+    "preference": {
+      "observed_count": 6,
+      "canonicalization_accuracy": 1.0,
+      "admission_accuracy": 1.0,
+      "relation_accuracy": 1.0,
+      "unknown_predicate_rate": 0.0
+    },
+    "relationship_state": {
+      "observed_count": 5,
+      "canonicalization_accuracy": 1.0,
+      "admission_accuracy": 1.0,
+      "relation_accuracy": 1.0,
+      "unknown_predicate_rate": 0.0
+    },
+    "stable_fact": {
+      "observed_count": 1,
+      "canonicalization_accuracy": 0.0,
+      "admission_accuracy": 1.0,
+      "relation_accuracy": 1.0,
+      "unknown_predicate_rate": 1.0
+    }
+  },
+  "by_tag": {
+    "admission": {
+      "case_count": 2,
+      "canonicalization_accuracy": 1.0,
+      "relation_accuracy": 1.0,
+      "wrong_merge_rate": 0.0
+    },
+    "canonical": {
+      "case_count": 2,
+      "canonicalization_accuracy": 1.0,
+      "relation_accuracy": 1.0,
+      "wrong_merge_rate": 0.0
+    },
+    "complementary": {
+      "case_count": 1,
+      "canonicalization_accuracy": 1.0,
+      "relation_accuracy": 1.0,
+      "wrong_merge_rate": 0.0
+    },
+    "confession": {
+      "case_count": 1,
+      "canonicalization_accuracy": 1.0,
+      "relation_accuracy": 1.0,
+      "wrong_merge_rate": 0.0
+    },
+    "conflict": {
+      "case_count": 1,
+      "canonicalization_accuracy": 0.0,
+      "relation_accuracy": 1.0,
+      "wrong_merge_rate": 0.0
+    },
+    "context": {
+      "case_count": 1,
+      "canonicalization_accuracy": 0.0,
+      "relation_accuracy": 1.0,
+      "wrong_merge_rate": 0.0
+    },
+    "contradiction": {
+      "case_count": 1,
+      "canonicalization_accuracy": 0.0,
+      "relation_accuracy": 1.0,
+      "wrong_merge_rate": 0.0
+    },
+    "cross_kind": {
+      "case_count": 1,
+      "canonicalization_accuracy": 1.0,
+      "relation_accuracy": 1.0,
+      "wrong_merge_rate": 0.0
+    },
+    "custom": {
+      "case_count": 1,
+      "canonicalization_accuracy": 0.0,
+      "relation_accuracy": 1.0,
+      "wrong_merge_rate": 0.0
+    },
+    "dedupe": {
+      "case_count": 1,
+      "canonicalization_accuracy": 1.0,
+      "relation_accuracy": 1.0,
+      "wrong_merge_rate": 0.0
+    },
+    "event_history": {
+      "case_count": 2,
+      "canonicalization_accuracy": 1.0,
+      "relation_accuracy": 1.0,
+      "wrong_merge_rate": 0.0
+    },
+    "event_identity": {
+      "case_count": 1,
+      "canonicalization_accuracy": 0.0,
+      "relation_accuracy": 0.0,
+      "wrong_merge_rate": 0.0
+    },
+    "high_risk": {
+      "case_count": 1,
+      "canonicalization_accuracy": 1.0,
+      "relation_accuracy": 0.0,
+      "wrong_merge_rate": 0.0
+    },
+    "lifecycle": {
+      "case_count": 2,
+      "canonicalization_accuracy": 1.0,
+      "relation_accuracy": 1.0,
+      "wrong_merge_rate": 0.0
+    },
+    "plan": {
+      "case_count": 1,
+      "canonicalization_accuracy": 0.0,
+      "relation_accuracy": 0.0,
+      "wrong_merge_rate": 0.0
+    },
+    "precision": {
+      "case_count": 1,
+      "canonicalization_accuracy": 1.0,
+      "relation_accuracy": 0.0,
+      "wrong_merge_rate": 0.0
+    },
+    "preference": {
+      "case_count": 3,
+      "canonicalization_accuracy": 1.0,
+      "relation_accuracy": 1.0,
+      "wrong_merge_rate": 0.0
+    },
+    "safety": {
+      "case_count": 1,
+      "canonicalization_accuracy": 0.0,
+      "relation_accuracy": 1.0,
+      "wrong_merge_rate": 0.0
+    },
+    "strong_review": {
+      "case_count": 1,
+      "canonicalization_accuracy": 1.0,
+      "relation_accuracy": 1.0,
+      "wrong_merge_rate": 0.0
+    },
+    "unknown_transition": {
+      "case_count": 1,
+      "canonicalization_accuracy": 0.0,
+      "relation_accuracy": 1.0,
+      "wrong_merge_rate": 0.0
+    },
+    "update": {
+      "case_count": 3,
+      "canonicalization_accuracy": 1.0,
+      "relation_accuracy": 1.0,
+      "wrong_merge_rate": 0.0
+    },
+    "wrong_merge": {
+      "case_count": 2,
+      "canonicalization_accuracy": 1.0,
+      "relation_accuracy": 1.0,
+      "wrong_merge_rate": 0.0
+    }
+  },
+  "cases": [
+    {
+      "case_id": "contact_restore_verified",
+      "tags": [
+        "canonical",
+        "update",
+        "strong_review"
+      ],
+      "step_count": 2,
+      "passed": 1,
+      "metrics": {
+        "canonical_expected": 2,
+        "canonical_correct": 2,
+        "admission_expected": 2,
+        "admission_correct": 2,
+        "relation_expected": 2,
+        "relation_correct": 2,
+        "complementary_expected": 0,
+        "wrong_merge": 0,
+        "audit_expected": 2,
+        "audit_present": 2,
+        "observed_predicates": 2,
+        "canonical_observed": 2,
+        "custom_predicates": 0,
+        "alias_expected": 2,
+        "alias_hits": 2,
+        "duplicate_expected": 0,
+        "duplicate_predicted": 0,
+        "duplicate_true_positive": 0,
+        "update_expected": 1,
+        "update_predicted": 1,
+        "update_true_positive": 1,
+        "contradiction_expected": 0,
+        "contradiction_predicted": 0,
+        "contradiction_true_positive": 0,
+        "contradiction_correct": 0,
+        "stale_expected": 1,
+        "stale_active": 0,
+        "conflict_expected": 0,
+        "conflict_leakage": 0,
+        "claim_count": 2,
+        "strong_calls": 1,
+        "strong_fixture_hits": 1,
+        "strong_supported": 1
+      },
+      "by_memory_kind": {
+        "relationship_state": {
+          "observed": 2,
+          "canonical_observed": 2,
+          "custom_predicates": 0,
+          "canonical_expected": 2,
+          "canonical_correct": 2,
+          "admission_expected": 2,
+          "admission_correct": 2,
+          "relation_expected": 2,
+          "relation_correct": 2
+        }
+      },
+      "relation_confusion": {
+        "unrelated|unrelated": 1,
+        "update|update": 1
+      },
+      "steps": [
+        {
+          "turn_id": "t1",
+          "saved_count": 1,
+          "canonical_predicates": [
+            "contact.status"
+          ],
+          "admission_decisions": [
+            "confirm"
+          ],
+          "relations": [
+            "unrelated"
+          ],
+          "active_refs": [
+            "contact_unavailable"
+          ],
+          "failures": []
+        },
+        {
+          "turn_id": "t2",
+          "saved_count": 1,
+          "canonical_predicates": [
+            "contact.status"
+          ],
+          "admission_decisions": [
+            "confirm"
+          ],
+          "relations": [
+            "update"
+          ],
+          "active_refs": [
+            "contact_restored"
+          ],
+          "failures": []
+        }
+      ],
+      "failures": []
+    },
+    {
+      "case_id": "speculative_breakup_rejected",
+      "tags": [
+        "admission",
+        "high_risk",
+        "precision"
+      ],
+      "step_count": 2,
+      "passed": 1,
+      "metrics": {
+        "canonical_expected": 1,
+        "canonical_correct": 1,
+        "admission_expected": 1,
+        "admission_correct": 1,
+        "relation_expected": 0,
+        "relation_correct": 0,
+        "complementary_expected": 0,
+        "wrong_merge": 0,
+        "audit_expected": 2,
+        "audit_present": 2,
+        "observed_predicates": 1,
+        "canonical_observed": 1,
+        "custom_predicates": 0,
+        "alias_expected": 1,
+        "alias_hits": 1,
+        "stale_expected": 0,
+        "stale_active": 0,
+        "conflict_expected": 0,
+        "conflict_leakage": 0,
+        "claim_count": 2,
+        "strong_calls": 0,
+        "strong_fixture_hits": 0,
+        "strong_supported": 0
+      },
+      "by_memory_kind": {
+        "relationship_state": {
+          "observed": 1,
+          "canonical_observed": 1,
+          "custom_predicates": 0,
+          "canonical_expected": 1,
+          "canonical_correct": 1,
+          "admission_expected": 1,
+          "admission_correct": 1
+        }
+      },
+      "relation_confusion": {},
+      "steps": [
+        {
+          "turn_id": "t1",
+          "saved_count": 1,
+          "canonical_predicates": [
+            "relationship.stage"
+          ],
+          "admission_decisions": [
+            "confirm"
+          ],
+          "relations": [
+            "unrelated"
+          ],
+          "active_refs": [
+            "stage_committed"
+          ],
+          "failures": []
+        },
+        {
+          "turn_id": "t2",
+          "saved_count": 0,
+          "canonical_predicates": [],
+          "admission_decisions": [],
+          "relations": [],
+          "active_refs": [
+            "stage_committed"
+          ],
+          "failures": []
+        }
+      ],
+      "failures": []
+    },
+    {
+      "case_id": "duplicate_cuisine_alias",
+      "tags": [
+        "canonical",
+        "dedupe",
+        "preference"
+      ],
+      "step_count": 2,
+      "passed": 1,
+      "metrics": {
+        "canonical_expected": 2,
+        "canonical_correct": 2,
+        "admission_expected": 2,
+        "admission_correct": 2,
+        "relation_expected": 1,
+        "relation_correct": 1,
+        "complementary_expected": 0,
+        "wrong_merge": 0,
+        "audit_expected": 2,
+        "audit_present": 2,
+        "observed_predicates": 2,
+        "canonical_observed": 2,
+        "custom_predicates": 0,
+        "alias_expected": 0,
+        "alias_hits": 0,
+        "duplicate_expected": 1,
+        "duplicate_predicted": 1,
+        "duplicate_true_positive": 1,
+        "update_expected": 0,
+        "update_predicted": 0,
+        "update_true_positive": 0,
+        "contradiction_expected": 0,
+        "contradiction_predicted": 0,
+        "contradiction_true_positive": 0,
+        "contradiction_correct": 0,
+        "stale_expected": 0,
+        "stale_active": 0,
+        "conflict_expected": 0,
+        "conflict_leakage": 0,
+        "claim_count": 2,
+        "strong_calls": 0,
+        "strong_fixture_hits": 0,
+        "strong_supported": 0
+      },
+      "by_memory_kind": {
+        "preference": {
+          "observed": 2,
+          "canonical_observed": 2,
+          "custom_predicates": 0,
+          "canonical_expected": 2,
+          "canonical_correct": 2,
+          "admission_expected": 2,
+          "admission_correct": 2,
+          "relation_expected": 1,
+          "relation_correct": 1
+        }
+      },
+      "relation_confusion": {
+        "same|same": 1
+      },
+      "steps": [
+        {
+          "turn_id": "t1",
+          "saved_count": 1,
+          "canonical_predicates": [
+            "preference.food.cuisine"
+          ],
+          "admission_decisions": [
+            "confirm"
+          ],
+          "relations": [
+            "unrelated"
+          ],
+          "active_refs": [
+            "pref_japanese"
+          ],
+          "failures": []
+        },
+        {
+          "turn_id": "t2",
+          "saved_count": 1,
+          "canonical_predicates": [
+            "preference.food.cuisine"
+          ],
+          "admission_decisions": [
+            "confirm"
+          ],
+          "relations": [
+            "same"
+          ],
+          "active_refs": [
+            "pref_japanese"
+          ],
+          "failures": []
+        }
+      ],
+      "failures": []
+    },
+    {
+      "case_id": "complementary_cuisine_preferences",
+      "tags": [
+        "complementary",
+        "wrong_merge",
+        "preference"
+      ],
+      "step_count": 2,
+      "passed": 1,
+      "metrics": {
+        "canonical_expected": 1,
+        "canonical_correct": 1,
+        "admission_expected": 0,
+        "admission_correct": 0,
+        "relation_expected": 1,
+        "relation_correct": 1,
+        "complementary_expected": 1,
+        "wrong_merge": 0,
+        "audit_expected": 2,
+        "audit_present": 2,
+        "observed_predicates": 2,
+        "canonical_observed": 2,
+        "custom_predicates": 0,
+        "alias_expected": 0,
+        "alias_hits": 0,
+        "duplicate_expected": 0,
+        "duplicate_predicted": 0,
+        "duplicate_true_positive": 0,
+        "update_expected": 0,
+        "update_predicted": 0,
+        "update_true_positive": 0,
+        "contradiction_expected": 0,
+        "contradiction_predicted": 0,
+        "contradiction_true_positive": 0,
+        "contradiction_correct": 0,
+        "stale_expected": 0,
+        "stale_active": 0,
+        "conflict_expected": 0,
+        "conflict_leakage": 0,
+        "claim_count": 2,
+        "strong_calls": 0,
+        "strong_fixture_hits": 0,
+        "strong_supported": 0
+      },
+      "by_memory_kind": {
+        "preference": {
+          "observed": 2,
+          "canonical_observed": 2,
+          "custom_predicates": 0,
+          "canonical_expected": 1,
+          "canonical_correct": 1,
+          "relation_expected": 1,
+          "relation_correct": 1
+        }
+      },
+      "relation_confusion": {
+        "complementary|complementary": 1
+      },
+      "steps": [
+        {
+          "turn_id": "t1",
+          "saved_count": 1,
+          "canonical_predicates": [
+            "preference.food.cuisine"
+          ],
+          "admission_decisions": [
+            "confirm"
+          ],
+          "relations": [
+            "unrelated"
+          ],
+          "active_refs": [
+            "pref_japanese"
+          ],
+          "failures": []
+        },
+        {
+          "turn_id": "t2",
+          "saved_count": 1,
+          "canonical_predicates": [
+            "preference.food.cuisine"
+          ],
+          "admission_decisions": [
+            "confirm"
+          ],
+          "relations": [
+            "complementary"
+          ],
+          "active_refs": [
+            "pref_japanese",
+            "pref_sushi"
+          ],
+          "failures": []
+        }
+      ],
+      "failures": []
+    },
+    {
+      "case_id": "proposed_does_not_close_confirmed",
+      "tags": [
+        "conflict",
+        "admission",
+        "context"
+      ],
+      "step_count": 2,
+      "passed": 1,
+      "metrics": {
+        "canonical_expected": 0,
+        "canonical_correct": 0,
+        "admission_expected": 2,
+        "admission_correct": 2,
+        "relation_expected": 1,
+        "relation_correct": 1,
+        "complementary_expected": 0,
+        "wrong_merge": 0,
+        "audit_expected": 2,
+        "audit_present": 2,
+        "observed_predicates": 2,
+        "canonical_observed": 2,
+        "custom_predicates": 0,
+        "alias_expected": 2,
+        "alias_hits": 2,
+        "duplicate_expected": 0,
+        "duplicate_predicted": 0,
+        "duplicate_true_positive": 0,
+        "update_expected": 0,
+        "update_predicted": 0,
+        "update_true_positive": 0,
+        "contradiction_expected": 1,
+        "contradiction_predicted": 1,
+        "contradiction_true_positive": 1,
+        "contradiction_correct": 1,
+        "stale_expected": 0,
+        "stale_active": 0,
+        "conflict_expected": 1,
+        "conflict_leakage": 0,
+        "claim_count": 2,
+        "strong_calls": 0,
+        "strong_fixture_hits": 0,
+        "strong_supported": 0
+      },
+      "by_memory_kind": {
+        "relationship_state": {
+          "observed": 2,
+          "canonical_observed": 2,
+          "custom_predicates": 0,
+          "admission_expected": 2,
+          "admission_correct": 2,
+          "relation_expected": 1,
+          "relation_correct": 1
+        }
+      },
+      "relation_confusion": {
+        "contradiction|contradiction": 1
+      },
+      "steps": [
+        {
+          "turn_id": "t1",
+          "saved_count": 1,
+          "canonical_predicates": [
+            "contact.status"
+          ],
+          "admission_decisions": [
+            "confirm"
+          ],
+          "relations": [
+            "unrelated"
+          ],
+          "active_refs": [
+            "confirmed_unavailable"
+          ],
+          "failures": []
+        },
+        {
+          "turn_id": "t2",
+          "saved_count": 1,
+          "canonical_predicates": [
+            "contact.status"
+          ],
+          "admission_decisions": [
+            "propose"
+          ],
+          "relations": [
+            "contradiction"
+          ],
+          "active_refs": [
+            "confirmed_unavailable",
+            "proposed_restored"
+          ],
+          "failures": []
+        }
+      ],
+      "failures": []
+    },
+    {
+      "case_id": "unknown_predicate_safe_fallback",
+      "tags": [
+        "custom",
+        "unknown_transition",
+        "safety"
+      ],
+      "step_count": 1,
+      "passed": 1,
+      "metrics": {
+        "canonical_expected": 0,
+        "canonical_correct": 0,
+        "admission_expected": 1,
+        "admission_correct": 1,
+        "relation_expected": 1,
+        "relation_correct": 1,
+        "complementary_expected": 0,
+        "wrong_merge": 0,
+        "audit_expected": 1,
+        "audit_present": 1,
+        "observed_predicates": 1,
+        "canonical_observed": 0,
+        "custom_predicates": 1,
+        "alias_expected": 0,
+        "alias_hits": 0,
+        "duplicate_expected": 0,
+        "duplicate_predicted": 0,
+        "duplicate_true_positive": 0,
+        "update_expected": 0,
+        "update_predicted": 0,
+        "update_true_positive": 0,
+        "contradiction_expected": 0,
+        "contradiction_predicted": 0,
+        "contradiction_true_positive": 0,
+        "contradiction_correct": 0,
+        "stale_expected": 0,
+        "stale_active": 0,
+        "conflict_expected": 0,
+        "conflict_leakage": 0,
+        "claim_count": 1,
+        "strong_calls": 1,
+        "strong_fixture_hits": 0,
+        "strong_supported": 0
+      },
+      "by_memory_kind": {
+        "stable_fact": {
+          "observed": 1,
+          "canonical_observed": 0,
+          "custom_predicates": 1,
+          "admission_expected": 1,
+          "admission_correct": 1,
+          "relation_expected": 1,
+          "relation_correct": 1
+        }
+      },
+      "relation_confusion": {
+        "uncertain|uncertain": 1
+      },
+      "steps": [
+        {
+          "turn_id": "t1",
+          "saved_count": 1,
+          "canonical_predicates": [
+            null
+          ],
+          "admission_decisions": [
+            "strong_review"
+          ],
+          "relations": [
+            "uncertain"
+          ],
+          "active_refs": [
+            "custom_secret"
+          ],
+          "failures": []
+        }
+      ],
+      "failures": []
+    },
+    {
+      "case_id": "planned_event_completed",
+      "tags": [
+        "plan",
+        "lifecycle",
+        "event_history"
+      ],
+      "step_count": 2,
+      "passed": 1,
+      "metrics": {
+        "canonical_expected": 0,
+        "canonical_correct": 0,
+        "admission_expected": 0,
+        "admission_correct": 0,
+        "relation_expected": 0,
+        "relation_correct": 0,
+        "complementary_expected": 0,
+        "wrong_merge": 0,
+        "audit_expected": 2,
+        "audit_present": 2,
+        "observed_predicates": 2,
+        "canonical_observed": 0,
+        "custom_predicates": 2,
+        "alias_expected": 0,
+        "alias_hits": 0,
+        "stale_expected": 1,
+        "stale_active": 0,
+        "conflict_expected": 0,
+        "conflict_leakage": 0,
+        "claim_count": 2,
+        "strong_calls": 2,
+        "strong_fixture_hits": 0,
+        "strong_supported": 0
+      },
+      "by_memory_kind": {
+        "planned_event": {
+          "observed": 1,
+          "canonical_observed": 0,
+          "custom_predicates": 1
+        },
+        "interaction_event": {
+          "observed": 1,
+          "canonical_observed": 0,
+          "custom_predicates": 1
+        }
+      },
+      "relation_confusion": {},
+      "steps": [
+        {
+          "turn_id": "t1",
+          "saved_count": 1,
+          "canonical_predicates": [
+            null
+          ],
+          "admission_decisions": [
+            "strong_review"
+          ],
+          "relations": [
+            "uncertain"
+          ],
+          "active_refs": [
+            "planned_hike"
+          ],
+          "failures": []
+        },
+        {
+          "turn_id": "t2",
+          "saved_count": 1,
+          "canonical_predicates": [
+            null
+          ],
+          "admission_decisions": [
+            "strong_review"
+          ],
+          "relations": [
+            "uncertain"
+          ],
+          "active_refs": [
+            "completed_hike"
+          ],
+          "failures": []
+        }
+      ],
+      "failures": []
+    },
+    {
+      "case_id": "repeated_events_keep_identity",
+      "tags": [
+        "event_identity",
+        "wrong_merge"
+      ],
+      "step_count": 2,
+      "passed": 1,
+      "metrics": {
+        "canonical_expected": 0,
+        "canonical_correct": 0,
+        "admission_expected": 0,
+        "admission_correct": 0,
+        "relation_expected": 0,
+        "relation_correct": 0,
+        "complementary_expected": 0,
+        "wrong_merge": 0,
+        "audit_expected": 2,
+        "audit_present": 2,
+        "observed_predicates": 2,
+        "canonical_observed": 0,
+        "custom_predicates": 2,
+        "alias_expected": 0,
+        "alias_hits": 0,
+        "stale_expected": 0,
+        "stale_active": 0,
+        "conflict_expected": 0,
+        "conflict_leakage": 0,
+        "claim_count": 2,
+        "strong_calls": 2,
+        "strong_fixture_hits": 0,
+        "strong_supported": 0
+      },
+      "by_memory_kind": {
+        "interaction_event": {
+          "observed": 2,
+          "canonical_observed": 0,
+          "custom_predicates": 2
+        }
+      },
+      "relation_confusion": {},
+      "steps": [
+        {
+          "turn_id": "t1",
+          "saved_count": 1,
+          "canonical_predicates": [
+            null
+          ],
+          "admission_decisions": [
+            "strong_review"
+          ],
+          "relations": [
+            "uncertain"
+          ],
+          "active_refs": [
+            "argument_one"
+          ],
+          "failures": []
+        },
+        {
+          "turn_id": "t2",
+          "saved_count": 1,
+          "canonical_predicates": [
+            null
+          ],
+          "admission_decisions": [
+            "strong_review"
+          ],
+          "relations": [
+            "uncertain"
+          ],
+          "active_refs": [
+            "argument_one",
+            "argument_two"
+          ],
+          "failures": []
+        }
+      ],
+      "failures": []
+    },
+    {
+      "case_id": "spiciness_preference_update",
+      "tags": [
+        "preference",
+        "contradiction",
+        "update"
+      ],
+      "step_count": 2,
+      "passed": 1,
+      "metrics": {
+        "canonical_expected": 0,
+        "canonical_correct": 0,
+        "admission_expected": 2,
+        "admission_correct": 2,
+        "relation_expected": 1,
+        "relation_correct": 1,
+        "complementary_expected": 0,
+        "wrong_merge": 0,
+        "audit_expected": 2,
+        "audit_present": 2,
+        "observed_predicates": 2,
+        "canonical_observed": 2,
+        "custom_predicates": 0,
+        "alias_expected": 0,
+        "alias_hits": 0,
+        "duplicate_expected": 0,
+        "duplicate_predicted": 0,
+        "duplicate_true_positive": 0,
+        "update_expected": 1,
+        "update_predicted": 1,
+        "update_true_positive": 1,
+        "contradiction_expected": 0,
+        "contradiction_predicted": 0,
+        "contradiction_true_positive": 0,
+        "contradiction_correct": 0,
+        "stale_expected": 1,
+        "stale_active": 0,
+        "conflict_expected": 0,
+        "conflict_leakage": 0,
+        "claim_count": 2,
+        "strong_calls": 1,
+        "strong_fixture_hits": 1,
+        "strong_supported": 1
+      },
+      "by_memory_kind": {
+        "preference": {
+          "observed": 2,
+          "canonical_observed": 2,
+          "custom_predicates": 0,
+          "admission_expected": 2,
+          "admission_correct": 2,
+          "relation_expected": 1,
+          "relation_correct": 1
+        }
+      },
+      "relation_confusion": {
+        "update|update": 1
+      },
+      "steps": [
+        {
+          "turn_id": "t1",
+          "saved_count": 1,
+          "canonical_predicates": [
+            "preference.food.spiciness"
+          ],
+          "admission_decisions": [
+            "confirm"
+          ],
+          "relations": [
+            "unrelated"
+          ],
+          "active_refs": [
+            "spicy_none"
+          ],
+          "failures": []
+        },
+        {
+          "turn_id": "t2",
+          "saved_count": 1,
+          "canonical_predicates": [
+            "preference.food.spiciness"
+          ],
+          "admission_decisions": [
+            "confirm"
+          ],
+          "relations": [
+            "update"
+          ],
+          "active_refs": [
+            "spicy_mild"
+          ],
+          "failures": []
+        }
+      ],
+      "failures": []
+    },
+    {
+      "case_id": "confession_intent_executed_accepted",
+      "tags": [
+        "confession",
+        "cross_kind",
+        "event_history",
+        "lifecycle",
+        "update"
+      ],
+      "step_count": 3,
+      "passed": 1,
+      "metrics": {
+        "canonical_expected": 3,
+        "canonical_correct": 3,
+        "admission_expected": 3,
+        "admission_correct": 3,
+        "relation_expected": 2,
+        "relation_correct": 2,
+        "complementary_expected": 0,
+        "wrong_merge": 0,
+        "audit_expected": 3,
+        "audit_present": 3,
+        "observed_predicates": 3,
+        "canonical_observed": 3,
+        "custom_predicates": 0,
+        "alias_expected": 3,
+        "alias_hits": 3,
+        "duplicate_expected": 0,
+        "duplicate_predicted": 0,
+        "duplicate_true_positive": 0,
+        "update_expected": 0,
+        "update_predicted": 0,
+        "update_true_positive": 0,
+        "contradiction_expected": 0,
+        "contradiction_predicted": 0,
+        "contradiction_true_positive": 0,
+        "contradiction_correct": 0,
+        "stale_expected": 1,
+        "stale_active": 0,
+        "conflict_expected": 0,
+        "conflict_leakage": 0,
+        "claim_count": 3,
+        "strong_calls": 0,
+        "strong_fixture_hits": 0,
+        "strong_supported": 0
+      },
+      "by_memory_kind": {
+        "planned_event": {
+          "observed": 1,
+          "canonical_observed": 1,
+          "custom_predicates": 0,
+          "canonical_expected": 1,
+          "canonical_correct": 1,
+          "admission_expected": 1,
+          "admission_correct": 1
+        },
+        "interaction_event": {
+          "observed": 2,
+          "canonical_observed": 2,
+          "custom_predicates": 0,
+          "canonical_expected": 2,
+          "canonical_correct": 2,
+          "admission_expected": 2,
+          "admission_correct": 2,
+          "relation_expected": 2,
+          "relation_correct": 2
+        }
+      },
+      "relation_confusion": {
+        "unrelated|unrelated": 2
+      },
+      "steps": [
+        {
+          "turn_id": "t1",
+          "saved_count": 1,
+          "canonical_predicates": [
+            "confession.status"
+          ],
+          "admission_decisions": [
+            "confirm"
+          ],
+          "relations": [
+            "unrelated"
+          ],
+          "active_refs": [
+            "confession_intent"
+          ],
+          "failures": []
+        },
+        {
+          "turn_id": "t2",
+          "saved_count": 1,
+          "canonical_predicates": [
+            "confession.status"
+          ],
+          "admission_decisions": [
+            "confirm"
+          ],
+          "relations": [
+            "unrelated"
+          ],
+          "active_refs": [
+            "confession_executed"
+          ],
+          "failures": []
+        },
+        {
+          "turn_id": "t3",
+          "saved_count": 1,
+          "canonical_predicates": [
+            "confession.status"
+          ],
+          "admission_decisions": [
+            "confirm"
+          ],
+          "relations": [
+            "unrelated"
+          ],
+          "active_refs": [
+            "confession_accepted",
+            "confession_executed"
+          ],
+          "failures": []
+        }
+      ],
+      "failures": []
+    }
+  ],
+  "comparison": {
+    "baseline": "not_available",
+    "reason": "Memory V1 had no equivalent deterministic lifecycle fixture; the current report is the first reproducible baseline."
+  }
+}
