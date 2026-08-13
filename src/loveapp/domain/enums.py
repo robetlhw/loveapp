@@ -35,6 +35,7 @@ class TaskType(StrEnum):
     GENERAL_CHAT = "general_chat"
     RELATIONSHIP_ADVICE = "relationship_advice"
     DATE_PLANNING = "date_planning"
+    OUT_OF_SCOPE = "out_of_scope"
 
 
 class DateRequestMode(StrEnum):

@@ -46,12 +46,24 @@ class DatePlanSlots(BaseModel):
     lodging_notes: list[str] = Field(default_factory=list, max_length=8)
 
 
+class RecentRiskState(BaseModel):
+    level: RiskLevel
+    reasons: list[str] = Field(default_factory=list, max_length=8)
+    expires_after_turns: int = Field(default=2, ge=0, le=4)
+
+
 class RouteInput(BaseModel):
     latest_query: str = Field(min_length=1, max_length=4000)
     recent_messages: list[StoredMessage] = Field(default_factory=list, max_length=20)
     active_task: TaskType | None = None
     forced_task: TaskType | None = None
     date_task_state: DatePlanningTaskState | None = None
+    pending_task: TaskType | None = None
+    pending_task_reason: str | None = Field(default=None, max_length=300)
+    pending_task_turns_remaining: int = Field(default=0, ge=0, le=4)
+    last_clarification_reason: str | None = Field(default=None, max_length=300)
+    clarification_attempt_count: int = Field(default=0, ge=0, le=3)
+    previous_risk_state: RecentRiskState | None = None
 
 
 class RouteCorrection(BaseModel):
@@ -105,3 +117,24 @@ class RouteResult(BaseModel):
     llm_error: str | None = None
     needs_clarification: bool = False
     evidence_spans: list[str] = Field(default_factory=list, max_length=12)
+    clarification_triggered: bool = False
+    clarification_exhausted: bool = False
+    clarification_options: list[str] = Field(default_factory=list, max_length=3)
+    clarification_reason: str | None = None
+    out_of_scope_reason: str | None = None
+    pending_task: TaskType | None = None
+    pending_task_reason: str | None = None
+    pending_task_source: str | None = None
+    pending_task_turns_remaining: int = Field(default=0, ge=0, le=4)
+    pending_task_cancelled: bool = False
+    slot_accepted_fields: dict[str, str] = Field(default_factory=dict)
+    slot_rejected_fields: dict[str, str] = Field(default_factory=dict)
+    slot_field_sources: dict[str, str] = Field(default_factory=dict)
+    recent_risk_inherited: bool = False
+    recent_risk_deescalated: bool = False
+    router_prompt_version: str | None = None
+    router_model: str | None = None
+    router_input_tokens: int | None = Field(default=None, ge=0)
+    router_output_tokens: int | None = Field(default=None, ge=0)
+    router_duration_ms: float | None = Field(default=None, ge=0)
+    fallback_reason: str | None = None

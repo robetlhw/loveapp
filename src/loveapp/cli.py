@@ -52,6 +52,7 @@ from loveapp.domain.observability import StepTiming, TimingEvent, TimingStatus
 from loveapp.domain.relationship_plan import PlanStatus, RelationshipPlan
 from loveapp.domain.routing import RouteResult
 from loveapp.evaluation import (
+    evaluate_live_routing_conversations,
     evaluate_memory_lifecycle,
     evaluate_routing_conversations,
     run_baseline,
@@ -124,25 +125,75 @@ def routing_eval(
     dataset: Annotated[
         Path,
         typer.Option("--dataset", help="多轮路由评测集路径。"),
-    ] = Path("evals/routing/cases_v2.jsonl"),
+    ] = Path("evals/routing/cases_v4.jsonl"),
     output: Annotated[
-        Path,
-        typer.Option("--output", help="路由评测报告保存路径。"),
-    ] = Path("evals/baselines/routing_v2_current.json"),
+        Path | None,
+        typer.Option("--output", help="路由评测报告保存路径；默认按 Policy/Live 分开。"),
+    ] = None,
+    live: Annotated[
+        bool,
+        typer.Option(
+            "--live/--policy",
+            help="调用真实 RouteCorrector；需显式启用 live eval 环境保护。",
+        ),
+    ] = False,
+    input_cost_per_million: Annotated[
+        float,
+        typer.Option("--input-cost-per-million", min=0, help="每百万输入 token 成本。"),
+    ] = 0,
+    output_cost_per_million: Annotated[
+        float,
+        typer.Option("--output-cost-per-million", min=0, help="每百万输出 token 成本。"),
+    ] = 0,
+    fail_on_targets: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-targets/--no-fail-on-targets",
+            help="未达到固定集验收目标时以非零状态退出。",
+        ),
+    ] = False,
 ) -> None:
-    """运行不调用真实模型的多轮路由策略回归评测。"""
+    """运行确定性 Policy Eval，或显式启用的真实模型 Live Eval。"""
+    output_path = output or Path(
+        "evals/baselines/routing_v4_live_current.json"
+        if live
+        else "evals/baselines/routing_v4_current.json"
+    )
     try:
-        report = asyncio.run(evaluate_routing_conversations(dataset))
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(
+        settings = get_settings()
+        if live:
+            report = asyncio.run(
+                evaluate_live_routing_conversations(
+                    dataset,
+                    settings,
+                    input_cost_per_million=input_cost_per_million,
+                    output_cost_per_million=output_cost_per_million,
+                )
+            )
+        else:
+            report = asyncio.run(
+                evaluate_routing_conversations(
+                    dataset,
+                    input_cost_per_million=input_cost_per_million,
+                    output_cost_per_million=output_cost_per_million,
+                    confidence_threshold=settings.router_confidence_threshold,
+                    ambiguity_margin=settings.router_ambiguity_margin,
+                    clarification_threshold=settings.router_clarification_threshold,
+                    safety_context_turns=settings.router_context_risk_turns,
+                    prompt_version=settings.router_prompt_version,
+                )
+            )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
             json.dumps(report, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
     except Exception as exc:
         console.print(f"[red]路由评测失败：[/red]{exc}")
         raise typer.Exit(code=1) from exc
-    console.print(f"[green]路由评测已保存：[/green]{output}")
-    table = Table(title="多轮路由评测摘要")
+    mode_name = "Live Router Eval" if live else "Policy Eval"
+    console.print(f"[green]{mode_name} 已保存：[/green]{output_path}")
+    table = Table(title=f"{mode_name} 摘要")
     table.add_column("指标")
     table.add_column("值", justify="right")
     for key, value in report.items():
@@ -150,6 +201,12 @@ def routing_eval(
             continue
         table.add_row(key, str(value))
     console.print(table)
+    if fail_on_targets and not report["acceptance_passed"]:
+        failed = [
+            name for name, passed in report["acceptance_targets"].items() if not passed
+        ]
+        console.print(f"[red]未达到验收目标：[/red]{', '.join(failed)}")
+        raise typer.Exit(code=2)
 
 
 @eval_app.command("memory-lifecycle")
@@ -1004,6 +1061,8 @@ async def _run_chat(
                 _render_date_plan(turn.date_plan)
             elif turn.message:
                 console.print(turn.message)
+            if turn.follow_up_prompt:
+                console.print(f"\n[dim]{turn.follow_up_prompt}[/dim]")
             if debug_route:
                 console.print()
                 _render_route(turn.route, active_task)
@@ -1169,6 +1228,24 @@ def _format_timing_details(record: StepTiming) -> str:
         "discard_reason",
         "failure_category",
         "retry_reason",
+        "clarification_reason",
+        "clarification_triggered",
+        "clarification_exhausted",
+        "out_of_scope_reason",
+        "pending_task",
+        "pending_task_source",
+        "pending_task_turns_remaining",
+        "recent_risk_inherited",
+        "recent_risk_deescalated",
+        "router_prompt_version",
+        "router_model",
+        "router_input_tokens",
+        "router_output_tokens",
+        "router_duration_ms",
+        "fallback_reason",
+        "accepted_fields_json",
+        "rejected_fields_json",
+        "field_sources_json",
     )
     values = [f"{key}={record.details[key]}" for key in preferred_keys if key in record.details]
     return ", ".join(values) or "-"
@@ -1179,6 +1256,10 @@ _TIMING_LABELS = {
     "history_load": "加载近期对话",
     "memory_sidecar_sync": "等待记忆侧路",
     "routing": "混合路由",
+    "route_slot_validation": "路由 Slot 校验",
+    "clarify_intent": "澄清意图",
+    "out_of_scope": "领域外请求",
+    "conversation_flow_state_persistence": "保存会话路由状态",
     "advice_classification": "建议场景确认",
     "safety_scan": "风险扫描",
     "user_message_persistence": "保存用户消息",
@@ -1200,6 +1281,7 @@ _TIMING_LABELS = {
     "policy_enforcement": "执行硬约束",
     "assistant_message_persistence": "保存模型回答",
     "safety_response": "生成安全响应",
+    "sensitive_safety_response": "生成敏感安全响应",
     "casual_response": "生成普通回复",
     "date_memory_load": "加载约会偏好",
     "date_task_state_persistence": "保存约会任务状态",
@@ -1247,8 +1329,46 @@ def _render_route(route: RouteResult, active_task: TaskType | None) -> None:
         ", ".join(item.value for item in route.secondary_scenarios) or "-",
     )
     table.add_row("risk", route.risk_level.value)
+    if route.recent_risk_inherited:
+        table.add_row("recent_risk_inherited", "yes")
+    if route.recent_risk_deescalated:
+        table.add_row("recent_risk_deescalated", "yes")
     table.add_row("source", route.source.value)
     table.add_row("llm_used", "yes" if route.llm_used else "no")
+    if route.clarification_triggered:
+        table.add_row("clarification", route.clarification_reason or "yes")
+        table.add_row("clarification_options", " / ".join(route.clarification_options) or "-")
+    elif route.clarification_exhausted:
+        table.add_row("clarification", "exhausted")
+        table.add_row("clarification_reason", route.clarification_reason or "-")
+    if route.out_of_scope_reason:
+        table.add_row("out_of_scope_reason", route.out_of_scope_reason)
+    if route.pending_task is not None:
+        table.add_row("pending_task", route.pending_task.value)
+        table.add_row("pending_task_source", route.pending_task_source or "-")
+    if route.slot_accepted_fields:
+        table.add_row(
+            "slot_accepted_fields",
+            "; ".join(f"{key}={value}" for key, value in route.slot_accepted_fields.items()),
+        )
+    if route.slot_rejected_fields:
+        table.add_row(
+            "slot_rejected_fields",
+            "; ".join(f"{key}={value}" for key, value in route.slot_rejected_fields.items()),
+        )
+    if route.slot_field_sources:
+        table.add_row(
+            "slot_field_sources",
+            "; ".join(f"{key}={value}" for key, value in route.slot_field_sources.items()),
+        )
+    if route.router_model:
+        table.add_row("router_model", route.router_model)
+    if route.router_prompt_version:
+        table.add_row("router_prompt_version", route.router_prompt_version)
+    if route.router_duration_ms is not None:
+        table.add_row("router_duration", _format_duration(route.router_duration_ms))
+    if route.fallback_reason:
+        table.add_row("fallback_reason", route.fallback_reason)
     if route.date_request_mode.value != "none":
         table.add_row("date_request_mode", route.date_request_mode.value)
     if route.task_type == TaskType.DATE_PLANNING or route.date_intent.value != "none":

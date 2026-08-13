@@ -67,9 +67,12 @@ class DatePlanningTaskState(BaseModel):
     updated_at: datetime = Field(default_factory=utc_now)
 
     @property
-    def is_resumable(self) -> bool:
+    def is_active(self) -> bool:
         return self.status in {
             DatePlanningStatus.COLLECTING,
             DatePlanningStatus.PLANNED,
-            DatePlanningStatus.PAUSED,
         }
+
+    @property
+    def is_resumable(self) -> bool:
+        return self.is_active or self.status == DatePlanningStatus.PAUSED

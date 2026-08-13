@@ -24,6 +24,11 @@ class AdviceRequest(BaseModel):
     secondary_goals: list[AdviceGoal] = Field(default_factory=list, max_length=2)
     scenario: AdviceScenario | None = None
     secondary_scenarios: list[AdviceScenario] = Field(default_factory=list, max_length=2)
+    # ConversationAgent may already have classified a multi-turn safety risk.
+    # This preserves the top-level safety decision when AdviceAgent starts its
+    # own graph and only sees the latest sentence.
+    forced_risk_level: RiskLevel | None = None
+    forced_risk_reasons: list[str] = Field(default_factory=list, max_length=8)
 
 
 class RelationshipContext(BaseModel):

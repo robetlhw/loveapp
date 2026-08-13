@@ -14,7 +14,7 @@ from loveapp.application.scenario_policy import (
 )
 from loveapp.core.timing import ExecutionTrace
 from loveapp.domain.advice import AdviceRequest, AdviceResponse, AdviceStreamEvent
-from loveapp.domain.enums import AdviceScenario
+from loveapp.domain.enums import AdviceScenario, RiskLevel
 from loveapp.domain.memory import AtomicExtraction
 from loveapp.safety import SafetyPolicy
 
@@ -74,6 +74,12 @@ class FailingRetriever:
     async def search(self, query, filters=None, limit=5, trace=None):
         del query, filters, limit, trace
         raise RuntimeError("vector store unavailable")
+
+
+class FailingComposer:
+    async def compose(self, *args, **kwargs):
+        del args, kwargs
+        raise AssertionError("safety responses must not use the regular advice composer")
 
 
 def test_structured_stream_parser_emits_completed_fields_and_array_items() -> None:
@@ -195,3 +201,40 @@ async def test_trace_identifies_rag_failure_instead_of_total_step() -> None:
 
     assert trace.failed_step is not None
     assert trace.failed_step.name == "rag_retrieval"
+
+
+async def test_sensitive_safety_response_bypasses_context_rag_and_regular_composer() -> None:
+    trace = ExecutionTrace()
+    store = InMemoryMemoryStore()
+    agent = AdviceAgent(
+        FailingRetriever(),
+        MemoryService(store, NoOpMemoryExtractor()),
+        SafetyPolicy(),
+        FailingComposer(),
+    )
+
+    turn = await agent.advise_turn(
+        AdviceRequest(
+            user_id="sensitive-user",
+            relationship_id="sensitive-relationship",
+            conversation_id="sensitive-conversation",
+            query="怎样避免伤害自己？",
+            scenario=AdviceScenario.RELATIONSHIP_MAINTENANCE,
+        ),
+        trace=trace,
+    )
+
+    assert turn.response.risk_level == RiskLevel.SENSITIVE
+    assert turn.response.risk_notes == ["用户表达了避免自伤的安全求助"]
+    timing_names = {record.name for record in trace.snapshot()}
+    assert "sensitive_safety_response" in timing_names
+    assert "context_load" not in timing_names
+    assert "policy_resolution" not in timing_names
+    assert "rag_retrieval" not in timing_names
+    assert "answer_generation" not in timing_names
+    messages = await store.list_messages(
+        user_id="sensitive-user",
+        relationship_id="sensitive-relationship",
+        conversation_id="sensitive-conversation",
+    )
+    assert [message.role.value for message in messages] == ["user", "assistant"]

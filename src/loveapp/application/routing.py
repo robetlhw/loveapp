@@ -1,8 +1,15 @@
 import re
 import unicodedata
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import date, datetime, timedelta
+from time import perf_counter
 
+from loveapp.application.conversation_flow import is_pending_cancellation
+from loveapp.application.route_slot_validation import (
+    SlotValidationResult,
+    merge_route_slot_sources,
+    validate_route_slots,
+)
 from loveapp.domain.date_plan import MAX_TRIP_DAYS
 from loveapp.domain.date_task import DatePlanningTaskState
 from loveapp.domain.enums import (
@@ -32,45 +39,175 @@ class HybridRouter:
         *,
         confidence_threshold: float = 0.72,
         ambiguity_margin: float = 0.16,
+        clarification_threshold: float = 0.68,
+        prompt_version: str = "routing-v3.0",
     ) -> None:
         self._safety_policy = safety_policy
         self._corrector = corrector
         self._confidence_threshold = confidence_threshold
         self._ambiguity_margin = ambiguity_margin
+        self._clarification_threshold = clarification_threshold
+        self._prompt_version = prompt_version
 
     async def route(self, route_input: RouteInput) -> RouteResult:
         normalized = normalize_route_text(route_input.latest_query)
-        safety = self._safety_policy.assess(normalized)
+        safety = self._safety_policy.assess(
+            normalized,
+            recent_messages=route_input.recent_messages,
+            previous_risk_state=route_input.previous_risk_state,
+        )
         result = route_by_rules(route_input, normalized)
         result = result.model_copy(
             update={
                 "risk_level": safety.risk_level,
                 "risk_reasons": safety.reasons,
+                "recent_risk_inherited": safety.inherited,
+                "recent_risk_deescalated": safety.deescalated,
+                "router_prompt_version": self._prompt_version,
             }
         )
-        if safety.risk_level == RiskLevel.HIGH or self._corrector is None:
-            return result
+        if safety.risk_level != RiskLevel.NORMAL or self._corrector is None:
+            return self._finalize_route_metadata(route_input, result)
         # Exact casual messages are a deterministic fast path.  This guard is
         # intentionally after the safety scan so a safety rule always wins.
         if _is_exact_casual_chat(normalized):
-            return result
+            return self._finalize_route_metadata(route_input, result)
+        if _is_clear_out_of_scope(result):
+            return self._finalize_route_metadata(route_input, result)
         if not self._needs_llm_correction(route_input, result):
-            return result
+            return self._finalize_route_metadata(route_input, result)
 
+        started = perf_counter()
         try:
             correction = await self._corrector.correct(route_input, result)
         except Exception as exc:
-            return result.model_copy(
-                update={
-                    "llm_error": str(exc)[:300],
-                    "needs_clarification": result.needs_clarification,
-                }
+            telemetry = _corrector_telemetry(self._corrector)
+            duration_ms = telemetry.get("duration_ms")
+            if not isinstance(duration_ms, (int, float)) or duration_ms < 0:
+                duration_ms = round((perf_counter() - started) * 1000, 3)
+            return self._finalize_route_metadata(
+                route_input,
+                result.model_copy(
+                    update={
+                        "llm_error": str(exc)[:300],
+                        "fallback_reason": "llm_correction_failed",
+                        "router_model": telemetry.get("model"),
+                        "router_input_tokens": telemetry.get("input_tokens"),
+                        "router_output_tokens": telemetry.get("output_tokens"),
+                        "router_duration_ms": duration_ms,
+                    }
+                ),
             )
-        return merge_route_correction(
+        telemetry = _corrector_telemetry(self._corrector)
+        latest_rule_slots = extract_date_plan_slots(
+            RouteInput(latest_query=route_input.latest_query)
+        )
+        task_slots = (
+            _date_slots_from_task_state(route_input.date_task_state)
+            if route_input.date_task_state is not None and route_input.date_task_state.is_resumable
+            else DatePlanSlots()
+        )
+        slot_validation = validate_route_slots(
+            route_input,
+            latest_rule_slots,
+            correction.date_plan,
+            task_slots,
+        )
+        merged = merge_route_correction(
             route_input,
             result,
             correction,
             allow_task_override=self._allow_task_override(route_input, result, correction),
+            validated_date_plan=slot_validation.validated_slots,
+            slot_validation=slot_validation,
+            rule_date_plan=latest_rule_slots,
+            task_date_plan=task_slots,
+        )
+        structural_slot_rejections = telemetry.get("slot_parse_rejections", {})
+        if not isinstance(structural_slot_rejections, dict):
+            structural_slot_rejections = {}
+        if structural_slot_rejections:
+            merged = merged.model_copy(
+                update={
+                    "slot_rejected_fields": {
+                        **{
+                            str(field): str(reason)
+                            for field, reason in structural_slot_rejections.items()
+                        },
+                        **merged.slot_rejected_fields,
+                    }
+                }
+            )
+        merged = merged.model_copy(
+            update={
+                "router_model": telemetry.get("model"),
+                "router_input_tokens": telemetry.get("input_tokens"),
+                "router_output_tokens": telemetry.get("output_tokens"),
+                "router_duration_ms": telemetry.get(
+                    "duration_ms", round((perf_counter() - started) * 1000, 3)
+                ),
+            }
+        )
+        return self._finalize_route_metadata(route_input, merged)
+
+    def _finalize_route_metadata(
+        self,
+        route_input: RouteInput,
+        result: RouteResult,
+    ) -> RouteResult:
+        clarify, reason, options = should_clarify_route(
+            route_input,
+            result,
+            clarification_threshold=self._clarification_threshold,
+        )
+        clarification_exhausted = (
+            _clarification_repeat(
+                route_input,
+                result,
+                clarification_threshold=self._clarification_threshold,
+            )
+            and not clarify
+        )
+        pending_task, pending_reason, pending_source, pending_turns, cancelled = (
+            _resolve_pending_task(route_input, result)
+        )
+        slot_accepted_fields = result.slot_accepted_fields
+        slot_field_sources = result.slot_field_sources
+        if not slot_accepted_fields and _date_slots_have_values(result.date_plan):
+            rule_slots = extract_date_plan_slots(
+                RouteInput(latest_query=route_input.latest_query)
+            )
+            task_slots = (
+                _date_slots_from_task_state(route_input.date_task_state)
+                if route_input.date_task_state is not None
+                and route_input.date_task_state.is_resumable
+                else DatePlanSlots()
+            )
+            _, slot_accepted_fields, slot_field_sources = merge_route_slot_sources(
+                rule_slots,
+                DatePlanSlots(),
+                task_slots,
+            )
+        return result.model_copy(
+            update={
+                "needs_clarification": clarify,
+                "clarification_triggered": clarify,
+                "clarification_exhausted": clarification_exhausted,
+                "clarification_reason": reason,
+                "clarification_options": options,
+                "out_of_scope_reason": (
+                    _out_of_scope_reason(result.normalized_query)
+                    if result.task_type == TaskType.OUT_OF_SCOPE
+                    else None
+                ),
+                "pending_task": pending_task,
+                "pending_task_reason": pending_reason,
+                "pending_task_source": pending_source,
+                "pending_task_turns_remaining": pending_turns,
+                "pending_task_cancelled": cancelled,
+                "slot_accepted_fields": slot_accepted_fields,
+                "slot_field_sources": slot_field_sources,
+            }
         )
 
     def _needs_task_correction(
@@ -85,7 +222,10 @@ class HybridRouter:
         if (
             route_input.date_task_state is None
             and route_input.active_task == TaskType.DATE_PLANNING
-            and _is_obvious_date_supplement(result.normalized_query)
+            and (
+                _is_obvious_date_supplement(result.normalized_query)
+                or _looks_like_date_edit_request(result.normalized_query)
+            )
         ):
             return False
         ambiguous = (
@@ -108,10 +248,15 @@ class HybridRouter:
     ) -> bool:
         if _is_exact_casual_chat(result.normalized_query):
             return False
+        if _is_clear_out_of_scope(result):
+            return False
         if (
             route_input.date_task_state is None
             and route_input.active_task == TaskType.DATE_PLANNING
-            and _is_obvious_date_supplement(result.normalized_query)
+            and (
+                _is_obvious_date_supplement(result.normalized_query)
+                or _looks_like_date_edit_request(result.normalized_query)
+            )
         ):
             return False
         if route_input.date_task_state is not None and route_input.date_task_state.is_resumable:
@@ -139,6 +284,18 @@ class HybridRouter:
         rules: RouteResult,
         correction: RouteCorrection,
     ) -> bool:
+        # A rule-recognized "first ... then ..." request already carries an
+        # execution order. The corrector may enrich labels, but cannot reverse
+        # which business task is handled first.
+        if _has_explicit_compound_order(rules):
+            return correction.task_type == rules.task_type
+        if rules.task_type == TaskType.OUT_OF_SCOPE and _is_clear_out_of_scope(rules):
+            return correction.task_type == TaskType.OUT_OF_SCOPE
+        if correction.task_type == TaskType.OUT_OF_SCOPE:
+            return (
+                rules.task_type in {TaskType.GENERAL_CHAT, TaskType.OUT_OF_SCOPE}
+                and not _has_explicit_business_request(rules.normalized_query)
+            )
         if correction.task_type == TaskType.DATE_PLANNING:
             correction_mode = _resolved_correction_date_mode(
                 route_input,
@@ -149,6 +306,8 @@ class HybridRouter:
                 DateRequestMode.EVALUATE,
                 DateRequestMode.CATEGORY_RECOMMENDATION,
             }:
+                return False
+            if not _has_verified_date_task_signal(route_input, rules):
                 return False
             if _is_executable_date_mode(correction_mode):
                 return True
@@ -184,6 +343,11 @@ def normalize_route_text(text: str) -> str:
     return normalized.strip()
 
 
+def _corrector_telemetry(corrector: RouteCorrector | None) -> Mapping[str, object]:
+    telemetry = getattr(corrector, "last_telemetry", {})
+    return telemetry if isinstance(telemetry, Mapping) else {}
+
+
 def route_by_rules(route_input: RouteInput, normalized_query: str | None = None) -> RouteResult:
     text = normalized_query or normalize_route_text(route_input.latest_query)
     latest_date_slots = extract_date_plan_slots(RouteInput(latest_query=route_input.latest_query))
@@ -197,6 +361,13 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
     )
     task_scores, task_evidence = _score_labels(text, _TASK_PATTERNS)
     _apply_regex_scores(text, task_scores, task_evidence, _TASK_REGEX_PATTERNS)
+    if _has_relationship_semantic_request(text) and task_scores.get(
+        TaskType.RELATIONSHIP_ADVICE, 0
+    ) >= 4:
+        # A technical noun can be part of a real relationship problem. Do not
+        # let "代码" alone outrank an explicit conflict or communication request.
+        task_scores.pop(TaskType.OUT_OF_SCOPE, None)
+        task_evidence.pop(TaskType.OUT_OF_SCOPE, None)
     date_request_mode = _infer_date_request_mode(route_input, text, latest_date_slots)
     executable_date_request = _is_executable_date_mode(date_request_mode)
 
@@ -213,6 +384,8 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
         task_evidence.pop(TaskType.DATE_PLANNING, None)
 
     if _is_exact_casual_chat(text):
+        task_scores.pop(TaskType.OUT_OF_SCOPE, None)
+        task_evidence.pop(TaskType.OUT_OF_SCOPE, None)
         task_scores[TaskType.GENERAL_CHAT] = task_scores.get(TaskType.GENERAL_CHAT, 0) + 8
         task_evidence.setdefault(TaskType.GENERAL_CHAT, []).append(route_input.latest_query)
 
@@ -252,13 +425,28 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
         # explicitly ordered after a relationship question, keep it as a
         # secondary candidate for the compound-task resolver instead of
         # letting it steal the primary task.
-        if not _has_ordered_primary_relationship_request(text):
+        if _has_ordered_primary_relationship_request(text):
+            task_scores[TaskType.DATE_PLANNING] = (
+                task_scores.get(TaskType.DATE_PLANNING, 0) + 1.5
+            )
+            task_evidence.setdefault(TaskType.DATE_PLANNING, []).append(
+                "复合请求中的后续约会规划"
+            )
+        else:
             task_scores[TaskType.DATE_PLANNING] = task_scores.get(TaskType.DATE_PLANNING, 0) + 4
             task_evidence.setdefault(TaskType.DATE_PLANNING, []).append("明确约会规划请求")
     elif _looks_like_date_candidate(text, None):
         # This is only a semantic-review candidate. Do not put it into the
         # task score, otherwise a weak candidate can become the primary task.
         pass
+    if _has_ordered_primary_relationship_request(text):
+        relationship_score = task_scores.get(TaskType.RELATIONSHIP_ADVICE, 0)
+        date_score = task_scores.get(TaskType.DATE_PLANNING, 0)
+        if relationship_score and date_score:
+            task_scores[TaskType.DATE_PLANNING] = min(
+                date_score,
+                relationship_score * 0.7,
+            )
     explicit_score = max(task_scores.values(), default=0)
     if (
         route_input.active_task is not None
@@ -352,7 +540,18 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
             goal_scores[AdviceGoal.PROGRESS] = goal_scores.get(AdviceGoal.PROGRESS, 0) + 2.5
             goal_evidence.setdefault(AdviceGoal.PROGRESS, []).append("评估下一步互动")
         if relationship_follow_up:
-            goal_scores[AdviceGoal.UNDERSTAND] = goal_scores.get(AdviceGoal.UNDERSTAND, 0) + 3
+            strongest_other = max(
+                (
+                    score
+                    for goal, score in goal_scores.items()
+                    if goal != AdviceGoal.UNDERSTAND
+                ),
+                default=0,
+            )
+            goal_scores[AdviceGoal.UNDERSTAND] = max(
+                goal_scores.get(AdviceGoal.UNDERSTAND, 0) + 3,
+                strongest_other + 1,
+            )
             goal_evidence.setdefault(AdviceGoal.UNDERSTAND, []).append("回答关系判断追问")
         _apply_default_goal(text, primary_scenario, scenario_scores, goal_scores, goal_evidence)
         if goal_scores:
@@ -398,8 +597,34 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
             _date_missing_fields(date_slots) if task_type == TaskType.DATE_PLANNING else []
         ),
         source=RouteSource.RULES,
-        needs_clarification=task_confidence < 0.58,
+        needs_clarification=_rule_needs_clarification(
+            route_input,
+            text,
+            task_type,
+            task_confidence,
+            secondary_tasks,
+        ),
         evidence_spans=evidence,
+    )
+
+
+def _has_verified_date_task_signal(
+    route_input: RouteInput,
+    rules: RouteResult,
+) -> bool:
+    """Require local date semantics before accepting an LLM task proposal."""
+
+    if (
+        route_input.forced_task == TaskType.DATE_PLANNING
+        or rules.task_type == TaskType.DATE_PLANNING
+        or TaskType.DATE_PLANNING in rules.secondary_tasks
+        or _is_executable_date_mode(rules.date_request_mode)
+    ):
+        return True
+    latest_slots = extract_date_plan_slots(RouteInput(latest_query=route_input.latest_query))
+    inferred_mode = _infer_date_request_mode(route_input, rules.normalized_query, latest_slots)
+    return _is_executable_date_mode(inferred_mode) or _has_local_date_execution_authorization(
+        rules.normalized_query
     )
 
 
@@ -445,6 +670,10 @@ def merge_route_correction(
     correction: RouteCorrection,
     *,
     allow_task_override: bool = True,
+    validated_date_plan: DatePlanSlots | None = None,
+    slot_validation: SlotValidationResult | None = None,
+    rule_date_plan: DatePlanSlots | None = None,
+    task_date_plan: DatePlanSlots | None = None,
 ) -> RouteResult:
     date_request_mode = _resolved_correction_date_mode(
         route_input,
@@ -467,11 +696,35 @@ def merge_route_correction(
             in {DateRequestMode.EVALUATE, DateRequestMode.CATEGORY_RECOMMENDATION}
             else DateRequestMode.NONE
         )
+    correction_secondary_tasks = [
+        task
+        for task in correction.secondary_tasks
+        if task != TaskType.DATE_PLANNING
+        or _has_verified_date_task_signal(route_input, rules)
+    ]
+    secondary_task_guard_applied = len(correction_secondary_tasks) != len(
+        correction.secondary_tasks
+    )
     secondary_tasks = _without_primary(
-        [*correction.secondary_tasks, *rules.secondary_tasks],
+        [*correction_secondary_tasks, *rules.secondary_tasks],
         task_type,
     )[:2]
-    date_plan = _merge_date_slots(rules.date_plan, correction.date_plan)
+    if (
+        validated_date_plan is not None
+        and rule_date_plan is not None
+        and task_date_plan is not None
+    ):
+        date_plan, slot_accepted_fields, slot_field_sources = merge_route_slot_sources(
+            rule_date_plan,
+            validated_date_plan,
+            task_date_plan,
+        )
+    else:
+        # Kept for direct callers of this public helper. HybridRouter always
+        # supplies a field-validated correction before reaching this branch.
+        date_plan = _merge_date_slots(rules.date_plan, correction.date_plan)
+        slot_accepted_fields = {}
+        slot_field_sources = {}
     if task_type != TaskType.DATE_PLANNING and TaskType.DATE_PLANNING not in secondary_tasks:
         date_plan = DatePlanSlots()
     date_intent = correction.date_intent if allow_task_override else rules.date_intent
@@ -536,7 +789,9 @@ def merge_route_correction(
                 correction.task_confidence if allow_task_override else rules.task_confidence
             ),
             "llm_task_type": correction.task_type,
-            "task_guard_applied": correction.task_type != task_type,
+            "task_guard_applied": (
+                correction.task_type != task_type or secondary_task_guard_applied
+            ),
             "primary_goal": primary_goal,
             "secondary_goals": secondary_goals,
             "primary_scenario": primary_scenario,
@@ -557,6 +812,11 @@ def merge_route_correction(
                 else rules.needs_clarification or correction.needs_clarification
             ),
             "evidence_spans": _unique([*correction.evidence_spans, *rules.evidence_spans])[:12],
+            "slot_accepted_fields": slot_accepted_fields,
+            "slot_rejected_fields": (
+                slot_validation.rejected_fields if slot_validation is not None else {}
+            ),
+            "slot_field_sources": slot_field_sources,
         }
     )
 
@@ -587,6 +847,8 @@ def extract_date_plan_slots(route_input: RouteInput) -> DatePlanSlots:
     if city is None:
         city_match = re.search(r"(?:城市|地点)\s*(?:是|:)?\s*([\u4e00-\u9fff]{2,6})", combined)
         city = city_match.group(1) if city_match else None
+        if city is not None and not _is_city_candidate(city):
+            city = None
 
     area_match = (
         re.search(
@@ -696,6 +958,18 @@ def _date_slots_from_task_state(state: DatePlanningTaskState) -> DatePlanSlots:
     )
 
 
+def _is_city_candidate(value: str) -> bool:
+    normalized = value.strip()
+    return normalized not in {
+        "你看着办",
+        "随便",
+        "都可以",
+        "不限",
+        "暂时不定",
+        "不知道",
+    }
+
+
 def _score_labels[LabelT](
     text: str,
     patterns: dict[LabelT, tuple[tuple[str, float], ...]],
@@ -722,6 +996,292 @@ def _is_negated(text: str, start: int) -> bool:
 def _is_exact_casual_chat(text: str) -> bool:
     cleaned = re.sub(r"[,.!?，。！？~～、 ]", "", text)
     return cleaned in _CASUAL_EXACT
+
+
+def should_clarify_route(
+    route_input: RouteInput,
+    route: RouteResult,
+    *,
+    clarification_threshold: float = 0.68,
+) -> tuple[bool, str | None, list[str]]:
+    """Decide clarification after safety, rule routing, and optional correction."""
+
+    text = route.normalized_query
+    if (
+        route.risk_level != RiskLevel.NORMAL
+        or route_input.forced_task is not None
+        or _is_exact_casual_chat(text)
+        or route.task_type == TaskType.OUT_OF_SCOPE
+        or is_pending_cancellation(text, route_input.pending_task)
+    ):
+        return False, None, []
+    if (
+        route_input.date_task_state is not None
+        and route_input.date_task_state.is_resumable
+        and route.task_type == TaskType.DATE_PLANNING
+    ):
+        return False, None, []
+    if route.secondary_tasks and _is_compound_task_request(route):
+        return False, None, []
+    active_task_is_reliable = (
+        route_input.active_task in {TaskType.RELATIONSHIP_ADVICE, TaskType.DATE_PLANNING}
+        and route_input.active_task == route.task_type
+        and bool(route_input.recent_messages)
+        and route.task_confidence >= 0.55
+        and _active_task_has_context(route_input, route)
+    )
+    if active_task_is_reliable:
+        return False, None, []
+    is_ambiguous = _looks_underspecified_route(text) or (
+        route.needs_clarification
+        and route.task_confidence < clarification_threshold
+    )
+    if not is_ambiguous:
+        return False, None, []
+    if _clarification_repeat(
+        route_input,
+        route,
+        clarification_threshold=clarification_threshold,
+    ):
+        return False, route_input.last_clarification_reason, []
+    reason = "ambiguous_cross_domain_intent"
+    options = _clarification_options(route_input, route)
+    return True, reason, options
+
+
+def _clarification_repeat(
+    route_input: RouteInput,
+    route: RouteResult,
+    *,
+    clarification_threshold: float = 0.68,
+) -> bool:
+    if not route_input.last_clarification_reason or route_input.clarification_attempt_count <= 0:
+        return False
+    if (
+        route.risk_level in {RiskLevel.HIGH, RiskLevel.SENSITIVE}
+        or route_input.forced_task is not None
+        or _is_exact_casual_chat(route.normalized_query)
+        or route.task_type == TaskType.OUT_OF_SCOPE
+    ):
+        return False
+    return _looks_underspecified_route(route.normalized_query) or (
+        route.needs_clarification and route.task_confidence < clarification_threshold
+    )
+
+
+def _active_task_has_context(route_input: RouteInput, route: RouteResult) -> bool:
+    """Require domain evidence before inheriting a possibly stale active task."""
+
+    if not _looks_underspecified_route(route.normalized_query):
+        return True
+    context = " ".join(message.content for message in route_input.recent_messages[-6:])
+    if route_input.active_task == TaskType.RELATIONSHIP_ADVICE:
+        return any(
+            marker in context
+            for marker in ("她", "他", "对方", "关系", "表白", "聊天", "吵架", "分手")
+        )
+    if route_input.active_task == TaskType.DATE_PLANNING:
+        return (
+            (
+                route_input.date_task_state is not None
+                and route_input.date_task_state.is_resumable
+            )
+            or any(
+                marker in context
+                for marker in ("约会", "行程", "城市", "预算", "地点", "餐厅")
+            )
+        )
+    return False
+
+
+def _rule_needs_clarification(
+    route_input: RouteInput,
+    text: str,
+    task_type: TaskType,
+    task_confidence: float,
+    secondary_tasks: list[TaskType],
+) -> bool:
+    if (
+        route_input.forced_task is not None
+        or _is_exact_casual_chat(text)
+        or task_type == TaskType.OUT_OF_SCOPE
+        or secondary_tasks
+    ):
+        return False
+    if (
+        route_input.date_task_state is not None
+        and route_input.date_task_state.is_resumable
+        and task_type == TaskType.DATE_PLANNING
+    ):
+        return False
+    return _looks_underspecified_route(text) or task_confidence < 0.58
+
+
+def _looks_underspecified_route(text: str) -> bool:
+    compact = re.sub(r"[，。！？!?、~～ ]", "", text)
+    if compact in {
+        "这样行吗",
+        "这样可以吗",
+        "这样好吗",
+        "你觉得这样行吗",
+        "你觉得这样可以吗",
+        "你觉得这样好吗",
+        "这个怎么办",
+        "怎么办",
+        "你觉得呢",
+        "就是这样",
+        "就是这样啊",
+        "就这样",
+    }:
+        return True
+    return bool(
+        re.fullmatch(r"(?:你觉得|觉得|这样|这个|那)(?:怎么样|行吗|可以吗|好吗|怎么办)?", compact)
+    )
+
+
+def _clarification_options(route_input: RouteInput, route: RouteResult) -> list[str]:
+    if route_input.date_task_state is not None and route_input.date_task_state.is_resumable:
+        return ["补充上一版约会计划", "重新开始一份约会计划"]
+    candidates = {
+        route.task_type,
+        *route.secondary_tasks,
+        *(
+            task
+            for task, score in route.task_scores.items()
+            if score >= 1.5
+        ),
+    }
+    if {
+        TaskType.RELATIONSHIP_ADVICE,
+        TaskType.DATE_PLANNING,
+    } <= candidates or not candidates - {TaskType.GENERAL_CHAT}:
+        return ["分析这段关系", "安排一次约会"]
+    if TaskType.DATE_PLANNING in candidates:
+        return ["安排约会", "继续聊关系问题"]
+    return ["分析关系问题", "说明你希望我帮你完成的事"]
+
+
+def _resolve_pending_task(
+    route_input: RouteInput,
+    route: RouteResult,
+) -> tuple[TaskType | None, str | None, str | None, int, bool]:
+    if route.risk_level in {RiskLevel.HIGH, RiskLevel.SENSITIVE}:
+        return None, None, None, 0, False
+    if is_pending_cancellation(route.normalized_query, route_input.pending_task):
+        return None, None, None, 0, True
+    if (
+        route_input.pending_task is not None
+        and route_input.forced_task == route_input.pending_task
+        and route.task_type == route_input.pending_task
+    ):
+        return None, None, None, 0, False
+    if (
+        route_input.pending_task is not None
+        and route.task_type == route_input.pending_task
+        and route.task_type in {TaskType.RELATIONSHIP_ADVICE, TaskType.DATE_PLANNING}
+    ):
+        # An explicit task turn has begun the pending work even if the user
+        # did not use a short continuation phrase.
+        return None, None, None, 0, False
+    secondary = next(
+        (
+            task
+            for task in route.secondary_tasks
+            if task in {TaskType.RELATIONSHIP_ADVICE, TaskType.DATE_PLANNING}
+        ),
+        None,
+    )
+    if secondary is not None:
+        return (
+            secondary,
+            f"当前先处理 {route.task_type.value}，后续可继续 {secondary.value}",
+            "secondary_task",
+            2,
+            False,
+        )
+    if route.task_type == TaskType.OUT_OF_SCOPE:
+        return None, None, None, 0, False
+    if (
+        route_input.pending_task is not None
+        and route.task_type in {TaskType.RELATIONSHIP_ADVICE, TaskType.DATE_PLANNING}
+        and route.task_type != route_input.pending_task
+        and not route.clarification_triggered
+    ):
+        return None, None, None, 0, False
+    if route_input.pending_task is not None and route.task_type == TaskType.GENERAL_CHAT:
+        remaining = max(route_input.pending_task_turns_remaining - 1, 0)
+        if remaining:
+            return (
+                route_input.pending_task,
+                route_input.pending_task_reason,
+                "carried",
+                remaining,
+                False,
+            )
+        return None, None, None, 0, False
+    return (
+        route_input.pending_task,
+        route_input.pending_task_reason,
+        "carried" if route_input.pending_task is not None else None,
+        route_input.pending_task_turns_remaining,
+        False,
+    )
+
+
+def _is_clear_out_of_scope(result: RouteResult) -> bool:
+    if result.task_type != TaskType.OUT_OF_SCOPE:
+        return False
+    return result.task_scores.get(TaskType.OUT_OF_SCOPE, 0) >= 4
+
+
+def _has_explicit_business_request(text: str) -> bool:
+    return _has_explicit_date_planning_request(text) or any(
+        marker in text
+        for marker in (
+            "约会",
+            "恋爱",
+            "她不理我",
+            "他不理我",
+            "关系",
+            "表白",
+            "吵架",
+            "分手",
+            "怎么追",
+            "怎么回复",
+        )
+    )
+
+
+def _has_relationship_semantic_request(text: str) -> bool:
+    return (
+        any(marker in text for marker in ("她", "他", "对方", "关系"))
+        and any(
+            marker in text
+            for marker in (
+                "吵架",
+                "冷战",
+                "分手",
+                "沟通",
+                "回复",
+                "不理",
+                "怎么办",
+                "怎么说",
+                "怎么做",
+            )
+        )
+    )
+
+
+def _out_of_scope_reason(text: str) -> str:
+    if any(marker in text for marker in ("代码", "python", "编程", "爬虫", "算法")):
+        return "programming_request"
+    if any(marker in text for marker in ("胸痛", "诊断", "疾病", "处方")):
+        return "medical_request"
+    if any(marker in text for marker in ("法律", "起诉", "合同", "律师")):
+        return "legal_request"
+    if any(marker in text for marker in ("新闻稿", "新闻", "论文", "作业", "翻译", "ppt")):
+        return "non_product_request"
+    return "unsupported_request"
 
 
 def _looks_like_advice_request(text: str) -> bool:
@@ -761,6 +1321,18 @@ def _has_compound_marker(text: str) -> bool:
     return any(
         marker in text
         for marker in ("先", "然后", "再帮", "再给", "再推荐", "同时", "另外", "顺便", "并且")
+    )
+
+
+def _has_explicit_compound_order(result: RouteResult) -> bool:
+    if not _is_compound_task_request(result):
+        return False
+    return (
+        re.search(
+            r"(?:^|[，,。；;])(?:先|首先).{0,56}(?:再|然后|之后)",
+            result.normalized_query,
+        )
+        is not None
     )
 
 
@@ -1039,9 +1611,14 @@ def _last_request_clause(text: str) -> str:
 
 def _looks_like_date_category_recommendation(clause: str) -> bool:
     has_category = _DATE_CATEGORY_TARGET_PATTERN.search(clause) is not None
+    has_category_comparison = re.search(
+        r"(?:吃|喝|去|选).{0,10}(?:还是|或者|or).{0,10}"
+        r"(?:吃|喝|去|选|火锅|咖啡|电影|展览|散步)",
+        clause,
+    ) is not None
     has_request = (
         re.search(
-            r"推荐|建议|选(?:择)?|哪(?:种|类)|什么|吃啥|吃什么|适合",
+            r"推荐|建议|选(?:择)?|哪(?:种|类|些)|什么|吃啥|吃什么|适合|更自然|尴尬",
             clause,
         )
         is not None
@@ -1050,7 +1627,7 @@ def _looks_like_date_category_recommendation(clause: str) -> bool:
         _DATE_PLACE_TARGET_PATTERN.search(clause) is not None
         and re.search(r"哪家|哪里|附近|具体|一家|一个|搜索|查找", clause) is not None
     )
-    return has_category and has_request and not asks_for_concrete_place
+    return (has_category or has_category_comparison) and has_request and not asks_for_concrete_place
 
 
 def _has_direct_date_execution_command(text: str) -> bool:
@@ -1072,6 +1649,40 @@ def _has_direct_date_execution_command(text: str) -> bool:
         )
         is not None
     )
+
+
+def _has_local_date_execution_authorization(text: str) -> bool:
+    """Require a user-directed planning command, not just a date activity mention."""
+
+    if _has_explicit_date_planning_request(text) or _has_direct_date_execution_command(text):
+        return True
+    has_agent_command = (
+        re.search(
+            r"(?:请|麻烦|帮我|请你|给我|能帮我|能不能|能否|可以帮我|希望你|想让你)"
+            r".{0,16}(?:安排|规划|推荐|找|搜索)",
+            text,
+        )
+        is not None
+    )
+    has_planning_context = any(
+        marker in text
+        for marker in (
+            "约会",
+            "行程",
+            "路线",
+            "餐厅",
+            "地点",
+            "场所",
+            "景点",
+            "城市",
+            "预算",
+            "周末",
+            "下周",
+            "这周",
+            "找个地方",
+        )
+    )
+    return has_agent_command and has_planning_context
 
 
 def _looks_like_place_search_request(clause: str) -> bool:
@@ -1304,7 +1915,8 @@ def _is_third_party_action_occurrence(clause: str, action_start: int) -> bool:
 def _has_ordered_primary_relationship_request(text: str) -> bool:
     return (
         re.search(
-            r"^(?:先|首先).{0,24}(?:分析|判断|看看|回答|解释|解决).{0,24}"
+            r"^(?:(?:先|首先)\s*)?(?:(?:帮我|请(?:你)?)\s*)?"
+            r"(?:分析|判断|看看|回答|解释|解决).{0,24}"
             r"(?:再|然后|同时|另外|顺便)",
             text,
         )
@@ -1383,7 +1995,10 @@ def _should_score_date_follow_up(
     latest_slots: DatePlanSlots,
 ) -> bool:
     state = route_input.date_task_state
-    if state is None or not state.is_resumable or _is_exact_casual_chat(text):
+    # A paused task retains its verified slots for an explicit future resume,
+    # but it must not turn a generic acknowledgement into date planning after
+    # a safety interruption, task switch, or cancellation.
+    if state is None or not state.is_active or _is_exact_casual_chat(text):
         return False
     if (
         _looks_like_date_action_evaluation(text)
@@ -1496,6 +2111,7 @@ def _is_obvious_date_supplement(text: str) -> bool:
             "美术馆",
             "景点",
             "餐厅",
+            "咖啡馆",
             "火锅",
             "日期",
             "时间",
@@ -1504,6 +2120,13 @@ def _is_obvious_date_supplement(text: str) -> bool:
             "多天",
             "酒店",
             "住宿",
+            "住在",
+            "增加",
+            "添加",
+            "替换",
+            "删除",
+            "不安排",
+            "太赶",
             "周",
             "星期",
             "月",
@@ -2354,7 +2977,8 @@ _DATE_EXECUTION_TARGET_PATTERN = re.compile(
 )
 _DATE_CATEGORY_TARGET_PATTERN = re.compile(
     r"菜系|菜品类型|餐饮类型|口味|料理类型|吃什么|吃啥|什么菜|"
-    r"哪种菜|哪类菜|活动类型|活动项目|什么活动|哪种活动"
+    r"哪种菜|哪类菜|活动类型|活动项目|什么活动|哪种活动|"
+    r"(?:什么|哪种|哪类).{0,4}活动"
 )
 _DIRECT_AGENT_REQUEST_PREFIX = re.compile(
     r"(?:请|麻烦|帮我|请你|你.{0,4}(?:帮|安排|规划|推荐|找)|"
@@ -2373,6 +2997,23 @@ _AGENT_DIRECTIVE_PREFIX = re.compile(
 
 _TASK_PATTERNS: dict[TaskType, tuple[tuple[str, float], ...]] = {
     TaskType.GENERAL_CHAT: (),
+    TaskType.OUT_OF_SCOPE: (
+        ("python", 5),
+        ("代码", 4),
+        ("编程", 5),
+        ("爬虫", 5),
+        ("算法", 4),
+        ("新闻稿", 5),
+        ("论文", 4),
+        ("作业", 4),
+        ("翻译", 4),
+        ("ppt", 4),
+        ("胸痛", 5),
+        ("诊断", 4),
+        ("法律", 5),
+        ("合同", 3),
+        ("律师", 4),
+    ),
     TaskType.RELATIONSHIP_ADVICE: (
         ("喜欢", 3),
         ("女朋友", 3),
@@ -2437,13 +3078,19 @@ _TASK_PATTERNS: dict[TaskType, tuple[tuple[str, float], ...]] = {
 
 
 _TASK_REGEX_PATTERNS: dict[TaskType, tuple[tuple[str, float], ...]] = {
+    TaskType.OUT_OF_SCOPE: (
+        (r"(?:帮|请|写|分析|解释).{0,12}(?:代码|python|爬虫|算法|论文|作业|新闻稿|ppt)", 4),
+        (r"(?:诊断|判断).{0,12}(?:胸痛|疾病|病情)", 4),
+        (r"(?:分析|咨询).{0,12}(?:法律|合同|起诉)", 4),
+    ),
     TaskType.RELATIONSHIP_ADVICE: (
         (r"(?:先|首先).{0,12}(?:分析|判断|看看).{0,12}(?:她|他|关系|冷淡|回复)", 4),
+        (r"(?:分析|判断|看看).{0,12}(?:她|他|对方).{0,8}(?:态度|想法|意思|反应)", 5),
         (r"(?:怎么|如何|怎样).{0,12}(?:追|接近|搭话|搭讪|开口|聊天|发展)", 5),
         (r"(?:接触|认识).{0,8}(?:很少|不多|机会少|不太熟|不怎么熟)", 4),
         (r"(?:创造|寻找|找).{0,10}(?:聊天|搭话|搭讪).{0,8}(?:机会|场景|切入点)", 5),
         (
-            r"(?:怎么|如何|怎样).{0,14}(?:展开|延续|继续|开启|接着)"
+            r"(?:怎么|如何|怎样).{0,14}(?:展开|延续|继续|开启|接着|顺着)"
             r".{0,6}(?:话题|聊天|交流|聊|说)",
             5,
         ),
@@ -2552,7 +3199,7 @@ _SCENARIO_REGEX_PATTERNS: dict[AdviceScenario, tuple[tuple[str, float], ...]] = 
         (r"(?:创造|寻找|找).{0,10}(?:聊天|搭话|搭讪).{0,8}(?:机会|场景|切入点)", 5),
         (r"第一次.{0,8}(?:找她|找他|和她|和他)?聊天", 4),
         (
-            r"(?:怎么|如何|怎样).{0,14}(?:展开|延续|继续|开启|接着)"
+            r"(?:怎么|如何|怎样).{0,14}(?:展开|延续|继续|开启|接着|顺着)"
             r".{0,6}(?:话题|聊天|交流|聊|说)",
             4,
         ),
@@ -2577,6 +3224,7 @@ _SCENARIO_REGEX_PATTERNS: dict[AdviceScenario, tuple[tuple[str, float], ...]] = 
 
 
 _CONTEXT_CONTINUITY_SCENARIOS = (
+    AdviceScenario.PURSUIT,
     AdviceScenario.BOUNDARY,
     AdviceScenario.CONFLICT,
     AdviceScenario.CHAT_ANALYSIS,
@@ -2735,6 +3383,7 @@ _CASUAL_EXACT = {
     "谢谢先这样",
     "谢谢先到这里",
     "好的先这样",
+    "先这样吧",
     "先这样谢谢",
     "早上好",
     "上午好",

@@ -1,0 +1,1258 @@
+{
+  "schema_version": 1,
+  "dataset": "evals\\routing\\cases_v2.jsonl",
+  "case_count": 13,
+  "turn_count": 36,
+  "multi_turn_case_count": 13,
+  "context_turn_count": 24,
+  "context_route_accuracy": 1.0,
+  "pass_rate": 1.0,
+  "conversation_pass_rate": 1.0,
+  "task_accuracy": 1.0,
+  "primary_scenario_accuracy": 1.0,
+  "secondary_scenario_recall": 1.0,
+  "risk_accuracy": 1.0,
+  "high_risk_recall": 1.0,
+  "goal_micro_precision": 0.95,
+  "goal_micro_recall": 1.0,
+  "goal_micro_f1": 0.9744,
+  "goal_annotation_turn_count": 18,
+  "llm_call_count": 4,
+  "llm_call_rate": 0.1111,
+  "never_policy_violations": 0,
+  "required_policy_misses": 0,
+  "mean_policy_latency_ms": 0.826,
+  "p95_policy_latency_ms": 1.443,
+  "cases": [
+    {
+      "id": "rt_v2_c01_casual_time_greetings",
+      "turn_count": 3,
+      "passed": true,
+      "turns": [
+        {
+          "turn_id": "t1",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.537,
+          "context_message_count": 0,
+          "active_task": null,
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "general_chat",
+            "rule_task_type": "general_chat",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": null,
+            "secondary_scenarios": [],
+            "primary_goal": null,
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t2",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.434,
+          "context_message_count": 2,
+          "active_task": null,
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "general_chat",
+            "rule_task_type": "general_chat",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": null,
+            "secondary_scenarios": [],
+            "primary_goal": null,
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t3",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.541,
+          "context_message_count": 4,
+          "active_task": null,
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "general_chat",
+            "rule_task_type": "general_chat",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": null,
+            "secondary_scenarios": [],
+            "primary_goal": null,
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rt_v2_c02_pursuit_initiation",
+      "turn_count": 3,
+      "passed": true,
+      "turns": [
+        {
+          "turn_id": "t1",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "goals": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.778,
+          "context_message_count": 0,
+          "active_task": null,
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "pursuit",
+            "secondary_scenarios": [],
+            "primary_goal": "initiate",
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t2",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "goals": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.678,
+          "context_message_count": 2,
+          "active_task": "relationship_advice",
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "pursuit",
+            "secondary_scenarios": [],
+            "primary_goal": "initiate",
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t3",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "goals": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.887,
+          "context_message_count": 4,
+          "active_task": "relationship_advice",
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "chat_analysis",
+            "secondary_scenarios": [],
+            "primary_goal": "understand",
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rt_v2_c03_pursuit_progress",
+      "turn_count": 3,
+      "passed": true,
+      "turns": [
+        {
+          "turn_id": "t1",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "goals": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.592,
+          "context_message_count": 0,
+          "active_task": null,
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "pursuit",
+            "secondary_scenarios": [],
+            "primary_goal": "understand",
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t2",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "goals": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.588,
+          "context_message_count": 2,
+          "active_task": "relationship_advice",
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "pursuit",
+            "secondary_scenarios": [],
+            "primary_goal": "progress",
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t3",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "goals": true,
+            "llm_policy": true
+          },
+          "duration_ms": 1.367,
+          "context_message_count": 4,
+          "active_task": "relationship_advice",
+          "llm_calls": 1,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": "relationship_advice",
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "pursuit",
+            "secondary_scenarios": [],
+            "primary_goal": "progress",
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "hybrid",
+            "llm_used": true,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rt_v2_c04_conflict_repair",
+      "turn_count": 3,
+      "passed": true,
+      "turns": [
+        {
+          "turn_id": "t1",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "goals": true,
+            "llm_policy": true
+          },
+          "duration_ms": 1.031,
+          "context_message_count": 0,
+          "active_task": null,
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "conflict",
+            "secondary_scenarios": [],
+            "primary_goal": "communicate",
+            "secondary_goals": [
+              "repair"
+            ],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t2",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "goals": true,
+            "llm_policy": true
+          },
+          "duration_ms": 1.048,
+          "context_message_count": 2,
+          "active_task": "relationship_advice",
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "chat_analysis",
+            "secondary_scenarios": [],
+            "primary_goal": "communicate",
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t3",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "goals": true,
+            "llm_policy": true
+          },
+          "duration_ms": 1.093,
+          "context_message_count": 4,
+          "active_task": "relationship_advice",
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "boundary",
+            "secondary_scenarios": [],
+            "primary_goal": "set_boundary",
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rt_v2_c05_date_slots",
+      "turn_count": 3,
+      "passed": true,
+      "turns": [
+        {
+          "turn_id": "t1",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.449,
+          "context_message_count": 0,
+          "active_task": null,
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "date_planning",
+            "rule_task_type": "date_planning",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": null,
+            "secondary_scenarios": [],
+            "primary_goal": null,
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "itinerary",
+            "date_intent": "new_request",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t2",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "llm_policy": true
+          },
+          "duration_ms": 1.662,
+          "context_message_count": 2,
+          "active_task": "date_planning",
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "date_planning",
+            "rule_task_type": "date_planning",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": null,
+            "secondary_scenarios": [],
+            "primary_goal": null,
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "new_request",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t3",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.707,
+          "context_message_count": 4,
+          "active_task": "date_planning",
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "date_planning",
+            "rule_task_type": "date_planning",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": null,
+            "secondary_scenarios": [],
+            "primary_goal": null,
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "new_request",
+            "date_mutation": "none"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rt_v2_c06_task_switch",
+      "turn_count": 3,
+      "passed": true,
+      "turns": [
+        {
+          "turn_id": "t1",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.503,
+          "context_message_count": 0,
+          "active_task": null,
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "date_planning",
+            "rule_task_type": "date_planning",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": null,
+            "secondary_scenarios": [],
+            "primary_goal": null,
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "itinerary",
+            "date_intent": "new_request",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t2",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "goals": true,
+            "llm_policy": true
+          },
+          "duration_ms": 1.443,
+          "context_message_count": 2,
+          "active_task": "date_planning",
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [
+              "date_planning"
+            ],
+            "primary_scenario": "boundary",
+            "secondary_scenarios": [],
+            "primary_goal": "set_boundary",
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "itinerary",
+            "date_intent": "cancel",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t3",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.704,
+          "context_message_count": 4,
+          "active_task": "relationship_advice",
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "boundary",
+            "secondary_scenarios": [],
+            "primary_goal": "communicate",
+            "secondary_goals": [
+              "set_boundary"
+            ],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rt_v2_c07_cross_task_compound",
+      "turn_count": 2,
+      "passed": true,
+      "turns": [
+        {
+          "turn_id": "t1",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "secondary_tasks": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.945,
+          "context_message_count": 0,
+          "active_task": null,
+          "llm_calls": 1,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": "relationship_advice",
+            "task_guard_applied": false,
+            "secondary_tasks": [
+              "date_planning"
+            ],
+            "primary_scenario": "chat_analysis",
+            "secondary_scenarios": [],
+            "primary_goal": "understand",
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "hybrid",
+            "llm_used": true,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t2",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.672,
+          "context_message_count": 2,
+          "active_task": "relationship_advice",
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "chat_analysis",
+            "secondary_scenarios": [],
+            "primary_goal": "understand",
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rt_v2_c08_context_ellipsis",
+      "turn_count": 2,
+      "passed": true,
+      "turns": [
+        {
+          "turn_id": "t1",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "goals": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.898,
+          "context_message_count": 2,
+          "active_task": null,
+          "llm_calls": 1,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": "relationship_advice",
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "chat_analysis",
+            "secondary_scenarios": [],
+            "primary_goal": "communicate",
+            "secondary_goals": [
+              "understand"
+            ],
+            "risk_level": "normal",
+            "source": "hybrid",
+            "llm_used": true,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t2",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "goals": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.616,
+          "context_message_count": 4,
+          "active_task": "relationship_advice",
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "chat_analysis",
+            "secondary_scenarios": [],
+            "primary_goal": "understand",
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rt_v2_c09_safety_and_negation",
+      "turn_count": 3,
+      "passed": true,
+      "turns": [
+        {
+          "turn_id": "t1",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "llm_policy": true
+          },
+          "duration_ms": 1.459,
+          "context_message_count": 0,
+          "active_task": null,
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "chat_analysis",
+            "secondary_scenarios": [],
+            "primary_goal": null,
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t2",
+          "passed": true,
+          "checks": {
+            "risk_level": true,
+            "route": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.83,
+          "context_message_count": 2,
+          "active_task": "relationship_advice",
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "chat_analysis",
+            "secondary_scenarios": [],
+            "primary_goal": "understand",
+            "secondary_goals": [],
+            "risk_level": "high",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t3",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "goals": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.63,
+          "context_message_count": 3,
+          "active_task": "relationship_advice",
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "boundary",
+            "secondary_scenarios": [],
+            "primary_goal": "set_boundary",
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rt_v2_c10_breakup_repair",
+      "turn_count": 2,
+      "passed": true,
+      "turns": [
+        {
+          "turn_id": "t1",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "goals": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.641,
+          "context_message_count": 0,
+          "active_task": null,
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "breakup",
+            "secondary_scenarios": [],
+            "primary_goal": "repair",
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t2",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "secondary_scenarios": true,
+            "goals": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.775,
+          "context_message_count": 2,
+          "active_task": "relationship_advice",
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "boundary",
+            "secondary_scenarios": [
+              "pursuit"
+            ],
+            "primary_goal": "set_boundary",
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rt_v2_c11_pursuit_to_date",
+      "turn_count": 3,
+      "passed": true,
+      "turns": [
+        {
+          "turn_id": "t1",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "goals": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.809,
+          "context_message_count": 0,
+          "active_task": null,
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "pursuit",
+            "secondary_scenarios": [],
+            "primary_goal": "initiate",
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t2",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "goals": true,
+            "llm_policy": true
+          },
+          "duration_ms": 1.047,
+          "context_message_count": 2,
+          "active_task": "relationship_advice",
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "pursuit",
+            "secondary_scenarios": [],
+            "primary_goal": "progress",
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t3",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.551,
+          "context_message_count": 3,
+          "active_task": "relationship_advice",
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "date_planning",
+            "rule_task_type": "date_planning",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": null,
+            "secondary_scenarios": [],
+            "primary_goal": null,
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "itinerary",
+            "date_intent": "new_request",
+            "date_mutation": "none"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rt_v2_c12_ambiguous_context",
+      "turn_count": 3,
+      "passed": true,
+      "turns": [
+        {
+          "turn_id": "t1",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "llm_policy": true
+          },
+          "duration_ms": 1.022,
+          "context_message_count": 0,
+          "active_task": null,
+          "llm_calls": 1,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": "relationship_advice",
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "relationship_maintenance",
+            "secondary_scenarios": [],
+            "primary_goal": "understand",
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "hybrid",
+            "llm_used": true,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t2",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.778,
+          "context_message_count": 2,
+          "active_task": "relationship_advice",
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "chat_analysis",
+            "secondary_scenarios": [],
+            "primary_goal": null,
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t3",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.723,
+          "context_message_count": 3,
+          "active_task": "relationship_advice",
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "chat_analysis",
+            "secondary_scenarios": [],
+            "primary_goal": "understand",
+            "secondary_goals": [
+              "set_boundary"
+            ],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rt_v2_c13_date_action_evaluation",
+      "turn_count": 3,
+      "passed": true,
+      "turns": [
+        {
+          "turn_id": "t1",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.681,
+          "context_message_count": 0,
+          "active_task": null,
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "pursuit",
+            "secondary_scenarios": [],
+            "primary_goal": "initiate",
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t2",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "primary_scenario": true,
+            "goals": true,
+            "llm_policy": true
+          },
+          "duration_ms": 1.028,
+          "context_message_count": 2,
+          "active_task": "relationship_advice",
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "pursuit",
+            "secondary_scenarios": [],
+            "primary_goal": "progress",
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "evaluate",
+            "date_intent": "none",
+            "date_mutation": "none"
+          }
+        },
+        {
+          "turn_id": "t3",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "risk_level": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.604,
+          "context_message_count": 3,
+          "active_task": "relationship_advice",
+          "llm_calls": 0,
+          "actual": {
+            "task_type": "date_planning",
+            "rule_task_type": "date_planning",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": null,
+            "secondary_scenarios": [],
+            "primary_goal": null,
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "date_request_mode": "place_search",
+            "date_intent": "new_request",
+            "date_mutation": "none"
+          }
+        }
+      ]
+    }
+  ]
+}

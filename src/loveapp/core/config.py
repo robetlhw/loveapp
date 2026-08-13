@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     router_thinking: Literal["enabled", "disabled"] = "disabled"
     router_confidence_threshold: float = Field(default=0.72, ge=0, le=1)
     router_ambiguity_margin: float = Field(default=0.16, ge=0, le=1)
+    router_clarification_threshold: float = Field(default=0.68, ge=0, le=1)
+    router_context_risk_turns: int = Field(default=4, ge=2, le=4)
+    router_live_eval_enabled: bool = False
+    router_prompt_version: str = "routing-v3.0"
 
     rag_backend: Literal["memory", "qdrant"] = "qdrant"
     rag_min_score: float = 0.45

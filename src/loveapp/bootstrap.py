@@ -10,6 +10,10 @@ from loveapp.adapters.advice import (
     OpenAICompatibleAdviceComposer,
     TemplateAdviceComposer,
 )
+from loveapp.adapters.conversation_states import (
+    InMemoryConversationFlowStateStore,
+    SQLiteConversationFlowStateStore,
+)
 from loveapp.adapters.date_tasks import (
     InMemoryDatePlanningTaskStore,
     SQLiteDatePlanningTaskStore,
@@ -40,6 +44,7 @@ from loveapp.application.memory import NoOpMemoryExtractor
 from loveapp.application.routing import HybridRouter
 from loveapp.core.config import Settings, get_settings
 from loveapp.domain.knowledge import KnowledgeDocument
+from loveapp.ports.conversation_states import ConversationFlowStateStore
 from loveapp.ports.date_tasks import DatePlanningTaskStore
 from loveapp.ports.memory import MemoryStore
 from loveapp.ports.routing import Router
@@ -56,6 +61,7 @@ class AppContainer:
     memory_service: MemoryService
     memory_store: MemoryStore
     date_task_store: DatePlanningTaskStore
+    conversation_flow_state_store: ConversationFlowStateStore
     resources: tuple[Any, ...] = ()
 
     def start_background_warmup(self) -> tuple[asyncio.Task, ...]:
@@ -108,13 +114,15 @@ def build_container(settings: Settings | None = None) -> AppContainer:
     resources.extend(memory_container.resources)
     date_task_store = _build_date_task_store(settings)
     resources.append(date_task_store)
+    conversation_flow_state_store = _build_conversation_flow_state_store(settings)
+    resources.append(conversation_flow_state_store)
     map_provider = _build_map_provider(settings)
     if hasattr(map_provider, "aclose"):
         resources.append(map_provider)
     weather_provider = _build_weather_provider(settings)
     if hasattr(weather_provider, "aclose"):
         resources.append(weather_provider)
-    safety_policy = SafetyPolicy()
+    safety_policy = SafetyPolicy(context_turns=settings.router_context_risk_turns)
     route_corrector = _build_route_corrector(settings)
     if route_corrector is not None:
         resources.append(route_corrector)
@@ -123,6 +131,8 @@ def build_container(settings: Settings | None = None) -> AppContainer:
         route_corrector,
         confidence_threshold=settings.router_confidence_threshold,
         ambiguity_margin=settings.router_ambiguity_margin,
+        clarification_threshold=settings.router_clarification_threshold,
+        prompt_version=settings.router_prompt_version,
     )
     advice_agent = AdviceAgent(
         retriever,
@@ -138,6 +148,7 @@ def build_container(settings: Settings | None = None) -> AppContainer:
         date_planning_agent,
         memory_service,
         date_task_store,
+        conversation_flow_state_store,
     )
     return AppContainer(
         advice_agent=advice_agent,
@@ -147,6 +158,7 @@ def build_container(settings: Settings | None = None) -> AppContainer:
         memory_service=memory_service,
         memory_store=memory_store,
         date_task_store=date_task_store,
+        conversation_flow_state_store=conversation_flow_state_store,
         resources=tuple(resources),
     )
 
@@ -275,6 +287,12 @@ def _build_date_task_store(settings: Settings) -> DatePlanningTaskStore:
     return SQLiteDatePlanningTaskStore(settings.memory_database_path)
 
 
+def _build_conversation_flow_state_store(settings: Settings) -> ConversationFlowStateStore:
+    if settings.memory_backend == "memory":
+        return InMemoryConversationFlowStateStore()
+    return SQLiteConversationFlowStateStore(settings.memory_database_path)
+
+
 def _build_memory_extractor(settings: Settings):
     use_llm = settings.memory_extraction_provider == "llm" or (
         settings.memory_extraction_provider == "auto" and settings.llm_provider != "demo"
@@ -339,6 +357,7 @@ def _build_route_corrector(settings: Settings):
         max_retries=settings.router_max_retries,
         max_tokens=settings.router_max_tokens,
         thinking=settings.router_thinking,
+        prompt_version=settings.router_prompt_version,
     )
 
 

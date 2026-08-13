@@ -1,94 +1,81 @@
  cd D:\project\loveapp
- powershell -ExecutionPolicy Bypass -File .\scripts\start_loveapp_debug.ps1 -UserId local-user -RelationshipId partner-22   
+ powershell -ExecutionPolicy Bypass -File .\scripts\start_loveapp_debug.ps1 -UserId local-user -RelationshipId partner-22
 
 
 
-完整启动流程：                                                                                                                                            
-                                                                                                                                                            
-  Set-Location D:\project\loveapp                                                                                                                           
-                                                                                                                                                            
-  # Docker 未运行时启动 Docker Desktop                                                                                                                      
-  Start-Process "C:\Program Files\Docker\Docker\Docker Desktop.exe"                                                                                         
-                                                                                                                                                            
-  # 启动 Qdrant                                                                                                                                             
-  docker compose up -d                                                                                                                                      
-                                                                                                                                                            
-  # 启动 LoveApp                                                                                                                                            
-  uv run loveapp chat  --user-id local-user --relationship-id partner-24  --debug-memory  --stream --timings                                                                                                                                               
-                                                                                                                                                            
-  另开一个终端实时查看记忆：                                                                                                                                
-                                                                                                                                                            
-  Set-Location D:\project\loveapp                                                                                                                           
-                                                                                                                                                            
-  uv run loveapp memory watch  --user-id local-user --relationship-id partner-23                                                                                                                            
-                                                                                                                                                            
-  退出聊天输入 /quit。停止 Qdrant 使用：                                                                                                                    
-                                                                                                                                                            
-  docker compose stop        
+完整启动流程：
 
-  
-  
-  后续每次修改路由后可以运行：                                                                                                                          
-                                                                                                                                                        
-  uv run loveapp eval routing --output evals/baselines/routing_v2_post_change.json                                                                      
-  uv run pytest -q   
+  Set-Location D:\project\loveapp
+
+  # Docker 未运行时启动 Docker Desktop
+  Start-Process "C:\Program Files\Docker\Docker\Docker Desktop.exe"
+
+  # 启动 Qdrant
+  docker compose up -d
+
+  # 启动 LoveApp
+  uv run loveapp chat  --user-id local-user --relationship-id partner-24  --debug-memory  --stream --timings
+
+  另开一个终端实时查看记忆：
+
+  Set-Location D:\project\loveapp
+
+  uv run loveapp memory watch  --user-id local-user --relationship-id partner-23
+
+  退出聊天输入 /quit。停止 Qdrant 使用：
+
+  docker compose stop
 
 
-  查看当前关系画像                                                                                                                                      
-                                                                                                                                                        
-  最接近“画像视图”的命令是：
-   uv run loveapp memory context `                                                                                                                       
-    --user-id local-user `                                                                                                                              
-    --relationship-id partner-5
-
-查看完整 JSON：                                                                                                                                       
-
-  uv run loveapp memory list --user-id local-user --relationship-id partner-5  --json                                                                                                                                              
-                                                                                                                                                        
-  只查看偏好：                                                                                                                                          
-                                                                                                                                                        
-  uv run loveapp memory list `                                                                                                                          
-    --user-id local-user `                                                                                                                              
-    --relationship-id partner-5 `                                                                                                                       
-    --kind preference      
-
-查看某次会话的抽取过程：                                                                                                                              
-                                                                                                                                                        
-  uv run loveapp memory runs `
-    --user-id local-user `                                                                                                                              
-    --relationship-id partner-5 `                                                                                                                       
-    --conversation-id <conversation-id> `                                                                                                               
-    --json           
 
 
-一条命令启动聊天和后台记忆监视：
+第一次 git push -u origin main 成功后，后续同步使用以下流程：
 
-  powershell -ExecutionPolicy Bypass -File .\scripts\start_loveapp_debug.ps1 `
-    -UserId local-user `
-    -RelationshipId partner-20
+  cd D:\project\loveapp
 
-该脚本会先启动 Qdrant，然后在新 PowerShell 窗口显示全部状态的记忆和抽取运行，
-当前窗口用于多轮聊天。后台窗口会保留 superseded、expired 等非活动记忆，便于查看状态迁移。
+  # 1. 查看修改
+  git status
+  git diff
 
-查看某个关系的完整调试快照：
+  # 2. 运行测试
+  uv run pytest
 
-  powershell -ExecutionPolicy Bypass -File .\scripts\memory_debug.ps1 `
-    -UserId local-user `
-    -RelationshipId partner-20 `
-    -Mode snapshot
+  # 3. 暂存全部修改
+  git add -A
 
-只查看某次会话的抽取运行：
+  # 4. 检查即将提交的内容
+  git diff --cached
 
-  powershell -ExecutionPolicy Bypass -File .\scripts\memory_debug.ps1 `
-    -UserId local-user `
-    -RelationshipId partner-20 `
-    -ConversationId <conversation-id> `
-    -Mode runs
+  # 5. 创建提交
+  git commit -m "feat: add conversation summary support"
 
-查看一条记忆的完整字段：
+  # 6. 推送到 GitHub
+  git push
 
-  powershell -ExecutionPolicy Bypass -File .\scripts\memory_debug.ps1 `
-    -UserId local-user `
-    -RelationshipId partner-20 `
-    -Mode show `
-    -MemoryId <memory-id>
+  提交信息可以按类型编写：
+
+  feat: 新增功能
+  fix: 修复问题
+  refactor: 重构但不改变功能
+  test: 增加测试
+  docs: 修改文档
+  chore: 配置或依赖调整
+
+  例如：
+
+  git commit -m "fix: prevent date planning route misclassification"
+  git commit -m "feat: add episodic memory summaries"
+  git commit -m "docs: update LoveApp interview guide"
+
+  如果 git push 提示远程存在本地没有的提交，先执行：
+
+  git pull --rebase origin main
+  git push
+
+  不要使用 git push --force，除非明确知道要覆盖远程历史。
+
+  日常可以记成：
+
+  修改代码 → 测试 → git add -A → git commit → git push
+
+  GitHub Connector 读取的是远程仓库，因此只有执行 git push 后，GPT 才可能看到新版本；本地未提交或未推送的修改不会同步。

@@ -97,6 +97,7 @@ class AdviceAgent:
     def _build_graph(self):
         graph = StateGraph(AdviceState)
         graph.add_node("record_normal", self._record_message)
+        graph.add_node("record_sensitive", self._record_message)
         graph.add_node("record_high", self._record_message)
         graph.add_node("load_context", self._load_context)
         graph.add_node("classify", self._classify)
@@ -105,6 +106,7 @@ class AdviceAgent:
         graph.add_node("retrieve", self._retrieve)
         graph.add_node("compose", self._compose)
         graph.add_node("enforce_policy", self._enforce_policy)
+        graph.add_node("compose_sensitive_safety", self._compose_sensitive_safety)
         graph.add_node("compose_safety", self._compose_safety)
         graph.add_node("save_response", self._save_response)
 
@@ -113,15 +115,21 @@ class AdviceAgent:
         graph.add_conditional_edges(
             "assess_safety",
             self._route_after_safety,
-            {"normal": "record_normal", "high": "record_high"},
+            {
+                "normal": "record_normal",
+                "sensitive": "record_sensitive",
+                "high": "record_high",
+            },
         )
         graph.add_edge("record_normal", "load_context")
         graph.add_edge("record_normal", "resolve_policy")
         graph.add_edge("record_high", "compose_safety")
+        graph.add_edge("record_sensitive", "compose_sensitive_safety")
         graph.add_edge("resolve_policy", "retrieve")
         graph.add_edge(["load_context", "retrieve"], "compose")
         graph.add_edge("compose", "enforce_policy")
         graph.add_edge("enforce_policy", "save_response")
+        graph.add_edge("compose_sensitive_safety", "save_response")
         graph.add_edge("compose_safety", "save_response")
         graph.add_edge("save_response", END)
         return graph.compile()
@@ -203,12 +211,33 @@ class AdviceAgent:
             }
 
     def _assess_safety(self, state: AdviceState) -> dict:
-        with state["trace"].measure("safety_scan"):
-            return {"safety": self._safety_policy.assess(state["request"].query)}
+        with state["trace"].measure("safety_scan") as details:
+            request = state["request"]
+            if request.forced_risk_level in {RiskLevel.HIGH, RiskLevel.SENSITIVE}:
+                details["forced_by_router"] = True
+                return {
+                    "safety": SafetyAssessment(
+                        risk_level=request.forced_risk_level,
+                        reasons=(
+                            request.forced_risk_reasons
+                            or [
+                                "上游路由已判定为高风险上下文"
+                                if request.forced_risk_level == RiskLevel.HIGH
+                                else "上游路由已判定为敏感安全上下文"
+                            ]
+                        ),
+                        inherited=True,
+                    )
+                }
+            return {"safety": self._safety_policy.assess(request.query)}
 
     @staticmethod
     def _route_after_safety(state: AdviceState) -> str:
-        return "high" if state["safety"].risk_level == RiskLevel.HIGH else "normal"
+        return {
+            RiskLevel.NORMAL: "normal",
+            RiskLevel.SENSITIVE: "sensitive",
+            RiskLevel.HIGH: "high",
+        }[state["safety"].risk_level]
 
     def _resolve_policy(self, state: AdviceState) -> dict:
         with state["trace"].measure("policy_resolution"):
@@ -318,6 +347,30 @@ class AdviceAgent:
                     "如涉及自伤风险，请立即联系身边可信任的人并寻求专业支持。",
                 ],
                 avoid_actions=["不要报复、威胁、跟踪或独自进行危险对抗。"],
+                risk_notes=reasons,
+            )
+            return {"response": response}
+
+    def _compose_sensitive_safety(self, state: AdviceState) -> dict:
+        with state["trace"].measure("sensitive_safety_response"):
+            reasons = state["safety"].reasons
+            response = AdviceResponse(
+                scenario=state["scenario"],
+                secondary_scenarios=state["request"].secondary_scenarios,
+                goal=state["request"].goal,
+                secondary_goals=state["request"].secondary_goals,
+                risk_level=RiskLevel.SENSITIVE,
+                problem_summary="当前内容涉及需要谨慎处理的安全或心理压力信号。",
+                assessment="我会先关注你的当下安全和情绪，不把这段内容按普通关系问题继续推演。",
+                clarifying_questions=["你现在是否处于安全的地方，身边是否有可以联系的人？"],
+                recommended_actions=[
+                    "先暂停可能让你或他人受伤的行动，去一个安全、有人在的地方。",
+                    "联系可信任的家人、朋友或当地专业支持，暂时不要独自承受。",
+                    "如果风险正在升级或无法保证安全，请立即联系当地紧急服务。",
+                ],
+                avoid_actions=[
+                    "不要独自接近冲突现场，也不要用酒精、武器或威胁来处理当前情绪。"
+                ],
                 risk_notes=reasons,
             )
             return {"response": response}

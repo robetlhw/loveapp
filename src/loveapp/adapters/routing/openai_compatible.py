@@ -1,10 +1,11 @@
 import json
-from typing import Literal
+from time import perf_counter
+from typing import Any, Literal
 
 from openai import AsyncOpenAI
 from pydantic import SecretStr, ValidationError
 
-from loveapp.domain.routing import RouteCorrection, RouteInput, RouteResult
+from loveapp.domain.routing import DatePlanSlots, RouteCorrection, RouteInput, RouteResult
 
 
 class OpenAICompatibleRouteCorrector:
@@ -18,10 +19,13 @@ class OpenAICompatibleRouteCorrector:
         max_retries: int = 2,
         max_tokens: int = 2048,
         thinking: Literal["enabled", "disabled"] | None = None,
+        prompt_version: str = "routing-v3.0",
     ) -> None:
         self._model = model
         self._max_tokens = max_tokens
         self._thinking = thinking
+        self._prompt_version = prompt_version
+        self.last_telemetry: dict[str, Any] = {}
         self._client = AsyncOpenAI(
             api_key=api_key.get_secret_value(),
             base_url=base_url,
@@ -34,6 +38,15 @@ class OpenAICompatibleRouteCorrector:
         route_input: RouteInput,
         rule_result: RouteResult,
     ) -> RouteCorrection:
+        started = perf_counter()
+        self.last_telemetry = {
+            "model": self._model,
+            "prompt_version": self._prompt_version,
+            "input_tokens": None,
+            "output_tokens": None,
+            "duration_ms": None,
+            "attempt_count": 0,
+        }
         messages = [
             {"role": "system", "content": _SYSTEM_PROMPT + "\n" + _DATE_SLOT_INSTRUCTIONS},
             {
@@ -43,6 +56,9 @@ class OpenAICompatibleRouteCorrector:
         ]
         last_error: ValueError | None = None
         for attempt in range(2):
+            # Count a request before sending it so a transport failure is still
+            # observable in the fallback trace.
+            self.last_telemetry["attempt_count"] = attempt + 1
             request_kwargs = {
                 "model": self._model,
                 "messages": messages,
@@ -53,10 +69,28 @@ class OpenAICompatibleRouteCorrector:
             if self._thinking is not None:
                 request_kwargs["extra_body"] = {"thinking": {"type": self._thinking}}
             completion = await self._client.chat.completions.create(**request_kwargs)
+            usage = getattr(completion, "usage", None)
+            self.last_telemetry.update(
+                {
+                    "input_tokens": _accumulate_token_count(
+                        self.last_telemetry.get("input_tokens"),
+                        getattr(usage, "prompt_tokens", None),
+                    ),
+                    "output_tokens": _accumulate_token_count(
+                        self.last_telemetry.get("output_tokens"),
+                        getattr(usage, "completion_tokens", None),
+                    ),
+                    "duration_ms": round((perf_counter() - started) * 1000, 3),
+                }
+            )
             choice = completion.choices[0]
             content = choice.message.content
             try:
-                correction = _parse_response(content, choice.finish_reason)
+                correction, slot_parse_rejections = _parse_response_with_slot_rejections(
+                    content,
+                    choice.finish_reason,
+                )
+                self.last_telemetry["slot_parse_rejections"] = slot_parse_rejections
                 _validate_evidence(correction, route_input)
                 return correction
             except ValueError as exc:
@@ -80,6 +114,18 @@ class OpenAICompatibleRouteCorrector:
         await self._client.close()
 
 
+def _accumulate_token_count(
+    total: object,
+    observed: object,
+) -> int | None:
+    """Accumulate provider usage without inventing a value when it is absent."""
+
+    known_total = total if isinstance(total, int) and not isinstance(total, bool) else None
+    if not isinstance(observed, int) or isinstance(observed, bool) or observed < 0:
+        return known_total
+    return (known_total or 0) + observed
+
+
 def _build_prompt(route_input: RouteInput, rule_result: RouteResult) -> str:
     payload = {
         "latest_query": route_input.latest_query,
@@ -89,6 +135,10 @@ def _build_prompt(route_input: RouteInput, rule_result: RouteResult) -> str:
         ],
         "active_task": route_input.active_task.value if route_input.active_task else None,
         "forced_task": route_input.forced_task.value if route_input.forced_task else None,
+        "pending_task": route_input.pending_task.value if route_input.pending_task else None,
+        "pending_task_reason": route_input.pending_task_reason,
+        "last_clarification_reason": route_input.last_clarification_reason,
+        "clarification_attempt_count": route_input.clarification_attempt_count,
         "date_task_state": (
             route_input.date_task_state.model_dump(mode="json")
             if route_input.date_task_state
@@ -118,6 +168,14 @@ def _build_prompt(route_input: RouteInput, rule_result: RouteResult) -> str:
 
 
 def _parse_response(content: str | None, finish_reason: str | None) -> RouteCorrection:
+    correction, _ = _parse_response_with_slot_rejections(content, finish_reason)
+    return correction
+
+
+def _parse_response_with_slot_rejections(
+    content: str | None,
+    finish_reason: str | None,
+) -> tuple[RouteCorrection, dict[str, str]]:
     if not content:
         raise ValueError(f"路由模型没有返回正文，finish_reason={finish_reason or 'unknown'}。")
     cleaned = content.strip()
@@ -125,9 +183,43 @@ def _parse_response(content: str | None, finish_reason: str | None) -> RouteCorr
         lines = cleaned.splitlines()
         cleaned = "\n".join(lines[1:-1])
     try:
-        return RouteCorrection.model_validate_json(cleaned)
+        payload = json.loads(cleaned)
     except (ValidationError, json.JSONDecodeError) as exc:
         raise ValueError("路由模型返回内容不符合 RouteCorrection 结构。") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("路由模型返回内容不符合 RouteCorrection 结构。")
+    sanitized_payload, slot_parse_rejections = _sanitize_date_plan_payload(payload)
+    try:
+        return RouteCorrection.model_validate(sanitized_payload), slot_parse_rejections
+    except ValidationError as exc:
+        raise ValueError("路由模型返回内容不符合 RouteCorrection 结构。") from exc
+
+
+def _sanitize_date_plan_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
+    """Drop only malformed nested Slots so a valid route can still be used."""
+
+    sanitized = dict(payload)
+    raw_slots = sanitized.get("date_plan")
+    if raw_slots is None:
+        return sanitized, {}
+    if not isinstance(raw_slots, dict):
+        sanitized["date_plan"] = {}
+        return sanitized, {"date_plan": "invalid_schema"}
+
+    valid_slots: dict[str, Any] = {}
+    rejected: dict[str, str] = {}
+    for field, value in raw_slots.items():
+        if field not in DatePlanSlots.model_fields:
+            rejected[field] = "unknown_field"
+            continue
+        try:
+            parsed = DatePlanSlots.model_validate({field: value})
+        except ValidationError:
+            rejected[field] = "invalid_schema"
+            continue
+        valid_slots[field] = getattr(parsed, field)
+    sanitized["date_plan"] = valid_slots
+    return sanitized, rejected
 
 
 def _validate_evidence(correction: RouteCorrection, route_input: RouteInput) -> None:
@@ -146,6 +238,7 @@ TaskType：
 - general_chat：寒暄、感谢、告别或不需要恋爱建议和地点规划的简短对话。
 - relationship_advice：追求、关系判断、聊天分析、冲突、边界、分手或关系经营建议。
 - date_planning：用户明确希望安排约会、推荐真实餐厅/地点或生成行程。
+- out_of_scope：编程、医疗诊断、法律分析、学术作业、新闻写作等当前产品不支持的请求。
 
 DateTaskIntent：none、new_request、supplement、continue、switch、cancel。
 DatePlanMutation：none、add、replace、remove、reorder、update_constraint、replan。
@@ -196,14 +289,16 @@ AdviceGoal：initiate、understand、progress、repair、communicate、set_bound
 8. date_plan 只能提取对话明确提供的 city、area、plan_mode、date、end_date、day_count、
    nights、target_day、start_time、budget、budget_scope、preferences、dining_keywords、
    activity_keywords、meal_keywords、schedule_hints、replace_place_names、transport_mode、
-   notes、constraints、lodging_notes，不得猜测地点。date 和 end_date 用 YYYY-MM-DD，
+    notes、constraints、lodging_notes。不得猜测地点、预算、日期或时间。
+    date 和 end_date 用 YYYY-MM-DD，
    start_time 用 ISO-8601；单日使用 single_day，多日使用 multi_day；“每天 500”使用
    per_day，默认总预算使用 total；target_day 只提取“第二天”等明确指定的目标天；
    replace_place_names 只记录用户明确要求删除或换掉的现有地点名称；
    meal_keywords 的键只能使用 breakfast、lunch、dinner，值是用户明确提到的餐饮关键词；
    schedule_hints 只记录明确的时间或先后提示，例如“下午”“看完电影后”。
    transport_mode 只能是 walking、transit、driving、cycling 或 null。
-9. evidence_spans 必须逐字来自 latest_query 或 recent_messages，最多 8 条。
+9. evidence_spans 必须逐字来自 latest_query 或 recent_messages，最多 8 条。每一个 date_plan
+   字段都必须有对应的用户原文依据；无法确认的字段留空，不得因为默认常识补齐。
 10. task_confidence 和 scenario_confidence 使用 0 到 1。确实需要用户补充才能路由时，
    needs_clarification 才为 true。
  11. rule_result.task_type 是 Python 的一级路由候选。当当前文本明确包含关系建议或约会规划

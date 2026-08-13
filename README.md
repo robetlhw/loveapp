@@ -6,14 +6,14 @@ LoveApp 是一个面向单用户的恋爱沟通与约会决策 Agent。当前版
 
 - 基于 LangGraph 的恋爱咨询工作流
 - 基于规则置信度与 DeepSeek 校正的分层混合路由
-- 普通对话、关系建议、约会规划和高风险响应的顶层 LangGraph 分支
+- HIGH/SENSITIVE 安全响应、意图澄清、关系建议、约会规划、领域外请求和普通对话的顶层 LangGraph 分支
 - 关系建议的主次 AdviceGoal、主次 AdviceScenario 与多标签 RAG 检索
 - 六类关系场景的 ScenarioPolicy、主次检索配额和生成后硬约束校验
 - 一个问答一个 chunk 的 Markdown 知识解析器
 - 本地中文 Embedding 与 Qdrant 持久化检索
 - 竞态安全的后台 Embedding 预热、单轮单次向量化与分阶段 RAG Trace
 - DeepSeek 结构化建议生成与知识引用
-- 高风险内容的独立安全分支
+- HIGH 与 SENSITIVE 内容的独立安全分支
 - 高德真实 POI、营业信息和路线规划
 - 按区域、偏好、距离、评分和预算组合约会行程
 - 持久化的约会任务状态：城市、区域、日期时间、预算、偏好、交通和限制条件可跨轮补充
@@ -80,7 +80,7 @@ uv run loveapp advice "和对象吵架后应该怎么开口道歉？" --stage da
 uv run loveapp chat --user-id local-user --relationship-id current-partner --debug-memory
 ```
 
-交互中输入 `/quit` 退出，输入 `/new` 开始一个新的短期会话；新会话仍会读取同一关系的长期记忆。`chat` 会根据每轮输入自动进入普通对话、关系建议或约会规划。约会规划会持久化一个独立的短期任务状态：首次缺少关键参数时只追问一次，后续仍未补充就生成通用草案并忽略无法确认的地点、路线或天气；之后用户再输入“上海”“预算 300”“周六下午”等内容，会被识别为同一任务的参数补充。
+交互中输入 `/quit` 退出，输入 `/new` 开始一个新的短期会话；新会话仍会读取同一关系的长期记忆。`chat` 会按优先级进入 HIGH/SENSITIVE 安全响应、意图澄清、关系建议、约会规划、领域外提示或普通对话。安全响应不会加载长期关系上下文、检索知识库或调用普通建议生成器，并会清除 `active_task` 与 `pending_task`；已有约会任务会暂停，因此后续泛化的“好，继续”不会误恢复安全前的任务。复合请求先执行主任务，并把首个次任务短期保存为 `pending_task`；下一轮输入“继续”“接着来”会自动恢复该任务并映射为 `forced_task`，执行完成后清除。明确取消、新任务、高风险或 TTL 到期也会清除。重复相同澄清会设置 `clarification_exhausted` 并改用一次性能力边界提示，不会无限追问；明确说明任务后状态会重置。约会规划仍使用独立任务状态，城市、预算和日期等参数可跨轮补充。
 
 恋爱咨询和约会规划共用同一个关系记忆侧路。约会规划的当前城市、日期和预算属于短期任务状态；用户/对方的饮食禁忌、活动偏好和已发生事件进入长期记忆，并在下一轮约会搜索时分别作为排除条件或排序依据。明确的菜系和地点类型会进入高德精确检索，例如：
 
@@ -93,13 +93,13 @@ uv run loveapp plan-date --city 上海 --area 静安区 `
 
 开发版本默认开启结构化流式预览、路由详情和模块耗时。流式预览只展示已经完成并经过场景策略过滤的 JSON 字段，不展示模型推理内容；最终答案仍会执行完整硬约束。可以分别使用 `--no-stream`、`--no-debug-route` 和 `--no-timings` 关闭。耗时表会继续显示尚未完成的后台记忆任务，并展示 Embedding 是否已就绪、候选数、Gate 决策和模型 token 等 Trace 详情；并行模块不能直接相加。
 
-`--debug-route` 会显示规则得分、主次目标、主次场景、置信度以及是否使用 LLM 校正。耗时表会区分路由、记忆抽取、上下文、RAG、模型生成、策略执行、消息持久化和地图检索，失败时也会标出实际失败阶段。
+`--debug-route` 会显示规则与 LLM Task、最终 Task、Guard、主次目标/场景、澄清与 `clarification_exhausted`、领域外原因、pending 状态、上下文风险继承、Router 模型/Prompt/token/耗时，以及 Slot 的接受值、拒绝原因和来源。耗时 Trace 会单列 `routing`、`route_slot_validation`、实际分支、会话流状态持久化、记忆、RAG、生成和地图检索；失败时也会标出实际失败阶段。
 
 路由模型可通过 `LOVEAPP_ROUTER_TIMEOUT_SECONDS`、`LOVEAPP_ROUTER_MAX_RETRIES` 和 `LOVEAPP_ROUTER_THINKING` 单独控制；默认关闭推理以控制延迟，超时会回退到规则结果。
 
 约会调试信息还会显示 `date_intent`（新建、补充、继续、切换或取消）、缺少字段和当前任务状态。真实高德查询会把已知城市名先转换为行政区划编码，并丢弃返回结果中明确属于其他城市的 POI；空路线会降级为计划说明，不会让整轮对话失败。
 
-路由按以下顺序执行：保留原文的文本标准化、安全规则扫描、TaskType 打分、AdviceGoal 与 AdviceScenario 多标签打分、低置信度或复合意图 LLM 校正、Python 结构校验与 LangGraph 条件路由。约会候选短语只负责触发语义复核，最终是否属于约会规划由 LLM 根据当前对话和任务状态判断；明确的城市、预算、日期补充也会结合已有状态判断是 `supplement` 还是任务切换。安全规则拥有最高优先级；高置信度的一级 `TaskType` 也会被保护，LLM 在这类请求中只校正 Goal/Scenario，不能把关系建议或约会规划降级成 `general_chat`。路由模型单独使用 `LOVEAPP_ROUTER_TIMEOUT_SECONDS` 和 `LOVEAPP_ROUTER_MAX_RETRIES`，超时后回退到规则结果，不拖住最终回答链路。调试路由会同时显示 `rule_task`、`llm_task` 和 `task_guard`，便于区分规则结果与模型建议。
+路由按以下顺序执行：文本标准化、当前轮与近期上下文 Safety、Task/Goal/Scenario/Date Mode 规则解析、灰区 LLM 校正、Pydantic 与原文 evidence 校验、约会 Slot 字段级证据校验、Python Task Guard、澄清/pending 元数据收敛和 LangGraph 条件分支。安全规则拥有最高优先级；明确寒暄和领域外请求走确定性快路径。日期/约会候选仅决定是否需要 LLM 语义校正，不单独授权启动行程；只有本地可验证的 Agent 指令或已有活动任务状态才能进入可执行的约会规划。明确“先...再...”的主次顺序同样由规则锁定，LLM 不能反转。未经证据支持的 LLM 城市、预算、日期等字段会单独丢弃，不影响其余合法路由结果；Router 失败则回退完整规则结果。
 
 关系建议进入二级路由后，会解析 `ScenarioPolicy`。每个场景分别定义生成规则、硬约束、允许的回答区块和检索权重；原来的 `3 + 2` 或 `3 + 1 + 1` 配额会转换成主次场景软权重。Qdrant 全库召回 15 个候选后，再结合标题、标签、Goal、Scenario 和关系阶段重排，因此错误路由不会把其他场景文档直接过滤掉。合并后的规则会传给 DeepSeek，返回结果还会经过 Python 后处理，过滤操控、纠缠和越界建议。
 
@@ -229,12 +229,17 @@ uv run ruff check .
 ```powershell
 uv run loveapp eval baseline --output evals/baselines/current.json
 uv run loveapp eval baseline --no-live-memory --output evals/baselines/rag-only.json
+uv run loveapp eval routing --policy --output evals/baselines/routing_v4_current.json
 uv run loveapp eval memory-lifecycle --output evals/baselines/memory_lifecycle_v1.json
 ```
 
-报告包含路由准确率、RAG Recall@3/5 与 MRR、高风险召回率/精确率/特异度、记忆污染率、Gate 召回率/特异度和尝试级 Trace。Memory Lifecycle 报告额外输出规范化、准入、关系判断、去重/更新 Precision 与 Recall、错误合并、旧状态残留、冲突泄漏、Strong 升级率、审计完整性、按场景和按 MemoryKind 汇总。指标只描述仓库中的固定小样例，扩充数据集后才适合设定更可靠的上线阈值。
+`eval routing --policy` 使用确定性的记录型 Corrector，适合验证调用策略、Guard、澄清、`clarification_exhausted`、pending continuation/取消和 Slot 校验，不代表真实模型准确率。真实模型评测必须先显式设置 `LOVEAPP_ROUTER_LIVE_EVAL_ENABLED=true`，再运行 `uv run loveapp eval routing --live --output evals/baselines/routing_v4_live_current.json`；可用 `--input-cost-per-million` 和 `--output-cost-per-million` 记录估算成本。Live token 会按实际底层模型请求累计；`average_input_tokens` 与 `average_output_tokens` 按实际请求数计算，同时保留每 turn 平均值。两类报告会明确标记评测模式，并输出 Task Macro-F1、Clarification、Out-of-Scope、Context Route、Slot Hallucination、LLM 调用/回退/Guard、延迟和 token 指标。
+
+全组件 baseline 还包含 RAG Recall@3/5 与 MRR、高风险召回率/精确率/特异度、记忆污染率、Gate 召回率/特异度和尝试级 Trace。Memory Lifecycle 报告额外输出规范化、准入、关系判断、去重/更新 Precision 与 Recall、错误合并、旧状态残留、冲突泄漏、Strong 升级率与审计完整性。所有指标只描述仓库中的固定样例，不能直接外推为线上效果。
 
 Memory V2 的完整现状审计、设计、迁移和限制见 [docs/Memory_System_V2.md](docs/Memory_System_V2.md)。
+
+路由整改的现状审计、触发/校验/回退策略、Trace、评测口径和限制见 [docs/Routing_System_Remediation.md](docs/Routing_System_Remediation.md)。
 
 ## 结构
 

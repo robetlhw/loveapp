@@ -1,18 +1,32 @@
 import asyncio
+import json
 from datetime import timedelta
 from typing import TypedDict
 from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
 
+from loveapp.adapters.conversation_states import InMemoryConversationFlowStateStore
 from loveapp.adapters.date_tasks import InMemoryDatePlanningTaskStore
 from loveapp.agents.advice import AdviceAgent
 from loveapp.agents.date_planner import DatePlanningAgent
 from loveapp.application import MemoryService
+from loveapp.application.conversation_flow import (
+    advance_conversation_flow,
+    clarification_message,
+    is_pending_continuation,
+    out_of_scope_message,
+    pending_cancel_message,
+    pending_follow_up_prompt,
+)
 from loveapp.application.routing import extract_date_plan_slots
 from loveapp.core.timing import ExecutionTrace
 from loveapp.domain.advice import AdviceRequest, AdviceTurnResult
-from loveapp.domain.conversation import ConversationRequest, ConversationTurnResult
+from loveapp.domain.conversation import (
+    ConversationFlowState,
+    ConversationRequest,
+    ConversationTurnResult,
+)
 from loveapp.domain.date_plan import DatePlan, DatePlanRequest
 from loveapp.domain.date_task import DatePlanningTaskState
 from loveapp.domain.enums import (
@@ -30,6 +44,7 @@ from loveapp.domain.enums import (
 from loveapp.domain.memory import MessageRole, RememberResult, StoredMessage, utc_now
 from loveapp.domain.routing import DatePlanSlots, RouteInput, RouteResult
 from loveapp.ports.advice import AdviceStreamCallback
+from loveapp.ports.conversation_states import ConversationFlowStateStore
 from loveapp.ports.date_tasks import DatePlanningTaskStore
 from loveapp.ports.routing import Router
 
@@ -39,6 +54,8 @@ class ConversationState(TypedDict, total=False):
     recent_messages: list[StoredMessage]
     route: RouteResult
     date_task_state: DatePlanningTaskState | None
+    flow_state: ConversationFlowState
+    follow_up_prompt: str | None
     message: str
     advice_turn: AdviceTurnResult
     date_plan: DatePlan
@@ -56,12 +73,16 @@ class ConversationAgent:
         date_planning_agent: DatePlanningAgent,
         memory_service: MemoryService,
         date_task_store: DatePlanningTaskStore | None = None,
+        conversation_flow_state_store: ConversationFlowStateStore | None = None,
     ) -> None:
         self._router = router
         self._advice_agent = advice_agent
         self._date_planning_agent = date_planning_agent
         self._memory_service = memory_service
         self._date_task_store = date_task_store or InMemoryDatePlanningTaskStore()
+        self._conversation_flow_state_store = (
+            conversation_flow_state_store or InMemoryConversationFlowStateStore()
+        )
         self._graph = self._build_graph()
 
     async def chat(
@@ -96,7 +117,13 @@ class ConversationAgent:
                 request.active_task,
                 route,
                 state.get("date_task_state"),
+                state.get("flow_state"),
             ),
+            pending_task=state.get("flow_state").pending_task if state.get("flow_state") else None,
+            pending_task_reason=(
+                state.get("flow_state").pending_task_reason if state.get("flow_state") else None
+            ),
+            follow_up_prompt=state.get("follow_up_prompt"),
             message=state.get("message"),
             advice=advice_turn.response if advice_turn else None,
             date_plan=state.get("date_plan"),
@@ -110,9 +137,13 @@ class ConversationAgent:
         graph.add_node("load_history", self._load_history)
         graph.add_node("route", self._route)
         graph.add_node("high_risk_response", self._relationship_advice)
+        graph.add_node("sensitive_risk_response", self._relationship_advice)
         graph.add_node("relationship_advice", self._relationship_advice)
         graph.add_node("date_planning", self._date_planning)
+        graph.add_node("clarify_intent", self._clarify_intent)
+        graph.add_node("out_of_scope", self._out_of_scope)
         graph.add_node("casual_chat", self._casual_chat)
+        graph.add_node("finalize_flow", self._finalize_flow)
         graph.add_edge(START, "load_history")
         graph.add_edge("load_history", "route")
         graph.add_conditional_edges(
@@ -120,15 +151,22 @@ class ConversationAgent:
             _route_branch,
             {
                 "high_risk_response": "high_risk_response",
+                "sensitive_risk_response": "sensitive_risk_response",
+                "clarify_intent": "clarify_intent",
                 "relationship_advice": "relationship_advice",
                 "date_planning": "date_planning",
+                "out_of_scope": "out_of_scope",
                 "casual_chat": "casual_chat",
             },
         )
-        graph.add_edge("high_risk_response", END)
-        graph.add_edge("relationship_advice", END)
-        graph.add_edge("date_planning", END)
-        graph.add_edge("casual_chat", END)
+        graph.add_edge("high_risk_response", "finalize_flow")
+        graph.add_edge("sensitive_risk_response", "finalize_flow")
+        graph.add_edge("relationship_advice", "finalize_flow")
+        graph.add_edge("date_planning", "finalize_flow")
+        graph.add_edge("clarify_intent", "finalize_flow")
+        graph.add_edge("out_of_scope", "finalize_flow")
+        graph.add_edge("casual_chat", "finalize_flow")
+        graph.add_edge("finalize_flow", END)
         return graph.compile()
 
     async def _load_history(self, state: ConversationState) -> dict:
@@ -154,6 +192,13 @@ class ConversationAgent:
                 relationship_id=request.relationship_id,
                 conversation_id=request.conversation_id,
             )
+            flow_state = await self._conversation_flow_state_store.get(
+                user_id=request.user_id,
+                relationship_id=request.relationship_id,
+                conversation_id=request.conversation_id,
+            )
+            if flow_state is None:
+                flow_state = _new_conversation_flow_state(request)
             if date_task_state is None and _should_recover_date_task(request, history):
                 current_slots = extract_date_plan_slots(RouteInput(latest_query=request.query))
                 current_has_slot = any(
@@ -235,28 +280,95 @@ class ConversationAgent:
                     date_task_state,
                     state["trace"],
                 )
-            return {"recent_messages": history, "date_task_state": date_task_state}
+            return {
+                "recent_messages": history,
+                "date_task_state": date_task_state,
+                "flow_state": flow_state,
+            }
 
     async def _route(self, state: ConversationState) -> dict:
-        with state["trace"].measure("routing"):
+        with state["trace"].measure("routing") as details:
             request = state["request"]
+            flow_state = state["flow_state"]
+            active_task = request.active_task or flow_state.active_task
+            forced_task = (
+                flow_state.pending_task
+                if is_pending_continuation(request.query, flow_state.pending_task)
+                else None
+            )
             route = await self._router.route(
                 RouteInput(
                     latest_query=request.query,
                     recent_messages=state.get("recent_messages", []),
-                    active_task=request.active_task,
+                    active_task=active_task,
+                    forced_task=forced_task,
                     date_task_state=state.get("date_task_state"),
+                    pending_task=flow_state.pending_task,
+                    pending_task_reason=flow_state.pending_task_reason,
+                    pending_task_turns_remaining=flow_state.pending_task_turns_remaining,
+                    last_clarification_reason=flow_state.last_clarification_reason,
+                    clarification_attempt_count=flow_state.clarification_attempt_count,
+                    previous_risk_state=flow_state.recent_risk_state,
                 )
             )
+            details.update(
+                {
+                    "final_task": route.task_type.value,
+                    "rule_task": route.rule_task_type.value if route.rule_task_type else None,
+                    "llm_task": route.llm_task_type.value if route.llm_task_type else None,
+                    "task_guard_applied": route.task_guard_applied,
+                    "clarification_triggered": route.clarification_triggered,
+                    "clarification_exhausted": route.clarification_exhausted,
+                    "clarification_reason": route.clarification_reason,
+                    "out_of_scope_reason": route.out_of_scope_reason,
+                    "pending_task": route.pending_task.value if route.pending_task else None,
+                    "pending_task_source": route.pending_task_source,
+                    "pending_task_turns_remaining": route.pending_task_turns_remaining,
+                    "recent_risk_inherited": route.recent_risk_inherited,
+                    "recent_risk_deescalated": route.recent_risk_deescalated,
+                    "router_prompt_version": route.router_prompt_version,
+                    "router_model": route.router_model,
+                    "router_input_tokens": route.router_input_tokens,
+                    "router_output_tokens": route.router_output_tokens,
+                    "router_duration_ms": route.router_duration_ms,
+                    "fallback_reason": route.fallback_reason,
+                }
+            )
+            with state["trace"].measure("route_slot_validation") as slot_details:
+                slot_details.update(
+                    {
+                        "accepted_fields_json": json.dumps(
+                            route.slot_accepted_fields,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        "rejected_fields_json": json.dumps(
+                            route.slot_rejected_fields,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        "field_sources_json": json.dumps(
+                            route.slot_field_sources,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    }
+                )
             task_state = state.get("date_task_state")
             if (
                 task_state is not None
-                and route.date_intent
-                in {
-                    DateTaskIntent.SWITCH,
-                    DateTaskIntent.CANCEL,
-                }
-                and route.task_type != TaskType.DATE_PLANNING
+                and (
+                    (
+                        route.date_intent
+                        in {
+                            DateTaskIntent.SWITCH,
+                            DateTaskIntent.CANCEL,
+                        }
+                        and route.task_type != TaskType.DATE_PLANNING
+                    )
+                    or route.task_type == TaskType.OUT_OF_SCOPE
+                    or route.risk_level in {RiskLevel.HIGH, RiskLevel.SENSITIVE}
+                )
             ):
                 task_state = await self._save_date_task_state(
                     task_state.model_copy(
@@ -283,6 +395,12 @@ class ConversationAgent:
                 secondary_goals=route.secondary_goals,
                 scenario=route.primary_scenario or AdviceScenario.RELATIONSHIP_MAINTENANCE,
                 secondary_scenarios=route.secondary_scenarios,
+                forced_risk_level=(
+                    route.risk_level
+                    if route.risk_level in {RiskLevel.HIGH, RiskLevel.SENSITIVE}
+                    else None
+                ),
+                forced_risk_reasons=route.risk_reasons,
             ),
             trace=state["trace"],
             stream_callback=state.get("stream_callback"),
@@ -448,9 +566,58 @@ class ConversationAgent:
         request = state["request"]
         recorded = await self._record_user_message(state)
         with state["trace"].measure("casual_response"):
-            message = _casual_reply(request.query)
+            route = state["route"]
+            pending_task = state["flow_state"].pending_task
+            message = (
+                pending_cancel_message(pending_task)
+                if route.pending_task_cancelled and pending_task is not None
+                else _casual_reply(request.query)
+            )
         await self._record_assistant_message(request, message, state["trace"])
         return {**recorded, "message": message}
+
+    async def _clarify_intent(self, state: ConversationState) -> dict:
+        request = state["request"]
+        with state["trace"].measure("clarify_intent") as details:
+            recorded = await self._record_user_message(state)
+            route = state["route"]
+            repeated = (
+                route.clarification_exhausted
+                or (
+                    route.clarification_reason
+                    == state["flow_state"].last_clarification_reason
+                    and state["flow_state"].clarification_attempt_count > 0
+                )
+            )
+            details["clarification_reason"] = route.clarification_reason
+            details["repeated"] = repeated
+            message = clarification_message(route, repeated=repeated)
+            await self._record_assistant_message(request, message, state["trace"])
+        return {**recorded, "message": message}
+
+    async def _out_of_scope(self, state: ConversationState) -> dict:
+        request = state["request"]
+        with state["trace"].measure("out_of_scope") as details:
+            recorded = await self._record_user_message(state)
+            details["out_of_scope_reason"] = state["route"].out_of_scope_reason
+            message = out_of_scope_message()
+            await self._record_assistant_message(request, message, state["trace"])
+        return {**recorded, "message": message}
+
+    async def _finalize_flow(self, state: ConversationState) -> dict:
+        request = state["request"]
+        flow = advance_conversation_flow(state["flow_state"], state["route"])
+        saved = await self._save_conversation_flow_state(flow, state["trace"])
+        follow_up_prompt = None
+        if (
+            state["route"].pending_task_source == "secondary_task"
+            and saved.pending_task is not None
+            and state["route"].task_type
+            in {TaskType.RELATIONSHIP_ADVICE, TaskType.DATE_PLANNING}
+        ):
+            follow_up_prompt = pending_follow_up_prompt(saved.pending_task)
+            await self._record_assistant_message(request, follow_up_prompt, state["trace"])
+        return {"flow_state": saved, "follow_up_prompt": follow_up_prompt}
 
     async def _record_user_message(self, state: ConversationState) -> dict:
         request = state["request"]
@@ -494,6 +661,14 @@ class ConversationAgent:
         with trace.measure("date_task_state_persistence"):
             return await self._date_task_store.save(state)
 
+    async def _save_conversation_flow_state(
+        self,
+        flow_state: ConversationFlowState,
+        trace: ExecutionTrace,
+    ) -> ConversationFlowState:
+        with trace.measure("conversation_flow_state_persistence"):
+            return await self._conversation_flow_state_store.save(flow_state)
+
 
 def _new_date_task_state(request: ConversationRequest) -> DatePlanningTaskState:
     now = utc_now()
@@ -505,6 +680,17 @@ def _new_date_task_state(request: ConversationRequest) -> DatePlanningTaskState:
         conversation_id=request.conversation_id,
         created_at=now,
         updated_at=now,
+    )
+
+
+def _new_conversation_flow_state(request: ConversationRequest) -> ConversationFlowState:
+    if request.conversation_id is None:  # guarded by ConversationAgent.chat
+        raise ValueError("conversation_id is required for conversation flow state")
+    return ConversationFlowState(
+        user_id=request.user_id,
+        relationship_id=request.relationship_id,
+        conversation_id=request.conversation_id,
+        active_task=request.active_task,
     )
 
 
@@ -888,6 +1074,14 @@ def _route_branch(state: ConversationState) -> str:
     route = state["route"]
     if route.risk_level == RiskLevel.HIGH:
         return "high_risk_response"
+    if route.risk_level == RiskLevel.SENSITIVE:
+        return "sensitive_risk_response"
+    if route.pending_task_cancelled:
+        return "casual_chat"
+    if route.task_type == TaskType.OUT_OF_SCOPE:
+        return "out_of_scope"
+    if route.clarification_triggered or route.clarification_exhausted:
+        return "clarify_intent"
     return {
         TaskType.RELATIONSHIP_ADVICE: "relationship_advice",
         TaskType.DATE_PLANNING: "date_planning",
@@ -912,7 +1106,15 @@ def _next_active_task(
     previous: TaskType | None,
     route: RouteResult,
     date_task_state: DatePlanningTaskState | None = None,
+    flow_state: ConversationFlowState | None = None,
 ) -> TaskType | None:
+    if flow_state is not None:
+        return flow_state.active_task
+    if (
+        route.risk_level in {RiskLevel.HIGH, RiskLevel.SENSITIVE}
+        or route.task_type == TaskType.OUT_OF_SCOPE
+    ):
+        return None
     if route.task_type == TaskType.GENERAL_CHAT:
         if date_task_state is not None and date_task_state.is_resumable:
             return TaskType.DATE_PLANNING

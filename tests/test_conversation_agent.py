@@ -11,6 +11,7 @@ from loveapp.domain.enums import (
     DateRequestMode,
     DateTaskIntent,
     RelationshipStage,
+    RiskLevel,
     TaskType,
 )
 from loveapp.domain.memory import (
@@ -793,3 +794,278 @@ async def test_legacy_date_conversation_recovers_task_state(
     assert turn.date_task_state is not None
     assert turn.date_task_state.city == "上海"
     assert turn.route.date_plan.budget == 300
+
+
+async def test_conversation_agent_routes_ambiguous_input_to_clarification(
+    app_settings: Settings,
+) -> None:
+    container = build_container(app_settings)
+    try:
+        turn = await container.conversation_agent.chat(
+            ConversationRequest(
+                user_id="clarify-user",
+                relationship_id="clarify-relationship",
+                conversation_id="clarify-conversation",
+                query="你觉得这样行吗？",
+            )
+        )
+    finally:
+        await container.aclose()
+
+    assert turn.route.clarification_triggered is True
+    assert turn.message == "你是想让我分析这段关系，还是帮你具体安排一次约会？"
+    assert turn.advice is None
+    assert {timing.name for timing in turn.timings} >= {
+        "clarify_intent",
+        "route_slot_validation",
+        "conversation_flow_state_persistence",
+    }
+
+
+async def test_conversation_agent_uses_persisted_advice_context_before_clarifying(
+    app_settings: Settings,
+) -> None:
+    container = build_container(app_settings)
+    scope = {
+        "user_id": "context-clarify-user",
+        "relationship_id": "context-clarify-relationship",
+        "conversation_id": "context-clarify-conversation",
+    }
+    try:
+        first = await container.conversation_agent.chat(
+            ConversationRequest(**scope, query="我准备向她表白，但担心太突然。")
+        )
+        second = await container.conversation_agent.chat(
+            ConversationRequest(**scope, query="你觉得这样行吗？")
+        )
+    finally:
+        await container.aclose()
+
+    assert first.active_task == TaskType.RELATIONSHIP_ADVICE
+    assert second.route.task_type == TaskType.RELATIONSHIP_ADVICE
+    assert second.route.clarification_triggered is False
+    assert second.advice is not None
+
+
+async def test_conversation_agent_stops_repeating_clarification_question(
+    app_settings: Settings,
+) -> None:
+    container = build_container(app_settings)
+    scope = {
+        "user_id": "clarify-repeat-user",
+        "relationship_id": "clarify-repeat-relationship",
+        "conversation_id": "clarify-repeat-conversation",
+    }
+    try:
+        first = await container.conversation_agent.chat(
+            ConversationRequest(**scope, query="你觉得这样行吗？")
+        )
+        second = await container.conversation_agent.chat(
+            ConversationRequest(**scope, query="就是这样啊")
+        )
+    finally:
+        await container.aclose()
+
+    assert first.route.clarification_triggered is True
+    assert second.route.clarification_triggered is False
+    assert second.route.clarification_exhausted is True
+    assert second.message is not None
+    assert "我还不能可靠判断" in second.message
+    assert "？" not in second.message
+
+
+async def test_conversation_agent_uses_out_of_scope_branch(
+    app_settings: Settings,
+) -> None:
+    container = build_container(app_settings)
+    try:
+        turn = await container.conversation_agent.chat(
+            ConversationRequest(
+                user_id="oos-user",
+                relationship_id="oos-relationship",
+                conversation_id="oos-conversation",
+                query="帮我写一个 Python 爬虫。",
+            )
+        )
+    finally:
+        await container.aclose()
+
+    assert turn.route.task_type == TaskType.OUT_OF_SCOPE
+    assert turn.message is not None and "关系咨询和约会规划" in turn.message
+    assert turn.advice is None
+
+
+async def test_conversation_agent_saves_and_resumes_secondary_task(
+    app_settings: Settings,
+) -> None:
+    container = build_container(app_settings)
+    scope = {
+        "user_id": "pending-user",
+        "relationship_id": "pending-relationship",
+        "conversation_id": "pending-conversation",
+    }
+    try:
+        first = await container.conversation_agent.chat(
+            ConversationRequest(
+                **scope,
+                query="先帮我判断她是不是对我有好感，再帮我安排周末约会。",
+            )
+        )
+        second = await container.conversation_agent.chat(
+            ConversationRequest(**scope, query="好，继续")
+        )
+    finally:
+        await container.aclose()
+
+    assert first.route.task_type == TaskType.RELATIONSHIP_ADVICE
+    assert first.pending_task == TaskType.DATE_PLANNING
+    assert first.follow_up_prompt is not None
+    assert second.route.task_type == TaskType.DATE_PLANNING
+    assert second.pending_task is None
+
+
+async def test_conversation_agent_cancels_pending_secondary_task(
+    app_settings: Settings,
+) -> None:
+    container = build_container(app_settings)
+    scope = {
+        "user_id": "pending-cancel-user",
+        "relationship_id": "pending-cancel-relationship",
+        "conversation_id": "pending-cancel-conversation",
+    }
+    try:
+        await container.conversation_agent.chat(
+            ConversationRequest(
+                **scope,
+                query="先帮我判断她是不是对我有好感，再帮我安排周末约会。",
+            )
+        )
+        cancelled = await container.conversation_agent.chat(
+            ConversationRequest(**scope, query="算了，不安排了")
+        )
+    finally:
+        await container.aclose()
+
+    assert cancelled.pending_task is None
+    assert cancelled.message == "好的，后续的约会安排已取消。"
+
+
+async def test_conversation_agent_clears_pending_task_for_sensitive_safety(
+    app_settings: Settings,
+) -> None:
+    container = build_container(app_settings)
+    scope = {
+        "user_id": "pending-sensitive-user",
+        "relationship_id": "pending-sensitive-relationship",
+        "conversation_id": "pending-sensitive-conversation",
+    }
+    try:
+        first = await container.conversation_agent.chat(
+            ConversationRequest(
+                **scope,
+                query="先帮我判断她是不是对我有好感，再帮我安排周末约会。",
+            )
+        )
+        safety_turn = await container.conversation_agent.chat(
+            ConversationRequest(**scope, query="怎样避免伤害自己？")
+        )
+        after_safety = await container.conversation_agent.chat(
+            ConversationRequest(**scope, query="好，继续")
+        )
+    finally:
+        await container.aclose()
+
+    assert first.pending_task == TaskType.DATE_PLANNING
+    assert safety_turn.route.risk_level == RiskLevel.SENSITIVE
+    assert safety_turn.pending_task is None
+    assert after_safety.route.task_type != TaskType.DATE_PLANNING
+    assert after_safety.route.pending_task is None
+
+
+async def test_conversation_agent_preserves_inherited_high_risk_for_safety_response(
+    app_settings: Settings,
+) -> None:
+    container = build_container(app_settings)
+    scope = {
+        "user_id": "context-risk-user",
+        "relationship_id": "context-risk-relationship",
+        "conversation_id": "context-risk-conversation",
+    }
+    try:
+        first = await container.conversation_agent.chat(
+            ConversationRequest(**scope, query="我拿刀去找她。")
+        )
+        second = await container.conversation_agent.chat(
+            ConversationRequest(**scope, query="我现在到她楼下了。")
+        )
+    finally:
+        await container.aclose()
+
+    assert first.route.risk_level.value == "high"
+    assert second.route.risk_level.value == "high"
+    assert second.route.recent_risk_inherited is True
+    assert second.advice is not None
+    assert second.advice.risk_level.value == "high"
+    assert "当前表达延续了近期高风险行动" in second.advice.risk_notes
+    assert "safety_response" in {timing.name for timing in second.timings}
+
+
+async def test_conversation_agent_uses_sensitive_safety_response_after_deescalation(
+    app_settings: Settings,
+) -> None:
+    container = build_container(app_settings)
+    scope = {
+        "user_id": "deescalated-risk-user",
+        "relationship_id": "deescalated-risk-relationship",
+        "conversation_id": "deescalated-risk-conversation",
+    }
+    try:
+        first = await container.conversation_agent.chat(
+            ConversationRequest(**scope, query="我拿刀去找她。")
+        )
+        second = await container.conversation_agent.chat(
+            ConversationRequest(**scope, query="我已经回家，把刀交给家人了。")
+        )
+    finally:
+        await container.aclose()
+
+    assert first.route.risk_level == RiskLevel.HIGH
+    assert second.route.risk_level == RiskLevel.SENSITIVE
+    assert second.route.recent_risk_deescalated is True
+    assert second.advice is not None
+    assert second.advice.risk_level == RiskLevel.SENSITIVE
+    timing_names = {timing.name for timing in second.timings}
+    assert "sensitive_safety_response" in timing_names
+    assert "context_load" not in timing_names
+    assert "rag_retrieval" not in timing_names
+    assert "answer_generation" not in timing_names
+
+
+async def test_conversation_agent_keeps_unresolved_recent_risk_out_of_normal_advice(
+    app_settings: Settings,
+) -> None:
+    container = build_container(app_settings)
+    scope = {
+        "user_id": "unresolved-risk-user",
+        "relationship_id": "unresolved-risk-relationship",
+        "conversation_id": "unresolved-risk-conversation",
+    }
+    try:
+        await container.conversation_agent.chat(
+            ConversationRequest(**scope, query="我拿刀去找她。")
+        )
+        turn = await container.conversation_agent.chat(
+            ConversationRequest(**scope, query="我现在不知道怎么办。")
+        )
+    finally:
+        await container.aclose()
+
+    assert turn.route.risk_level == RiskLevel.SENSITIVE
+    assert turn.route.recent_risk_inherited is True
+    assert turn.advice is not None
+    assert turn.advice.risk_level == RiskLevel.SENSITIVE
+    assert "近期对话包含尚未完全解除的高风险情境" in turn.advice.risk_notes
+    timing_names = {timing.name for timing in turn.timings}
+    assert "sensitive_safety_response" in timing_names
+    assert "rag_retrieval" not in timing_names
+    assert "answer_generation" not in timing_names
