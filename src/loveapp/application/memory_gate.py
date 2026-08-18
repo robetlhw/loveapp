@@ -3,6 +3,10 @@ import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from loveapp.application.contextual_memory_updates import (
+    may_contain_contextual_memory_update,
+    resolve_contextual_memory_update,
+)
 from loveapp.application.relationship_events import resolve_contextual_relationship_event
 from loveapp.domain.memory import MemoryGateDecision, MemoryGateReason, MemoryItem, StoredMessage
 from loveapp.domain.relationship_plan import has_retrospective_event_semantics
@@ -75,6 +79,25 @@ class MemoryGate:
                 matched_span=explicit_remember.span,
             )
 
+        contextual_update = resolve_contextual_memory_update(
+            text,
+            conversation_history,
+            existing_memories,
+        )
+        if contextual_update.resolved:
+            return MemoryGateDecision(
+                should_extract=True,
+                reason=MemoryGateReason.CONTEXTUAL_UPDATE,
+                signals=["contextual_memory_update", contextual_update.update_type.value],
+                matched_rule=f"contextual_{contextual_update.update_type.value}",
+                matched_span=contextual_update.evidence_span,
+                contextual_probe=True,
+                antecedent_candidate_ids=list(contextual_update.candidate_ids),
+                selected_target_memory_id=contextual_update.target.id,
+                target_guard_result="compatible_active_target",
+                contextual_update_type=contextual_update.update_type.value,
+            )
+
         contextual_event = resolve_contextual_relationship_event(
             text,
             conversation_history,
@@ -96,6 +119,20 @@ class MemoryGate:
                 signals=["retrospective_event_semantics"],
                 matched_rule="retrospective_event_semantics",
                 matched_span=text,
+                contextual_probe=may_contain_contextual_memory_update(text),
+            )
+
+        pure_partner_hypothesis = _first_match(
+            normalized,
+            _PURE_PARTNER_HYPOTHESIS_PATTERNS,
+            "pure_partner_hypothesis",
+        )
+        if pure_partner_hypothesis is not None:
+            return _skip(
+                MemoryGateReason.CONSULTATION_ONLY,
+                "partner hypothesis without observable claim",
+                matched_rule=pure_partner_hypothesis.rule,
+                matched_span=pure_partner_hypothesis.span,
             )
 
         signals = [
@@ -108,15 +145,19 @@ class MemoryGate:
         interaction_decline = _find_interaction_decline(normalized)
         if interaction_decline is not None and "interaction_decline" not in signals:
             signals.append("interaction_decline")
+        interaction_qualifier = _find_interaction_qualifier(normalized)
+        if interaction_qualifier is not None and "interaction_qualifier" not in signals:
+            signals.append("interaction_qualifier")
         if signals:
             generic_match = _first_signal_match(normalized, signals)
-            matched = interaction_decline or generic_match
+            matched = interaction_decline or interaction_qualifier or generic_match
             return MemoryGateDecision(
                 should_extract=True,
                 reason=MemoryGateReason.DURABLE_SIGNAL,
                 signals=signals,
                 matched_rule=matched.rule if matched is not None else None,
                 matched_span=matched.span if matched is not None else None,
+                contextual_probe=may_contain_contextual_memory_update(text),
             )
         consultation = _first_match(
             normalized,
@@ -189,6 +230,14 @@ def _find_interaction_decline(text: str) -> _GateMatch | None:
     return None
 
 
+def _find_interaction_qualifier(text: str) -> _GateMatch | None:
+    for rule, pattern in _INTERACTION_QUALIFIER_RULES:
+        match = pattern.search(text)
+        if match is not None:
+            return _GateMatch(rule, match.group(0))
+    return None
+
+
 def _has_consultation_question(text: str) -> bool:
     return any(pattern.search(text) for pattern in _CONSULTATION_PATTERNS)
 
@@ -238,6 +287,11 @@ _OPERATION_PATTERNS = (
 _KNOWLEDGE_QUESTION_PATTERNS = (
     re.compile(r"^(?:什么叫|什么是|请解释|解释一下|介绍一下|如何定义)"),
     re.compile(r"(?:是什么概念|是什么意思)\??$"),
+)
+
+_PURE_PARTNER_HYPOTHESIS_PATTERNS = (
+    re.compile(r"^(?:你觉得)?(?:她|他|对方).{0,12}(?:是不是|会不会).{0,16}(?:不喜欢|没兴趣|兴趣下降).*[?？]?$"),
+    re.compile(r"^你觉得.{0,20}(?:兴趣下降|不喜欢).*[?？]?$"),
 )
 
 _EXPLICIT_REMEMBER_PATTERNS = (
@@ -295,6 +349,36 @@ _INTERACTION_DECLINE_RULES = (
         ),
     ),
     ("interaction_decline", re.compile(_INTERACTION_DECLINE_PHRASE)),
+)
+
+# These are independent observable interaction dimensions.  They deliberately
+# avoid inferring motivation or a global relationship state from one channel.
+_INTERACTION_QUALIFIER_RULES = (
+    (
+        "quantified_contact_frequency",
+        re.compile(
+            r"(?:一天|每天|一日).{0,5}(?:只|就|才).{0,5}"
+            r"(?:回(?:复)?|联系|聊天).{0,8}"
+            r"(?:\d+|[一二三四五六七八九十两]+).{0,4}(?:条|次)"
+        ),
+    ),
+    (
+        "response_engagement_qualifier",
+        re.compile(
+            r"(?:内容|回复|回(?:我|消息)?).{0,10}"
+            r"(?:不(?:是|算)?(?:特别)?敷衍|不敷衍|还算认真|挺认真|很认真)"
+        ),
+    ),
+    (
+        "offline_interaction_qualifier",
+        re.compile(
+            r"(?:线下|见面).{0,14}(?:挺正常|很正常|没什么问题|还不错|挺好)"
+        ),
+    ),
+    (
+        "initiation_balance_qualifier",
+        re.compile(r"(?:基本|大多|通常).{0,8}(?:都是|由).{0,6}我主动(?:联系|聊天|找她)?"),
+    ),
 )
 
 _DURABLE_SIGNAL_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {

@@ -579,12 +579,67 @@ async def test_sqlite_migrates_legacy_episode_and_evidence_column(tmp_path: Path
     assert item.kind == MemoryKind.INTERACTION_EVENT
     assert item.evidence_spans == ["周一我们一起参观了科技馆"]
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         run_columns = {
             row[1]
             for row in connection.execute("PRAGMA table_info(memory_extraction_runs)")
         }
         assert "discarded_spans_json" in run_columns
+
+
+async def test_sqlite_persists_contextual_gate_observability(tmp_path: Path) -> None:
+    database_path = tmp_path / "gate-context.db"
+    store = SQLiteMemoryStore(database_path)
+    now = datetime(2026, 8, 8, 12, tzinfo=UTC)
+    run = MemoryExtractionRun(
+        id="contextual-run",
+        user_id="gate-user",
+        relationship_id="primary",
+        conversation_id="gate-conversation",
+        source_message_id="gate-message",
+        status=MemoryExtractionStatus.SKIPPED,
+        gate_decision=MemoryGateDecision(
+            should_extract=False,
+            reason=MemoryGateReason.NO_DURABLE_SIGNAL,
+            signals=["no durable signal"],
+            matched_rule="contextual_duration",
+            matched_span="持续了一个月了",
+            contextual_probe=True,
+            history_loaded_for_gate=True,
+            antecedent_candidate_ids=["memory-a"],
+            selected_target_memory_id="memory-a",
+            target_guard_result="compatible_active_target",
+            contextual_update_type="duration",
+        ),
+        created_at=now,
+        updated_at=now,
+        completed_at=now,
+    )
+    await store.save_relationship_context(
+        RelationshipContext(user_id="gate-user", relationship_id="primary")
+    )
+    message = await store.add_message(
+        user_id="gate-user",
+        relationship_id="primary",
+        conversation_id="gate-conversation",
+        role=MessageRole.USER,
+        content="持续了一个月了",
+    )
+    await store.save_extraction_run(
+        run.model_copy(update={"source_message_id": message.id})
+    )
+
+    restored = (await store.list_extraction_runs(
+        user_id="gate-user",
+        relationship_id="primary",
+        conversation_id="gate-conversation",
+    ))[0]
+
+    assert restored.gate_decision.matched_rule == "contextual_duration"
+    assert restored.gate_decision.matched_span == "持续了一个月了"
+    assert restored.gate_decision.history_loaded_for_gate is True
+    assert restored.gate_decision.antecedent_candidate_ids == ["memory-a"]
+    assert restored.gate_decision.selected_target_memory_id == "memory-a"
 
 
 def _preference(value: str) -> MemoryCandidate:

@@ -171,9 +171,15 @@ class HybridRouter:
         pending_task, pending_reason, pending_source, pending_turns, cancelled = (
             _resolve_pending_task(route_input, result)
         )
-        slot_accepted_fields = result.slot_accepted_fields
-        slot_field_sources = result.slot_field_sources
-        if not slot_accepted_fields and _date_slots_have_values(result.date_plan):
+        date_authorized = (
+            result.task_type == TaskType.DATE_PLANNING
+            or TaskType.DATE_PLANNING in result.secondary_tasks
+        )
+        date_plan = result.date_plan if date_authorized else DatePlanSlots()
+        slot_accepted_fields = result.slot_accepted_fields if date_authorized else {}
+        slot_rejected_fields = result.slot_rejected_fields if date_authorized else {}
+        slot_field_sources = result.slot_field_sources if date_authorized else {}
+        if date_authorized and not slot_accepted_fields and _date_slots_have_values(date_plan):
             rule_slots = extract_date_plan_slots(
                 RouteInput(latest_query=route_input.latest_query)
             )
@@ -205,7 +211,9 @@ class HybridRouter:
                 "pending_task_source": pending_source,
                 "pending_task_turns_remaining": pending_turns,
                 "pending_task_cancelled": cancelled,
+                "date_plan": date_plan,
                 "slot_accepted_fields": slot_accepted_fields,
+                "slot_rejected_fields": slot_rejected_fields,
                 "slot_field_sources": slot_field_sources,
             }
         )
@@ -361,6 +369,14 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
     )
     task_scores, task_evidence = _score_labels(text, _TASK_PATTERNS)
     _apply_regex_scores(text, task_scores, task_evidence, _TASK_REGEX_PATTERNS)
+    if _has_general_relationship_request(text):
+        task_scores[TaskType.RELATIONSHIP_ADVICE] = max(
+            task_scores.get(TaskType.RELATIONSHIP_ADVICE, 0),
+            4,
+        )
+        task_evidence.setdefault(TaskType.RELATIONSHIP_ADVICE, []).append(
+            "明确关系咨询请求"
+        )
     if _has_relationship_semantic_request(text) and task_scores.get(
         TaskType.RELATIONSHIP_ADVICE, 0
     ) >= 4:
@@ -468,6 +484,22 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
         minimum_secondary_score=2.5,
         relative_secondary_score=0.5,
     )
+    if (
+        route_input.forced_task is None
+        and executable_date_request
+        and _has_ordered_primary_relationship_request(text)
+        and TaskType.RELATIONSHIP_ADVICE in task_scores
+        and TaskType.DATE_PLANNING in task_scores
+    ):
+        # A direct "first assess the relationship, then plan the date"
+        # instruction is stronger than score magnitude. Keep the later task
+        # available for the pending-task workflow even when a long first
+        # clause makes its score fall below the generic secondary threshold.
+        task_type = TaskType.RELATIONSHIP_ADVICE
+        secondary_tasks = _without_primary(
+            [TaskType.DATE_PLANNING, *secondary_tasks],
+            task_type,
+        )[:2]
     task_confidence = 1.0 if route_input.forced_task else _score_confidence(task_scores, 7)
 
     scenario_scores: dict[AdviceScenario, float] = {}
@@ -505,11 +537,6 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
                 scenario_scores.get(AdviceScenario.PURSUIT, 0) + 2.5
             )
             scenario_evidence.setdefault(AdviceScenario.PURSUIT, []).append("评估低压力推进动作")
-        if relationship_follow_up or historical_relationship_report:
-            scenario_scores[AdviceScenario.PURSUIT] = (
-                scenario_scores.get(AdviceScenario.PURSUIT, 0) + 4
-            )
-            scenario_evidence.setdefault(AdviceScenario.PURSUIT, []).append("关系互动证据")
         if not scenario_scores:
             scenario_scores[AdviceScenario.RELATIONSHIP_MAINTENANCE] = 1
         primary_scenario, secondary_scenarios = _primary_and_secondary(
@@ -1235,7 +1262,13 @@ def _is_clear_out_of_scope(result: RouteResult) -> bool:
 
 
 def _has_explicit_business_request(text: str) -> bool:
-    return _has_explicit_date_planning_request(text) or any(
+    if (
+        _has_explicit_date_planning_request(text)
+        or _has_relationship_semantic_request(text)
+        or _has_general_relationship_request(text)
+    ):
+        return True
+    return any(
         marker in text
         for marker in (
             "约会",
@@ -1249,6 +1282,23 @@ def _has_explicit_business_request(text: str) -> bool:
             "怎么追",
             "怎么回复",
         )
+    )
+
+
+def _has_general_relationship_request(text: str) -> bool:
+    return (
+        re.search(
+            r"(?:感情|恋爱|关系|相处|暧昧|追求).{0,16}"
+            r"(?:怎么|如何|怎样|建议|经营|处理|发展|改善|推进)",
+            text,
+        )
+        is not None
+        or re.search(
+            r"(?:怎么|如何|怎样|建议|经营|处理|发展|改善|推进).{0,16}"
+            r"(?:感情|恋爱|关系|相处|暧昧|追求)",
+            text,
+        )
+        is not None
     )
 
 
@@ -1327,13 +1377,7 @@ def _has_compound_marker(text: str) -> bool:
 def _has_explicit_compound_order(result: RouteResult) -> bool:
     if not _is_compound_task_request(result):
         return False
-    return (
-        re.search(
-            r"(?:^|[，,。；;])(?:先|首先).{0,56}(?:再|然后|之后)",
-            result.normalized_query,
-        )
-        is not None
-    )
+    return _ORDERED_COMPOUND_PATTERN.search(result.normalized_query) is not None
 
 
 def _is_context_dependent_follow_up(
@@ -1913,15 +1957,7 @@ def _is_third_party_action_occurrence(clause: str, action_start: int) -> bool:
 
 
 def _has_ordered_primary_relationship_request(text: str) -> bool:
-    return (
-        re.search(
-            r"^(?:(?:先|首先)\s*)?(?:(?:帮我|请(?:你)?)\s*)?"
-            r"(?:分析|判断|看看|回答|解释|解决).{0,24}"
-            r"(?:再|然后|同时|另外|顺便)",
-            text,
-        )
-        is not None
-    )
+    return _ORDERED_RELATIONSHIP_FIRST_PATTERN.search(text) is not None
 
 
 def _has_concrete_date_planning_detail(text: str) -> bool:
@@ -2993,6 +3029,17 @@ _COMITATIVE_RELATIONSHIP_PREFIX = re.compile(
 _AGENT_DIRECTIVE_PREFIX = re.compile(
     r"(?:请|麻烦|帮我|请你|能帮我|能不能|能否|可以帮我|希望你|想让你).{0,8}$"
 )
+_ORDERED_COMPOUND_PATTERN = re.compile(
+    r"(?:^|[，,。；;：:])"
+    r"(?:(?:请(?:你)?|麻烦(?:你)?|帮我|我想|我希望(?:你)?|能否|可以)\s*){0,2}"
+    r"(?:先|首先)\s*(?:(?:请(?:你)?|麻烦(?:你)?|帮我)\s*)?.{0,56}(?:再|然后|之后)"
+)
+_ORDERED_RELATIONSHIP_FIRST_PATTERN = re.compile(
+    r"(?:^|[，,。；;：:])"
+    r"(?:(?:请(?:你)?|麻烦(?:你)?|帮我|我想|我希望(?:你)?|能否|可以)\s*){0,2}"
+    r"(?:先|首先)\s*(?:(?:请(?:你)?|麻烦(?:你)?|帮我)\s*)?"
+    r"(?:分析|判断|看看|回答|解释|解决).{0,32}(?:再|然后|之后|同时|另外|顺便)"
+)
 
 
 _TASK_PATTERNS: dict[TaskType, tuple[tuple[str, float], ...]] = {
@@ -3013,6 +3060,13 @@ _TASK_PATTERNS: dict[TaskType, tuple[tuple[str, float], ...]] = {
         ("法律", 5),
         ("合同", 3),
         ("律师", 4),
+        ("excel", 5),
+        ("表格公式", 5),
+        ("简历", 5),
+        ("求职邮件", 5),
+        ("登录系统", 5),
+        ("接口", 3),
+        ("bug", 4),
     ),
     TaskType.RELATIONSHIP_ADVICE: (
         ("喜欢", 3),
@@ -3077,13 +3131,18 @@ _TASK_PATTERNS: dict[TaskType, tuple[tuple[str, float], ...]] = {
 }
 
 
+_CONFLICT_EVENT_REGEX = r"(?:大)?吵(?:了|过)?一架"
+
+
 _TASK_REGEX_PATTERNS: dict[TaskType, tuple[tuple[str, float], ...]] = {
     TaskType.OUT_OF_SCOPE: (
         (r"(?:帮|请|写|分析|解释).{0,12}(?:代码|python|爬虫|算法|论文|作业|新闻稿|ppt)", 4),
+        (r"(?:帮|请|写|做|分析|修复).{0,16}(?:excel|公式|简历|求职邮件|登录系统|接口|bug)", 4),
         (r"(?:诊断|判断).{0,12}(?:胸痛|疾病|病情)", 4),
         (r"(?:分析|咨询).{0,12}(?:法律|合同|起诉)", 4),
     ),
     TaskType.RELATIONSHIP_ADVICE: (
+        (_CONFLICT_EVENT_REGEX, 4),
         (r"(?:先|首先).{0,12}(?:分析|判断|看看).{0,12}(?:她|他|关系|冷淡|回复)", 4),
         (r"(?:分析|判断|看看).{0,12}(?:她|他|对方).{0,8}(?:态度|想法|意思|反应)", 5),
         (r"(?:怎么|如何|怎样).{0,12}(?:追|接近|搭话|搭讪|开口|聊天|发展)", 5),
@@ -3217,6 +3276,7 @@ _SCENARIO_REGEX_PATTERNS: dict[AdviceScenario, tuple[tuple[str, float], ...]] = 
         (r"尊重.{0,8}边界", 5),
     ),
     AdviceScenario.CONFLICT: (
+        (_CONFLICT_EVENT_REGEX, 4.5),
         (r"道.{0,2}歉", 3),
         (r"(?:谈|聊|沟通).{0,10}(?:分歧|矛盾|冲突|消费观|争执)", 4),
     ),

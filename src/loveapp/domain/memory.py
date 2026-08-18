@@ -129,6 +129,7 @@ class DiscardedSpan(BaseModel):
 
 class MemoryGateReason(StrEnum):
     DURABLE_SIGNAL = "durable_signal"
+    CONTEXTUAL_UPDATE = "contextual_update"
     EXPLICIT_REMEMBER = "explicit_remember"
     FORCED = "forced"
     CASUAL = "casual"
@@ -145,6 +146,46 @@ class MemoryGateDecision(BaseModel):
     signals: list[str] = Field(default_factory=list)
     matched_rule: str | None = None
     matched_span: str | None = None
+    contextual_probe: bool = False
+    history_loaded_for_gate: bool = False
+    antecedent_candidate_ids: list[str] = Field(default_factory=list)
+    selected_target_memory_id: str | None = None
+    target_guard_result: str | None = None
+    contextual_update_type: str | None = None
+
+
+class ContextualUpdateType(StrEnum):
+    DURATION = "duration"
+    PERSISTENCE = "persistence"
+
+
+class ContextualMemoryUpdate(BaseModel):
+    """A constrained, user-evidenced patch for an active interaction memory.
+
+    This intentionally does not expose a generic field-update dictionary.  New
+    update kinds must be modeled explicitly and validated by both the resolver
+    and the persistence layer.
+    """
+
+    target_memory_id: str = Field(min_length=1)
+    update_type: ContextualUpdateType
+    evidence_span: str = Field(min_length=1, max_length=1000)
+    temporal_expression: str = Field(min_length=1, max_length=200)
+    reference_time: datetime
+    target_canonical_predicate: str = Field(min_length=1, max_length=120)
+    duration_value: int | None = Field(default=None, ge=1, le=3650)
+    duration_unit: str | None = Field(default=None, max_length=20)
+    confidence: float = Field(default=0.95, ge=0, le=1)
+    reason: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> "ContextualMemoryUpdate":
+        if self.update_type == ContextualUpdateType.DURATION:
+            if self.duration_value is None or self.duration_unit is None:
+                raise ValueError("duration updates require duration_value and duration_unit")
+        elif self.duration_value is not None or self.duration_unit is not None:
+            raise ValueError("persistence updates cannot carry a duration value")
+        return self
 
 
 class MemoryExtractionStatus(StrEnum):
@@ -573,6 +614,7 @@ class MemorySaveResult(BaseModel):
 class RememberResult(BaseModel):
     message: StoredMessage
     saved: list[MemorySaveResult] = Field(default_factory=list)
+    contextual_updated_memory_ids: list[str] = Field(default_factory=list)
     discarded_spans: list[DiscardedSpan] = Field(default_factory=list)
     skipped_low_confidence: int = 0
     rejected_by_policy: int = 0

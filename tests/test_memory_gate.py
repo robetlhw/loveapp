@@ -1,6 +1,16 @@
+from datetime import UTC, datetime
+
 import pytest
 
 from loveapp.application.memory_gate import MemoryGate
+from loveapp.domain.memory import (
+    MemoryItem,
+    MemoryKind,
+    MemoryStatus,
+    MessageRole,
+    StoredMessage,
+    memory_dedupe_key,
+)
 
 
 @pytest.mark.parametrize(
@@ -145,3 +155,80 @@ def test_memory_gate_does_not_confuse_non_interaction_phrases(text: str) -> None
     assert decision.should_extract is False
     assert decision.reason.value == "no_durable_signal"
     assert decision.matched_rule == "no_durable_signal"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "她一天只回两三条消息。",
+        "她每次回复都不算敷衍。",
+        "我们线下见面其实还挺正常。",
+        "基本都是我主动联系她。",
+    ],
+)
+def test_memory_gate_accepts_direct_interaction_pattern_qualifiers(text: str) -> None:
+    decision = MemoryGate().evaluate(text)
+
+    assert decision.should_extract is True
+    assert decision.reason.value == "durable_signal"
+    assert "interaction_qualifier" in decision.signals
+
+
+def test_memory_gate_resolves_duration_against_recent_user_contact_memory() -> None:
+    source = StoredMessage(
+        id="contact-source",
+        conversation_id="conversation",
+        user_id="user",
+        relationship_id="relationship",
+        role=MessageRole.USER,
+        content="她最近回复越来越慢。",
+    )
+    memory = _contact_frequency_memory(source_message_id=source.id)
+
+    decision = MemoryGate().evaluate(
+        "持续了一个月了，你觉得这是兴趣下降了吗？",
+        conversation_history=[source],
+        existing_memories=[memory],
+    )
+
+    assert decision.should_extract is True
+    assert decision.reason.value == "contextual_update"
+    assert decision.matched_rule == "contextual_duration"
+    assert decision.matched_span == "持续了一个月了"
+    assert decision.selected_target_memory_id == memory.id
+    assert decision.target_guard_result == "compatible_active_target"
+
+
+def test_memory_gate_rejects_pure_partner_interest_hypothesis() -> None:
+    decision = MemoryGate().evaluate("你觉得她是不是不喜欢我了？")
+
+    assert decision.should_extract is False
+    assert decision.reason.value == "consultation_only"
+    assert decision.matched_rule == "pure_partner_hypothesis_1"
+
+
+def _contact_frequency_memory(*, source_message_id: str) -> MemoryItem:
+    candidate = MemoryItem(
+        id="contact-frequency",
+        user_id="user",
+        relationship_id="relationship",
+        source_message_id=source_message_id,
+        status=MemoryStatus.CONFIRMED,
+        kind=MemoryKind.INTERACTION_PATTERN,
+        subject="relationship",
+        summary="用户报告最近线上联系频率降低",
+        original_text="她最近回复越来越慢。",
+        evidence_spans=["她最近回复越来越慢"],
+        canonical_predicate="interaction.contact_frequency",
+        raw_predicate="reply_frequency_declined",
+        payload={
+            "predicate": "reply_frequency_declined",
+            "metric": "contact_frequency",
+            "direction": "decreasing",
+            "channel": "messaging",
+        },
+        created_at=datetime(2026, 8, 1, tzinfo=UTC),
+        updated_at=datetime(2026, 8, 1, tzinfo=UTC),
+        dedupe_key="placeholder",
+    )
+    return candidate.model_copy(update={"dedupe_key": memory_dedupe_key(candidate)})

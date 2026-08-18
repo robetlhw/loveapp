@@ -1,3 +1,5 @@
+import pytest
+
 from loveapp.application.routing import (
     HybridRouter,
     extract_date_plan_slots,
@@ -86,6 +88,171 @@ def test_rule_router_respects_negation() -> None:
     assert result.task_type == TaskType.RELATIONSHIP_ADVICE
     assert result.primary_scenario == AdviceScenario.CHAT_ANALYSIS
     assert AdviceScenario.CONFLICT not in result.scenario_scores
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "我和女朋友吵架了",
+        "我和女朋友昨天因为周末去哪玩吵了一架。",
+        "昨天我们因为钱怎么安排大吵了一架。",
+    ),
+)
+def test_scenario_router_recognizes_common_conflict_word_forms(query: str) -> None:
+    result = route_by_rules(RouteInput(latest_query=query))
+
+    assert result.primary_scenario == AdviceScenario.CONFLICT
+
+
+def test_scenario_router_respects_negated_conflict_word_form() -> None:
+    result = route_by_rules(
+        RouteInput(latest_query="我们没有大吵一架，只是对安排有不同意见。")
+    )
+
+    assert AdviceScenario.CONFLICT not in result.scenario_scores
+
+
+def test_scenario_router_keeps_conflict_for_relationship_clarification_follow_up() -> None:
+    first_query = "我和女朋友昨天因为周末去哪玩吵了一架。"
+    first = route_by_rules(RouteInput(latest_query=first_query))
+    history = [
+        StoredMessage(
+            id="conflict-follow-up-user",
+            conversation_id="conflict-follow-up",
+            user_id="u1",
+            relationship_id="r1",
+            role=MessageRole.USER,
+            content=first_query,
+        ),
+        StoredMessage(
+            id="conflict-follow-up-assistant",
+            conversation_id="conflict-follow-up",
+            user_id="u1",
+            relationship_id="r1",
+            role=MessageRole.ASSISTANT,
+            content="待确认：你们各自最想去的周末活动是什么？",
+        ),
+    ]
+
+    follow_up = route_by_rules(
+        RouteInput(
+            latest_query=(
+                "主要是我觉得她每次都让我做决定，我有点烦。"
+                "后来我说话也有点重，她现在不太想跟我说话。"
+            ),
+            recent_messages=history,
+            active_task=TaskType.RELATIONSHIP_ADVICE,
+        )
+    )
+
+    assert follow_up.primary_scenario == AdviceScenario.CONFLICT
+    assert AdviceScenario.PURSUIT not in follow_up.secondary_scenarios
+    assert AdviceScenario.PURSUIT not in follow_up.scenario_scores
+    assert first.primary_scenario == AdviceScenario.CONFLICT
+
+
+def test_scenario_router_keeps_conflict_for_elliptical_follow_up() -> None:
+    history = [
+        StoredMessage(
+            id="elliptical-conflict-user",
+            conversation_id="elliptical-conflict",
+            user_id="u1",
+            relationship_id="r1",
+            role=MessageRole.USER,
+            content="我们昨天吵了一架。",
+        ),
+        StoredMessage(
+            id="elliptical-conflict-assistant",
+            conversation_id="elliptical-conflict",
+            user_id="u1",
+            relationship_id="r1",
+            role=MessageRole.ASSISTANT,
+            content="可以先说说当时发生了什么。",
+        ),
+    ]
+
+    result = route_by_rules(
+        RouteInput(
+            latest_query="那我现在怎么办？",
+            recent_messages=history,
+            active_task=TaskType.RELATIONSHIP_ADVICE,
+        )
+    )
+
+    assert result.primary_scenario == AdviceScenario.CONFLICT
+    assert AdviceScenario.PURSUIT not in result.secondary_scenarios
+
+
+def test_scenario_router_does_not_add_pursuit_to_contact_boundary_follow_up() -> None:
+    history = [
+        StoredMessage(
+            id="contact-boundary-assistant",
+            conversation_id="contact-boundary",
+            user_id="u1",
+            relationship_id="r1",
+            role=MessageRole.ASSISTANT,
+            content="待确认：她有没有明确要求暂停联系？",
+        )
+    ]
+
+    result = route_by_rules(
+        RouteInput(
+            latest_query="她明确表示过暂时别联系，我应该先道歉还是先把我的不满说清楚？",
+            recent_messages=history,
+            active_task=TaskType.RELATIONSHIP_ADVICE,
+        )
+    )
+
+    assert result.primary_scenario in {
+        AdviceScenario.BOUNDARY,
+        AdviceScenario.CONFLICT,
+    }
+    assert AdviceScenario.PURSUIT not in result.secondary_scenarios
+    assert AdviceScenario.PURSUIT not in result.scenario_scores
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "我喜欢一个女生，不知道怎么追她。",
+        "我跟她不太熟，想找机会和她聊天。",
+    ),
+)
+def test_scenario_router_preserves_explicit_pursuit_cases(query: str) -> None:
+    result = route_by_rules(RouteInput(latest_query=query))
+
+    assert result.primary_scenario == AdviceScenario.PURSUIT
+
+
+def test_scenario_router_current_conflict_overrides_chat_analysis_history() -> None:
+    history = [
+        StoredMessage(
+            id="chat-analysis-user",
+            conversation_id="chat-to-conflict",
+            user_id="u1",
+            relationship_id="r1",
+            role=MessageRole.USER,
+            content="她最近回复很慢，我不知道是不是不想聊天。",
+        ),
+        StoredMessage(
+            id="chat-analysis-assistant",
+            conversation_id="chat-to-conflict",
+            user_id="u1",
+            relationship_id="r1",
+            role=MessageRole.ASSISTANT,
+            content="可以结合持续时间和互动内容判断。",
+        ),
+    ]
+
+    result = route_by_rules(
+        RouteInput(
+            latest_query="先不说回复了，我们昨天大吵了一架。",
+            recent_messages=history,
+            active_task=TaskType.RELATIONSHIP_ADVICE,
+        )
+    )
+
+    assert result.primary_scenario == AdviceScenario.CONFLICT
 
 
 def test_greeting_does_not_hide_relationship_request() -> None:
@@ -519,6 +686,159 @@ async def test_hybrid_router_corrects_missing_goal_for_advice_request() -> None:
     assert result.primary_goal == AdviceGoal.INITIATE
 
 
+@pytest.mark.parametrize(
+    ("query", "expected_scenario", "expected_mode", "expected_corrector_calls"),
+    (
+        (
+            "我和女朋友昨天因为周末去哪玩吵了一架。",
+            AdviceScenario.CONFLICT,
+            DateRequestMode.NONE,
+            1,
+        ),
+        (
+            "我想周六约她看电影，你觉得合适吗？",
+            AdviceScenario.PURSUIT,
+            DateRequestMode.EVALUATE,
+            0,
+        ),
+        (
+            "我们上周六一起吃了日料，但后来吵架了。",
+            AdviceScenario.CONFLICT,
+            DateRequestMode.NONE,
+            0,
+        ),
+        (
+            "她说下周工作特别忙，我担心她是不是在疏远我。",
+            AdviceScenario.CHAT_ANALYSIS,
+            DateRequestMode.NONE,
+            1,
+        ),
+    ),
+)
+async def test_date_slot_authorization_hides_metadata_for_non_date_workflows(
+    query: str,
+    expected_scenario: AdviceScenario,
+    expected_mode: DateRequestMode,
+    expected_corrector_calls: int,
+) -> None:
+    detected_slots = extract_date_plan_slots(RouteInput(latest_query=query))
+    corrector = StubCorrector(
+        RouteCorrection(
+            task_type=TaskType.RELATIONSHIP_ADVICE,
+            task_confidence=0.95,
+            primary_scenario=expected_scenario,
+            scenario_confidence=0.9,
+            date_plan=(
+                {"city": "杭州"}
+                if query.startswith("她说下周工作特别忙")
+                else {}
+            ),
+        )
+    )
+
+    result = await HybridRouter(SafetyPolicy(), corrector).route(
+        RouteInput(latest_query=query)
+    )
+
+    assert detected_slots.date is not None
+    assert corrector.calls == expected_corrector_calls
+    assert result.task_type == TaskType.RELATIONSHIP_ADVICE
+    assert result.primary_scenario == expected_scenario
+    assert result.date_request_mode == expected_mode
+    assert result.date_plan == DatePlanSlots()
+    assert result.slot_rejected_fields == {}
+    assert result.slot_accepted_fields == {}
+    assert result.slot_field_sources == {}
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_fields"),
+    (
+        ("帮我安排周六在上海的约会。", {"city", "date", "plan_mode"}),
+        ("帮我安排周末约会，预算500。", {"date", "budget", "plan_mode"}),
+    ),
+)
+async def test_date_slot_authorization_keeps_metadata_for_date_workflows(
+    query: str,
+    expected_fields: set[str],
+) -> None:
+    result = await HybridRouter(SafetyPolicy()).route(RouteInput(latest_query=query))
+
+    assert result.task_type == TaskType.DATE_PLANNING
+    assert expected_fields <= set(result.slot_accepted_fields)
+    assert all(result.slot_field_sources[field] == "rule" for field in expected_fields)
+    assert result.date_plan != DatePlanSlots()
+
+
+async def test_date_slot_authorization_keeps_active_date_task_supplements() -> None:
+    router = HybridRouter(SafetyPolicy())
+    state = DatePlanningTaskState(
+        user_id="slot-supplement-user",
+        relationship_id="slot-supplement-relationship",
+        conversation_id="slot-supplement-conversation",
+        status="collecting",
+    )
+
+    city_turn = await router.route(
+        RouteInput(
+            latest_query="上海。",
+            active_task=TaskType.DATE_PLANNING,
+            date_task_state=state,
+        )
+    )
+    state = state.model_copy(update={"city": city_turn.date_plan.city})
+    date_turn = await router.route(
+        RouteInput(
+            latest_query="周六下午。",
+            active_task=TaskType.DATE_PLANNING,
+            date_task_state=state,
+        )
+    )
+    state = state.model_copy(update={"date": date_turn.date_plan.date})
+    budget_turn = await router.route(
+        RouteInput(
+            latest_query="预算300。",
+            active_task=TaskType.DATE_PLANNING,
+            date_task_state=state,
+        )
+    )
+
+    assert city_turn.task_type == TaskType.DATE_PLANNING
+    assert city_turn.slot_accepted_fields["city"] == "上海"
+    assert city_turn.slot_field_sources["city"] == "rule"
+    assert date_turn.task_type == TaskType.DATE_PLANNING
+    assert "date" in date_turn.slot_accepted_fields
+    assert date_turn.slot_accepted_fields["schedule_hints"] == "下午"
+    assert date_turn.slot_field_sources["date"] == "rule"
+    assert budget_turn.task_type == TaskType.DATE_PLANNING
+    assert budget_turn.slot_accepted_fields["budget"] == "300"
+    assert budget_turn.slot_field_sources["budget"] == "rule"
+
+
+async def test_date_slot_authorization_keeps_metadata_for_secondary_date_task() -> None:
+    query = "先帮我分析她最近是什么状态，然后帮我安排一次周末约会。"
+    corrector = StubCorrector(
+        RouteCorrection(
+            task_type=TaskType.RELATIONSHIP_ADVICE,
+            secondary_tasks=[TaskType.DATE_PLANNING],
+            task_confidence=0.95,
+            primary_scenario=AdviceScenario.CHAT_ANALYSIS,
+            scenario_confidence=0.9,
+        )
+    )
+
+    result = await HybridRouter(SafetyPolicy(), corrector).route(
+        RouteInput(latest_query=query)
+    )
+
+    assert corrector.calls == 1
+    assert result.task_type == TaskType.RELATIONSHIP_ADVICE
+    assert TaskType.DATE_PLANNING in result.secondary_tasks
+    assert result.date_plan.date is not None
+    assert result.slot_accepted_fields["date"] == result.date_plan.date.isoformat()
+    assert result.slot_field_sources["date"] == "rule"
+
+
 async def test_hybrid_router_rejects_hallucinated_semantic_date_slots() -> None:
     corrector = StubCorrector(
         RouteCorrection(
@@ -901,6 +1221,42 @@ async def test_hybrid_router_preserves_explicit_compound_task_order() -> None:
     assert result.task_guard_applied is True
 
 
+@pytest.mark.parametrize(
+    "query",
+    (
+        "帮我先判断她是不是对我有好感，再帮我安排周末约会。",
+        "请你先判断她是不是对我有好感，然后安排周末约会。",
+        "请你帮我先判断她是不是对我有好感，然后安排周末约会。",
+        "我想先判断她是不是对我有好感，再帮我安排周末约会。",
+        (
+            "帮我先分析她最近为什么冷淡，她不理我，我们还吵架了，"
+            "再帮我推荐一家适合约会的餐厅。"
+        ),
+    ),
+)
+async def test_hybrid_router_preserves_prefixed_explicit_compound_task_order(
+    query: str,
+) -> None:
+    corrector = StubCorrector(
+        RouteCorrection(
+            task_type=TaskType.DATE_PLANNING,
+            secondary_tasks=[TaskType.RELATIONSHIP_ADVICE],
+            task_confidence=0.99,
+            date_request_mode=DateRequestMode.ITINERARY,
+            date_intent=DateTaskIntent.NEW_REQUEST,
+        )
+    )
+
+    result = await HybridRouter(SafetyPolicy(), corrector).route(
+        RouteInput(latest_query=query)
+    )
+
+    assert result.task_type == TaskType.RELATIONSHIP_ADVICE
+    assert result.secondary_tasks == [TaskType.DATE_PLANNING]
+    assert result.pending_task == TaskType.DATE_PLANNING
+    assert result.task_guard_applied is True
+
+
 async def test_hybrid_router_rejects_llm_date_planning_for_relationship_actions() -> None:
     for query in (
         "我想约她看电影，但不知道怎么开口？",
@@ -938,6 +1294,24 @@ async def test_hybrid_router_keeps_weak_date_request_in_product_scope() -> None:
     )
 
     assert result.task_type != TaskType.OUT_OF_SCOPE
+    assert result.llm_task_type == TaskType.OUT_OF_SCOPE
+    assert result.task_guard_applied is True
+
+
+async def test_hybrid_router_keeps_weak_relationship_request_in_product_scope() -> None:
+    corrector = StubCorrector(
+        RouteCorrection(
+            task_type=TaskType.OUT_OF_SCOPE,
+            task_confidence=0.99,
+            evidence_spans=["感情怎么经营"],
+        )
+    )
+
+    result = await HybridRouter(SafetyPolicy(), corrector).route(
+        RouteInput(latest_query="感情怎么经营？")
+    )
+
+    assert result.task_type == TaskType.RELATIONSHIP_ADVICE
     assert result.llm_task_type == TaskType.OUT_OF_SCOPE
     assert result.task_guard_applied is True
 
@@ -1052,6 +1426,7 @@ def test_safety_policy_handles_synonyms_negation_and_figures_of_speech() -> None
     assert policy.assess("我不会跟踪或骚扰她。").risk_level == RiskLevel.NORMAL
     assert policy.assess("我不会伤害她，但是我会杀她。").risk_level == RiskLevel.HIGH
     assert policy.assess("我不会伤害她，我要报复她。").risk_level == RiskLevel.HIGH
+    assert policy.assess("我不会伤害她,我会杀她。").risk_level == RiskLevel.HIGH
     assert policy.assess("怎样避免伤害自己？").risk_level == RiskLevel.SENSITIVE
     assert policy.assess("这次比赛要杀死比赛。").risk_level == RiskLevel.NORMAL
 
@@ -1163,6 +1538,46 @@ def test_rule_router_distinguishes_out_of_scope_from_relationship_context() -> N
 
     assert out_of_scope.task_type == TaskType.OUT_OF_SCOPE
     assert relationship.task_type == TaskType.RELATIONSHIP_ADVICE
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "帮我写一个Excel公式",
+        "帮我做一个简历",
+        "帮我写一个用户登录系统",
+        "帮我分析一下这个bug",
+        "帮我写一封求职邮件",
+    ),
+)
+async def test_router_routes_extended_non_product_work_requests_out_of_scope(
+    query: str,
+) -> None:
+    result = await HybridRouter(SafetyPolicy()).route(
+        RouteInput(
+            latest_query=query,
+            pending_task=TaskType.DATE_PLANNING,
+            pending_task_reason="previous secondary task",
+            pending_task_turns_remaining=2,
+        )
+    )
+
+    assert result.task_type == TaskType.OUT_OF_SCOPE
+    assert result.pending_task is None
+
+
+async def test_router_clears_pending_for_high_risk_interruption() -> None:
+    result = await HybridRouter(SafetyPolicy()).route(
+        RouteInput(
+            latest_query="我拿刀去找她。",
+            pending_task=TaskType.DATE_PLANNING,
+            pending_task_reason="previous secondary task",
+            pending_task_turns_remaining=2,
+        )
+    )
+
+    assert result.risk_level == RiskLevel.HIGH
+    assert result.pending_task is None
 
 
 def test_rule_router_treats_date_category_comparisons_as_relationship_advice() -> None:
@@ -1292,7 +1707,13 @@ async def test_recent_high_risk_continuation_variants_stay_high() -> None:
     ]
     router = HybridRouter(SafetyPolicy())
 
-    for query in ("我已经上楼了。", "我正在敲门。", "我站在她门口。", "我进她家了。"):
+    for query in (
+        "我已经上楼了。",
+        "我正在敲门。",
+        "我正在拉门。",
+        "我站在她门口。",
+        "我进她家了。",
+    ):
         result = await router.route(RouteInput(latest_query=query, recent_messages=history))
         assert result.risk_level == RiskLevel.HIGH
         assert result.recent_risk_inherited is True

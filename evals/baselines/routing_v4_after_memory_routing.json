@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "generated_at": "2026-08-13T13:59:49.682671+00:00",
+  "generated_at": "2026-08-13T13:56:39.200547+00:00",
   "evaluation_mode": "policy",
   "corrector_kind": "recording",
   "dataset": "evals\\routing\\cases_v4.jsonl",
@@ -97,9 +97,9 @@
   "invalid_json_rate": 0.0625,
   "evidence_validation_failure_count": 1,
   "evidence_validation_failure_rate": 0.0625,
-  "mean_policy_latency_ms": 0.648,
-  "p50_policy_latency_ms": 0.58,
-  "p95_policy_latency_ms": 1.017,
+  "mean_policy_latency_ms": 0.743,
+  "p50_policy_latency_ms": 0.687,
+  "p95_policy_latency_ms": 1.18,
   "p50_live_router_latency_ms": 0.0,
   "p95_live_router_latency_ms": 0.0,
   "average_input_tokens": 0.0,
@@ -130,7 +130,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.501,
+          "duration_ms": 0.499,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -221,7 +221,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.55,
+          "duration_ms": 0.567,
           "context_message_count": 2,
           "active_task": null,
           "forced_task": null,
@@ -312,7 +312,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.402,
+          "duration_ms": 0.448,
           "context_message_count": 4,
           "active_task": null,
           "forced_task": null,
@@ -411,7 +411,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.301,
+          "duration_ms": 0.345,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -502,7 +502,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.396,
+          "duration_ms": 0.548,
           "context_message_count": 2,
           "active_task": null,
           "forced_task": null,
@@ -593,7 +593,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.405,
+          "duration_ms": 0.401,
           "context_message_count": 4,
           "active_task": null,
           "forced_task": null,
@@ -692,7 +692,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.299,
+          "duration_ms": 0.303,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -783,7 +783,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.338,
+          "duration_ms": 0.369,
           "context_message_count": 2,
           "active_task": null,
           "forced_task": null,
@@ -874,7 +874,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.382,
+          "duration_ms": 0.389,
           "context_message_count": 4,
           "active_task": null,
           "forced_task": null,
@@ -973,7 +973,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.429,
+          "duration_ms": 0.424,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -1064,7 +1064,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.81,
+          "duration_ms": 1.004,
           "context_message_count": 2,
           "active_task": null,
           "forced_task": null,
@@ -1125,7 +1125,7 @@
             "router_model": null,
             "router_input_tokens": null,
             "router_output_tokens": null,
-            "router_duration_ms": 0.416
+            "router_duration_ms": 0.55
           },
           "flow_before": {
             "active_task": null,
@@ -1155,7 +1155,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.765,
+          "duration_ms": 0.933,
           "context_message_count": 4,
           "active_task": null,
           "forced_task": null,
@@ -1216,7 +1216,7 @@
             "router_model": null,
             "router_input_tokens": null,
             "router_output_tokens": null,
-            "router_duration_ms": 0.325
+            "router_duration_ms": 0.432
           },
           "flow_before": {
             "active_task": null,
@@ -1254,7 +1254,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.368,
+          "duration_ms": 0.404,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -1345,7 +1345,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.396,
+          "duration_ms": 0.393,
           "context_message_count": 2,
           "active_task": null,
           "forced_task": null,
@@ -1436,7 +1436,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.406,
+          "duration_ms": 0.579,
           "context_message_count": 4,
           "active_task": null,
           "forced_task": null,
@@ -1535,7 +1535,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.329,
+          "duration_ms": 0.35,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -1626,7 +1626,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.374,
+          "duration_ms": 0.368,
           "context_message_count": 2,
           "active_task": null,
           "forced_task": null,
@@ -1717,7 +1717,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.406,
+          "duration_ms": 0.409,
           "context_message_count": 4,
           "active_task": null,
           "forced_task": null,
@@ -1816,7 +1816,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.322,
+          "duration_ms": 0.335,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -1907,7 +1907,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.376,
+          "duration_ms": 0.515,
           "context_message_count": 2,
           "active_task": null,
           "forced_task": null,
@@ -1998,7 +1998,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.459,
+          "duration_ms": 0.455,
           "context_message_count": 4,
           "active_task": null,
           "forced_task": null,
@@ -2097,7 +2097,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.329,
+          "duration_ms": 0.339,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -2188,7 +2188,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.363,
+          "duration_ms": 0.367,
           "context_message_count": 2,
           "active_task": null,
           "forced_task": null,
@@ -2279,7 +2279,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.413,
+          "duration_ms": 0.42,
           "context_message_count": 4,
           "active_task": null,
           "forced_task": null,
@@ -2379,7 +2379,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.679,
+          "duration_ms": 0.795,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -2471,7 +2471,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.718,
+          "duration_ms": 0.768,
           "context_message_count": 2,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -2563,7 +2563,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.772,
+          "duration_ms": 0.794,
           "context_message_count": 4,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -2665,7 +2665,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.52,
+          "duration_ms": 0.642,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -2756,7 +2756,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.62,
+          "duration_ms": 0.737,
           "context_message_count": 2,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -2850,7 +2850,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.673,
+          "duration_ms": 0.692,
           "context_message_count": 4,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -2950,7 +2950,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.534,
+          "duration_ms": 0.649,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -3041,7 +3041,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.587,
+          "duration_ms": 0.6,
           "context_message_count": 2,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -3135,7 +3135,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.675,
+          "duration_ms": 0.84,
           "context_message_count": 4,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -3235,7 +3235,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.565,
+          "duration_ms": 0.708,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -3326,7 +3326,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.648,
+          "duration_ms": 0.691,
           "context_message_count": 2,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -3420,7 +3420,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.737,
+          "duration_ms": 0.731,
           "context_message_count": 4,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -3520,7 +3520,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.509,
+          "duration_ms": 0.516,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -3612,7 +3612,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.704,
+          "duration_ms": 0.873,
           "context_message_count": 2,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -3704,7 +3704,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.681,
+          "duration_ms": 0.718,
           "context_message_count": 4,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -3804,7 +3804,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.902,
+          "duration_ms": 1.054,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -3865,7 +3865,7 @@
             "router_model": null,
             "router_input_tokens": null,
             "router_output_tokens": null,
-            "router_duration_ms": 0.384
+            "router_duration_ms": 0.515
           },
           "flow_before": {
             "active_task": null,
@@ -3895,7 +3895,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.591,
+          "duration_ms": 0.595,
           "context_message_count": 2,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -3986,7 +3986,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 1.03,
+          "duration_ms": 1.146,
           "context_message_count": 4,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -4047,7 +4047,7 @@
             "router_model": null,
             "router_input_tokens": null,
             "router_output_tokens": null,
-            "router_duration_ms": 0.357
+            "router_duration_ms": 0.461
           },
           "flow_before": {
             "active_task": "relationship_advice",
@@ -4086,7 +4086,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.474,
+          "duration_ms": 0.628,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -4177,7 +4177,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.665,
+          "duration_ms": 0.742,
           "context_message_count": 2,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -4273,7 +4273,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.679,
+          "duration_ms": 0.905,
           "context_message_count": 4,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -4375,7 +4375,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.58,
+          "duration_ms": 0.613,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -4466,7 +4466,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.673,
+          "duration_ms": 0.779,
           "context_message_count": 2,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -4559,7 +4559,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.758,
+          "duration_ms": 0.929,
           "context_message_count": 4,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -4660,7 +4660,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.555,
+          "duration_ms": 0.711,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -4757,7 +4757,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 1.472,
+          "duration_ms": 1.498,
           "context_message_count": 2,
           "active_task": "date_planning",
           "forced_task": null,
@@ -4856,7 +4856,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.854,
+          "duration_ms": 0.845,
           "context_message_count": 4,
           "active_task": "date_planning",
           "forced_task": null,
@@ -4963,7 +4963,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.544,
+          "duration_ms": 0.839,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -5058,7 +5058,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.772,
+          "duration_ms": 0.882,
           "context_message_count": 2,
           "active_task": "date_planning",
           "forced_task": null,
@@ -5155,7 +5155,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.834,
+          "duration_ms": 0.89,
           "context_message_count": 4,
           "active_task": "date_planning",
           "forced_task": null,
@@ -5264,7 +5264,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.514,
+          "duration_ms": 0.68,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -5359,7 +5359,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.81,
+          "duration_ms": 0.933,
           "context_message_count": 2,
           "active_task": "date_planning",
           "forced_task": null,
@@ -5464,7 +5464,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.808,
+          "duration_ms": 0.858,
           "context_message_count": 4,
           "active_task": "date_planning",
           "forced_task": null,
@@ -5571,7 +5571,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.488,
+          "duration_ms": 0.537,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -5672,7 +5672,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.6,
+          "duration_ms": 0.619,
           "context_message_count": 2,
           "active_task": "date_planning",
           "forced_task": null,
@@ -5767,7 +5767,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.641,
+          "duration_ms": 0.684,
           "context_message_count": 4,
           "active_task": "date_planning",
           "forced_task": null,
@@ -5872,7 +5872,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.543,
+          "duration_ms": 0.618,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -5967,7 +5967,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.874,
+          "duration_ms": 0.973,
           "context_message_count": 2,
           "active_task": "date_planning",
           "forced_task": null,
@@ -6082,7 +6082,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.88,
+          "duration_ms": 0.96,
           "context_message_count": 4,
           "active_task": "date_planning",
           "forced_task": null,
@@ -6191,7 +6191,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.553,
+          "duration_ms": 0.617,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -6292,7 +6292,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.732,
+          "duration_ms": 1.035,
           "context_message_count": 2,
           "active_task": "date_planning",
           "forced_task": null,
@@ -6389,7 +6389,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.636,
+          "duration_ms": 0.762,
           "context_message_count": 4,
           "active_task": "date_planning",
           "forced_task": null,
@@ -6489,7 +6489,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.477,
+          "duration_ms": 0.593,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -6580,7 +6580,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.977,
+          "duration_ms": 1.281,
           "context_message_count": 2,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -6641,7 +6641,7 @@
             "router_model": null,
             "router_input_tokens": null,
             "router_output_tokens": null,
-            "router_duration_ms": 0.384
+            "router_duration_ms": 0.504
           },
           "flow_before": {
             "active_task": "relationship_advice",
@@ -6671,7 +6671,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.686,
+          "duration_ms": 0.811,
           "context_message_count": 4,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -6770,7 +6770,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.434,
+          "duration_ms": 0.491,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -6861,7 +6861,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.532,
+          "duration_ms": 0.774,
           "context_message_count": 2,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -6952,7 +6952,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.658,
+          "duration_ms": 0.846,
           "context_message_count": 4,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -7051,7 +7051,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.523,
+          "duration_ms": 0.564,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -7144,7 +7144,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.667,
+          "duration_ms": 0.687,
           "context_message_count": 2,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -7237,7 +7237,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.632,
+          "duration_ms": 0.662,
           "context_message_count": 4,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -7340,7 +7340,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.575,
+          "duration_ms": 0.712,
           "context_message_count": 2,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -7431,7 +7431,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.619,
+          "duration_ms": 0.739,
           "context_message_count": 4,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -7524,7 +7524,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.709,
+          "duration_ms": 0.872,
           "context_message_count": 6,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -7623,7 +7623,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.308,
+          "duration_ms": 0.364,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -7714,7 +7714,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.61,
+          "duration_ms": 0.656,
           "context_message_count": 2,
           "active_task": "date_planning",
           "forced_task": null,
@@ -7809,7 +7809,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.797,
+          "duration_ms": 0.815,
           "context_message_count": 4,
           "active_task": "date_planning",
           "forced_task": null,
@@ -7926,7 +7926,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.584,
+          "duration_ms": 0.583,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -8032,7 +8032,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.966,
+          "duration_ms": 1.18,
           "context_message_count": 2,
           "active_task": "date_planning",
           "forced_task": null,
@@ -8126,7 +8126,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.665,
+          "duration_ms": 0.69,
           "context_message_count": 4,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -8227,7 +8227,7 @@
             "pending_task": true,
             "llm_policy": true
           },
-          "duration_ms": 0.812,
+          "duration_ms": 0.91,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -8290,7 +8290,7 @@
             "router_model": null,
             "router_input_tokens": null,
             "router_output_tokens": null,
-            "router_duration_ms": 0.246
+            "router_duration_ms": 0.266
           },
           "flow_before": {
             "active_task": null,
@@ -8322,7 +8322,7 @@
             "pending_task": true,
             "llm_policy": true
           },
-          "duration_ms": 0.439,
+          "duration_ms": 0.535,
           "context_message_count": 2,
           "active_task": "relationship_advice",
           "forced_task": "date_planning",
@@ -8414,7 +8414,7 @@
             "pending_task_cancelled": true,
             "llm_policy": true
           },
-          "duration_ms": 0.72,
+          "duration_ms": 0.719,
           "context_message_count": 4,
           "active_task": "date_planning",
           "forced_task": null,
@@ -8513,7 +8513,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.378,
+          "duration_ms": 0.509,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -8604,7 +8604,7 @@
             "clarification_exhausted": true,
             "llm_policy": true
           },
-          "duration_ms": 1.955,
+          "duration_ms": 2.187,
           "context_message_count": 2,
           "active_task": null,
           "forced_task": null,
@@ -8665,7 +8665,7 @@
             "router_model": null,
             "router_input_tokens": null,
             "router_output_tokens": null,
-            "router_duration_ms": 1.554
+            "router_duration_ms": 1.744
           },
           "flow_before": {
             "active_task": null,
@@ -8695,7 +8695,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.658,
+          "duration_ms": 0.842,
           "context_message_count": 4,
           "active_task": null,
           "forced_task": null,
@@ -8795,7 +8795,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 1.453,
+          "duration_ms": 1.539,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -8887,7 +8887,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.682,
+          "duration_ms": 0.872,
           "context_message_count": 2,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -8978,7 +8978,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.753,
+          "duration_ms": 0.922,
           "context_message_count": 4,
           "active_task": "relationship_advice",
           "forced_task": null,
@@ -9078,7 +9078,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.47,
+          "duration_ms": 0.582,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -9170,7 +9170,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.495,
+          "duration_ms": 0.778,
           "context_message_count": 2,
           "active_task": null,
           "forced_task": null,
@@ -9262,7 +9262,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.518,
+          "duration_ms": 0.589,
           "context_message_count": 4,
           "active_task": null,
           "forced_task": null,
@@ -9362,7 +9362,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.396,
+          "duration_ms": 0.413,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -9454,7 +9454,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.407,
+          "duration_ms": 0.401,
           "context_message_count": 2,
           "active_task": null,
           "forced_task": null,
@@ -9545,7 +9545,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.982,
+          "duration_ms": 1.18,
           "context_message_count": 4,
           "active_task": null,
           "forced_task": null,
@@ -9606,7 +9606,7 @@
             "router_model": null,
             "router_input_tokens": null,
             "router_output_tokens": null,
-            "router_duration_ms": 0.36
+            "router_duration_ms": 0.397
           },
           "flow_before": {
             "active_task": null,
@@ -9645,7 +9645,7 @@
             "slots": true,
             "llm_policy": true
           },
-          "duration_ms": 0.556,
+          "duration_ms": 0.781,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -9745,7 +9745,7 @@
             "slots": true,
             "llm_policy": true
           },
-          "duration_ms": 0.671,
+          "duration_ms": 0.782,
           "context_message_count": 2,
           "active_task": "date_planning",
           "forced_task": null,
@@ -9843,7 +9843,7 @@
             "slots": true,
             "llm_policy": true
           },
-          "duration_ms": 0.795,
+          "duration_ms": 0.965,
           "context_message_count": 4,
           "active_task": "date_planning",
           "forced_task": null,
@@ -9950,7 +9950,7 @@
             "slot_rejected_fields": true,
             "llm_policy": true
           },
-          "duration_ms": 2.769,
+          "duration_ms": 2.94,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -10014,7 +10014,7 @@
             "router_model": null,
             "router_input_tokens": null,
             "router_output_tokens": null,
-            "router_duration_ms": 2.19
+            "router_duration_ms": 2.326
           },
           "flow_before": {
             "active_task": null,
@@ -10046,7 +10046,7 @@
             "slot_rejected_fields": true,
             "llm_policy": true
           },
-          "duration_ms": 1.588,
+          "duration_ms": 2.056,
           "context_message_count": 2,
           "active_task": null,
           "forced_task": null,
@@ -10115,7 +10115,7 @@
             "router_model": null,
             "router_input_tokens": null,
             "router_output_tokens": null,
-            "router_duration_ms": 0.891
+            "router_duration_ms": 1.132
           },
           "flow_before": {
             "active_task": null,
@@ -10146,7 +10146,7 @@
             "slots": true,
             "llm_policy": true
           },
-          "duration_ms": 0.461,
+          "duration_ms": 0.573,
           "context_message_count": 4,
           "active_task": null,
           "forced_task": null,
@@ -10246,7 +10246,7 @@
             "fallback_reason": true,
             "llm_policy": true
           },
-          "duration_ms": 0.519,
+          "duration_ms": 0.549,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -10268,6 +10268,106 @@
             "source": "rules",
             "llm_used": false,
             "llm_error": "路由模型返回内容不符合 RouteCorrection JSON 结构。",
+            "fallback_reason": "llm_correction_failed",
+            "clarification_triggered": false,
+            "clarification_exhausted": false,
+            "clarification_reason": null,
+            "pending_task": null,
+            "pending_task_cancelled": false,
+            "date_request_mode": "none",
+            "date_intent": "none",
+            "date_mutation": "none",
+            "date_plan": {
+              "city": null,
+              "area": null,
+              "plan_mode": null,
+              "date": null,
+              "end_date": null,
+              "day_count": null,
+              "nights": null,
+              "target_day": null,
+              "start_time": null,
+              "budget": null,
+              "budget_scope": null,
+              "preferences": [],
+              "dining_keywords": [],
+              "meal_keywords": {},
+              "activity_keywords": [],
+              "schedule_hints": [],
+              "replace_place_names": [],
+              "excluded_keywords": [],
+              "transport_mode": null,
+              "notes": [],
+              "constraints": [],
+              "lodging_notes": []
+            },
+            "slot_accepted_fields": {},
+            "slot_rejected_fields": {},
+            "slot_field_sources": {},
+            "router_model": null,
+            "router_input_tokens": null,
+            "router_output_tokens": null,
+            "router_duration_ms": 0.016
+          },
+          "flow_before": {
+            "active_task": null,
+            "pending_task": null,
+            "pending_task_source": null,
+            "pending_task_turns_remaining": 0,
+            "last_clarification_reason": null,
+            "clarification_attempt_count": 0,
+            "recent_risk_level": null
+          },
+          "flow_after": {
+            "active_task": "relationship_advice",
+            "pending_task": null,
+            "pending_task_source": null,
+            "pending_task_turns_remaining": 0,
+            "last_clarification_reason": null,
+            "clarification_attempt_count": 0,
+            "recent_risk_level": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "rt_v4_c37_evidence_failure_fallback",
+      "category": "llm_failure",
+      "turn_count": 1,
+      "passed": true,
+      "turns": [
+        {
+          "turn_id": "t1",
+          "category": "llm_failure",
+          "passed": true,
+          "checks": {
+            "task_type": true,
+            "clarification": true,
+            "fallback_reason": true,
+            "llm_policy": true
+          },
+          "duration_ms": 0.594,
+          "context_message_count": 0,
+          "active_task": null,
+          "forced_task": null,
+          "pending_continuation": false,
+          "llm_calls": 1,
+          "router_correction_calls": 1,
+          "actual": {
+            "route": "relationship_advice",
+            "task_type": "relationship_advice",
+            "rule_task_type": "relationship_advice",
+            "llm_task_type": null,
+            "task_guard_applied": false,
+            "secondary_tasks": [],
+            "primary_scenario": "pursuit",
+            "secondary_scenarios": [],
+            "primary_goal": "initiate",
+            "secondary_goals": [],
+            "risk_level": "normal",
+            "source": "rules",
+            "llm_used": false,
+            "llm_error": "路由证据不在对话原文中。",
             "fallback_reason": "llm_correction_failed",
             "clarification_triggered": false,
             "clarification_exhausted": false,
@@ -10331,106 +10431,6 @@
       ]
     },
     {
-      "id": "rt_v4_c37_evidence_failure_fallback",
-      "category": "llm_failure",
-      "turn_count": 1,
-      "passed": true,
-      "turns": [
-        {
-          "turn_id": "t1",
-          "category": "llm_failure",
-          "passed": true,
-          "checks": {
-            "task_type": true,
-            "clarification": true,
-            "fallback_reason": true,
-            "llm_policy": true
-          },
-          "duration_ms": 0.506,
-          "context_message_count": 0,
-          "active_task": null,
-          "forced_task": null,
-          "pending_continuation": false,
-          "llm_calls": 1,
-          "router_correction_calls": 1,
-          "actual": {
-            "route": "relationship_advice",
-            "task_type": "relationship_advice",
-            "rule_task_type": "relationship_advice",
-            "llm_task_type": null,
-            "task_guard_applied": false,
-            "secondary_tasks": [],
-            "primary_scenario": "pursuit",
-            "secondary_scenarios": [],
-            "primary_goal": "initiate",
-            "secondary_goals": [],
-            "risk_level": "normal",
-            "source": "rules",
-            "llm_used": false,
-            "llm_error": "路由证据不在对话原文中。",
-            "fallback_reason": "llm_correction_failed",
-            "clarification_triggered": false,
-            "clarification_exhausted": false,
-            "clarification_reason": null,
-            "pending_task": null,
-            "pending_task_cancelled": false,
-            "date_request_mode": "none",
-            "date_intent": "none",
-            "date_mutation": "none",
-            "date_plan": {
-              "city": null,
-              "area": null,
-              "plan_mode": null,
-              "date": null,
-              "end_date": null,
-              "day_count": null,
-              "nights": null,
-              "target_day": null,
-              "start_time": null,
-              "budget": null,
-              "budget_scope": null,
-              "preferences": [],
-              "dining_keywords": [],
-              "meal_keywords": {},
-              "activity_keywords": [],
-              "schedule_hints": [],
-              "replace_place_names": [],
-              "excluded_keywords": [],
-              "transport_mode": null,
-              "notes": [],
-              "constraints": [],
-              "lodging_notes": []
-            },
-            "slot_accepted_fields": {},
-            "slot_rejected_fields": {},
-            "slot_field_sources": {},
-            "router_model": null,
-            "router_input_tokens": null,
-            "router_output_tokens": null,
-            "router_duration_ms": 0.011
-          },
-          "flow_before": {
-            "active_task": null,
-            "pending_task": null,
-            "pending_task_source": null,
-            "pending_task_turns_remaining": 0,
-            "last_clarification_reason": null,
-            "clarification_attempt_count": 0,
-            "recent_risk_level": null
-          },
-          "flow_after": {
-            "active_task": "relationship_advice",
-            "pending_task": null,
-            "pending_task_source": null,
-            "pending_task_turns_remaining": 0,
-            "last_clarification_reason": null,
-            "clarification_attempt_count": 0,
-            "recent_risk_level": null
-          }
-        }
-      ]
-    },
-    {
       "id": "rt_v4_c38_timeout_fallback",
       "category": "llm_failure",
       "turn_count": 1,
@@ -10446,7 +10446,7 @@
             "fallback_reason": true,
             "llm_policy": true
           },
-          "duration_ms": 0.497,
+          "duration_ms": 0.52,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -10507,7 +10507,7 @@
             "router_model": null,
             "router_input_tokens": null,
             "router_output_tokens": null,
-            "router_duration_ms": 0.007
+            "router_duration_ms": 0.009
           },
           "flow_before": {
             "active_task": null,
@@ -10547,7 +10547,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.552,
+          "duration_ms": 0.607,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -10648,7 +10648,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.548,
+          "duration_ms": 0.644,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -10751,7 +10751,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.54,
+          "duration_ms": 0.853,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -10852,7 +10852,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.538,
+          "duration_ms": 0.602,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -10954,7 +10954,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.555,
+          "duration_ms": 0.558,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -11057,7 +11057,7 @@
             "clarification": true,
             "llm_policy": true
           },
-          "duration_ms": 0.489,
+          "duration_ms": 0.511,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -11158,7 +11158,7 @@
             "pending_task": true,
             "llm_policy": true
           },
-          "duration_ms": 0.971,
+          "duration_ms": 1.098,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -11219,7 +11219,7 @@
             "router_model": null,
             "router_input_tokens": null,
             "router_output_tokens": null,
-            "router_duration_ms": 0.452
+            "router_duration_ms": 0.568
           },
           "flow_before": {
             "active_task": null,
@@ -11259,7 +11259,7 @@
             "pending_task": true,
             "llm_policy": true
           },
-          "duration_ms": 1.017,
+          "duration_ms": 1.034,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -11320,7 +11320,7 @@
             "router_model": null,
             "router_input_tokens": null,
             "router_output_tokens": null,
-            "router_duration_ms": 0.52
+            "router_duration_ms": 0.516
           },
           "flow_before": {
             "active_task": null,
@@ -11360,7 +11360,7 @@
             "pending_task": true,
             "llm_policy": true
           },
-          "duration_ms": 0.743,
+          "duration_ms": 0.945,
           "context_message_count": 0,
           "active_task": null,
           "forced_task": null,
@@ -11423,7 +11423,7 @@
             "router_model": null,
             "router_input_tokens": null,
             "router_output_tokens": null,
-            "router_duration_ms": 0.214
+            "router_duration_ms": 0.25
           },
           "flow_before": {
             "active_task": null,
@@ -11454,7 +11454,7 @@
             "pending_task_cancelled": true,
             "llm_policy": true
           },
-          "duration_ms": 0.443,
+          "duration_ms": 0.506,
           "context_message_count": 2,
           "active_task": "relationship_advice",
           "forced_task": null,

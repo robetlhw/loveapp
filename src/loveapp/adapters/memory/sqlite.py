@@ -26,6 +26,7 @@ from loveapp.domain.memory import (
     utc_now,
 )
 from loveapp.domain.memory_context import attach_memories, select_context_memories
+from loveapp.domain.contextual_memory import apply_contextual_memory_update
 from loveapp.domain.memory_predicates import normalize_predicate
 from loveapp.domain.memory_write import (
     MemoryTransitionAudit,
@@ -169,7 +170,7 @@ class SQLiteMemoryStore:
         query = f"""
             SELECT * FROM messages
             WHERE {" AND ".join(clauses)}
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, rowid DESC
             LIMIT ?
         """
         connection = await self._open_connection()
@@ -275,6 +276,8 @@ class SQLiteMemoryStore:
             await _ensure_scope(connection, user_id, relationship_id, now)
             await _expire_due_memories(connection, now)
             results: list[MemorySaveResult] = []
+            updated_memory_ids: list[str] = []
+            implicit_audits: list[MemoryTransitionAudit] = []
             for operation in batch.operations:
                 candidate = normalize_candidate_predicate(operation.candidate).model_copy(
                     update={"supersedes_id": None}
@@ -291,6 +294,80 @@ class SQLiteMemoryStore:
                 results.append(result)
                 if result.item.kind == MemoryKind.PLANNED_EVENT:
                     await _ensure_plan_for_memory_in_transaction(connection, result.item)
+
+            for contextual_update in batch.contextual_updates:
+                target_row = await _fetchone(
+                    connection,
+                    """
+                    SELECT * FROM memory_items
+                    WHERE id = ? AND user_id = ? AND relationship_id = ?
+                    """,
+                    (
+                        contextual_update.target_memory_id,
+                        user_id,
+                        relationship_id,
+                    ),
+                )
+                if target_row is None:
+                    raise ValueError(
+                        "contextual update target is outside the current relationship scope"
+                    )
+                target = _row_to_memory(target_row)
+                updated = apply_contextual_memory_update(
+                    target,
+                    contextual_update,
+                    updated_at=now,
+                )
+                await connection.execute(
+                    """
+                    UPDATE memory_items
+                    SET evidence_spans_json = ?, time_kind = ?, period_end = ?,
+                        temporal_precision = ?, payload_json = ?, claim_relation = ?,
+                        updated_at = ?, last_seen_at = ?
+                    WHERE id = ? AND user_id = ? AND relationship_id = ?
+                    """,
+                    (
+                        _dump_json(updated.evidence_spans),
+                        updated.time_kind.value,
+                        _dump_datetime(updated.period_end),
+                        updated.temporal_precision.value,
+                        _dump_json(updated.payload),
+                        updated.claim_relation.value if updated.claim_relation else None,
+                        _dump_datetime(updated.updated_at),
+                        _dump_datetime(updated.last_seen_at),
+                        updated.id,
+                        user_id,
+                        relationship_id,
+                    ),
+                )
+                updated_memory_ids.append(updated.id)
+                audit = MemoryTransitionAudit(
+                    user_id=user_id,
+                    relationship_id=relationship_id,
+                    source_message_id=batch.source_message_id,
+                    incoming_memory_id=updated.id,
+                    target_memory_ids=[updated.id],
+                    relation=ClaimRelation.UPDATE,
+                    decision=updated.admission_decision or AdmissionDecision.PROPOSE,
+                    rule_name=f"contextual_{contextual_update.update_type.value}_update",
+                    admission_score=updated.admission_score,
+                    score_breakdown={
+                        "contextual_update_type": contextual_update.update_type.value,
+                        "temporal_expression": contextual_update.temporal_expression,
+                        "duration_value": contextual_update.duration_value,
+                        "duration_unit": contextual_update.duration_unit,
+                    },
+                    raw_predicate=updated.raw_predicate,
+                    canonical_predicate=updated.canonical_predicate,
+                    extractor_model=updated.extractor_model,
+                    verifier_model=updated.verifier_model,
+                    prompt_version=updated.prompt_version,
+                    evidence=[contextual_update.evidence_span],
+                    reason=contextual_update.reason,
+                    created_at=now,
+                )
+                await _insert_transition_audit(connection, audit)
+                implicit_audits.append(audit)
 
             for update in batch.plan_updates:
                 source_event_memory_id = (
@@ -311,7 +388,6 @@ class SQLiteMemoryStore:
 
             saved_memory_ids = [result.item.id for result in results]
             resolved_targets: list[list[str]] = []
-            implicit_audits: list[MemoryTransitionAudit] = []
             for index, operation in enumerate(batch.operations):
                 operation_targets = resolve_operation_target_ids(
                     operation,
@@ -458,7 +534,11 @@ class SQLiteMemoryStore:
                 if row is None:
                     raise RuntimeError("memory disappeared after committing its write batch")
                 refreshed.append(result.model_copy(update={"item": _row_to_memory(row)}))
-            return MemoryWriteBatchResult(saved=refreshed, audits=audits)
+            return MemoryWriteBatchResult(
+                saved=refreshed,
+                updated_memory_ids=updated_memory_ids,
+                audits=audits,
+            )
         except Exception:
             await connection.rollback()
             raise
@@ -1033,14 +1113,18 @@ class SQLiteMemoryStore:
                 INSERT INTO memory_extraction_runs (
                     id, user_id, relationship_id, conversation_id, source_message_id,
                     status, gate_should_extract, gate_reason, gate_signals_json,
+                    gate_matched_rule, gate_matched_span, gate_context_json,
                     attempts_json, saved_memory_ids_json, discarded_spans_json,
                     error, created_at, updated_at, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     status = excluded.status,
                     gate_should_extract = excluded.gate_should_extract,
                     gate_reason = excluded.gate_reason,
                     gate_signals_json = excluded.gate_signals_json,
+                    gate_matched_rule = excluded.gate_matched_rule,
+                    gate_matched_span = excluded.gate_matched_span,
+                    gate_context_json = excluded.gate_context_json,
                     attempts_json = excluded.attempts_json,
                     saved_memory_ids_json = excluded.saved_memory_ids_json,
                     discarded_spans_json = excluded.discarded_spans_json,
@@ -1058,6 +1142,18 @@ class SQLiteMemoryStore:
                     int(run.gate_decision.should_extract),
                     run.gate_decision.reason.value,
                     _dump_json(run.gate_decision.signals),
+                    run.gate_decision.matched_rule,
+                    run.gate_decision.matched_span,
+                    _dump_json(
+                        {
+                            "contextual_probe": run.gate_decision.contextual_probe,
+                            "history_loaded_for_gate": run.gate_decision.history_loaded_for_gate,
+                            "antecedent_candidate_ids": run.gate_decision.antecedent_candidate_ids,
+                            "selected_target_memory_id": run.gate_decision.selected_target_memory_id,
+                            "target_guard_result": run.gate_decision.target_guard_result,
+                            "contextual_update_type": run.gate_decision.contextual_update_type,
+                        }
+                    ),
                     _dump_json([attempt.model_dump(mode="json") for attempt in run.attempts]),
                     _dump_json(run.saved_memory_ids),
                     _dump_json(
@@ -2138,6 +2234,9 @@ def _row_to_extraction_run(row: aiosqlite.Row) -> MemoryExtractionRun:
             should_extract=bool(row["gate_should_extract"]),
             reason=row["gate_reason"],
             signals=json.loads(row["gate_signals_json"]),
+            matched_rule=row["gate_matched_rule"],
+            matched_span=row["gate_matched_span"],
+            **json.loads(row["gate_context_json"]),
         ),
         attempts=json.loads(row["attempts_json"]),
         saved_memory_ids=json.loads(row["saved_memory_ids_json"]),
@@ -2289,7 +2388,17 @@ async def _migrate_schema(connection: aiosqlite.Connection) -> None:
             ADD COLUMN discarded_spans_json TEXT NOT NULL DEFAULT '[]'
             """
         )
-    await connection.execute("PRAGMA user_version = 6")
+    run_columns_to_add = {
+        "gate_matched_rule": "TEXT",
+        "gate_matched_span": "TEXT",
+        "gate_context_json": "TEXT NOT NULL DEFAULT '{}'",
+    }
+    for column, declaration in run_columns_to_add.items():
+        if column not in run_columns:
+            await connection.execute(
+                f"ALTER TABLE memory_extraction_runs ADD COLUMN {column} {declaration}"
+            )
+    await connection.execute("PRAGMA user_version = 7")
 
 
 _SCHEMA = """
@@ -2421,6 +2530,9 @@ CREATE TABLE IF NOT EXISTS memory_extraction_runs (
     gate_should_extract INTEGER NOT NULL,
     gate_reason TEXT NOT NULL,
     gate_signals_json TEXT NOT NULL DEFAULT '[]',
+    gate_matched_rule TEXT,
+    gate_matched_span TEXT,
+    gate_context_json TEXT NOT NULL DEFAULT '{}',
     attempts_json TEXT NOT NULL DEFAULT '[]',
     saved_memory_ids_json TEXT NOT NULL DEFAULT '[]',
     discarded_spans_json TEXT NOT NULL DEFAULT '[]',
@@ -2485,5 +2597,5 @@ CREATE INDEX IF NOT EXISTS idx_memory_extraction_runs_scope
 CREATE INDEX IF NOT EXISTS idx_memory_transition_audit_scope
     ON memory_transition_audit(user_id, relationship_id, created_at);
 
-PRAGMA user_version = 6;
+PRAGMA user_version = 7;
 """

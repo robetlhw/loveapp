@@ -19,6 +19,7 @@ from loveapp.domain.memory import (
     utc_now,
 )
 from loveapp.domain.memory_context import attach_memories, select_context_memories
+from loveapp.domain.contextual_memory import apply_contextual_memory_update
 from loveapp.domain.memory_write import (
     MemoryTransitionAudit,
     MemoryWriteBatch,
@@ -240,6 +241,7 @@ class InMemoryMemoryStore:
         audit_snapshot = dict(self._transition_audits)
         try:
             saved: list[MemorySaveResult] = []
+            updated_memory_ids: list[str] = []
             audits: list[MemoryTransitionAudit] = []
             for operation in batch.operations:
                 candidate = operation.candidate.model_copy(update={"supersedes_id": None})
@@ -251,6 +253,51 @@ class InMemoryMemoryStore:
                     status=operation.status,
                 )
                 saved.append(result)
+
+            for contextual_update in batch.contextual_updates:
+                target = self._memories.get(contextual_update.target_memory_id)
+                if (
+                    target is None
+                    or target.user_id != user_id
+                    or target.relationship_id != relationship_id
+                ):
+                    raise ValueError(
+                        "contextual update target is outside the current relationship scope"
+                    )
+                updated = apply_contextual_memory_update(
+                    target,
+                    contextual_update,
+                    updated_at=self._clock(),
+                )
+                self._memories[target.id] = updated
+                updated_memory_ids.append(target.id)
+                audit = MemoryTransitionAudit(
+                    user_id=user_id,
+                    relationship_id=relationship_id,
+                    source_message_id=batch.source_message_id,
+                    incoming_memory_id=target.id,
+                    target_memory_ids=[target.id],
+                    relation=ClaimRelation.UPDATE,
+                    decision=target.admission_decision or AdmissionDecision.PROPOSE,
+                    rule_name=f"contextual_{contextual_update.update_type.value}_update",
+                    admission_score=target.admission_score,
+                    score_breakdown={
+                        "contextual_update_type": contextual_update.update_type.value,
+                        "temporal_expression": contextual_update.temporal_expression,
+                        "duration_value": contextual_update.duration_value,
+                        "duration_unit": contextual_update.duration_unit,
+                    },
+                    raw_predicate=target.raw_predicate,
+                    canonical_predicate=target.canonical_predicate,
+                    extractor_model=target.extractor_model,
+                    verifier_model=target.verifier_model,
+                    prompt_version=target.prompt_version,
+                    evidence=[contextual_update.evidence_span],
+                    reason=contextual_update.reason,
+                    created_at=self._clock(),
+                )
+                self._transition_audits[audit.id] = audit
+                audits.append(audit.model_copy(deep=True))
 
             for update in batch.plan_updates:
                 source_event_memory_id = (
@@ -396,7 +443,11 @@ class InMemoryMemoryStore:
                 for audit_id, audit in self._transition_audits.items()
                 if audit_id not in audit_snapshot
             ]
-            return MemoryWriteBatchResult(saved=saved, audits=committed_audits)
+            return MemoryWriteBatchResult(
+                saved=saved,
+                updated_memory_ids=updated_memory_ids,
+                audits=committed_audits,
+            )
         except Exception:
             self._memories = memory_snapshot
             self._relationship_plans = plan_snapshot

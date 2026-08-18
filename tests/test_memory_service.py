@@ -8,6 +8,7 @@ from loveapp.adapters.memory import InMemoryMemoryStore
 from loveapp.agents import AdviceAgent, DatePlanningAgent
 from loveapp.application import MemoryService
 from loveapp.application.memory import NoOpMemoryExtractor
+from loveapp.application.memory_gate import MemoryGate
 from loveapp.bootstrap import build_memory_container, load_seed_documents
 from loveapp.core.config import Settings
 from loveapp.domain.advice import AdviceRequest, AdviceResponse, RelationshipContext
@@ -35,6 +36,7 @@ from loveapp.domain.memory import (
 )
 from loveapp.domain.policy import ResolvedScenarioPolicy
 from loveapp.safety import SafetyPolicy
+from loveapp.core.timing import ExecutionTrace
 
 
 class StubExtractor:
@@ -474,6 +476,148 @@ async def test_memory_service_exposes_discarded_consultation_question() -> None:
 
     assert result.saved == []
     assert result.discarded_spans[0].reason == DiscardReason.CONSULTATION_QUESTION
+
+
+async def test_sidecar_duration_qualifier_updates_only_compatible_contact_pattern() -> None:
+    now = datetime(2026, 8, 8, 12, tzinfo=UTC)
+    store = InMemoryMemoryStore(clock=lambda: now)
+    service = MemoryService(store, NoOpMemoryExtractor(), clock=lambda: now)
+    scope = {
+        "user_id": "contextual-update-user",
+        "relationship_id": "primary",
+        "conversation_id": "contextual-update-conversation",
+    }
+    first = await service.record_message(
+        role=MessageRole.USER,
+        content="她最近回复越来越慢。",
+        **scope,
+    )
+    contact = await store.save_memory(
+        user_id=scope["user_id"],
+        relationship_id=scope["relationship_id"],
+        source_message_id=first.id,
+        status=MemoryStatus.CONFIRMED,
+        candidate=MemoryCandidate(
+            kind=MemoryKind.INTERACTION_PATTERN,
+            subject="relationship",
+            summary="用户报告最近线上联系频率降低",
+            original_text=first.content,
+            evidence_spans=["最近回复越来越慢"],
+            time_kind=TimeKind.INTERVAL,
+            confidence=0.98,
+            canonical_predicate="interaction.contact_frequency",
+            raw_predicate="reply_frequency_declined",
+            payload={
+                "predicate": "reply_frequency_declined",
+                "metric": "contact_frequency",
+                "direction": "decreasing",
+                "channel": "messaging",
+            },
+        ),
+    )
+    preference = await store.save_memory(
+        user_id=scope["user_id"],
+        relationship_id=scope["relationship_id"],
+        status=MemoryStatus.CONFIRMED,
+        candidate=MemoryCandidate(
+            kind=MemoryKind.PREFERENCE,
+            subject="partner",
+            summary="对方喜欢日料",
+            original_text="她喜欢日料。",
+            evidence_spans=["喜欢日料"],
+            confidence=0.98,
+            payload={"predicate": "likes_cuisine", "preference": "日料"},
+        ),
+    )
+    current = await service.record_message(
+        role=MessageRole.USER,
+        content="持续了一个月了，你觉得这种情况是兴趣下降了吗？",
+        **scope,
+    )
+    trace = ExecutionTrace()
+
+    result = await service.remember_recorded_message(
+        message=current,
+        text=current.content,
+        trace=trace,
+    )
+
+    updated = await store.get_memory(contact.item.id, scope["user_id"])
+    unchanged_preference = await store.get_memory(preference.item.id, scope["user_id"])
+    audits = await store.list_transition_audits(
+        user_id=scope["user_id"],
+        relationship_id=scope["relationship_id"],
+        source_message_id=current.id,
+    )
+    gate = result.gate_decision
+    assert gate is not None and gate.reason.value == "contextual_update"
+    assert gate.history_loaded_for_gate is True
+    assert gate.selected_target_memory_id == contact.item.id
+    assert result.saved == []
+    assert result.contextual_updated_memory_ids == [contact.item.id]
+    assert updated is not None
+    assert updated.payload["duration_value"] == 1
+    assert updated.payload["duration_unit"] == "month"
+    assert updated.payload["temporal_expression"] == "持续了一个月了"
+    assert "持续了一个月了" in updated.evidence_spans
+    assert unchanged_preference is not None
+    assert unchanged_preference.payload.get("duration_value") is None
+    assert any(audit.rule_name == "contextual_duration_update" for audit in audits)
+    assert all(audit.canonical_predicate != "relationship.romantic_interest" for audit in audits)
+    gate_trace = next(record for record in trace.snapshot() if record.name == "memory_gate")
+    assert gate_trace.details["contextual_probe"] is True
+    assert gate_trace.details["history_loaded_for_gate"] is True
+
+
+async def test_contextual_duration_does_not_update_ambiguous_or_incompatible_targets() -> None:
+    now = datetime(2026, 8, 8, 12, tzinfo=UTC)
+    store = InMemoryMemoryStore(clock=lambda: now)
+    service = MemoryService(store, NoOpMemoryExtractor(), clock=lambda: now)
+    scope = {
+        "user_id": "ambiguous-contextual-update-user",
+        "relationship_id": "primary",
+        "conversation_id": "ambiguous-contextual-update-conversation",
+    }
+    prior = await service.record_message(
+        role=MessageRole.USER,
+        content="她最近回复越来越慢，而且现在也很少回。",
+        **scope,
+    )
+    for index, evidence in enumerate(("最近回复越来越慢", "现在也很少回")):
+        await store.save_memory(
+            user_id=scope["user_id"],
+            relationship_id=scope["relationship_id"],
+            source_message_id=prior.id,
+            status=MemoryStatus.CONFIRMED,
+            candidate=MemoryCandidate(
+                kind=MemoryKind.INTERACTION_PATTERN,
+                subject="relationship",
+                summary=f"用户报告最近联系频率降低 {index}",
+                original_text=prior.content,
+                evidence_spans=[evidence],
+                confidence=0.98,
+                canonical_predicate="interaction.contact_frequency",
+                raw_predicate="reply_frequency_declined",
+                payload={
+                    "predicate": "reply_frequency_declined",
+                    "metric": "contact_frequency",
+                    "direction": "decreasing" if index == 0 else "low",
+                    "channel": "messaging",
+                },
+            ),
+        )
+    current = await service.record_message(
+        role=MessageRole.USER,
+        content="持续了一个月了。",
+        **scope,
+    )
+
+    result = await service.remember_recorded_message(message=current, text=current.content)
+
+    assert result.gate_decision is not None
+    assert result.gate_decision.should_extract is False
+    assert result.gate_decision.reason.value == "no_durable_signal"
+    assert result.contextual_updated_memory_ids == []
 
 
 async def test_date_planner_uses_preference_from_memory_when_request_has_none() -> None:

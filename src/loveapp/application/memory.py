@@ -21,6 +21,7 @@ from loveapp.domain.memory import (
     MemoryExtractionRun,
     MemoryExtractionStatus,
     MemoryGateDecision,
+    MemoryGateReason,
     MemoryItem,
     MemoryKind,
     MemoryPerspective,
@@ -78,6 +79,10 @@ from .memory_admission import (
     build_admission_policies,
     interaction_pattern_has_frequency,
     interaction_pattern_has_multiple_evidence,
+)
+from .contextual_memory_updates import (
+    may_contain_contextual_memory_update,
+    resolve_contextual_memory_update,
 )
 from .memory_gate import MemoryGate
 from .memory_relations import (
@@ -191,15 +196,20 @@ class MemoryService:
     ) -> RememberResult:
         retrospective_probe = has_retrospective_event_semantics(text)
         contextual_probe = may_contain_contextual_relationship_event(text)
+        contextual_update_probe = may_contain_contextual_memory_update(text)
         preloaded_memories: list[MemoryItem] | None = None
-        if conversation_history is None and (contextual_probe or retrospective_probe):
+        history_loaded_for_gate = conversation_history is not None
+        if conversation_history is None and (
+            contextual_probe or retrospective_probe or contextual_update_probe
+        ):
             conversation_history = await self.get_conversation_history(
                 message.user_id,
                 message.relationship_id,
                 message.conversation_id,
                 exclude_message_id=message.id,
             )
-        if contextual_probe or retrospective_probe:
+            history_loaded_for_gate = True
+        if contextual_probe or retrospective_probe or contextual_update_probe:
             preloaded_memories = await self.store.list_memories(
                 user_id=message.user_id,
                 relationship_id=message.relationship_id,
@@ -210,6 +220,14 @@ class MemoryService:
             text,
             conversation_history=conversation_history or [],
             existing_memories=preloaded_memories or [],
+        )
+        gate_decision = gate_decision.model_copy(
+            update={
+                "contextual_probe": (
+                    gate_decision.contextual_probe or contextual_update_probe
+                ),
+                "history_loaded_for_gate": history_loaded_for_gate,
+            }
         )
         _record_gate_trace(trace, gate_decision)
         now = self._clock()
@@ -297,51 +315,64 @@ class MemoryService:
         if pending_confession is not None:
             pending_candidates.append(pending_confession)
         deterministic_candidates = [*contextual_candidates, *pending_candidates]
+        contextual_update = resolve_contextual_memory_update(
+            text,
+            conversation_history,
+            active,
+        )
+        if contextual_update.resolved:
+            _record_contextual_update_trace(trace, contextual_update)
         attempts: list[MemoryExtractionAttempt] = []
         extraction_failure: Exception | None = None
-        try:
-            extraction_kwargs = {
-                "reference_time": self._clock(),
-                "existing_memories": select_context_memories(
-                    active,
-                    query=text,
-                    limit=20,
-                    reference_time=now,
-                ),
-                "conversation_history": conversation_history,
-                "trace": trace,
-            }
-            # Keep older third-party extractors usable while the telemetry
-            # callback is adopted by the extractor port.
-            if _supports_keyword(self._extractor.extract, "attempt_callback"):
-                extraction_kwargs["attempt_callback"] = attempts.append
-            extraction = await self._extractor.extract(text, **extraction_kwargs)
-        except asyncio.CancelledError:
-            await self._finish_extraction_run(
-                extraction_run,
-                MemoryExtractionStatus.CANCELLED,
-                attempts=attempts,
-                error="memory extraction task was cancelled",
-            )
-            raise
-        except Exception as exc:
-            if not deterministic_candidates:
+        if contextual_update.resolved and gate_decision.reason == MemoryGateReason.CONTEXTUAL_UPDATE:
+            # The current turn only qualifies a known fact.  Invoking the
+            # extractor here would invite it to turn the attached consultation
+            # into a partner-state claim.
+            extraction = AtomicExtraction()
+        else:
+            try:
+                extraction_kwargs = {
+                    "reference_time": self._clock(),
+                    "existing_memories": select_context_memories(
+                        active,
+                        query=text,
+                        limit=20,
+                        reference_time=now,
+                    ),
+                    "conversation_history": conversation_history,
+                    "trace": trace,
+                }
+                # Keep older third-party extractors usable while the telemetry
+                # callback is adopted by the extractor port.
+                if _supports_keyword(self._extractor.extract, "attempt_callback"):
+                    extraction_kwargs["attempt_callback"] = attempts.append
+                extraction = await self._extractor.extract(text, **extraction_kwargs)
+            except asyncio.CancelledError:
                 await self._finish_extraction_run(
                     extraction_run,
-                    MemoryExtractionStatus.FAILED,
+                    MemoryExtractionStatus.CANCELLED,
                     attempts=attempts,
-                    error=str(exc),
+                    error="memory extraction task was cancelled",
                 )
-                if raise_on_extraction_error:
-                    raise
-                return RememberResult(
-                    message=message,
-                    extraction_error=str(exc),
-                    gate_decision=gate_decision,
-                    extraction_run_id=extraction_run.id,
-                )
-            extraction_failure = exc
-            extraction = AtomicExtraction()
+                raise
+            except Exception as exc:
+                if not deterministic_candidates:
+                    await self._finish_extraction_run(
+                        extraction_run,
+                        MemoryExtractionStatus.FAILED,
+                        attempts=attempts,
+                        error=str(exc),
+                    )
+                    if raise_on_extraction_error:
+                        raise
+                    return RememberResult(
+                        message=message,
+                        extraction_error=str(exc),
+                        gate_decision=gate_decision,
+                        extraction_run_id=extraction_run.id,
+                    )
+                extraction_failure = exc
+                extraction = AtomicExtraction()
 
         result = RememberResult(
             message=message,
@@ -774,6 +805,11 @@ class MemoryService:
             )
         status_updates: list[MemoryStatusUpdate] = []
         plan_updates: list[RelationshipPlanStatusUpdate] = []
+        contextual_updates = (
+            [contextual_update.to_update(reference_time=now)]
+            if contextual_update.resolved
+            else []
+        )
         for transition in plan_transitions:
             candidate = prepared[transition.candidate_index]
             plan_updates.append(
@@ -806,13 +842,14 @@ class MemoryService:
                             )
         try:
             prepared_saved = []
-            if operations or audit_only:
+            if operations or audit_only or contextual_updates:
                 committed = await self.store.commit_memory_batch(
                     user_id=message.user_id,
                     relationship_id=message.relationship_id,
                     batch=MemoryWriteBatch(
                         source_message_id=message.id,
                         operations=operations,
+                        contextual_updates=contextual_updates,
                         status_updates=status_updates,
                         plan_updates=plan_updates,
                         audit_only=audit_only,
@@ -820,6 +857,7 @@ class MemoryService:
                 )
                 prepared_saved = committed.saved
                 result.saved.extend(prepared_saved)
+                result.contextual_updated_memory_ids.extend(committed.updated_memory_ids)
                 await self._project_relationship_stage(
                     message.user_id,
                     message.relationship_id,
@@ -1585,6 +1623,46 @@ def _record_gate_trace(
                 "gate_should_extract": decision.should_extract,
                 "matched_rule": decision.matched_rule,
                 "matched_span": decision.matched_span,
+                "contextual_probe": decision.contextual_probe,
+                "history_loaded_for_gate": decision.history_loaded_for_gate,
+                "antecedent_candidate_ids_json": json.dumps(
+                    decision.antecedent_candidate_ids
+                ),
+                "selected_target_memory_id": decision.selected_target_memory_id,
+                "target_guard_result": decision.target_guard_result,
+                "contextual_update_type": decision.contextual_update_type,
+            }
+        )
+
+
+def _record_contextual_update_trace(
+    trace: TraceRecorder | None,
+    resolution,
+) -> None:
+    if trace is None:
+        return
+    with trace.measure("memory_contextual_update") as details:
+        details.update(
+            {
+                "contextual_update_probe": True,
+                "antecedent_candidate_ids_json": json.dumps(
+                    list(resolution.candidate_ids)
+                ),
+                "selected_target_memory_id": (
+                    resolution.target.id if resolution.target is not None else None
+                ),
+                "target_guard_result": (
+                    "compatible_active_target"
+                    if resolution.resolved
+                    else resolution.reason
+                ),
+                "contextual_update_type": (
+                    resolution.update_type.value
+                    if resolution.update_type is not None
+                    else None
+                ),
+                "evidence_span": resolution.evidence_span,
+                "reason": resolution.reason,
             }
         )
 

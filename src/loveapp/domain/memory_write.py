@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from loveapp.domain.memory import (
     AdmissionDecision,
     ClaimRelation,
+    ContextualMemoryUpdate,
     MemoryCandidate,
     MemorySaveResult,
     MemoryStatus,
@@ -60,6 +61,7 @@ class RelationshipPlanStatusUpdate(BaseModel):
 class MemoryWriteBatch(BaseModel):
     source_message_id: str | None = None
     operations: list[MemoryWriteOperation] = Field(default_factory=list)
+    contextual_updates: list[ContextualMemoryUpdate] = Field(default_factory=list)
     status_updates: list[MemoryStatusUpdate] = Field(default_factory=list)
     plan_updates: list[RelationshipPlanStatusUpdate] = Field(default_factory=list)
     audit_only: list[MemoryAuditDraft] = Field(default_factory=list)
@@ -89,6 +91,7 @@ class MemoryTransitionAudit(BaseModel):
 
 class MemoryWriteBatchResult(BaseModel):
     saved: list[MemorySaveResult] = Field(default_factory=list)
+    updated_memory_ids: list[str] = Field(default_factory=list)
     audits: list[MemoryTransitionAudit] = Field(default_factory=list)
 
 

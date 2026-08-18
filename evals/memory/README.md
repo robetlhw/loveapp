@@ -6,6 +6,8 @@
 
 `conversations_v3.jsonl` 覆盖关系状态维度、同维度状态迁移、渠道限定与互动指标拆分，以及事实和咨询问题同句出现的场景。v1/v2 保持不变，避免修改历史基线。
 
+`conversations_v4.jsonl` 覆盖多轮 interaction pattern 的时长限定更新。它要求频率、回复质量和线下互动保持为独立维度，并验证“持续一个月”只更新兼容的联系模式，不能把咨询性推测写成对方兴趣事实。
+
 `gate_v1.jsonl` 另行评估抽取前 Gate。`should_store=false` 的样例若产生任何持久化候选，就计入记忆污染；同时统计 Gate 召回率和特异度，防止只靠“全部跳过”获得低污染率。
 
 `lifecycle_v1.jsonl` 使用固定的 scripted claims，不调用真实模型，专门回归 Predicate 规范化、typed admission、六类 ClaimRelation、状态/计划迁移、错误合并、冲突泄漏和 transition audit。运行方式：

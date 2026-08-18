@@ -345,6 +345,7 @@ async def _observe_turn(
             if result.gate_decision is not None
             else None
         ),
+        "contextual_update": _contextual_update(records),
         "model_outputs": model_outputs,
         "flash_output": [item for item in model_outputs if item["tier"] == "flash"],
         "governance_candidates": candidates,
@@ -431,6 +432,21 @@ def _governance_candidates(records: list[Any]) -> list[dict[str, Any]]:
     return sorted(candidates, key=lambda item: int(item.get("candidate_index", 0)))
 
 
+def _contextual_update(records: list[Any]) -> dict[str, Any] | None:
+    record = next(
+        (item for item in records if item.name == "memory_contextual_update"),
+        None,
+    )
+    if record is None:
+        return None
+    details = dict(record.details)
+    details["antecedent_candidate_ids"] = _load_json(
+        details.pop("antecedent_candidate_ids_json", None),
+        [],
+    )
+    return details
+
+
 def _actual_changes(
     before: list[MemoryItem],
     after: list[MemoryItem],
@@ -466,6 +482,7 @@ def _actual_changes(
                 }
             )
     replaced: list[dict[str, Any]] = []
+    updated: list[dict[str, Any]] = []
     expired: list[dict[str, Any]] = []
     for memory_id, old in before_by_id.items():
         current = after_by_id.get(memory_id)
@@ -480,9 +497,25 @@ def _actual_changes(
             replaced.append(change)
         if current.status == MemoryStatus.EXPIRED:
             expired.append(change)
+    for memory_id in result.contextual_updated_memory_ids:
+        current = after_by_id.get(memory_id)
+        old = before_by_id.get(memory_id)
+        if current is None:
+            continue
+        updated.append(
+            {
+                "memory": _compact_memory(current),
+                "new_evidence": [
+                    value
+                    for value in current.evidence_spans
+                    if old is None or value not in old.evidence_spans
+                ],
+            }
+        )
     return {
         "added": added,
         "merged": merged,
+        "updated": updated,
         "replaced": replaced,
         "expired": expired,
         "scheduled_expiration": scheduled,
@@ -572,6 +605,16 @@ def _render_report(console: Console, report: dict[str, Any]) -> None:
         f"matched_rule={gate.get('matched_rule') or '-'} "
         f"matched_span={gate.get('matched_span') or '-'}",
     )
+    contextual_update = report.get("contextual_update")
+    if contextual_update is not None:
+        overview.add_row(
+            "Contextual update",
+            f"type={contextual_update.get('contextual_update_type') or '-'} "
+            f"target={contextual_update.get('selected_target_memory_id') or '-'}\n"
+            f"candidates={contextual_update.get('antecedent_candidate_ids') or []} "
+            f"guard={contextual_update.get('target_guard_result') or '-'}\n"
+            f"reason={contextual_update.get('reason') or '-'}",
+        )
     if report["result"].get("extraction_error"):
         overview.add_row("Extraction error", str(report["result"]["extraction_error"]))
     console.print(overview)
@@ -743,6 +786,11 @@ def _render_actual_changes(console: Console, changes: dict[str, list[dict[str, A
         item = entry["memory"]
         evidence = "; ".join(entry["new_evidence"]) or "no new evidence"
         table.add_row("merged", item["id"], item["status"], f"{item['summary']} [{evidence}]")
+        rows += 1
+    for entry in changes.get("updated", []):
+        item = entry["memory"]
+        evidence = "; ".join(entry["new_evidence"]) or "no new evidence"
+        table.add_row("contextual update", item["id"], item["status"], f"{item['summary']} [{evidence}]")
         rows += 1
     for entry in changes["replaced"]:
         item = entry["memory"]
