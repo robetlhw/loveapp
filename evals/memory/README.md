@@ -8,6 +8,8 @@
 
 `conversations_v4.jsonl` 覆盖多轮 interaction pattern 的时长限定更新。它要求频率、回复质量和线下互动保持为独立维度，并验证“持续一个月”只更新兼容的联系模式，不能把咨询性推测写成对方兴趣事实。
 
+交互式测试多组 Memory 更新时运行 `python scripts/test_memory_update_groups.py`。每组使用全新的 InMemory Store，以及独立的 user、relationship 和 conversation ID。输入 `s` 并回车结束当前组、创建下一组；输入 `state` 查看当前组，输入 `q` 结束全部测试。可使用 `--output <path>.json` 保存每轮 trace 和各组最终 Memory。
+
 `gate_v1.jsonl` 另行评估抽取前 Gate。`should_store=false` 的样例若产生任何持久化候选，就计入记忆污染；同时统计 Gate 召回率和特异度，防止只靠“全部跳过”获得低污染率。
 
 `lifecycle_v1.jsonl` 使用固定的 scripted claims，不调用真实模型，专门回归 Predicate 规范化、typed admission、六类 ClaimRelation、状态/计划迁移、错误合并、冲突泄漏和 transition audit。运行方式：
