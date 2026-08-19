@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from loveapp.application.contextual_memory_updates import (
+    detect_contextual_signal,
     may_contain_contextual_memory_update,
     resolve_contextual_memory_update,
 )
@@ -26,6 +27,8 @@ class MemoryGate:
         conversation_history: Iterable[StoredMessage] = (),
         existing_memories: Iterable[MemoryItem] = (),
     ) -> MemoryGateDecision:
+        conversation_history = list(conversation_history)
+        existing_memories = list(existing_memories)
         normalized = _normalize(text)
         compact = _compact(normalized)
         if compact in _CASUAL_MESSAGES or any(
@@ -98,6 +101,11 @@ class MemoryGate:
                 contextual_update_type=contextual_update.update_type.value,
             )
 
+        contextual_signal = detect_contextual_signal(
+            text,
+            conversation_history,
+        )
+
         contextual_event = resolve_contextual_relationship_event(
             text,
             conversation_history,
@@ -149,8 +157,22 @@ class MemoryGate:
         if interaction_qualifier is not None and "interaction_qualifier" not in signals:
             signals.append("interaction_qualifier")
         if signals:
+            if contextual_signal is not None:
+                signals.append(f"contextual_{contextual_signal.category}")
+                if contextual_signal.history_derived:
+                    signals.append("contextual_history_derived")
             generic_match = _first_signal_match(normalized, signals)
-            matched = interaction_decline or interaction_qualifier or generic_match
+            contextual_match = (
+                _GateMatch(
+                    contextual_signal.matched_rule,
+                    contextual_signal.matched_span,
+                )
+                if contextual_signal is not None
+                else None
+            )
+            matched = (
+                contextual_match or interaction_decline or interaction_qualifier or generic_match
+            )
             return MemoryGateDecision(
                 should_extract=True,
                 reason=MemoryGateReason.DURABLE_SIGNAL,
@@ -158,6 +180,21 @@ class MemoryGate:
                 matched_rule=matched.rule if matched is not None else None,
                 matched_span=matched.span if matched is not None else None,
                 contextual_probe=may_contain_contextual_memory_update(text),
+            )
+        if contextual_signal is not None:
+            signal_names = [
+                "contextual_signal",
+                f"contextual_{contextual_signal.category}",
+            ]
+            if contextual_signal.history_derived:
+                signal_names.append("contextual_history_derived")
+            return MemoryGateDecision(
+                should_extract=True,
+                reason=MemoryGateReason.DURABLE_SIGNAL,
+                signals=signal_names,
+                matched_rule=contextual_signal.matched_rule,
+                matched_span=contextual_signal.matched_span,
+                contextual_probe=True,
             )
         if contextual_update.semantic_candidate_ids:
             return MemoryGateDecision(
@@ -174,9 +211,7 @@ class MemoryGate:
                 ),
                 matched_span=contextual_update.evidence_span,
                 contextual_probe=True,
-                antecedent_candidate_ids=list(
-                    contextual_update.semantic_candidate_ids
-                ),
+                antecedent_candidate_ids=list(contextual_update.semantic_candidate_ids),
                 target_guard_result=contextual_update.reason,
                 contextual_update_type=(
                     contextual_update.update_type.value
@@ -269,11 +304,14 @@ def _has_consultation_question(text: str) -> bool:
 
 def _is_habitual_not_future(text: str) -> bool:
     habitual = re.search(r"平时|通常|每周|每月|每逢|偶尔|有时", text) is not None
-    explicit_future = re.search(
-        r"明天|后天|大后天|下周|下个月|本周末|这周末|过几天|几天后|月底|"
-        r"准备|计划|打算|将要|约好|已经约",
-        text,
-    ) is not None
+    explicit_future = (
+        re.search(
+            r"明天|后天|大后天|下周|下个月|本周末|这周末|过几天|几天后|月底|"
+            r"准备|计划|打算|将要|约好|已经约",
+            text,
+        )
+        is not None
+    )
     return habitual and not explicit_future
 
 
@@ -315,7 +353,9 @@ _KNOWLEDGE_QUESTION_PATTERNS = (
 )
 
 _PURE_PARTNER_HYPOTHESIS_PATTERNS = (
-    re.compile(r"^(?:你觉得)?(?:她|他|对方).{0,12}(?:是不是|会不会).{0,16}(?:不喜欢|没兴趣|兴趣下降).*[?？]?$"),
+    re.compile(
+        r"^(?:你觉得)?(?:她|他|对方).{0,12}(?:是不是|会不会).{0,16}(?:不喜欢|没兴趣|兴趣下降).*[?？]?$"
+    ),
     re.compile(r"^你觉得.{0,20}(?:兴趣下降|不喜欢).*[?？]?$"),
 )
 
@@ -396,9 +436,7 @@ _INTERACTION_QUALIFIER_RULES = (
     ),
     (
         "offline_interaction_qualifier",
-        re.compile(
-            r"(?:线下|见面).{0,14}(?:挺正常|很正常|没什么问题|还不错|挺好)"
-        ),
+        re.compile(r"(?:线下|见面).{0,14}(?:挺正常|很正常|没什么问题|还不错|挺好)"),
     ),
     (
         "initiation_balance_qualifier",
@@ -469,6 +507,15 @@ _DURABLE_SIGNAL_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
     ),
     "relationship_state": (
         re.compile(
+            r"(?:我和她|我和他|我俩|我们).{0,12}"
+            r"(?:现在|目前|还在|还是|处于)?"
+            r"(?:冷战|暧昧(?:关系)?|闹矛盾|有冲突|冲突状态)"
+        ),
+        re.compile(
+            r"(?:我和她|我和他|我俩|我们).{0,16}"
+            r"(?:已经|正式|重新)?(?:分手|在一起|确认关系|复合)"
+        ),
+        re.compile(
             r"(?:刚认识|认识不久|不.{0,2}熟|不熟悉|越来越熟|已经很熟|彼此熟悉|"
             r"比较熟|熟了(?:一|些|一点|一些)?|更熟|逐渐熟|慢慢熟|熟络|"
             r"比较陌生|了解不多|关系生疏)"
@@ -486,6 +533,36 @@ _DURABLE_SIGNAL_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
         re.compile(
             r"(?:她|他|对方).{0,12}(?:单身|有对象|有男朋友|有女朋友|"
             r"有伴侣|已婚|结婚了)"
+        ),
+    ),
+    "interaction_trend": (
+        re.compile(
+            r"(?:最近|近来|这段时间|这几天|过去).{0,16}"
+            r"(?:(?:我们(?:的)?)(?:矛盾|冲突|争执)|"
+            r"(?:我和她|我和他|我俩).{0,6}(?:矛盾|冲突|争执)).{0,8}"
+            r"(?:越来越多|变多|加剧|更明显|变严重|升级)"
+        ),
+        re.compile(
+            r"(?:最近|近来|这段时间|这几天|过去).{0,16}"
+            r"(?:回复|联系|聊天|交流|见面|互动).{0,8}"
+            r"(?:越来越慢|越来越少|明显变差|明显变少|明显变慢|变冷淡)"
+        ),
+    ),
+    "relationship_transition": (
+        re.compile(
+            r"(?:我和她|我和他|我俩|我们)(?:的关系)?"
+            r"(?:(?:现在|目前|最近|已经|终于|也|都|又|重新)|[\s，,]){0,4}"
+            r"(?:恢复正常|说开了?|和好|冷战结束|重新在一起|复合)"
+        ),
+        re.compile(
+            r"(?:我和她|我和他|我俩|我们).{0,12}"
+            r"(?:矛盾|冲突|争执|冷战).{0,10}"
+            r"(?:说开|解决|缓和|恢复正常)"
+        ),
+        re.compile(
+            r"(?:我和她|我和他|我俩|我们)(?:的关系)?"
+            r"(?:(?:现在|目前|最近|这几天|这周|又|再次|重新)|[\s，,]){0,4}"
+            r"(?:又出现|再次出现|重新出现)(?:矛盾|冲突|问题)"
         ),
     ),
     "planned_event": (

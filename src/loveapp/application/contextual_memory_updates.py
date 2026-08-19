@@ -57,6 +57,16 @@ class ContextualMemoryUpdateResolution:
         )
 
 
+@dataclass(frozen=True)
+class ContextualSignalMatch:
+    """A detected contextual cue that still needs downstream governance."""
+
+    category: str
+    matched_rule: str
+    matched_span: str
+    history_derived: bool = False
+
+
 _DURATION_PATTERN = re.compile(
     r"(?P<prefix>持续(?:了)?|已经|都|足足|整整)"
     r"(?P<value>\d+|[一二三四五六七八九十两]+)(?:个)?"
@@ -65,9 +75,183 @@ _DURATION_PATTERN = re.compile(
 _PERSISTENCE_PATTERN = re.compile(
     r"还是这样|一直(?:没|没有)?恢复|依然(?:这样|没有恢复)|一直如此|没什么变化"
 )
-_INTERACTION_DECLINE_MARKER = (
-    r"(?:慢|少|很少|不怎么|不太|几乎不|降低|下降|减少|变少|越来越少)"
+_FREQUENCY_SIGNAL_PATTERNS = (
+    (
+        "contextual_frequency_rate",
+        re.compile(
+            r"(?:大概|差不多|大约|约)?\s*"
+            r"(?:每天|每周|每月|一天|一日|一周|一个月|每星期|一星期)"
+            r".{0,5}(?:\d+|[一二三四五六七八九十两]+)"
+            r"(?:到|至|-)?(?:\d+|[一二三四五六七八九十两]+)?"
+            r"(?:次|条|回)"
+        ),
+    ),
+    (
+        "contextual_frequency_range",
+        re.compile(
+            r"(?:\d+|[一二三四五六七八九十两]+)"
+            r"(?:到|至|-)(?:\d+|[一二三四五六七八九十两]+)"
+            r"(?:次|条|回)"
+        ),
+    ),
 )
+_CORRECTION_SIGNAL_PATTERN = re.compile(
+    r"(?:不对|我刚才说错了|刚才说错了|我说少了|我说多了|刚才说反了|"
+    r"我刚才说反了|不是.{0,16}(?:而是|[，,]\s*(?:其实)?是)|"
+    r"更正一下|准确地说)"
+)
+_RESTORATION_SIGNAL_PATTERN = re.compile(
+    r"(?:恢复正常|恢复了|正常了|没事了|说开了|和好了|和解了|解决了|"
+    r"缓和了|改善了|好起来了|重新在一起了|复合了)"
+)
+_RECURRENCE_SIGNAL_PATTERN = re.compile(
+    r"(?:又开始|又变得|又出现|再次出现|重新出现|再次|重新|重又|最近又|这几天又|这周又|"
+    r"但(?:是)?(?:最近|这几天|这周).{0,8}又)"
+)
+_CAUSE_SCOPE_SIGNAL_PATTERN = re.compile(
+    r"(?:主要是|基本都是|大多是|原因是|问题在于|因为|由于).{0,32}"
+    r"(?:钱|花|消费|沟通|回复|联系|见面|吵|矛盾|安排|态度|相处)"
+)
+_RELATIONSHIP_CONTEXT_PATTERN = re.compile(
+    r"(?:我和她|我和他|我俩|对象|伴侣|女朋友|男朋友)|"
+    r"(?:她|他|对方).{0,12}(?:回我|回复我|联系我|和我聊天|跟我聊天|"
+    r"与我沟通|跟我见面|和我见面|冷战|吵架|矛盾|冲突|分手|和好)|"
+    r"我们.{0,12}(?:联系|回复|聊天|交流|沟通|互动|见面|碰面|吵架|"
+    r"矛盾|冲突|冷战|暧昧|分手|和好|复合|在一起)"
+)
+_PARTNER_INTERACTION_HISTORY_PATTERN = re.compile(
+    r"(?:她|他|对方|对象|伴侣).{0,12}(?:回复|回消息|回信息|联系|聊天|互动|见面)"
+    r".{0,12}(?:慢|少|冷淡|正常|恢复|增加|减少|变多|变少|频繁|主动|不怎么|很少)"
+)
+_ANAPHORIC_CAUSE_SCOPE_PATTERN = re.compile(r"(?:主要是|基本都是|大多是|原因是)")
+_HISTORY_CAUSE_SCOPE_CONTENT_PATTERN = re.compile(r"(?:钱|花|消费|吵|矛盾|安排|态度|相处)")
+_EXPLICIT_INTERACTION_FREQUENCY_PATTERN = re.compile(
+    r"(?:(?:她|他|对方|对象|伴侣).{0,10}"
+    r"(?:回我|回消息|回信息|回复我|回复消息|联系我|和我聊天|跟我聊天|"
+    r"与我沟通|跟我见面|和我见面)|"
+    r"我.{0,10}(?:回复|联系|聊天|交流|沟通|互动|见面|碰面)"
+    r".{0,6}(?:她|他|对方|对象|伴侣))"
+)
+_EXPLICIT_RELATIONSHIP_RESTORATION_PATTERN = re.compile(
+    r"(?:(?:我和她|我和他|我俩|我们)(?:的关系)?"
+    r"(?:(?:现在|目前|最近|已经|终于|也|都|又|重新)|[\s，,]){0,4}"
+    r"(?:恢复正常|说开了?|和好|冷战结束|重新在一起|复合)|"
+    r"(?:她|他|对方|对象|伴侣).{0,10}"
+    r"(?:联系|回复|聊天|互动|见面|冷战|矛盾|冲突).{0,12}"
+    r"(?:恢复正常|没事了|说开了|和好|和解|解决|缓和|改善))"
+)
+_EXPLICIT_RELATIONSHIP_RECURRENCE_PATTERN = re.compile(
+    r"(?:(?:我和她|我和他|我俩|我们)(?:的关系)?"
+    r"(?:(?:现在|目前|最近|这几天|这周|又|再次|重新)|[\s，,]){0,4}"
+    r"(?:又开始|又变得|又出现|再次出现|重新出现|再次|重新|重又)|"
+    r"(?:她|他|对方|对象|伴侣).{0,10}"
+    r"(?:联系|回复|聊天|互动|见面|冷战|矛盾|冲突).{0,12}"
+    r"(?:又开始|又变得|又出现|再次出现|重新出现|再次|重新|重又))"
+)
+_CORRECTION_VALUE_PATTERN = re.compile(
+    r"(?:\d+|[一二三四五六七八九十两]+)"
+    r"(?:到|至|-)?(?:\d+|[一二三四五六七八九十两]+)?(?:个)?"
+    r"(?:次|条|回|天|周|星期|个月|月|年)"
+)
+_RECURRENCE_TREND_PATTERN = re.compile(
+    r"(?:越来越慢|越来越少|变慢|变少|变冷淡|明显变差|明显变少|"
+    r"明显变慢|恶化|出问题|这样)"
+)
+_CONTEXTUAL_FILLER_PATTERN = re.compile(
+    r"(?:昨天|最近|现在|目前|这几天|这周|上周|已经|终于|不过|但是|但|"
+    r"其实|大概|差不多|大约|约|也|都|还是|只有|只|就|才|开始|了|"
+    r"[\s，,。.!！?？、])+"
+)
+_CONTEXTUAL_SIGNAL_RULES = (
+    ("frequency", "contextual_frequency_rate", _FREQUENCY_SIGNAL_PATTERNS[0][1]),
+    ("frequency", "contextual_frequency_range", _FREQUENCY_SIGNAL_PATTERNS[1][1]),
+    ("correction", "contextual_correction", _CORRECTION_SIGNAL_PATTERN),
+    ("restoration", "contextual_restoration", _RESTORATION_SIGNAL_PATTERN),
+    ("recurrence", "contextual_recurrence", _RECURRENCE_SIGNAL_PATTERN),
+    ("cause_scope", "contextual_cause_scope", _CAUSE_SCOPE_SIGNAL_PATTERN),
+)
+_CONTEXT_HISTORY_LIMIT = 3
+
+
+def _contextual_signal_shape_supported(
+    category: str,
+    text: str,
+    match: re.Match[str],
+    *,
+    history_context: bool,
+) -> bool:
+    if category == "frequency":
+        return bool(
+            _EXPLICIT_INTERACTION_FREQUENCY_PATTERN.search(text)
+            or (history_context and _is_elliptical_frequency(text, match))
+        )
+    if category == "correction":
+        return history_context and _is_quantified_correction(text)
+    if category == "restoration":
+        return bool(
+            _EXPLICIT_RELATIONSHIP_RESTORATION_PATTERN.search(text)
+            or (history_context and _is_contextual_only(text, _RESTORATION_SIGNAL_PATTERN))
+        )
+    if category == "recurrence":
+        return bool(
+            _EXPLICIT_RELATIONSHIP_RECURRENCE_PATTERN.search(text)
+            or (
+                history_context
+                and _is_contextual_only(
+                    text,
+                    _RECURRENCE_SIGNAL_PATTERN,
+                    _RECURRENCE_TREND_PATTERN,
+                )
+            )
+        )
+    if category == "cause_scope":
+        return bool(
+            _RELATIONSHIP_CONTEXT_PATTERN.search(text)
+            or (
+                history_context
+                and _ANAPHORIC_CAUSE_SCOPE_PATTERN.search(text)
+                and _HISTORY_CAUSE_SCOPE_CONTENT_PATTERN.search(match.group(0))
+            )
+        )
+    return False
+
+
+def _is_elliptical_frequency(text: str, match: re.Match[str]) -> bool:
+    residual = f"{text[: match.start()]}{text[match.end() :]}"
+    return not _strip_contextual_fillers(residual)
+
+
+def _is_quantified_correction(text: str) -> bool:
+    residual = _CORRECTION_SIGNAL_PATTERN.sub("", text)
+    residual = _CORRECTION_VALUE_PATTERN.sub("", residual)
+    return not _strip_contextual_fillers(residual)
+
+
+def _is_contextual_only(text: str, *patterns: re.Pattern[str]) -> bool:
+    residual = text
+    for pattern in patterns:
+        residual = pattern.sub("", residual)
+    return not _strip_contextual_fillers(residual)
+
+
+def _strip_contextual_fillers(text: str) -> str:
+    return _CONTEXTUAL_FILLER_PATTERN.sub("", text)
+
+
+def _first_contextual_signal_match(text: str) -> re.Match[str] | None:
+    for category, _, pattern in _CONTEXTUAL_SIGNAL_RULES:
+        match = pattern.search(text)
+        if match is not None and _contextual_signal_shape_supported(
+            category,
+            text,
+            match,
+            history_context=True,
+        ):
+            return match
+    return None
+
+
+_INTERACTION_DECLINE_MARKER = r"(?:慢|少|很少|不怎么|不太|几乎不|降低|下降|减少|变少|越来越少)"
 _WEAK_DECLINE_PREFIX = r"(?:很少|不怎么|不太|几乎不)"
 _RESPONSE_TARGET = r"(?:回复|回(?:我|消息|信息|得)|回应|理我|搭理)"
 _CONTACT_FREQUENCY_TARGET = r"(?:联系|聊天|交流|沟通|互动|见面|碰面)"
@@ -84,9 +268,7 @@ _PLURAL_REFERENCE_PATTERN = re.compile(
     r"(?:这(?:两|几|多)种(?:情况|问题|变化|表现)|"
     r"这些(?:情况|问题|变化|表现)|(?:两|几|多)个(?:情况|问题|表现))"
 )
-_NON_PARTNER_REFERENCE_PATTERN = re.compile(
-    r"(?:我|自己).{0,10}(?:工作|学习|身体|生活|项目|状态)"
-)
+_NON_PARTNER_REFERENCE_PATTERN = re.compile(r"(?:我|自己).{0,10}(?:工作|学习|身体|生活|项目|状态)")
 _SEMANTIC_ANTECEDENT_KINDS = {
     MemoryKind.INTERACTION_PATTERN,
     MemoryKind.INTERACTION_EVENT,
@@ -100,7 +282,65 @@ _CONTACT_FREQUENCY_PREDICATES = {
 
 def may_contain_contextual_memory_update(text: str) -> bool:
     normalized = _normalize(text)
-    return bool(_DURATION_PATTERN.search(normalized) or _PERSISTENCE_PATTERN.search(normalized))
+    return bool(
+        _DURATION_PATTERN.search(normalized)
+        or _PERSISTENCE_PATTERN.search(normalized)
+        or _first_contextual_signal_match(normalized) is not None
+    )
+
+
+def detect_contextual_signal(
+    text: str,
+    conversation_history: Iterable[StoredMessage] = (),
+) -> ContextualSignalMatch | None:
+    """Detect a contextual cue without authorizing a mutation.
+
+    Elliptical follow-ups require relationship context from the current text or
+    recent user history.  This keeps short numeric/correction phrases from
+    becoming relationship memories on their own.
+    """
+
+    normalized = _normalize(text)
+    direct_context = _RELATIONSHIP_CONTEXT_PATTERN.search(normalized) is not None
+    recent_user_messages = [
+        message
+        for message in reversed(list(conversation_history))
+        if message.role == MessageRole.USER and message.content.strip()
+    ][:_CONTEXT_HISTORY_LIMIT]
+    recent_user_message = next(
+        (
+            message
+            for message in recent_user_messages
+            if _has_relationship_history_context(_normalize(message.content))
+        ),
+        None,
+    )
+    history_context = recent_user_message is not None
+    for category, rule, pattern in _CONTEXTUAL_SIGNAL_RULES:
+        match = pattern.search(normalized)
+        if match is None:
+            continue
+        if not _contextual_signal_shape_supported(
+            category,
+            normalized,
+            match,
+            history_context=history_context,
+        ):
+            continue
+        return ContextualSignalMatch(
+            category=category,
+            matched_rule=rule,
+            matched_span=match.group(0),
+            history_derived=not direct_context and history_context,
+        )
+    return None
+
+
+def _has_relationship_history_context(text: str) -> bool:
+    return bool(
+        _RELATIONSHIP_CONTEXT_PATTERN.search(text)
+        or _PARTNER_INTERACTION_HISTORY_PATTERN.search(text)
+    )
 
 
 def resolve_contextual_memory_update(
@@ -123,9 +363,7 @@ def resolve_contextual_memory_update(
         return ContextualMemoryUpdateResolution()
 
     update_type = (
-        ContextualUpdateType.DURATION
-        if duration is not None
-        else ContextualUpdateType.PERSISTENCE
+        ContextualUpdateType.DURATION if duration is not None else ContextualUpdateType.PERSISTENCE
     )
     qualifier_match = duration or persistence
     assert qualifier_match is not None
@@ -183,14 +421,11 @@ def resolve_contextual_memory_update(
         if item.status not in {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}:
             continue
         source_match = item.source_message_id in antecedent_ids
-        predicate_match = (
-            item.kind in _SEMANTIC_ANTECEDENT_KINDS
-            and (
-                (item.canonical_predicate or "").startswith(
-                    ("interaction.", "contact.", "relationship.")
-                )
-                or item.kind == MemoryKind.INTERACTION_PATTERN
+        predicate_match = item.kind in _SEMANTIC_ANTECEDENT_KINDS and (
+            (item.canonical_predicate or "").startswith(
+                ("interaction.", "contact.", "relationship.")
             )
+            or item.kind == MemoryKind.INTERACTION_PATTERN
         )
         deduped_semantic_match = _matches_recent_antecedent_semantics(
             item,
@@ -210,9 +445,7 @@ def resolve_contextual_memory_update(
     if not semantic_candidates:
         return unresolved("no_semantic_antecedent")
 
-    def compatibility_diagnostics() -> tuple[
-        tuple[str, ...], tuple[tuple[str, str], ...]
-    ]:
+    def compatibility_diagnostics() -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
         compatible_ids = tuple(
             item.id
             for item in semantic_candidates[:8]
@@ -232,8 +465,7 @@ def resolve_contextual_memory_update(
             semantic_ids=semantic_ids,
             compatible_ids=compatible_ids,
             rejected=tuple(
-                (item.id, "explicit_subject_mismatch")
-                for item in semantic_candidates[:8]
+                (item.id, "explicit_subject_mismatch") for item in semantic_candidates[:8]
             ),
         )
 
