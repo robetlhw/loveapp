@@ -444,6 +444,18 @@ def _contextual_update(records: list[Any]) -> dict[str, Any] | None:
         details.pop("antecedent_candidate_ids_json", None),
         [],
     )
+    details["semantic_candidate_ids"] = _load_json(
+        details.pop("semantic_candidate_ids_json", None),
+        [],
+    )
+    details["compatible_candidate_ids"] = _load_json(
+        details.pop("compatible_candidate_ids_json", None),
+        [],
+    )
+    details["rejected_candidates"] = _load_json(
+        details.pop("rejected_candidates_json", None),
+        [],
+    )
     return details
 
 
@@ -613,6 +625,10 @@ def _render_report(console: Console, report: dict[str, Any]) -> None:
             f"target={contextual_update.get('selected_target_memory_id') or '-'}\n"
             f"candidates={contextual_update.get('antecedent_candidate_ids') or []} "
             f"guard={contextual_update.get('target_guard_result') or '-'}\n"
+            f"semantic={contextual_update.get('semantic_candidate_ids') or []} "
+            f"compatible={contextual_update.get('compatible_candidate_ids') or []}\n"
+            f"rejected={contextual_update.get('rejected_candidates') or []} "
+            f"plural={contextual_update.get('plural_reference') or False}\n"
             f"reason={contextual_update.get('reason') or '-'}",
         )
     if report["result"].get("extraction_error"):
@@ -790,7 +806,12 @@ def _render_actual_changes(console: Console, changes: dict[str, list[dict[str, A
     for entry in changes.get("updated", []):
         item = entry["memory"]
         evidence = "; ".join(entry["new_evidence"]) or "no new evidence"
-        table.add_row("contextual update", item["id"], item["status"], f"{item['summary']} [{evidence}]")
+        table.add_row(
+            "contextual update",
+            item["id"],
+            item["status"],
+            f"{item['summary']} [{evidence}]",
+        )
         rows += 1
     for entry in changes["replaced"]:
         item = entry["memory"]

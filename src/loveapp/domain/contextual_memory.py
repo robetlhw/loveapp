@@ -11,9 +11,12 @@ from loveapp.domain.memory import (
     TimeKind,
 )
 
-
 _ACTIVE_STATUSES = {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}
-_CONTACT_PREDICATES = {"interaction.contact_frequency", "contact.status"}
+_CONTACT_PREDICATES = {
+    "interaction.contact_frequency",
+    "interaction.response_engagement",
+    "contact.status",
+}
 
 
 def is_contextual_update_target_compatible(item: MemoryItem) -> bool:
@@ -21,7 +24,10 @@ def is_contextual_update_target_compatible(item: MemoryItem) -> bool:
 
     if item.status not in _ACTIVE_STATUSES:
         return False
-    if item.canonical_predicate == "interaction.contact_frequency":
+    if item.canonical_predicate in {
+        "interaction.contact_frequency",
+        "interaction.response_engagement",
+    }:
         return item.kind == MemoryKind.INTERACTION_PATTERN
     return (
         item.canonical_predicate == "contact.status"

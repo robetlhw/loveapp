@@ -74,15 +74,15 @@ from loveapp.domain.relationship_plan import (
 from loveapp.ports.memory import MemoryExtractor, MemoryStore, StrongClaimVerifier
 from loveapp.ports.observability import TraceRecorder
 
+from .contextual_memory_updates import (
+    may_contain_contextual_memory_update,
+    resolve_contextual_memory_update,
+)
 from .memory_admission import (
     assess_memory_admission,
     build_admission_policies,
     interaction_pattern_has_frequency,
     interaction_pattern_has_multiple_evidence,
-)
-from .contextual_memory_updates import (
-    may_contain_contextual_memory_update,
-    resolve_contextual_memory_update,
 )
 from .memory_gate import MemoryGate
 from .memory_relations import (
@@ -230,6 +230,14 @@ class MemoryService:
             }
         )
         _record_gate_trace(trace, gate_decision)
+        if contextual_update_probe and not gate_decision.should_extract:
+            unresolved_contextual_update = resolve_contextual_memory_update(
+                text,
+                conversation_history or [],
+                preloaded_memories or [],
+            )
+            if unresolved_contextual_update.update_type is not None:
+                _record_contextual_update_trace(trace, unresolved_contextual_update)
         now = self._clock()
         extraction_run = MemoryExtractionRun(
             id=str(uuid4()),
@@ -320,11 +328,14 @@ class MemoryService:
             conversation_history,
             active,
         )
-        if contextual_update.resolved:
+        if contextual_update.update_type is not None:
             _record_contextual_update_trace(trace, contextual_update)
         attempts: list[MemoryExtractionAttempt] = []
         extraction_failure: Exception | None = None
-        if contextual_update.resolved and gate_decision.reason == MemoryGateReason.CONTEXTUAL_UPDATE:
+        if (
+            contextual_update.resolved
+            and gate_decision.reason == MemoryGateReason.CONTEXTUAL_UPDATE
+        ):
             # The current turn only qualifies a known fact.  Invoking the
             # extractor here would invite it to turn the attached consultation
             # into a partner-state claim.
@@ -1648,6 +1659,19 @@ def _record_contextual_update_trace(
                 "antecedent_candidate_ids_json": json.dumps(
                     list(resolution.candidate_ids)
                 ),
+                "semantic_candidate_ids_json": json.dumps(
+                    list(resolution.semantic_candidate_ids)
+                ),
+                "compatible_candidate_ids_json": json.dumps(
+                    list(resolution.compatible_candidate_ids)
+                ),
+                "rejected_candidates_json": json.dumps(
+                    [
+                        {"memory_id": memory_id, "reason": reason}
+                        for memory_id, reason in resolution.rejected_candidates
+                    ]
+                ),
+                "plural_reference": resolution.plural_reference,
                 "selected_target_memory_id": (
                     resolution.target.id if resolution.target is not None else None
                 ),

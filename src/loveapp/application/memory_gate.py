@@ -159,6 +159,31 @@ class MemoryGate:
                 matched_span=matched.span if matched is not None else None,
                 contextual_probe=may_contain_contextual_memory_update(text),
             )
+        if contextual_update.semantic_candidate_ids:
+            return MemoryGateDecision(
+                should_extract=False,
+                reason=MemoryGateReason.NO_DURABLE_SIGNAL,
+                signals=[
+                    "contextual_memory_update_unresolved",
+                    contextual_update.reason,
+                ],
+                matched_rule=(
+                    f"contextual_{contextual_update.update_type.value}_unresolved"
+                    if contextual_update.update_type is not None
+                    else "contextual_update_unresolved"
+                ),
+                matched_span=contextual_update.evidence_span,
+                contextual_probe=True,
+                antecedent_candidate_ids=list(
+                    contextual_update.semantic_candidate_ids
+                ),
+                target_guard_result=contextual_update.reason,
+                contextual_update_type=(
+                    contextual_update.update_type.value
+                    if contextual_update.update_type is not None
+                    else None
+                ),
+            )
         consultation = _first_match(
             normalized,
             _CONSULTATION_PATTERNS,
