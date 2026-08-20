@@ -36,10 +36,7 @@ from loveapp.domain.memory import (
     memory_dedupe_key,
     utc_now,
 )
-from loveapp.domain.memory_context import (
-    attach_memories,
-    select_context_memories,
-)
+from loveapp.domain.memory_context import select_context_memories
 from loveapp.domain.memory_lifecycle import (
     governed_state_identity,
     governed_state_value,
@@ -73,6 +70,7 @@ from loveapp.domain.relationship_plan import (
     memory_with_plan,
     suppressed_plan_ids_for_text,
 )
+from loveapp.ports.embeddings import EmbeddingProvider
 from loveapp.ports.memory import MemoryExtractor, MemoryStore, StrongClaimVerifier
 from loveapp.ports.observability import TraceRecorder
 
@@ -93,6 +91,11 @@ from .memory_relations import (
     ClaimRelationResolution,
     has_local_conflict,
     resolve_claim_relation,
+)
+from .memory_retrieval import (
+    HybridMemoryRetriever,
+    MemoryContextBuilder,
+    RetrievedMemory,
 )
 from .relationship_events import (
     build_contextual_relationship_candidate,
@@ -131,6 +134,8 @@ class MemoryService:
         clock: Callable[[], datetime] = utc_now,
         admission_policy_overrides: dict[str, dict[str, object]] | None = None,
         verifier: StrongClaimVerifier | None = None,
+        embedding_provider: EmbeddingProvider | None = None,
+        context_token_budget: int = 4096,
     ) -> None:
         self.store = store
         self._extractor = extractor
@@ -145,6 +150,11 @@ class MemoryService:
         self._clock = clock
         self._admission_policies = build_admission_policies(admission_policy_overrides)
         self._verifier = verifier
+        self._memory_retriever = HybridMemoryRetriever(
+            embedding_provider,
+            token_budget=context_token_budget,
+        )
+        self._memory_context_builder = MemoryContextBuilder()
         set_store_clock = getattr(store, "set_clock", None)
         if callable(set_store_clock):
             set_store_clock(clock)
@@ -1437,7 +1447,7 @@ class MemoryService:
                 and any(memory_references_plan(item, plan) for plan in suppressed_plans)
             )
         ]
-        selected = select_context_memories(
+        retrieved = await self._memory_retriever.retrieve(
             active,
             query=query,
             limit=self._context_limit,
@@ -1448,12 +1458,42 @@ class MemoryService:
             relationship_id=relationship_id,
             relationship_stage=context.relationship_stage,
         )
-        return attach_memories(
+        return self._memory_context_builder.build(
             base,
-            selected,
+            retrieved,
             active_plans=visible_plans,
             relationship_evidence=relationship_evidence,
             reference_time=context_time,
+        )
+
+    async def retrieve_memories(
+        self,
+        user_id: str,
+        relationship_id: str,
+        *,
+        query: str | None = None,
+        limit: int | None = None,
+    ) -> list[RetrievedMemory]:
+        """Return ranked current memories without assembling an advice context."""
+
+        memories = await self.store.list_memories(
+            user_id=user_id,
+            relationship_id=relationship_id,
+            limit=200,
+        )
+        active = [
+            item
+            for item in memories
+            if item.status in {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}
+        ]
+        reconciled_ids = await self._reconcile_active_lifecycle(user_id, active)
+        if reconciled_ids:
+            active = [item for item in active if item.id not in reconciled_ids]
+        return await self._memory_retriever.retrieve(
+            active,
+            query=query,
+            limit=limit or self._context_limit,
+            reference_time=self._clock(),
         )
 
 

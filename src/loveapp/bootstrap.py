@@ -46,6 +46,7 @@ from loveapp.core.config import Settings, get_settings
 from loveapp.domain.knowledge import KnowledgeDocument
 from loveapp.ports.conversation_states import ConversationFlowStateStore
 from loveapp.ports.date_tasks import DatePlanningTaskStore
+from loveapp.ports.embeddings import EmbeddingProvider
 from loveapp.ports.memory import MemoryStore
 from loveapp.ports.routing import Router
 from loveapp.ports.weather import WeatherProvider
@@ -95,10 +96,15 @@ class MemoryContainer:
 def build_container(settings: Settings | None = None) -> AppContainer:
     settings = settings or get_settings()
     resources: list[Any] = []
+    embedding_provider = build_embedding_provider(settings)
     if settings.rag_backend == "qdrant":
-        retriever = build_qdrant_store(settings)
+        retriever = build_qdrant_store(
+            settings,
+            embedding_provider=embedding_provider,
+        )
         resources.append(retriever)
     else:
+        resources.append(embedding_provider)
         documents = _merge_documents(
             load_seed_documents(),
             load_knowledge_path(settings.knowledge_path),
@@ -108,7 +114,10 @@ def build_container(settings: Settings | None = None) -> AppContainer:
     composer = _build_advice_composer(settings)
     if hasattr(composer, "aclose"):
         resources.append(composer)
-    memory_container = build_memory_container(settings)
+    memory_container = build_memory_container(
+        settings,
+        embedding_provider=embedding_provider,
+    )
     memory_store = memory_container.memory_store
     memory_service = memory_container.memory_service
     resources.extend(memory_container.resources)
@@ -167,8 +176,11 @@ def build_memory_container(
     settings: Settings | None = None,
     *,
     enable_extraction: bool = True,
+    embedding_provider: EmbeddingProvider | None = None,
 ) -> MemoryContainer:
     settings = settings or get_settings()
+    owns_embedding_provider = embedding_provider is None
+    embedding_provider = embedding_provider or build_embedding_provider(settings)
     memory_store = _build_memory_store(settings)
     memory_extractor = (
         _build_memory_extractor(settings) if enable_extraction else NoOpMemoryExtractor()
@@ -184,16 +196,20 @@ def build_memory_container(
         context_wait_seconds=settings.memory_context_wait_seconds,
         shutdown_grace_seconds=settings.memory_shutdown_grace_seconds,
         admission_policy_overrides=settings.memory_admission_policy_overrides,
+        embedding_provider=embedding_provider,
         verifier=(
             memory_extractor
             if getattr(memory_extractor, "can_verify", False)
             else None
         ),
     )
+    resources: tuple[Any, ...] = (memory_store, memory_extractor, memory_service)
+    if owns_embedding_provider:
+        resources += (embedding_provider,)
     return MemoryContainer(
         memory_service=memory_service,
         memory_store=memory_store,
-        resources=(memory_store, memory_extractor, memory_service),
+        resources=resources,
     )
 
 
@@ -207,7 +223,11 @@ def build_embedding_provider(settings: Settings) -> SentenceTransformerEmbedding
     )
 
 
-def build_qdrant_store(settings: Settings) -> QdrantKnowledgeStore:
+def build_qdrant_store(
+    settings: Settings,
+    *,
+    embedding_provider: EmbeddingProvider | None = None,
+) -> QdrantKnowledgeStore:
     client = AsyncQdrantClient(
         url=settings.qdrant_url,
         timeout=settings.qdrant_timeout_seconds,
@@ -215,7 +235,7 @@ def build_qdrant_store(settings: Settings) -> QdrantKnowledgeStore:
     return QdrantKnowledgeStore(
         client=client,
         collection_name=settings.qdrant_collection,
-        embedding_provider=build_embedding_provider(settings),
+        embedding_provider=embedding_provider or build_embedding_provider(settings),
         min_score=settings.rag_min_score,
     )
 
