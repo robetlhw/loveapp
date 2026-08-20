@@ -77,8 +77,10 @@ from loveapp.ports.memory import MemoryExtractor, MemoryStore, StrongClaimVerifi
 from loveapp.ports.observability import TraceRecorder
 
 from .contextual_memory_updates import (
+    ExplicitMemoryCorrectionResolution,
     may_contain_contextual_memory_update,
     resolve_contextual_memory_update,
+    resolve_explicit_memory_correction,
 )
 from .memory_admission import (
     assess_memory_admission,
@@ -240,6 +242,15 @@ class MemoryService:
             )
             if unresolved_contextual_update.update_type is not None:
                 _record_contextual_update_trace(trace, unresolved_contextual_update)
+            unresolved_correction = resolve_explicit_memory_correction(
+                text,
+                conversation_history or [],
+                preloaded_memories or [],
+                reference_time=self._clock(),
+                source_message_id=message.id,
+            )
+            if unresolved_correction.detected:
+                _record_explicit_correction_trace(trace, unresolved_correction)
         now = self._clock()
         extraction_run = MemoryExtractionRun(
             id=str(uuid4()),
@@ -330,11 +341,22 @@ class MemoryService:
             conversation_history,
             active,
         )
+        correction_resolution = resolve_explicit_memory_correction(
+            text,
+            conversation_history,
+            active,
+            reference_time=now,
+            source_message_id=message.id,
+        )
+        if correction_resolution.resolved and correction_resolution.candidate is not None:
+            deterministic_candidates.append(correction_resolution.candidate)
         if contextual_update.update_type is not None:
             _record_contextual_update_trace(trace, contextual_update)
+        if correction_resolution.detected:
+            _record_explicit_correction_trace(trace, correction_resolution)
         attempts: list[MemoryExtractionAttempt] = []
         extraction_failure: Exception | None = None
-        if (
+        if correction_resolution.detected or correction_resolution.idempotent or (
             contextual_update.resolved
             and gate_decision.reason == MemoryGateReason.CONTEXTUAL_UPDATE
         ):
@@ -617,6 +639,43 @@ class MemoryService:
                     rule_name="strong_claim_verifier",
                     reason=verification.reason,
                 )
+            correction_target_id = candidate.payload.get("correction_target_memory_id")
+            is_explicit_correction = (
+                correction_resolution.resolved
+                and isinstance(correction_target_id, str)
+                and correction_target_id == correction_resolution.target.id
+            )
+            if is_explicit_correction:
+                correction_target = next(
+                    (item for item in active if item.id == correction_target_id),
+                    None,
+                )
+                if correction_target is None:
+                    resolution = ClaimRelationResolution(
+                        relation=ClaimRelation.UNCERTAIN,
+                        target_memory_ids=(),
+                        rule_name="explicit_memory_correction",
+                        reason="Correction target is no longer active in the current scope.",
+                    )
+                elif (
+                    incoming_status == MemoryStatus.PROPOSED
+                    and correction_target.status == MemoryStatus.CONFIRMED
+                ):
+                    resolution = ClaimRelationResolution(
+                        relation=ClaimRelation.CONTRADICTION,
+                        target_memory_ids=(correction_target.id,),
+                        rule_name="explicit_memory_correction_proposed_protection",
+                        reason="A proposed correction cannot supersede a confirmed claim.",
+                    )
+                else:
+                    resolution = ClaimRelationResolution(
+                        relation=ClaimRelation.UPDATE,
+                        target_memory_ids=(correction_target.id,),
+                        rule_name="explicit_memory_correction",
+                        reason=(
+                            "An explicit user correction replaces the uniquely matched prior claim."
+                        ),
+                    )
             if decision == AdmissionDecision.REJECT:
                 result.rejected_by_policy += 1
                 rejection_breakdown = {
@@ -1689,6 +1748,41 @@ def _record_contextual_update_trace(
                 ),
                 "evidence_span": resolution.evidence_span,
                 "reason": resolution.reason,
+            }
+        )
+
+
+def _record_explicit_correction_trace(
+    trace: TraceRecorder | None,
+    resolution: ExplicitMemoryCorrectionResolution,
+) -> None:
+    if trace is None:
+        return
+    with trace.measure("memory_explicit_correction") as details:
+        details.update(
+            {
+                "correction_probe": resolution.detected,
+                "correction_type": resolution.correction_type,
+                "correction_value": resolution.correction_value,
+                "correction_unit": resolution.correction_unit,
+                "semantic_candidate_ids_json": json.dumps(
+                    list(resolution.semantic_candidate_ids)
+                ),
+                "compatible_candidate_ids_json": json.dumps(
+                    list(resolution.compatible_candidate_ids)
+                ),
+                "rejected_candidates_json": json.dumps(
+                    [
+                        {"memory_id": memory_id, "reason": reason}
+                        for memory_id, reason in resolution.rejected_candidates
+                    ]
+                ),
+                "selected_target_memory_id": (
+                    resolution.target.id if resolution.target is not None else None
+                ),
+                "resolution_status": "resolved" if resolution.resolved else "no_op",
+                "resolution_reason": resolution.reason,
+                "source_evidence": resolution.evidence_span,
             }
         )
 

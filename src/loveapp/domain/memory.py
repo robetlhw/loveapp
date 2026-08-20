@@ -681,6 +681,16 @@ def _memory_identity_parts(candidate: MemoryCandidate) -> tuple[str, ...]:
         payload=payload,
     )
     predicate_name = predicate.canonical_predicate or f"custom:{predicate.custom_predicate}"
+    if payload.get("contextual_update_type") == "correction":
+        return (
+            kind,
+            subject,
+            predicate_name,
+            "correction",
+            str(payload.get("correction_target_memory_id") or ""),
+            str(payload.get("correction_type") or ""),
+            str(payload.get("correction_value") or ""),
+        )
 
     if candidate.kind == MemoryKind.PREFERENCE:
         preference = payload.get("preference")

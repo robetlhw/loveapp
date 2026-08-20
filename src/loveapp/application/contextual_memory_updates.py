@@ -8,11 +8,14 @@ from loveapp.domain.contextual_memory import is_contextual_update_target_compati
 from loveapp.domain.memory import (
     ContextualMemoryUpdate,
     ContextualUpdateType,
+    MemoryCandidate,
     MemoryItem,
     MemoryKind,
     MemoryStatus,
     MessageRole,
     StoredMessage,
+    TemporalPrecision,
+    TimeKind,
     utc_now,
 )
 
@@ -65,6 +68,30 @@ class ContextualSignalMatch:
     matched_rule: str
     matched_span: str
     history_derived: bool = False
+
+
+@dataclass(frozen=True)
+class ExplicitMemoryCorrectionResolution:
+    """A fail-closed, single-target correction of a prior memory claim."""
+
+    detected: bool = False
+    target: MemoryItem | None = None
+    candidate: MemoryCandidate | None = None
+    correction_type: str | None = None
+    correction_value: str | None = None
+    correction_unit: str | None = None
+    signal_span: str | None = None
+    evidence_span: str | None = None
+    reason: str = "no_explicit_correction"
+    semantic_candidate_ids: tuple[str, ...] = ()
+    compatible_candidate_ids: tuple[str, ...] = ()
+    rejected_candidates: tuple[tuple[str, str], ...] = ()
+    plural_reference: bool = False
+    idempotent: bool = False
+
+    @property
+    def resolved(self) -> bool:
+        return self.target is not None and self.candidate is not None
 
 
 _DURATION_PATTERN = re.compile(
@@ -152,6 +179,15 @@ _CORRECTION_VALUE_PATTERN = re.compile(
     r"(?:\d+|[一二三四五六七八九十两]+)"
     r"(?:到|至|-)?(?:\d+|[一二三四五六七八九十两]+)?(?:个)?"
     r"(?:次|条|回|天|周|星期|个月|月|年)"
+)
+_CORRECTION_FREQUENCY_VALUE_PATTERN = re.compile(
+    r"(?:(?P<period>每天|每日|一天|一日|每周|一周|每星期|一星期|每月|每个月|一个月)"
+    r".{0,5})?(?P<value>\d+|[一二三四五六七八九十两]+)"
+    r"(?:到|至|-)?(?:\d+|[一二三四五六七八九十两]+)?(?:次|条|回)"
+)
+_CORRECTION_DURATION_VALUE_PATTERN = re.compile(
+    r"(?P<value>\d+|[一二三四五六七八九十两]+)(?:个)?"
+    r"(?P<unit>天|周|星期|个月|月|年)"
 )
 _RECURRENCE_TREND_PATTERN = re.compile(
     r"(?:越来越慢|越来越少|变慢|变少|变冷淡|明显变差|明显变少|"
@@ -278,6 +314,15 @@ _CONTACT_FREQUENCY_PREDICATES = {
     "interaction.contact_frequency",
     "contact.status",
 }
+_CORRECTION_FREQUENCY_PREDICATES = {
+    "interaction.contact_frequency",
+    "interaction.response_engagement",
+}
+_CORRECTION_DURATION_PREDICATE_PREFIXES = (
+    "interaction.",
+    "contact.",
+    "relationship.",
+)
 
 
 def may_contain_contextual_memory_update(text: str) -> bool:
@@ -286,6 +331,10 @@ def may_contain_contextual_memory_update(text: str) -> bool:
         _DURATION_PATTERN.search(normalized)
         or _PERSISTENCE_PATTERN.search(normalized)
         or _first_contextual_signal_match(normalized) is not None
+        or (
+            _CORRECTION_SIGNAL_PATTERN.search(normalized) is not None
+            and _CORRECTION_VALUE_PATTERN.search(normalized) is not None
+        )
     )
 
 
@@ -336,11 +385,278 @@ def detect_contextual_signal(
     return None
 
 
+def resolve_explicit_memory_correction(
+    text: str,
+    conversation_history: Iterable[StoredMessage],
+    existing_memories: Iterable[MemoryItem],
+    *,
+    reference_time: datetime | None = None,
+    source_message_id: str | None = None,
+) -> ExplicitMemoryCorrectionResolution:
+    """Resolve only explicit, quantified self-corrections.
+
+    Candidate discovery intentionally happens before correction compatibility
+    checks.  This preserves the Issue #3.1 invariant that rejected candidates
+    cannot manufacture a unique target.
+    """
+
+    normalized = _normalize(text)
+    signal_matches = list(_CORRECTION_SIGNAL_PATTERN.finditer(normalized))
+    if not signal_matches:
+        return ExplicitMemoryCorrectionResolution()
+    signal = max(signal_matches, key=lambda match: match.end())
+    value_match = _extract_correction_value(normalized[signal.end() :])
+    if value_match is None:
+        return ExplicitMemoryCorrectionResolution()
+    correction_type, value, unit = value_match
+    plural_reference = _PLURAL_REFERENCE_PATTERN.search(normalized) is not None
+    if source_message_id is not None:
+        replayed = next(
+            (
+                item
+                for item in existing_memories
+                if item.source_message_id == source_message_id
+                and item.payload.get("contextual_update_type") == "correction"
+            ),
+            None,
+        )
+        if replayed is not None:
+            return ExplicitMemoryCorrectionResolution(
+                detected=True,
+                correction_type=correction_type,
+                correction_value=value,
+                correction_unit=unit,
+                signal_span=signal.group(0),
+                evidence_span=text.strip(),
+                reason="correction_replay_idempotent",
+                semantic_candidate_ids=(replayed.id,),
+                compatible_candidate_ids=(replayed.id,),
+                idempotent=True,
+            )
+    evidence_span = text.strip()
+    user_history = [
+        message
+        for message in conversation_history
+        if message.role == MessageRole.USER and message.content.strip()
+    ]
+    antecedent = None
+    antecedent_predicates: frozenset[str] = frozenset()
+    for message in reversed(user_history):
+        predicates = _antecedent_predicates(_normalize(message.content))
+        if predicates:
+            antecedent = message
+            antecedent_predicates = predicates
+            break
+
+    def unresolved(
+        reason: str,
+        *,
+        semantic_ids: tuple[str, ...] = (),
+        compatible_ids: tuple[str, ...] = (),
+        rejected: tuple[tuple[str, str], ...] = (),
+    ) -> ExplicitMemoryCorrectionResolution:
+        return ExplicitMemoryCorrectionResolution(
+            detected=True,
+            correction_type=correction_type,
+            correction_value=value,
+            correction_unit=unit,
+            signal_span=signal.group(0),
+            evidence_span=evidence_span,
+            reason=reason,
+            semantic_candidate_ids=semantic_ids,
+            compatible_candidate_ids=compatible_ids,
+            rejected_candidates=rejected,
+            plural_reference=plural_reference,
+        )
+
+    if antecedent is None:
+        return unresolved("no_correction_antecedent")
+
+    antecedent_ids = {antecedent.id}
+    semantic_candidates = _semantic_antecedent_candidates(
+        antecedent,
+        antecedent_predicates,
+        existing_memories,
+        antecedent_ids,
+    )
+    semantic_ids = tuple(item.id for item in semantic_candidates[:8])
+    if not semantic_candidates:
+        return unresolved("no_correction_semantic_antecedent")
+
+    if _NON_PARTNER_REFERENCE_PATTERN.search(normalized):
+        return unresolved(
+            "explicit_subject_mismatch",
+            semantic_ids=semantic_ids,
+            rejected=tuple(
+                (item.id, "explicit_subject_mismatch")
+                for item in semantic_candidates[:8]
+            ),
+        )
+    if plural_reference and len(semantic_candidates) > 1:
+        return unresolved(
+            "unsupported_multi_target",
+            semantic_ids=semantic_ids,
+            rejected=tuple(
+                (item.id, "unsupported_multi_target")
+                for item in semantic_candidates[:8]
+            ),
+        )
+    if len(semantic_candidates) > 1:
+        return unresolved(
+            "ambiguous_correction_antecedent",
+            semantic_ids=semantic_ids,
+            rejected=tuple(
+                (item.id, "ambiguous_correction_antecedent")
+                for item in semantic_candidates[:8]
+            ),
+        )
+
+    target = semantic_candidates[0]
+    if not _is_explicit_correction_target_compatible(target, correction_type):
+        return unresolved(
+            "no_compatible_correction_target",
+            semantic_ids=semantic_ids,
+            rejected=((target.id, "mutation_incompatible"),),
+        )
+    candidate = _build_correction_candidate(
+        target,
+        text=evidence_span,
+        signal_span=signal.group(0),
+        correction_type=correction_type,
+        correction_value=value,
+        correction_unit=unit,
+        reference_time=reference_time or utc_now(),
+    )
+    return ExplicitMemoryCorrectionResolution(
+        detected=True,
+        target=target,
+        candidate=candidate,
+        correction_type=correction_type,
+        correction_value=value,
+        correction_unit=unit,
+        signal_span=signal.group(0),
+        evidence_span=evidence_span,
+        reason="explicit_memory_correction",
+        semantic_candidate_ids=semantic_ids,
+        compatible_candidate_ids=(target.id,),
+        plural_reference=plural_reference,
+    )
+
+
 def _has_relationship_history_context(text: str) -> bool:
     return bool(
         _RELATIONSHIP_CONTEXT_PATTERN.search(text)
         or _PARTNER_INTERACTION_HISTORY_PATTERN.search(text)
     )
+
+
+def _extract_correction_value(text: str) -> tuple[str, str, str | None] | None:
+    frequency = _CORRECTION_FREQUENCY_VALUE_PATTERN.search(text)
+    if frequency is not None:
+        return "frequency", frequency.group(0).strip(), frequency.group("period")
+    duration = _CORRECTION_DURATION_VALUE_PATTERN.search(text)
+    if duration is not None:
+        return (
+            "duration",
+            duration.group(0).strip(),
+            _normalize_duration_unit(duration.group("unit")),
+        )
+    return None
+
+
+def _semantic_antecedent_candidates(
+    antecedent: StoredMessage,
+    antecedent_predicates: frozenset[str],
+    existing_memories: Iterable[MemoryItem],
+    antecedent_ids: set[str],
+) -> list[MemoryItem]:
+    semantic_candidates = []
+    for item in existing_memories:
+        if item.status not in {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}:
+            continue
+        source_match = item.source_message_id in antecedent_ids
+        predicate_match = item.kind in _SEMANTIC_ANTECEDENT_KINDS and (
+            (item.canonical_predicate or "").startswith(
+                ("interaction.", "contact.", "relationship.")
+            )
+            or item.kind == MemoryKind.INTERACTION_PATTERN
+        )
+        deduped_semantic_match = _matches_recent_antecedent_semantics(
+            item,
+            antecedent_predicates,
+            antecedent.created_at,
+        )
+        if (source_match and predicate_match) or deduped_semantic_match:
+            semantic_candidates.append(item)
+    semantic_candidates.sort(
+        key=lambda item: (
+            item.source_message_id in antecedent_ids,
+            item.updated_at,
+        ),
+        reverse=True,
+    )
+    return semantic_candidates
+
+
+def _is_explicit_correction_target_compatible(
+    item: MemoryItem,
+    correction_type: str,
+) -> bool:
+    predicate = item.canonical_predicate or ""
+    if correction_type == "frequency":
+        return (
+            item.kind == MemoryKind.INTERACTION_PATTERN
+            and predicate in _CORRECTION_FREQUENCY_PREDICATES
+        )
+    return predicate.startswith(_CORRECTION_DURATION_PREDICATE_PREFIXES)
+
+
+def _build_correction_candidate(
+    target: MemoryItem,
+    *,
+    text: str,
+    signal_span: str,
+    correction_type: str,
+    correction_value: str,
+    correction_unit: str | None,
+    reference_time: datetime,
+) -> MemoryCandidate:
+    fields = set(MemoryCandidate.model_fields)
+    data = {key: value for key, value in target.model_dump().items() if key in fields}
+    payload = dict(target.payload)
+    payload.update(
+        {
+            "contextual_update_type": "correction",
+            "correction_type": correction_type,
+            "correction_target_memory_id": target.id,
+            "correction_signal": signal_span,
+            "correction_value": correction_value,
+        }
+    )
+    if correction_type == "frequency":
+        payload["frequency"] = correction_value
+        payload["current"] = correction_value
+    else:
+        parsed = _CORRECTION_DURATION_VALUE_PATTERN.fullmatch(correction_value)
+        if parsed is None or correction_unit is None:
+            raise ValueError("invalid duration correction value")
+        payload["duration_value"] = _parse_chinese_number(parsed.group("value"))
+        payload["duration_unit"] = correction_unit
+        payload["temporal_expression"] = correction_value
+        data["time_kind"] = TimeKind.INTERVAL
+        data["period_end"] = reference_time
+        data["temporal_precision"] = TemporalPrecision.APPROXIMATE
+    data.update(
+        {
+            "summary": f"{target.summary}；用户更正为{correction_value}",
+            "original_text": text,
+            "evidence_spans": [text],
+            "payload": payload,
+            "supersedes_id": None,
+            "claim_relation": None,
+        }
+    )
+    return MemoryCandidate.model_validate(data)
 
 
 def resolve_contextual_memory_update(
@@ -538,8 +854,15 @@ def _antecedent_predicates(text: str) -> frozenset[str]:
     predicates: set[str] = set()
     if _RESPONSE_ANTECEDENT_PATTERN.search(text):
         predicates.add("interaction.response_engagement")
+    if _EXPLICIT_INTERACTION_FREQUENCY_PATTERN.search(text):
+        if re.search(r"(?:回复|回我|回消息|回信息|回应)", text):
+            predicates.add("interaction.response_engagement")
+        if re.search(r"(?:联系|聊天|交流|沟通|互动|见面|碰面)", text):
+            predicates.update(_CONTACT_FREQUENCY_PREDICATES)
     if _CONTACT_FREQUENCY_ANTECEDENT_PATTERN.search(text):
         predicates.update(_CONTACT_FREQUENCY_PREDICATES)
+    if re.search(r"(?:冷战|吵架|矛盾|冲突)", text):
+        predicates.add("relationship.conflict_status")
     return frozenset(predicates)
 
 
@@ -556,7 +879,15 @@ def _matches_recent_antecedent_semantics(
         return False
     evidence = _normalize(" ".join([item.summary, *item.evidence_spans]))
     if item_predicate == "interaction.response_engagement":
-        return _RESPONSE_ANTECEDENT_PATTERN.search(evidence) is not None
+        return bool(
+            _RESPONSE_ANTECEDENT_PATTERN.search(evidence)
+            or (
+                _EXPLICIT_INTERACTION_FREQUENCY_PATTERN.search(evidence)
+                and re.search(r"(?:回复|回我|回消息|回信息|回应)", evidence)
+            )
+        )
+    if item_predicate == "relationship.conflict_status":
+        return re.search(r"(?:冷战|吵架|矛盾|冲突)", evidence) is not None
     return _CONTACT_FREQUENCY_ANTECEDENT_PATTERN.search(evidence) is not None
 
 
