@@ -108,7 +108,7 @@ async def test_apology_supersedes_contact_outage_but_keeps_conflict_history() ->
     ]
 
 
-async def test_get_context_reconciles_legacy_transition_and_preference_shape() -> None:
+async def test_get_context_projects_legacy_transition_without_mutating_store() -> None:
     store = InMemoryMemoryStore()
     service = MemoryService(store, SequenceExtractor([]))
     await service.ensure_context("legacy-user", "partner")
@@ -159,7 +159,7 @@ async def test_get_context_reconciles_legacy_transition_and_preference_shape() -
     context = await service.get_context("legacy-user", "partner")
 
     stale = await store.get_memory(unavailable.item.id, "legacy-user")
-    assert stale is not None and stale.status == MemoryStatus.SUPERSEDED
+    assert stale is not None and stale.status == MemoryStatus.PROPOSED
     assert context.partner_preferences == []
     assert any(item.summary == "对方比较节俭" for item in context.uncertain_items)
     assert all(item.id != unavailable.item.id for item in context.remembered_items)

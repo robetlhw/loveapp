@@ -1,8 +1,8 @@
 """Read-path retrieval for governed memories.
 
-The write path remains the authority for admission and lifecycle state.  This
-module only ranks already stored memories and deliberately treats inactive
-rows as ineligible candidates.
+The write path remains the authority for admission and lifecycle state. This
+module only ranks already stored memories; inactive rows remain ineligible in
+current mode, while explicit history mode may read superseded rows.
 """
 
 import re
@@ -10,6 +10,7 @@ import unicodedata
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from math import sqrt
 
 from loveapp.domain.advice import RelationshipContext
@@ -19,6 +20,33 @@ from loveapp.domain.memory_lifecycle import MemoryRole, memory_role, semantic_co
 from loveapp.domain.relationship_evidence import RelationshipEvidenceProfile
 from loveapp.domain.relationship_plan import RelationshipPlan
 from loveapp.ports.embeddings import EmbeddingProvider
+
+
+class MemoryRetrievalMode(StrEnum):
+    """Scope of memories eligible for a read-path retrieval."""
+
+    CURRENT = "current"
+    HISTORY = "history"
+
+
+_HISTORICAL_QUERY_PATTERN = re.compile(
+    r"(?:以前|之前|曾经|过去|当时|从前|历史上|"
+    r"\b(?:before|previously|formerly|historically|in the past|used to)\b)",
+    re.IGNORECASE,
+)
+
+
+def resolve_memory_retrieval_mode(
+    query: str | None,
+    requested: MemoryRetrievalMode | str | None = None,
+) -> MemoryRetrievalMode:
+    """Use explicit mode when supplied, otherwise recognize clear history intent."""
+
+    if requested is not None:
+        return MemoryRetrievalMode(requested)
+    if query and _HISTORICAL_QUERY_PATTERN.search(query):
+        return MemoryRetrievalMode.HISTORY
+    return MemoryRetrievalMode.CURRENT
 
 
 @dataclass(frozen=True)
@@ -68,7 +96,7 @@ class HybridMemoryRetriever:
         token_budget: int = 4096,
     ) -> None:
         self._embedding_provider = embedding_provider
-        self._token_budget = max(token_budget, 1)
+        self._token_budget = max(token_budget, 0)
 
     async def retrieve(
         self,
@@ -78,12 +106,14 @@ class HybridMemoryRetriever:
         limit: int = 20,
         reference_time: datetime | None = None,
         token_budget: int | None = None,
+        mode: MemoryRetrievalMode | None = None,
     ) -> list[RetrievedMemory]:
+        mode = resolve_memory_retrieval_mode(query, mode)
         now = reference_time or utc_now()
         candidates = [
             item
             for item in memories
-            if _is_retrievable(item, now)
+            if _is_retrievable(item, now, mode=mode)
         ]
         if not candidates or limit <= 0:
             return []
@@ -136,15 +166,15 @@ class HybridMemoryRetriever:
             )
 
         scored.sort(key=_retrieval_sort_key)
-        deduplicated = _deduplicate(scored)
-        budget = self._token_budget if token_budget is None else max(token_budget, 1)
+        deduplicated = _deduplicate(scored, preserve_history=mode == MemoryRetrievalMode.HISTORY)
+        budget = self._token_budget if token_budget is None else max(token_budget, 0)
         selected: list[RetrievedMemory] = []
         used_tokens = 0
         for result in deduplicated:
             if len(selected) >= limit:
                 break
             estimated = _estimate_tokens(result.item)
-            if selected and used_tokens + estimated > budget:
+            if used_tokens + estimated > budget:
                 continue
             selected.append(result)
             used_tokens += estimated
@@ -162,6 +192,7 @@ class MemoryContextBuilder:
         active_plans: Sequence[RelationshipPlan] | None = None,
         relationship_evidence: RelationshipEvidenceProfile | None = None,
         reference_time: datetime | None = None,
+        mode: MemoryRetrievalMode = MemoryRetrievalMode.CURRENT,
     ) -> RelationshipContext:
         return attach_memories(
             base,
@@ -169,6 +200,12 @@ class MemoryContextBuilder:
             active_plans=active_plans,
             relationship_evidence=relationship_evidence,
             reference_time=reference_time,
+            historical_ids={
+                result.item.id
+                for result in retrieved
+                if mode == MemoryRetrievalMode.HISTORY
+                and result.item.status == MemoryStatus.SUPERSEDED
+            },
         )
 
 
@@ -203,8 +240,16 @@ _RELATIONSHIP_TERMS = frozenset(
 )
 
 
-def _is_retrievable(item: MemoryItem, now: datetime) -> bool:
-    if item.status not in {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}:
+def _is_retrievable(
+    item: MemoryItem,
+    now: datetime,
+    *,
+    mode: MemoryRetrievalMode = MemoryRetrievalMode.CURRENT,
+) -> bool:
+    allowed_statuses = {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}
+    if mode == MemoryRetrievalMode.HISTORY:
+        allowed_statuses.add(MemoryStatus.SUPERSEDED)
+    if item.status not in allowed_statuses:
         return False
     if item.expires_at is not None:
         expires_at = _align_timezone(item.expires_at, now)
@@ -349,7 +394,13 @@ def _lifecycle_priority(item: MemoryItem) -> float:
     return status_priority * role_priority
 
 
-def _deduplicate(results: Sequence[RetrievedMemory]) -> list[RetrievedMemory]:
+def _deduplicate(
+    results: Sequence[RetrievedMemory],
+    *,
+    preserve_history: bool = False,
+) -> list[RetrievedMemory]:
+    if preserve_history:
+        return sorted(results, key=_retrieval_sort_key)
     grouped: dict[tuple[str, str, str], RetrievedMemory] = {}
     ungrouped: list[RetrievedMemory] = []
     for result in results:
@@ -363,12 +414,19 @@ def _deduplicate(results: Sequence[RetrievedMemory]) -> list[RetrievedMemory]:
     return sorted([*ungrouped, *grouped.values()], key=_retrieval_sort_key)
 
 
-def _retrieval_sort_key(result: RetrievedMemory) -> tuple[float, int, float, str]:
+def _retrieval_sort_key(
+    result: RetrievedMemory,
+) -> tuple[float, float, int, float, str, str, str, str]:
     item = result.item
+    created_at = _align_timezone(item.created_at, item.updated_at)
     return (
         -result.score.total,
-        -int(item.status == MemoryStatus.CONFIRMED),
-        -(item.occurred_at or item.period_end or item.updated_at).timestamp(),
+        -result.score.confidence,
+        -item.importance,
+        -created_at.timestamp(),
+        item.canonical_predicate or item.custom_predicate or "",
+        item.summary,
+        item.source_message_id or "",
         item.id,
     )
 
@@ -418,6 +476,8 @@ def _align_timezone(value: datetime, reference: datetime) -> datetime:
 __all__ = [
     "HybridMemoryRetriever",
     "MemoryContextBuilder",
+    "MemoryRetrievalMode",
     "MemoryRetrievalScore",
     "RetrievedMemory",
+    "resolve_memory_retrieval_mode",
 ]

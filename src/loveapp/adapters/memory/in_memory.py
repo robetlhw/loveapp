@@ -3,6 +3,7 @@ from datetime import datetime
 from uuid import uuid4
 
 from loveapp.domain.advice import RelationshipContext
+from loveapp.domain.contextual_memory import apply_contextual_memory_update
 from loveapp.domain.memory import (
     AdmissionDecision,
     ClaimRelation,
@@ -19,7 +20,6 @@ from loveapp.domain.memory import (
     utc_now,
 )
 from loveapp.domain.memory_context import attach_memories, select_context_memories
-from loveapp.domain.contextual_memory import apply_contextual_memory_update
 from loveapp.domain.memory_write import (
     MemoryTransitionAudit,
     MemoryWriteBatch,
@@ -468,8 +468,10 @@ class InMemoryMemoryStore:
         kind: MemoryKind | None = None,
         status: MemoryStatus | None = None,
         limit: int = 100,
+        read_only: bool = False,
     ) -> list[MemoryItem]:
-        self._expire_due_memories()
+        if not read_only:
+            self._expire_due_memories()
         items = [
             item
             for item in self._memories.values()
@@ -594,10 +596,13 @@ class InMemoryMemoryStore:
         user_id: str,
         relationship_id: str,
         limit: int = 20,
+        read_only: bool = False,
     ) -> RelationshipContext | None:
         context = self._contexts.get((user_id, relationship_id))
         if context is None:
             return None
+        if read_only:
+            return context.model_copy(deep=True)
         plans = await self.sync_relationship_plans(
             user_id=user_id,
             relationship_id=relationship_id,
@@ -720,11 +725,13 @@ class InMemoryMemoryStore:
         relationship_id: str,
         status: PlanStatus | None = None,
         limit: int = 100,
+        read_only: bool = False,
     ) -> list[RelationshipPlan]:
-        await self.sync_relationship_plans(
-            user_id=user_id,
-            relationship_id=relationship_id,
-        )
+        if not read_only:
+            await self.sync_relationship_plans(
+                user_id=user_id,
+                relationship_id=relationship_id,
+            )
         plans = [
             plan
             for plan in self._relationship_plans.values()

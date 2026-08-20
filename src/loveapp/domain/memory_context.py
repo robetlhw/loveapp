@@ -112,10 +112,13 @@ def attach_memories(
     active_plans: Sequence[RelationshipPlan] | None = None,
     relationship_evidence: RelationshipEvidenceProfile | None = None,
     reference_time: datetime | None = None,
+    historical_ids: set[str] | None = None,
 ) -> RelationshipContext:
+    historical_ids = historical_ids or set()
     result = context.model_copy(deep=True)
+    projection_memories = [item for item in memories if item.id not in historical_ids]
     result.relationship_evidence = relationship_evidence or project_relationship_evidence(
-        memories
+        projection_memories
     )
     if active_plans is not None:
         active_plan_memory_ids = {
@@ -150,6 +153,11 @@ def attach_memories(
 
     for item in memories:
         context_item = MemoryContextItem.from_item(item)
+        is_historical = item.id in historical_ids
+        if is_historical:
+            # Explicit history is visible in remembered_items, but it must not
+            # be projected into any current-state or confirmed-fact field.
+            continue
         if item.status == MemoryStatus.PROPOSED:
             result.uncertain_items.append(context_item)
         if item.claim_relation == "contradiction":

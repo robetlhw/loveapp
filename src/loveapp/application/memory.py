@@ -95,7 +95,9 @@ from .memory_relations import (
 from .memory_retrieval import (
     HybridMemoryRetriever,
     MemoryContextBuilder,
+    MemoryRetrievalMode,
     RetrievedMemory,
+    resolve_memory_retrieval_mode,
 )
 from .relationship_events import (
     build_contextual_relationship_candidate,
@@ -1297,9 +1299,7 @@ class MemoryService:
         user_id: str,
         active_memories: list[MemoryItem],
     ) -> set[str]:
-        stale_ids = legacy_transition_target_ids(active_memories)
-        duplicate_ids = semantic_duplicate_ids(active_memories)
-        reconciled_ids = stale_ids | duplicate_ids
+        reconciled_ids = _reconciled_active_ids(active_memories)
         for memory_id in reconciled_ids:
             await self.store.set_memory_status(
                 memory_id,
@@ -1385,42 +1385,74 @@ class MemoryService:
         relationship_stage: RelationshipStage = RelationshipStage.UNKNOWN,
         *,
         query: str | None = None,
+        mode: MemoryRetrievalMode | None = None,
     ) -> RelationshipContext:
-        context = await self.ensure_context(user_id, relationship_id, relationship_stage)
+        mode = resolve_memory_retrieval_mode(query, mode)
+        context = await self.store.get_relationship_context(
+            user_id,
+            relationship_id,
+            read_only=True,
+        )
+        if context is None:
+            context = RelationshipContext(
+                user_id=user_id,
+                relationship_id=relationship_id,
+                relationship_stage=relationship_stage,
+            )
+        elif relationship_stage != RelationshipStage.UNKNOWN:
+            context = context.model_copy(update={"relationship_stage": relationship_stage})
+        context_time = self._clock()
         memories = await self.store.list_memories(
             user_id=user_id,
             relationship_id=relationship_id,
             limit=200,
+            read_only=True,
         )
-        active = [
+        current = [
             item
             for item in memories
             if item.status in {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}
+            and _memory_is_current(item, context_time)
         ]
-        reconciled_ids = await self._reconcile_active_lifecycle(user_id, active)
+        reconciled_ids = _reconciled_active_ids(current)
         if reconciled_ids:
-            active = [item for item in active if item.id not in reconciled_ids]
-        plans = await self.store.sync_relationship_plans(
+            current = [item for item in current if item.id not in reconciled_ids]
+        plans = await self.store.list_relationship_plans(
             user_id=user_id,
             relationship_id=relationship_id,
+            read_only=True,
         )
-        plans = await self.reconcile_relationship_plans(
-            user_id=user_id,
-            relationship_id=relationship_id,
-            memories=memories,
-            plans=plans,
-        )
-        active = _filter_memories_for_plan_status(active, plans)
-        context_time = self._clock()
+        plans = [plan for plan in plans if _plan_is_current(plan, context_time)]
+        reconciled_plan_ids = {
+            transition.plan_id
+            for transition in match_plan_transitions(
+                current,
+                plans,
+                infer_legacy_completion=True,
+            )
+        }
+        current_view = _filter_memories_for_plan_status(current, plans)
+        active = list(current_view)
+        if mode == MemoryRetrievalMode.HISTORY:
+            active.extend(
+                item
+                for item in memories
+                if item.status == MemoryStatus.SUPERSEDED
+            )
         standardized_evidence = standardize_relationship_evidence(
-            active,
+            current_view,
             reference_time=context_time,
         )
         relationship_evidence = project_standardized_relationship_evidence(
             standardized_evidence,
             reference_time=context_time,
         )
-        active_plans = [plan for plan in plans if plan.status in ACTIVE_PLAN_STATUSES]
+        active_plans = [
+            plan
+            for plan in plans
+            if plan.status in ACTIVE_PLAN_STATUSES
+            and plan.plan_id not in reconciled_plan_ids
+        ]
         suppressed_plan_ids = (
             suppressed_plan_ids_for_text(query, active_plans) if query else set()
         )
@@ -1452,6 +1484,7 @@ class MemoryService:
             query=query,
             limit=self._context_limit,
             reference_time=context_time,
+            mode=mode,
         )
         base = RelationshipContext(
             user_id=user_id,
@@ -1464,6 +1497,7 @@ class MemoryService:
             active_plans=visible_plans,
             relationship_evidence=relationship_evidence,
             reference_time=context_time,
+            mode=mode,
         )
 
     async def retrieve_memories(
@@ -1473,28 +1507,70 @@ class MemoryService:
         *,
         query: str | None = None,
         limit: int | None = None,
+        mode: MemoryRetrievalMode | None = None,
     ) -> list[RetrievedMemory]:
-        """Return ranked current memories without assembling an advice context."""
+        """Return ranked memories without mutating lifecycle or context state."""
 
+        mode = resolve_memory_retrieval_mode(query, mode)
+        reference_time = self._clock()
         memories = await self.store.list_memories(
             user_id=user_id,
             relationship_id=relationship_id,
             limit=200,
+            read_only=True,
         )
         active = [
             item
             for item in memories
             if item.status in {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}
+            and _memory_is_current(item, reference_time)
         ]
-        reconciled_ids = await self._reconcile_active_lifecycle(user_id, active)
+        reconciled_ids = _reconciled_active_ids(active)
         if reconciled_ids:
             active = [item for item in active if item.id not in reconciled_ids]
+        if mode == MemoryRetrievalMode.HISTORY:
+            active.extend(
+                item
+                for item in memories
+                if item.status == MemoryStatus.SUPERSEDED
+            )
         return await self._memory_retriever.retrieve(
             active,
             query=query,
             limit=limit or self._context_limit,
-            reference_time=self._clock(),
+            reference_time=reference_time,
+            mode=mode,
         )
+
+
+def _reconciled_active_ids(active_memories: list[MemoryItem]) -> set[str]:
+    """Identify stale active rows without applying lifecycle mutations."""
+
+    return legacy_transition_target_ids(active_memories) | semantic_duplicate_ids(
+        active_memories
+    )
+
+
+def _memory_is_current(item: MemoryItem, reference_time: datetime) -> bool:
+    if item.expires_at is None:
+        return True
+    expires_at = item.expires_at
+    if expires_at.tzinfo is None and reference_time.tzinfo is not None:
+        expires_at = expires_at.replace(tzinfo=reference_time.tzinfo)
+    elif expires_at.tzinfo is not None and reference_time.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=None)
+    return expires_at > reference_time
+
+
+def _plan_is_current(plan: RelationshipPlan, reference_time: datetime) -> bool:
+    if plan.expires_at is None:
+        return True
+    expires_at = plan.expires_at
+    if expires_at.tzinfo is None and reference_time.tzinfo is not None:
+        expires_at = expires_at.replace(tzinfo=reference_time.tzinfo)
+    elif expires_at.tzinfo is not None and reference_time.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=None)
+    return expires_at > reference_time
 
 
 def _planned_memory_action(relation: ClaimRelation) -> str:

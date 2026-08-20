@@ -9,6 +9,7 @@ from uuid import uuid4
 import aiosqlite
 
 from loveapp.domain.advice import RelationshipContext
+from loveapp.domain.contextual_memory import apply_contextual_memory_update
 from loveapp.domain.enums import RelationshipStage
 from loveapp.domain.memory import (
     AdmissionDecision,
@@ -26,7 +27,6 @@ from loveapp.domain.memory import (
     utc_now,
 )
 from loveapp.domain.memory_context import attach_memories, select_context_memories
-from loveapp.domain.contextual_memory import apply_contextual_memory_update
 from loveapp.domain.memory_predicates import normalize_predicate
 from loveapp.domain.memory_write import (
     MemoryTransitionAudit,
@@ -566,6 +566,7 @@ class SQLiteMemoryStore:
         kind: MemoryKind | None = None,
         status: MemoryStatus | None = None,
         limit: int = 100,
+        read_only: bool = False,
     ) -> list[MemoryItem]:
         await self.initialize()
         clauses = ["user_id = ?"]
@@ -590,9 +591,10 @@ class SQLiteMemoryStore:
         """
         connection = await self._open_connection()
         try:
-            now = self._clock()
-            await _expire_due_memories(connection, now)
-            await connection.commit()
+            if not read_only:
+                now = self._clock()
+                await _expire_due_memories(connection, now)
+                await connection.commit()
             cursor = await connection.execute(query, values)
             rows = await cursor.fetchall()
             await cursor.close()
@@ -781,10 +783,27 @@ class SQLiteMemoryStore:
         user_id: str,
         relationship_id: str,
         limit: int = 20,
+        read_only: bool = False,
     ) -> RelationshipContext | None:
         await self.initialize()
         connection = await self._open_connection()
         try:
+            if read_only:
+                relationship = await _fetchone(
+                    connection,
+                    """
+                    SELECT stage FROM relationships
+                    WHERE user_id = ? AND id = ?
+                    """,
+                    (user_id, relationship_id),
+                )
+                if relationship is None:
+                    return None
+                return RelationshipContext(
+                    user_id=user_id,
+                    relationship_id=relationship_id,
+                    relationship_stage=RelationshipStage(relationship["stage"]),
+                )
             now = self._clock()
             await _expire_due_memories(connection, now)
             await _sync_relationship_plans_in_transaction(
@@ -946,11 +965,13 @@ class SQLiteMemoryStore:
         relationship_id: str,
         status: PlanStatus | None = None,
         limit: int = 100,
+        read_only: bool = False,
     ) -> list[RelationshipPlan]:
-        await self.sync_relationship_plans(
-            user_id=user_id,
-            relationship_id=relationship_id,
-        )
+        if not read_only:
+            await self.sync_relationship_plans(
+                user_id=user_id,
+                relationship_id=relationship_id,
+            )
         clauses = ["user_id = ?", "relationship_id = ?"]
         values: list[str | int] = [user_id, relationship_id]
         if status is not None:
@@ -1149,7 +1170,9 @@ class SQLiteMemoryStore:
                             "contextual_probe": run.gate_decision.contextual_probe,
                             "history_loaded_for_gate": run.gate_decision.history_loaded_for_gate,
                             "antecedent_candidate_ids": run.gate_decision.antecedent_candidate_ids,
-                            "selected_target_memory_id": run.gate_decision.selected_target_memory_id,
+                            "selected_target_memory_id": (
+                                run.gate_decision.selected_target_memory_id
+                            ),
                             "target_guard_result": run.gate_decision.target_guard_result,
                             "contextual_update_type": run.gate_decision.contextual_update_type,
                         }

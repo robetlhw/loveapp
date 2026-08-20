@@ -252,7 +252,7 @@ async def test_current_retrospective_fact_suppresses_stale_plan_without_mutating
     assert plans[0].status == PlanStatus.CONFIRMED
 
 
-async def test_legacy_retrospective_memory_reconciles_plan_without_activity_rules() -> None:
+async def test_legacy_retrospective_memory_reconciles_only_explicitly() -> None:
     store = InMemoryMemoryStore()
     planned = await store.save_memory(
         user_id="legacy-plan-user",
@@ -286,17 +286,33 @@ async def test_legacy_retrospective_memory_reconciles_plan_without_activity_rule
         "partner",
         query="这段互动说明了什么？",
     )
-    plans = await store.list_relationship_plans(
+    plans_before = await store.list_relationship_plans(
         user_id="legacy-plan-user",
         relationship_id="partner",
+        read_only=True,
+    )
+    source_before = await store.get_memory(planned.item.id, "legacy-plan-user")
+
+    assert plans_before[0].status == PlanStatus.PROPOSED
+    assert source_before is not None and source_before.status == MemoryStatus.PROPOSED
+    assert context.active_plans == []
+    assert context.planned_events == []
+
+    memories = await store.list_memories(
+        user_id="legacy-plan-user",
+        relationship_id="partner",
+    )
+    plans = await service.reconcile_relationship_plans(
+        user_id="legacy-plan-user",
+        relationship_id="partner",
+        memories=memories,
+        plans=plans_before,
     )
     source = await store.get_memory(planned.item.id, "legacy-plan-user")
 
     assert plans[0].status == PlanStatus.COMPLETED
     assert plans[0].payload["terminal_event_memory_id"] == event.item.id
     assert source is not None and source.status == MemoryStatus.SUPERSEDED
-    assert context.active_plans == []
-    assert context.planned_events == []
 
 
 def test_old_event_does_not_close_a_future_recurrence_with_same_activity() -> None:

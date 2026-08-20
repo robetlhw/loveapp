@@ -85,6 +85,7 @@ class MemoryStore(Protocol):
         kind: MemoryKind | None = None,
         status: MemoryStatus | None = None,
         limit: int = 100,
+        read_only: bool = False,
     ) -> list[MemoryItem]: ...
 
     async def set_memory_status(
@@ -103,6 +104,7 @@ class MemoryStore(Protocol):
         user_id: str,
         relationship_id: str,
         limit: int = 20,
+        read_only: bool = False,
     ) -> RelationshipContext | None: ...
 
     async def save_relationship_context(self, context: RelationshipContext) -> None: ...
@@ -122,6 +124,7 @@ class MemoryStore(Protocol):
         relationship_id: str,
         status: PlanStatus | None = None,
         limit: int = 100,
+        read_only: bool = False,
     ) -> list[RelationshipPlan]: ...
 
     async def set_relationship_plan_status(

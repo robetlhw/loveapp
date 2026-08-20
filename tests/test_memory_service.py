@@ -8,9 +8,9 @@ from loveapp.adapters.memory import InMemoryMemoryStore
 from loveapp.agents import AdviceAgent, DatePlanningAgent
 from loveapp.application import MemoryService
 from loveapp.application.memory import NoOpMemoryExtractor
-from loveapp.application.memory_gate import MemoryGate
 from loveapp.bootstrap import build_memory_container, load_seed_documents
 from loveapp.core.config import Settings
+from loveapp.core.timing import ExecutionTrace
 from loveapp.domain.advice import AdviceRequest, AdviceResponse, RelationshipContext
 from loveapp.domain.date_plan import DatePlanRequest
 from loveapp.domain.enums import AdviceScenario
@@ -36,7 +36,6 @@ from loveapp.domain.memory import (
 )
 from loveapp.domain.policy import ResolvedScenarioPolicy
 from loveapp.safety import SafetyPolicy
-from loveapp.core.timing import ExecutionTrace
 
 
 class StubExtractor:
