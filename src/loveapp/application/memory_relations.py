@@ -9,6 +9,11 @@ from loveapp.domain.memory import (
     PredicateType,
     memory_dedupe_key,
 )
+from loveapp.domain.memory_lifecycle import (
+    governed_state_identity,
+    governed_state_value,
+    memory_concept,
+)
 from loveapp.domain.memory_predicates import normalize_preference_value
 
 
@@ -37,17 +42,15 @@ def resolve_claim_relation(
             "The normalized claim identity already exists in this relationship.",
         )
 
-    if (
-        candidate.kind == MemoryKind.RELATIONSHIP_STATE
-        and candidate.state_dimension
-        and candidate.state_value
-    ):
+    state_identity = governed_state_identity(candidate)
+    state_value = governed_state_value(candidate)
+    if state_identity is not None and state_value is not None:
         same_dimension = [
             item
             for item in active_memories
             if item.subject.casefold() == candidate.subject.casefold()
-            and item.state_dimension == candidate.state_dimension
-            and item.state_value != candidate.state_value
+            and governed_state_identity(item) == state_identity
+            and governed_state_value(item) not in {None, state_value}
         ]
         if same_dimension:
             confirmed = [item for item in same_dimension if item.status == MemoryStatus.CONFIRMED]
@@ -63,6 +66,35 @@ def resolve_claim_relation(
                 tuple(item.id for item in confirmed or same_dimension),
                 "proposed_state_conflict",
                 "An unconfirmed value cannot close an existing state value.",
+            )
+
+    candidate_concept = memory_concept(candidate)
+    if candidate_concept in {"contact_reduced", "contact_restored"}:
+        opposite_concept = (
+            "contact_restored"
+            if candidate_concept == "contact_reduced"
+            else "contact_reduced"
+        )
+        opposite = [
+            item
+            for item in active_memories
+            if item.subject.casefold() == candidate.subject.casefold()
+            and memory_concept(item) == opposite_concept
+        ]
+        if opposite:
+            confirmed = [item for item in opposite if item.status == MemoryStatus.CONFIRMED]
+            if incoming_status == MemoryStatus.CONFIRMED:
+                return ClaimRelationResolution(
+                    ClaimRelation.UPDATE,
+                    tuple(item.id for item in opposite),
+                    "contact_state_transition",
+                    "A confirmed contact state replaces an opposite active contact representation.",
+                )
+            return ClaimRelationResolution(
+                ClaimRelation.CONTRADICTION,
+                tuple(item.id for item in confirmed or opposite),
+                "proposed_contact_state_conflict",
+                "An unconfirmed contact state cannot close an existing confirmed contact state.",
             )
 
     if candidate.kind == MemoryKind.PREFERENCE:
@@ -101,15 +133,27 @@ def resolve_claim_relation(
 
 
 def has_local_conflict(candidate: MemoryCandidate, active_memories: list[MemoryItem]) -> bool:
-    if (
-        candidate.kind == MemoryKind.RELATIONSHIP_STATE
-        and candidate.state_dimension
-        and candidate.state_value
-    ):
+    state_identity = governed_state_identity(candidate)
+    state_value = governed_state_value(candidate)
+    if state_identity is not None and state_value is not None:
+        same_dimension_conflict = any(
+            item.subject.casefold() == candidate.subject.casefold()
+            and governed_state_identity(item) == state_identity
+            and governed_state_value(item) not in {None, state_value}
+            for item in active_memories
+        )
+        if same_dimension_conflict:
+            return True
+    candidate_concept = memory_concept(candidate)
+    if candidate_concept in {"contact_reduced", "contact_restored"}:
+        opposite_concept = (
+            "contact_restored"
+            if candidate_concept == "contact_reduced"
+            else "contact_reduced"
+        )
         return any(
             item.subject.casefold() == candidate.subject.casefold()
-            and item.state_dimension == candidate.state_dimension
-            and item.state_value not in {None, candidate.state_value}
+            and memory_concept(item) == opposite_concept
             for item in active_memories
         )
     if candidate.kind == MemoryKind.PREFERENCE:

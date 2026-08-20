@@ -41,6 +41,8 @@ from loveapp.domain.memory_context import (
     select_context_memories,
 )
 from loveapp.domain.memory_lifecycle import (
+    governed_state_identity,
+    governed_state_value,
     legacy_transition_target_ids,
     memory_concept,
     normalize_memory_candidate,
@@ -1714,18 +1716,16 @@ def _plan_in_batch_state_transitions(
 ) -> dict[int, list[int]]:
     targets: dict[int, list[int]] = {}
     for index, candidate in enumerate(candidates):
-        if (
-            candidate.kind != MemoryKind.RELATIONSHIP_STATE
-            or not candidate.state_dimension
-            or candidate.state_value is None
-        ):
+        identity = governed_state_identity(candidate)
+        value = governed_state_value(candidate)
+        if identity is None or value is None:
             continue
         eligible: list[int] = []
         for previous_index, previous in enumerate(candidates[:index]):
             if (
                 previous.subject.casefold() != candidate.subject.casefold()
-                or previous.state_dimension != candidate.state_dimension
-                or previous.state_value in {None, candidate.state_value}
+                or governed_state_identity(previous) != identity
+                or governed_state_value(previous) in {None, value}
             ):
                 continue
             if (
@@ -1744,18 +1744,15 @@ def _has_in_batch_state_conflict(
     statuses: list[MemoryStatus],
 ) -> bool:
     candidate = candidates[index]
-    if (
-        statuses[index] != MemoryStatus.PROPOSED
-        or candidate.kind != MemoryKind.RELATIONSHIP_STATE
-        or not candidate.state_dimension
-        or candidate.state_value is None
-    ):
+    identity = governed_state_identity(candidate)
+    value = governed_state_value(candidate)
+    if statuses[index] != MemoryStatus.PROPOSED or identity is None or value is None:
         return False
     return any(
         statuses[previous_index] == MemoryStatus.CONFIRMED
         and previous.subject.casefold() == candidate.subject.casefold()
-        and previous.state_dimension == candidate.state_dimension
-        and previous.state_value not in {None, candidate.state_value}
+        and governed_state_identity(previous) == identity
+        and governed_state_value(previous) not in {None, value}
         for previous_index, previous in enumerate(candidates[:index])
     )
 

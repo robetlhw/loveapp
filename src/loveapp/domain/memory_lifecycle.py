@@ -181,6 +181,11 @@ STATE_TRANSITION_RULES: tuple[StateTransitionRule, ...] = (
         closes_concepts=frozenset({"contact_unavailable"}),
     ),
     StateTransitionRule(
+        name="restore_contact_frequency",
+        trigger_concepts=frozenset({"contact_restored"}),
+        closes_concepts=frozenset({"contact_reduced"}),
+    ),
+    StateTransitionRule(
         name="resolve_active_conflict",
         trigger_concepts=frozenset({"relationship_repaired"}),
         closes_concepts=frozenset({"active_conflict"}),
@@ -228,14 +233,21 @@ def memory_concept(memory: MemoryCandidate) -> str:
     canonical = normalized.canonical_predicate
     state_value = normalized.state_value
     if canonical == "contact.status" and state_value:
+        if state_value in {"normal", "restored"}:
+            return "contact_restored"
+        if state_value == "reduced":
+            return "contact_reduced"
         return f"contact_{state_value}"
     if canonical == "relationship.repair_status" and state_value:
         return {
             "in_progress": "repair_started",
             "completed": "relationship_repaired",
         }.get(state_value, f"repair_{state_value}")
-    if canonical == "relationship.conflict_status" and state_value == "active":
-        return "active_conflict"
+    if canonical == "relationship.conflict_status" and state_value:
+        return {
+            "active": "active_conflict",
+            "resolved": "relationship_repaired",
+        }.get(state_value, f"conflict_{state_value}")
     if canonical == "confession.status" and state_value:
         return {
             "intended": "confession_intent",
@@ -243,10 +255,15 @@ def memory_concept(memory: MemoryCandidate) -> str:
         }.get(state_value, f"confession_{state_value}")
     if canonical == "relationship.stage" and state_value in {"dating", "committed"}:
         return "relationship_started"
-    state_identity = relationship_state_identity(memory)
-    relationship_value = relationship_state_value(memory)
-    if state_identity is not None and relationship_value is not None:
-        return f"state:{state_identity[1]}:{relationship_value}"
+    if canonical == "interaction.contact_frequency" and state_value:
+        if state_value in {"low", "decreasing", "reduced"}:
+            return "contact_reduced"
+        if state_value in {"normal", "restored"}:
+            return "contact_restored"
+    state_identity = governed_state_identity(memory)
+    state_value = governed_state_value(memory)
+    if state_identity is not None and state_value is not None:
+        return f"state:{state_identity[1]}:{state_value}"
     if _has_preference_payload(memory):
         preference = memory.payload.get("preference")
         preference_type = memory.payload.get("preference_type") or "unknown"
@@ -408,16 +425,16 @@ def plan_memory_transitions(
                 )
             )
     for index, trigger in enumerate(triggers):
-        identity = relationship_state_identity(trigger)
-        value = relationship_state_value(trigger)
+        identity = governed_state_identity(trigger)
+        value = governed_state_value(trigger)
         if identity is None or value is None:
             continue
         targets = tuple(
             item.id
             for item in active_memories
             if item.id not in claimed_targets
-            and relationship_state_identity(item) == identity
-            and relationship_state_value(item) not in {None, value}
+            and governed_state_identity(item) == identity
+            and governed_state_value(item) not in {None, value}
             and _trigger_can_close_target(
                 trigger,
                 item,
@@ -483,7 +500,7 @@ def semantic_duplicate_ids(active_memories: Sequence[MemoryItem]) -> set[str]:
 
 def semantic_context_key(memory: MemoryItem) -> tuple[str, str, str] | None:
     role = memory_role(memory)
-    state_identity = relationship_state_identity(memory)
+    state_identity = governed_state_identity(memory)
     if state_identity is not None:
         return role.value, memory.subject.casefold(), f"state:{state_identity[1]}"
     concept = memory_concept(memory)
@@ -518,6 +535,36 @@ def relationship_state_value(memory: MemoryCandidate) -> str | None:
     if raw_value is None and memory.payload.get("uncertainty_type") is not None:
         raw_value = "unknown"
     return normalize_state_value(identity[1], raw_value)
+
+
+_GOVERNED_INTERACTION_STATE_DIMENSIONS = frozenset(
+    {"interaction.contact_frequency"}
+)
+_GOVERNED_INTERACTION_STATE_VALUES = frozenset(
+    {"low", "decreasing", "reduced", "normal", "restored"}
+)
+
+
+def governed_state_identity(memory: MemoryCandidate) -> tuple[str, str] | None:
+    relationship_identity = relationship_state_identity(memory)
+    if relationship_identity is not None:
+        return relationship_identity
+    if (
+        memory.kind == MemoryKind.INTERACTION_PATTERN
+        and memory.state_dimension in _GOVERNED_INTERACTION_STATE_DIMENSIONS
+        and memory.state_value in _GOVERNED_INTERACTION_STATE_VALUES
+    ):
+        return "interaction", memory.state_dimension
+    return None
+
+
+def governed_state_value(memory: MemoryCandidate) -> str | None:
+    identity = governed_state_identity(memory)
+    if identity is None:
+        return None
+    if identity[0] == "relationship":
+        return relationship_state_value(memory)
+    return memory.state_value
 
 
 def _matching_family(memory: MemoryCandidate) -> PredicateFamily | None:
