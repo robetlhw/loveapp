@@ -10,6 +10,7 @@ from loveapp.adapters.conversation_states import InMemoryConversationFlowStateSt
 from loveapp.adapters.date_tasks import InMemoryDatePlanningTaskStore
 from loveapp.agents.advice import AdviceAgent
 from loveapp.agents.date_planner import DatePlanningAgent
+from loveapp.agents.date_workflow import DatePlanningWorkflow
 from loveapp.application import MemoryService
 from loveapp.application.conversation_flow import (
     advance_conversation_flow,
@@ -29,6 +30,7 @@ from loveapp.domain.conversation import (
 )
 from loveapp.domain.date_plan import DatePlan, DatePlanRequest
 from loveapp.domain.date_task import DatePlanningTaskState
+from loveapp.domain.date_workflow import DatePlanningWorkflowInput
 from loveapp.domain.enums import (
     AdviceScenario,
     BudgetScope,
@@ -74,12 +76,17 @@ class ConversationAgent:
         memory_service: MemoryService,
         date_task_store: DatePlanningTaskStore | None = None,
         conversation_flow_state_store: ConversationFlowStateStore | None = None,
+        date_planning_workflow: DatePlanningWorkflow | None = None,
     ) -> None:
         self._router = router
         self._advice_agent = advice_agent
         self._date_planning_agent = date_planning_agent
         self._memory_service = memory_service
         self._date_task_store = date_task_store or InMemoryDatePlanningTaskStore()
+        self._date_planning_workflow = date_planning_workflow or DatePlanningWorkflow(
+            date_planning_agent,
+            self._date_task_store,
+        )
         self._conversation_flow_state_store = (
             conversation_flow_state_store or InMemoryConversationFlowStateStore()
         )
@@ -355,20 +362,17 @@ class ConversationAgent:
                     }
                 )
             task_state = state.get("date_task_state")
-            if (
-                task_state is not None
-                and (
-                    (
-                        route.date_intent
-                        in {
-                            DateTaskIntent.SWITCH,
-                            DateTaskIntent.CANCEL,
-                        }
-                        and route.task_type != TaskType.DATE_PLANNING
-                    )
-                    or route.task_type == TaskType.OUT_OF_SCOPE
-                    or route.risk_level in {RiskLevel.HIGH, RiskLevel.SENSITIVE}
+            if task_state is not None and (
+                (
+                    route.date_intent
+                    in {
+                        DateTaskIntent.SWITCH,
+                        DateTaskIntent.CANCEL,
+                    }
+                    and route.task_type != TaskType.DATE_PLANNING
                 )
+                or route.task_type == TaskType.OUT_OF_SCOPE
+                or route.risk_level in {RiskLevel.HIGH, RiskLevel.SENSITIVE}
             ):
                 task_state = await self._save_date_task_state(
                     task_state.model_copy(
@@ -409,6 +413,40 @@ class ConversationAgent:
         return {"advice_turn": advice_turn}
 
     async def _date_planning(self, state: ConversationState) -> dict:
+        request = state["request"]
+        recorded = await self._record_user_message(state)
+        result = await self._date_planning_workflow.run(
+            DatePlanningWorkflowInput(
+                request=request,
+                route=state["route"],
+                current_task_state=state.get("date_task_state"),
+            ),
+            trace=state["trace"],
+        )
+        response_message = result.message
+        if result.plan is not None:
+            response_message = _compose_date_response(
+                current=state.get("date_task_state") or _new_date_task_state(request),
+                route=state["route"],
+                plan=result.plan,
+                changed=result.plan_changed,
+            )
+        history_message = (
+            _date_history_message(response_message, result.plan)
+            if result.plan is not None
+            else response_message
+        )
+        await self._record_assistant_message(request, history_message, state["trace"])
+        payload = {
+            **recorded,
+            "message": response_message,
+            "date_task_state": result.task_state,
+        }
+        if result.plan is not None:
+            payload["date_plan"] = result.plan
+        return payload
+
+    async def _legacy_date_planning(self, state: ConversationState) -> dict:
         request = state["request"]
         route = state["route"]
         recorded = await self._record_user_message(state)
@@ -581,13 +619,9 @@ class ConversationAgent:
         with state["trace"].measure("clarify_intent") as details:
             recorded = await self._record_user_message(state)
             route = state["route"]
-            repeated = (
-                route.clarification_exhausted
-                or (
-                    route.clarification_reason
-                    == state["flow_state"].last_clarification_reason
-                    and state["flow_state"].clarification_attempt_count > 0
-                )
+            repeated = route.clarification_exhausted or (
+                route.clarification_reason == state["flow_state"].last_clarification_reason
+                and state["flow_state"].clarification_attempt_count > 0
             )
             details["clarification_reason"] = route.clarification_reason
             details["repeated"] = repeated
@@ -612,8 +646,7 @@ class ConversationAgent:
         if (
             state["route"].pending_task_source == "secondary_task"
             and saved.pending_task is not None
-            and state["route"].task_type
-            in {TaskType.RELATIONSHIP_ADVICE, TaskType.DATE_PLANNING}
+            and state["route"].task_type in {TaskType.RELATIONSHIP_ADVICE, TaskType.DATE_PLANNING}
         ):
             follow_up_prompt = pending_follow_up_prompt(saved.pending_task)
             await self._record_assistant_message(request, follow_up_prompt, state["trace"])

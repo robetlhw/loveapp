@@ -38,7 +38,12 @@ from loveapp.adapters.weather import (
     DemoWeatherProvider,
     DisabledWeatherProvider,
 )
-from loveapp.agents import AdviceAgent, ConversationAgent, DatePlanningAgent
+from loveapp.agents import (
+    AdviceAgent,
+    ConversationAgent,
+    DatePlanningAgent,
+    DatePlanningWorkflow,
+)
 from loveapp.application import MemoryService
 from loveapp.application.memory import NoOpMemoryExtractor
 from loveapp.application.routing import HybridRouter
@@ -57,6 +62,7 @@ from loveapp.safety import SafetyPolicy
 class AppContainer:
     advice_agent: AdviceAgent
     date_planning_agent: DatePlanningAgent
+    date_planning_workflow: DatePlanningWorkflow
     conversation_agent: ConversationAgent
     router: Router
     memory_service: MemoryService
@@ -151,17 +157,20 @@ def build_container(settings: Settings | None = None) -> AppContainer:
         router,
     )
     date_planning_agent = DatePlanningAgent(map_provider, memory_service, weather_provider)
+    date_planning_workflow = DatePlanningWorkflow(date_planning_agent, date_task_store)
     conversation_agent = ConversationAgent(
-        router,
-        advice_agent,
-        date_planning_agent,
-        memory_service,
-        date_task_store,
-        conversation_flow_state_store,
+        router=router,
+        advice_agent=advice_agent,
+        date_planning_agent=date_planning_agent,
+        memory_service=memory_service,
+        date_task_store=date_task_store,
+        conversation_flow_state_store=conversation_flow_state_store,
+        date_planning_workflow=date_planning_workflow,
     )
     return AppContainer(
         advice_agent=advice_agent,
         date_planning_agent=date_planning_agent,
+        date_planning_workflow=date_planning_workflow,
         conversation_agent=conversation_agent,
         router=router,
         memory_service=memory_service,
@@ -197,11 +206,7 @@ def build_memory_container(
         shutdown_grace_seconds=settings.memory_shutdown_grace_seconds,
         admission_policy_overrides=settings.memory_admission_policy_overrides,
         embedding_provider=embedding_provider,
-        verifier=(
-            memory_extractor
-            if getattr(memory_extractor, "can_verify", False)
-            else None
-        ),
+        verifier=(memory_extractor if getattr(memory_extractor, "can_verify", False) else None),
     )
     resources: tuple[Any, ...] = (memory_store, memory_extractor, memory_service)
     if owns_embedding_provider:
