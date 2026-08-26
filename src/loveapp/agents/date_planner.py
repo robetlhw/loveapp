@@ -6,6 +6,8 @@ from typing import TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from loveapp.application import MemoryService
+from loveapp.application.date_planning.mutations import DatePlanMutator
+from loveapp.application.date_planning.ranking import DateCandidateOptimizer
 from loveapp.core.timing import ExecutionTrace
 from loveapp.domain.advice import RelationshipContext
 from loveapp.domain.date_plan import (
@@ -52,6 +54,8 @@ class DatePlanningAgent:
         self._map_provider = map_provider
         self._memory_service = memory_service
         self._weather_provider = weather_provider
+        self._mutator = DatePlanMutator(map_provider)
+        self._candidate_optimizer = DateCandidateOptimizer(map_provider)
         self._graph = self._build_graph()
 
     async def plan(
@@ -362,17 +366,25 @@ class DatePlanningAgent:
                         existing_plan,
                     )
                 }
-            return {
-                "response": _preserve_existing_plan(
-                    existing_plan,
-                    request,
-                    weather=weather,
-                    note=(
-                        "已保留上一版行程。若要全部重新安排，请明确说“重新规划”；"
-                        "修改预算或日期后，我会在现有节点上重新校验。"
-                    ),
-                )
-            }
+            if mutation == DatePlanMutation.REORDER:
+                return {"response": await self._mutator.reorder(existing_plan, request)}
+            if mutation == DatePlanMutation.UPDATE_CONSTRAINT:
+                updated = self._mutator.update_constraint(existing_plan, request)
+                if updated is not None:
+                    return {"response": updated}
+                mutation = DatePlanMutation.REPLAN
+            elif mutation != DatePlanMutation.REPLAN:
+                return {
+                    "response": _preserve_existing_plan(
+                        existing_plan,
+                        request,
+                        weather=weather,
+                        note=(
+                            "已保留上一版行程。若要全部重新安排，请明确说“重新规划”；"
+                            "修改预算或日期后，我会在现有节点上重新校验。"
+                        ),
+                    )
+                }
 
         if request.plan_mode == DatePlanMode.MULTI_DAY or request.day_count > 1:
             return {
@@ -500,22 +512,25 @@ class DatePlanningAgent:
                 )
             }
 
-        activity, restaurant = max(
-            feasible_pairs,
-            key=lambda pair: _pair_score(pair, weather, request.constraints),
+        optimized = await self._candidate_optimizer.optimize_pair(
+            activities,
+            dining_places,
+            request,
         )
-        route = None
-        route_note: str | None = None
-        try:
-            route = await self._map_provider.route(
-                activity,
-                restaurant,
-                request.transport_mode,
+        if optimized is None:  # guarded by feasible_pairs; keep the fallback deterministic.
+            activity, restaurant = max(
+                feasible_pairs,
+                key=lambda pair: _pair_score(pair, weather, request.constraints),
             )
-        except Exception as exc:
-            # A route is useful but not a reason to discard otherwise valid
-            # venue recommendations. Keep the failure visible to the user.
-            route_note = f"地点已找到，但路线服务暂未返回结果：{str(exc)[:160]}"
+            route, route_note = None, "候选路线暂不可用。"
+        else:
+            activity, restaurant = optimized.activity, optimized.dining
+            route = optimized.route
+            route_note = (
+                f"地点已找到，但路线服务暂未返回结果：{optimized.route_error}"
+                if optimized.route_error
+                else None
+            )
         items = [
             DatePlanItem(
                 order=1,
