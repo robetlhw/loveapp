@@ -1,7 +1,9 @@
 from datetime import timedelta
 
 from loveapp.agents.date_planner import DatePlanningAgent
+from loveapp.application.date_planning import DatePlanValidator
 from loveapp.core.timing import ExecutionTrace
+from loveapp.domain.date_constraints import build_date_constraints
 from loveapp.domain.date_plan import DatePlan, DatePlanRequest
 from loveapp.domain.date_task import DatePlanningTaskState
 from loveapp.domain.date_workflow import DatePlanningWorkflowInput, DatePlanningWorkflowResult
@@ -22,9 +24,15 @@ from loveapp.ports.date_tasks import DatePlanningTaskStore
 class DatePlanningWorkflow:
     """Owns DatePlan task-state transitions around deterministic planning."""
 
-    def __init__(self, planner: DatePlanningAgent, task_store: DatePlanningTaskStore) -> None:
+    def __init__(
+        self,
+        planner: DatePlanningAgent,
+        task_store: DatePlanningTaskStore,
+        validator: DatePlanValidator | None = None,
+    ) -> None:
         self._planner = planner
         self._task_store = task_store
+        self._validator = validator or DatePlanValidator()
 
     async def run(
         self,
@@ -86,8 +94,9 @@ class DatePlanningWorkflow:
                 if merged.budget is None and (merged.day_count or 1) > 1
                 else merged.budget_scope
             )
+            plan_request = _build_request(request, merged, route.date_plan, budget_scope)
             plan = await self._planner.plan(
-                _build_request(request, merged, route.date_plan, budget_scope),
+                plan_request,
                 trace=trace,
                 existing_plan=current.current_plan,
                 mutation=mutation,
@@ -102,6 +111,20 @@ class DatePlanningWorkflow:
                     else None
                 ),
             )
+            constraints = build_date_constraints(plan_request)
+            with trace.measure("date_plan_validation") as details:
+                validation = self._validator.validate(plan, plan_request, constraints)
+                details["valid"] = validation.valid
+                details["issue_codes"] = ",".join(issue.code for issue in validation.issues)
+            if not validation.valid:
+                return await self._invalid_plan_result(
+                    current=current,
+                    merged=merged,
+                    candidate_plan=plan,
+                    mutation=mutation,
+                    validation_codes=[issue.code for issue in validation.issues],
+                    trace=trace,
+                )
             persisted_plan = plan if plan.items else current.current_plan
             changed = _date_plan_changed(current.current_plan, persisted_plan)
             planned = merged.model_copy(
@@ -131,6 +154,52 @@ class DatePlanningWorkflow:
                 plan=plan,
                 plan_changed=changed,
             )
+
+    async def _invalid_plan_result(
+        self,
+        *,
+        current: DatePlanningTaskState,
+        merged: DatePlanningTaskState,
+        candidate_plan: DatePlan,
+        mutation: DatePlanMutation,
+        validation_codes: list[str],
+        trace: ExecutionTrace,
+    ) -> DatePlanningWorkflowResult:
+        if current.current_plan is not None:
+            saved = await self._save(
+                merged.model_copy(
+                    update={
+                        "status": DatePlanningStatus.PLANNED,
+                        "current_plan": current.current_plan,
+                        "plan_version": current.plan_version,
+                        "last_mutation": mutation,
+                        "updated_at": utc_now(),
+                    }
+                ),
+                trace,
+            )
+            return DatePlanningWorkflowResult(
+                message="新的条件无法满足；已保留上一版有效行程。",
+                task_state=saved,
+                # Return the candidate response for this turn while retaining
+                # the persisted snapshot as the last known-valid plan.
+                plan=candidate_plan,
+                plan_changed=False,
+            )
+        saved = await self._save(
+            merged.model_copy(
+                update={
+                    "status": DatePlanningStatus.COLLECTING,
+                    "updated_at": utc_now(),
+                }
+            ),
+            trace,
+        )
+        return DatePlanningWorkflowResult(
+            message="当前条件无法生成满足硬约束的行程，请调整地点、预算或明确要求。",
+            task_state=saved,
+            plan_changed=False,
+        )
 
     async def _save(
         self, state: DatePlanningTaskState, trace: ExecutionTrace

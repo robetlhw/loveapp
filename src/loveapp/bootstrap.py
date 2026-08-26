@@ -45,6 +45,7 @@ from loveapp.agents import (
     DatePlanningWorkflow,
 )
 from loveapp.application import MemoryService
+from loveapp.application.date_planning import DatePlanValidator
 from loveapp.application.memory import NoOpMemoryExtractor
 from loveapp.application.routing import HybridRouter
 from loveapp.core.config import Settings, get_settings
@@ -63,6 +64,7 @@ class AppContainer:
     advice_agent: AdviceAgent
     date_planning_agent: DatePlanningAgent
     date_planning_workflow: DatePlanningWorkflow
+    date_plan_validator: DatePlanValidator
     conversation_agent: ConversationAgent
     router: Router
     memory_service: MemoryService
@@ -157,7 +159,12 @@ def build_container(settings: Settings | None = None) -> AppContainer:
         router,
     )
     date_planning_agent = DatePlanningAgent(map_provider, memory_service, weather_provider)
-    date_planning_workflow = DatePlanningWorkflow(date_planning_agent, date_task_store)
+    date_plan_validator = DatePlanValidator()
+    date_planning_workflow = DatePlanningWorkflow(
+        date_planning_agent,
+        date_task_store,
+        date_plan_validator,
+    )
     conversation_agent = ConversationAgent(
         router=router,
         advice_agent=advice_agent,
@@ -171,6 +178,7 @@ def build_container(settings: Settings | None = None) -> AppContainer:
         advice_agent=advice_agent,
         date_planning_agent=date_planning_agent,
         date_planning_workflow=date_planning_workflow,
+        date_plan_validator=date_plan_validator,
         conversation_agent=conversation_agent,
         router=router,
         memory_service=memory_service,

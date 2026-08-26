@@ -693,8 +693,30 @@ class DatePlanningAgent:
             has_activity = any(not _is_dining_item(item) for item in day_items)
             has_dining = any(_is_dining_item(item) for item in day_items)
             current_cost = sum(item.estimated_cost for item in day_items)
-            available_activities = [place for place in activities if place.id not in used_ids]
-            available_dining = [place for place in dining_places if place.id not in used_ids]
+            # Do not spend a later day's explicitly requested candidate while
+            # filling this day's generic activity or dining slot.
+            reserved_activity_ids = _reserved_candidate_ids(
+                activities,
+                activity_assignments,
+                day_index,
+                used_ids,
+            )
+            reserved_dining_ids = _reserved_candidate_ids(
+                dining_places,
+                dining_assignments,
+                day_index,
+                used_ids,
+            )
+            available_activities = [
+                place
+                for place in activities
+                if place.id not in used_ids and place.id not in reserved_activity_ids
+            ]
+            available_dining = [
+                place
+                for place in dining_places
+                if place.id not in used_ids and place.id not in reserved_dining_ids
+            ]
 
             if not has_activity and not has_dining:
                 feasible_pairs = [
@@ -1367,6 +1389,25 @@ def _assign_keywords_to_days(
     for index, keyword in enumerate(dict.fromkeys(keywords)):
         assignments[(index % day_count) + 1].append(keyword)
     return assignments
+
+
+def _reserved_candidate_ids(
+    places: list[Place],
+    assignments: dict[int, list[str]],
+    current_day: int,
+    used_ids: set[str],
+) -> set[str]:
+    reserved: set[str] = set()
+    unavailable = set(used_ids)
+    for day_index in sorted(assignments):
+        if day_index <= current_day:
+            continue
+        for keyword in assignments[day_index]:
+            candidate = _first_matching_place(places, keyword, unavailable)
+            if candidate is not None:
+                reserved.add(candidate.id)
+                unavailable.add(candidate.id)
+    return reserved
 
 
 def _target_day_for_edit(existing_plan: DatePlan, request: DatePlanRequest) -> int:
