@@ -5,7 +5,6 @@ from loveapp.domain.date_patch import DatePlanPatch
 from loveapp.domain.date_task import DatePlanningTaskState
 from loveapp.domain.enums import DatePlanMode
 
-
 _SCALAR_FIELDS = (
     "city",
     "area",
