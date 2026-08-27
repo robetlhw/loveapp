@@ -1,7 +1,9 @@
 import asyncio
 
 import pytest
+from typer.testing import CliRunner
 
+import loveapp.cli as cli_module
 from loveapp.adapters.advice import TemplateAdviceComposer
 from loveapp.adapters.advice.openai_compatible import _StructuredAdviceStreamParser
 from loveapp.adapters.memory import InMemoryMemoryStore
@@ -80,6 +82,26 @@ class FailingComposer:
     async def compose(self, *args, **kwargs):
         del args, kwargs
         raise AssertionError("safety responses must not use the regular advice composer")
+
+
+def test_chat_timings_flag_is_a_hidden_compatibility_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_run_chat(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(cli_module, "_run_chat", fake_run_chat)
+    runner = CliRunner()
+
+    result = runner.invoke(cli_module.app, ["chat", "--timings", "--no-stream"])
+    help_result = runner.invoke(cli_module.app, ["chat", "--help"])
+
+    assert result.exit_code == 0
+    assert "show_timings" not in captured
+    assert help_result.exit_code == 0
+    assert "--timings" not in help_result.output
 
 
 def test_structured_stream_parser_emits_completed_fields_and_array_items() -> None:

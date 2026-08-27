@@ -48,7 +48,7 @@ from loveapp.domain.memory import (
 )
 from loveapp.domain.memory_context import memory_attention_reason
 from loveapp.domain.memory_write import MemoryTransitionAudit
-from loveapp.domain.observability import StepTiming, TimingEvent, TimingStatus
+from loveapp.domain.observability import TimingEvent
 from loveapp.domain.relationship_plan import PlanStatus, RelationshipPlan
 from loveapp.domain.routing import RouteResult
 from loveapp.evaluation import (
@@ -648,10 +648,11 @@ def chat(
     ] = True,
     show_timings: Annotated[
         bool,
-        typer.Option("--timings/--no-timings", help="每轮显示各执行模块耗时。"),
-    ] = True,
+        typer.Option("--timings/--no-timings", hidden=True),
+    ] = False,
 ) -> None:
     """在固定关系和会话中持续进行多轮咨询。"""
+    del show_timings  # Retained as a hidden no-op for command compatibility.
     try:
         asyncio.run(
             _run_chat(
@@ -662,7 +663,6 @@ def chat(
                 debug_memory=debug_memory,
                 debug_route=debug_route,
                 stream_output=stream_output,
-                show_timings=show_timings,
             )
         )
     except KeyboardInterrupt:
@@ -996,7 +996,6 @@ async def _run_chat(
     debug_memory: bool,
     debug_route: bool,
     stream_output: bool,
-    show_timings: bool,
 ) -> None:
     container = build_container()
     container.start_background_warmup()
@@ -1026,7 +1025,7 @@ async def _run_chat(
                 active_task = None
                 console.print(f"[dim]新会话：{conversation_id}[/dim]")
                 continue
-            live_display = _LiveTurnDisplay(enabled=stream_output or show_timings)
+            live_display = _LiveTurnDisplay(enabled=stream_output)
             trace = ExecutionTrace(live_display.on_timing)
             live_display.start()
             try:
@@ -1045,8 +1044,6 @@ async def _run_chat(
             except Exception as exc:
                 live_display.stop()
                 _render_turn_error(exc, trace)
-                if show_timings:
-                    _render_timings(trace.snapshot())
                 continue
             finally:
                 live_display.stop()
@@ -1068,9 +1065,6 @@ async def _run_chat(
                 _render_route(turn.route, active_task)
                 if turn.date_task_state is not None:
                     _render_date_task_state(turn.date_task_state)
-            if show_timings:
-                console.print()
-                _render_timings(turn.timings)
             if debug_memory and turn.memory_result is not None:
                 console.print()
                 _render_remember_result(turn.memory_result)
@@ -1166,89 +1160,10 @@ def _render_turn_error(exc: Exception, trace: ExecutionTrace) -> None:
     console.print(f"[red]本轮执行失败（{stage}）：[/red]{detail}")
 
 
-def _render_timings(records: list[StepTiming]) -> None:
-    table = Table(title="本轮模块耗时", caption="并行模块的耗时会重叠，不应直接相加。")
-    table.add_column("模块")
-    table.add_column("状态")
-    table.add_column("开始", justify="right")
-    table.add_column("耗时", justify="right")
-    table.add_column("Trace 详情")
-    for record in sorted(records, key=lambda value: value.started_offset_ms):
-        status, style = {
-            TimingStatus.RUNNING: ("后台中", "cyan"),
-            TimingStatus.COMPLETED: ("完成", "green"),
-            TimingStatus.FAILED: ("失败", "red"),
-        }[record.status]
-        table.add_row(
-            _TIMING_LABELS.get(record.name, record.name),
-            f"[{style}]{status}[/{style}]",
-            _format_duration(record.started_offset_ms),
-            _format_duration(record.duration_ms),
-            _format_timing_details(record),
-        )
-    console.print(table)
-
-
 def _format_duration(milliseconds: float) -> str:
     if milliseconds < 1000:
         return f"{milliseconds:.0f} ms"
     return f"{milliseconds / 1000:.2f} s"
-
-
-def _format_timing_details(record: StepTiming) -> str:
-    preferred_keys = (
-        "already_ready",
-        "available",
-        "activity_count",
-        "restaurant_count",
-        "cafe_count",
-        "dining_keywords",
-        "activity_keywords",
-        "excluded_keywords",
-        "source",
-        "candidate_count",
-        "returned_count",
-        "gate_reason",
-        "gate_should_extract",
-        "prompt_tokens",
-        "completion_tokens",
-        "reasoning_tokens",
-        "claim_count",
-        "discarded_span_count",
-        "claim_confidences",
-        "invalid_claim_count",
-        "tier",
-        "repair_status",
-        "repair_steps",
-        "original_claim_count",
-        "repaired_claim_count",
-        "discarded_claim_count",
-        "should_upgrade",
-        "upgrade_reason",
-        "discard_reason",
-        "failure_category",
-        "retry_reason",
-        "clarification_reason",
-        "clarification_triggered",
-        "clarification_exhausted",
-        "out_of_scope_reason",
-        "pending_task",
-        "pending_task_source",
-        "pending_task_turns_remaining",
-        "recent_risk_inherited",
-        "recent_risk_deescalated",
-        "router_prompt_version",
-        "router_model",
-        "router_input_tokens",
-        "router_output_tokens",
-        "router_duration_ms",
-        "fallback_reason",
-        "accepted_fields_json",
-        "rejected_fields_json",
-        "field_sources_json",
-    )
-    values = [f"{key}={record.details[key]}" for key in preferred_keys if key in record.details]
-    return ", ".join(values) or "-"
 
 
 _TIMING_LABELS = {
