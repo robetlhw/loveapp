@@ -3,6 +3,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from loveapp.domain.date_patch import DatePlanPatch
 from loveapp.domain.date_plan import MAX_TRIP_DAYS
 from loveapp.domain.date_task import DatePlanningTaskState
 from loveapp.domain.enums import (
@@ -19,6 +20,7 @@ from loveapp.domain.enums import (
     TransportMode,
 )
 from loveapp.domain.memory import StoredMessage
+from loveapp.domain.runtime_context import RuntimeContext
 
 
 class DatePlanSlots(BaseModel):
@@ -58,6 +60,7 @@ class RouteInput(BaseModel):
     active_task: TaskType | None = None
     forced_task: TaskType | None = None
     date_task_state: DatePlanningTaskState | None = None
+    runtime_context: RuntimeContext | None = None
     pending_task: TaskType | None = None
     pending_task_reason: str | None = Field(default=None, max_length=300)
     pending_task_turns_remaining: int = Field(default=0, ge=0, le=4)
@@ -80,6 +83,7 @@ class RouteCorrection(BaseModel):
     needs_clarification: bool = False
     evidence_spans: list[str] = Field(default_factory=list, max_length=8)
     date_plan: DatePlanSlots = Field(default_factory=DatePlanSlots)
+    date_patch: DatePlanPatch | None = None
     date_request_mode: DateRequestMode = DateRequestMode.NONE
     date_intent: DateTaskIntent = DateTaskIntent.NONE
     date_mutation: DatePlanMutation = DatePlanMutation.NONE
@@ -108,6 +112,7 @@ class RouteResult(BaseModel):
     scenario_scores: dict[AdviceScenario, float] = Field(default_factory=dict)
 
     date_plan: DatePlanSlots = Field(default_factory=DatePlanSlots)
+    date_patch: DatePlanPatch | None = None
     date_request_mode: DateRequestMode = DateRequestMode.NONE
     date_intent: DateTaskIntent = DateTaskIntent.NONE
     date_mutation: DatePlanMutation = DatePlanMutation.NONE

@@ -7,9 +7,12 @@ from time import perf_counter
 from loveapp.application.conversation_flow import is_pending_cancellation
 from loveapp.application.route_slot_validation import (
     SlotValidationResult,
+    merge_current_turn_slot_sources,
     merge_route_slot_sources,
+    validate_current_turn_route_slots,
     validate_route_slots,
 )
+from loveapp.domain.date_patch import DatePlanPatch, SlotSource
 from loveapp.domain.date_plan import MAX_TRIP_DAYS
 from loveapp.domain.date_task import DatePlanningTaskState
 from loveapp.domain.enums import (
@@ -102,6 +105,7 @@ class HybridRouter:
         latest_rule_slots = extract_date_plan_slots(
             RouteInput(latest_query=route_input.latest_query)
         )
+        correction_slots = _date_slots_from_correction(correction)
         task_slots = (
             _date_slots_from_task_state(route_input.date_task_state)
             if route_input.date_task_state is not None and route_input.date_task_state.is_resumable
@@ -110,8 +114,19 @@ class HybridRouter:
         slot_validation = validate_route_slots(
             route_input,
             latest_rule_slots,
-            correction.date_plan,
+            correction_slots,
             task_slots,
+        )
+        current_turn_slot_validation = validate_current_turn_route_slots(
+            route_input,
+            latest_rule_slots,
+            correction_slots,
+        )
+        current_turn_date_plan, _, current_turn_field_sources = (
+            merge_current_turn_slot_sources(
+                latest_rule_slots,
+                current_turn_slot_validation.validated_slots,
+            )
         )
         merged = merge_route_correction(
             route_input,
@@ -122,6 +137,8 @@ class HybridRouter:
             slot_validation=slot_validation,
             rule_date_plan=latest_rule_slots,
             task_date_plan=task_slots,
+            current_turn_date_plan=current_turn_date_plan,
+            current_turn_field_sources=current_turn_field_sources,
         )
         structural_slot_rejections = telemetry.get("slot_parse_rejections", {})
         if not isinstance(structural_slot_rejections, dict):
@@ -176,6 +193,7 @@ class HybridRouter:
             or TaskType.DATE_PLANNING in result.secondary_tasks
         )
         date_plan = result.date_plan if date_authorized else DatePlanSlots()
+        date_patch = result.date_patch if date_authorized else None
         slot_accepted_fields = result.slot_accepted_fields if date_authorized else {}
         slot_rejected_fields = result.slot_rejected_fields if date_authorized else {}
         slot_field_sources = result.slot_field_sources if date_authorized else {}
@@ -212,6 +230,7 @@ class HybridRouter:
                 "pending_task_turns_remaining": pending_turns,
                 "pending_task_cancelled": cancelled,
                 "date_plan": date_plan,
+                "date_patch": date_patch,
                 "slot_accepted_fields": slot_accepted_fields,
                 "slot_rejected_fields": slot_rejected_fields,
                 "slot_field_sources": slot_field_sources,
@@ -602,6 +621,11 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
         if task_type == TaskType.DATE_PLANNING or TaskType.DATE_PLANNING in secondary_tasks
         else DatePlanSlots()
     )
+    date_patch = (
+        _date_plan_patch_from_slots(latest_date_slots)
+        if task_type == TaskType.DATE_PLANNING or TaskType.DATE_PLANNING in secondary_tasks
+        else None
+    )
     return RouteResult(
         normalized_query=text,
         task_type=task_type,
@@ -617,6 +641,7 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
         scenario_confidence=scenario_confidence,
         scenario_scores=_rounded_scores(scenario_scores),
         date_plan=date_plan,
+        date_patch=date_patch,
         date_request_mode=date_request_mode,
         date_intent=date_intent,
         date_mutation=date_mutation,
@@ -701,6 +726,8 @@ def merge_route_correction(
     slot_validation: SlotValidationResult | None = None,
     rule_date_plan: DatePlanSlots | None = None,
     task_date_plan: DatePlanSlots | None = None,
+    current_turn_date_plan: DatePlanSlots | None = None,
+    current_turn_field_sources: dict[str, str] | None = None,
 ) -> RouteResult:
     date_request_mode = _resolved_correction_date_mode(
         route_input,
@@ -752,8 +779,20 @@ def merge_route_correction(
         date_plan = _merge_date_slots(rules.date_plan, correction.date_plan)
         slot_accepted_fields = {}
         slot_field_sources = {}
+    if current_turn_date_plan is None:
+        rule_patch_slots = _date_slots_from_patch(rules.date_patch)
+        correction_patch_slots = _date_slots_from_correction(correction)
+        current_turn_date_plan, _, current_turn_field_sources = merge_current_turn_slot_sources(
+            rule_patch_slots,
+            correction_patch_slots,
+        )
+    date_patch = _date_plan_patch_from_slots(
+        current_turn_date_plan,
+        current_turn_field_sources,
+    )
     if task_type != TaskType.DATE_PLANNING and TaskType.DATE_PLANNING not in secondary_tasks:
         date_plan = DatePlanSlots()
+        date_patch = None
     date_intent = correction.date_intent if allow_task_override else rules.date_intent
     if date_intent == DateTaskIntent.NONE:
         date_intent = rules.date_intent
@@ -825,6 +864,7 @@ def merge_route_correction(
             "secondary_scenarios": secondary_scenarios,
             "scenario_confidence": scenario_confidence,
             "date_plan": date_plan,
+            "date_patch": date_patch,
             "date_request_mode": date_request_mode,
             "date_intent": date_intent,
             "date_mutation": date_mutation,
@@ -962,6 +1002,50 @@ def extract_date_plan_slots(route_input: RouteInput) -> DatePlanSlots:
         constraints=constraints,
         lodging_notes=lodging_notes,
     )
+
+
+def _date_slots_from_correction(correction: RouteCorrection) -> DatePlanSlots:
+    if correction.date_patch is None:
+        return correction.date_plan
+    return _date_slots_from_patch(correction.date_patch)
+
+
+def _date_slots_from_patch(patch: DatePlanPatch | None) -> DatePlanSlots:
+    if patch is None:
+        return DatePlanSlots()
+    return DatePlanSlots.model_validate(
+        patch.model_dump(exclude={"source_by_field"})
+    )
+
+
+def _date_plan_patch_from_slots(
+    slots: DatePlanSlots,
+    field_sources: dict[str, str] | None = None,
+) -> DatePlanPatch:
+    sources = field_sources or {
+        name: SlotSource.RULE.value
+        for name, value in slots.model_dump().items()
+        if value is not None and value != [] and value != {}
+    }
+    source_by_field = {
+        name: _slot_source(source)
+        for name, source in sources.items()
+        if name in DatePlanPatch.model_fields and _slot_source(source) is not None
+    }
+    return DatePlanPatch.model_validate(
+        {
+            **slots.model_dump(),
+            "source_by_field": source_by_field,
+        }
+    )
+
+
+def _slot_source(value: str) -> SlotSource | None:
+    if "rule" in value:
+        return SlotSource.RULE
+    if "llm_verified" in value:
+        return SlotSource.LLM_VERIFIED
+    return None
 
 
 def _date_slots_from_task_state(state: DatePlanningTaskState) -> DatePlanSlots:

@@ -21,6 +21,7 @@ from loveapp.application.conversation_flow import (
     pending_follow_up_prompt,
 )
 from loveapp.application.routing import extract_date_plan_slots
+from loveapp.application.runtime_context import RuntimeContextBuilder
 from loveapp.core.timing import ExecutionTrace
 from loveapp.domain.advice import AdviceRequest, AdviceTurnResult
 from loveapp.domain.conversation import (
@@ -45,6 +46,7 @@ from loveapp.domain.enums import (
 )
 from loveapp.domain.memory import MessageRole, RememberResult, StoredMessage, utc_now
 from loveapp.domain.routing import DatePlanSlots, RouteInput, RouteResult
+from loveapp.domain.runtime_context import RuntimeContext
 from loveapp.ports.advice import AdviceStreamCallback
 from loveapp.ports.conversation_states import ConversationFlowStateStore
 from loveapp.ports.date_tasks import DatePlanningTaskStore
@@ -56,6 +58,7 @@ class ConversationState(TypedDict, total=False):
     recent_messages: list[StoredMessage]
     route: RouteResult
     date_task_state: DatePlanningTaskState | None
+    runtime_context: RuntimeContext
     flow_state: ConversationFlowState
     follow_up_prompt: str | None
     message: str
@@ -83,6 +86,7 @@ class ConversationAgent:
         self._date_planning_agent = date_planning_agent
         self._memory_service = memory_service
         self._date_task_store = date_task_store or InMemoryDatePlanningTaskStore()
+        self._runtime_context_builder = RuntimeContextBuilder(self._date_task_store)
         self._date_planning_workflow = date_planning_workflow or DatePlanningWorkflow(
             date_planning_agent,
             self._date_task_store,
@@ -287,10 +291,17 @@ class ConversationAgent:
                     date_task_state,
                     state["trace"],
                 )
+            runtime_context = await self._runtime_context_builder.build(
+                request,
+                active_task=request.active_task or flow_state.active_task,
+                date_task_state=date_task_state,
+                trace=state["trace"],
+            )
             return {
                 "recent_messages": history,
                 "date_task_state": date_task_state,
                 "flow_state": flow_state,
+                "runtime_context": runtime_context,
             }
 
     async def _route(self, state: ConversationState) -> dict:
@@ -310,6 +321,7 @@ class ConversationAgent:
                     active_task=active_task,
                     forced_task=forced_task,
                     date_task_state=state.get("date_task_state"),
+                    runtime_context=state.get("runtime_context"),
                     pending_task=flow_state.pending_task,
                     pending_task_reason=flow_state.pending_task_reason,
                     pending_task_turns_remaining=flow_state.pending_task_turns_remaining,
@@ -339,6 +351,11 @@ class ConversationAgent:
                     "router_output_tokens": route.router_output_tokens,
                     "router_duration_ms": route.router_duration_ms,
                     "fallback_reason": route.fallback_reason,
+                    "date_patch_fields": (
+                        ",".join(route.date_patch.source_by_field)
+                        if route.date_patch is not None
+                        else ""
+                    ),
                 }
             )
             with state["trace"].measure("route_slot_validation") as slot_details:
@@ -420,6 +437,7 @@ class ConversationAgent:
                 request=request,
                 route=state["route"],
                 current_task_state=state.get("date_task_state"),
+                runtime_context=state.get("runtime_context"),
             ),
             trace=state["trace"],
         )

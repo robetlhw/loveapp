@@ -178,6 +178,41 @@ def validate_route_slots(
     )
 
 
+def validate_current_turn_route_slots(
+    route_input: RouteInput,
+    rule_slots: DatePlanSlots,
+    llm_slots: DatePlanSlots,
+) -> SlotValidationResult:
+    """Validate LLM fields as current-turn data, never as task-state echo.
+
+    The legacy validator intentionally accepts trusted task state when an LLM
+    repeats it. That is useful for the old full-slot route output, but it is
+    invalid provenance for a ``DatePlanPatch``.
+    """
+
+    current_turn_input = route_input.model_copy(
+        update={
+            "recent_messages": [],
+            "date_task_state": None,
+        }
+    )
+    return validate_route_slots(
+        current_turn_input,
+        rule_slots,
+        llm_slots,
+        DatePlanSlots(),
+    )
+
+
+def merge_current_turn_slot_sources(
+    rule_slots: DatePlanSlots,
+    validated_llm_slots: DatePlanSlots,
+) -> tuple[DatePlanSlots, dict[str, str], dict[str, str]]:
+    """Merge only current-turn rule and verified LLM sources."""
+
+    return merge_route_slot_sources(rule_slots, validated_llm_slots, DatePlanSlots())
+
+
 def merge_route_slot_sources(
     rule_slots: DatePlanSlots,
     validated_llm_slots: DatePlanSlots,

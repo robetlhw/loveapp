@@ -4,6 +4,7 @@ from loveapp.domain.conversation import ConversationRequest
 from loveapp.domain.date_plan import DatePlan
 from loveapp.domain.date_task import DatePlanningTaskState
 from loveapp.domain.routing import RouteResult
+from loveapp.domain.runtime_context import RuntimeContext
 
 
 class DatePlanningWorkflowInput(BaseModel):
@@ -12,6 +13,7 @@ class DatePlanningWorkflowInput(BaseModel):
     request: ConversationRequest
     route: RouteResult
     current_task_state: DatePlanningTaskState | None = None
+    runtime_context: RuntimeContext | None = None
 
 
 class DatePlanningWorkflowResult(BaseModel):

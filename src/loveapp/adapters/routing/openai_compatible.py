@@ -5,6 +5,7 @@ from typing import Any, Literal
 from openai import AsyncOpenAI
 from pydantic import SecretStr, ValidationError
 
+from loveapp.domain.date_patch import DatePlanPatch
 from loveapp.domain.routing import DatePlanSlots, RouteCorrection, RouteInput, RouteResult
 
 
@@ -139,9 +140,9 @@ def _build_prompt(route_input: RouteInput, rule_result: RouteResult) -> str:
         "pending_task_reason": route_input.pending_task_reason,
         "last_clarification_reason": route_input.last_clarification_reason,
         "clarification_attempt_count": route_input.clarification_attempt_count,
-        "date_task_state": (
-            route_input.date_task_state.model_dump(mode="json")
-            if route_input.date_task_state
+        "runtime_context": (
+            route_input.runtime_context.model_dump(mode="json")
+            if route_input.runtime_context
             else None
         ),
         "rule_result": {
@@ -158,6 +159,11 @@ def _build_prompt(route_input: RouteInput, rule_result: RouteResult) -> str:
             },
             "scenario_confidence": rule_result.scenario_confidence,
             "date_plan": rule_result.date_plan.model_dump(mode="json"),
+            "date_patch": (
+                rule_result.date_patch.model_dump(mode="json")
+                if rule_result.date_patch
+                else None
+            ),
             "date_request_mode": rule_result.date_request_mode.value,
             "date_intent": rule_result.date_intent.value,
             "date_mutation": rule_result.date_mutation.value,
@@ -219,6 +225,29 @@ def _sanitize_date_plan_payload(payload: dict[str, Any]) -> tuple[dict[str, Any]
             continue
         valid_slots[field] = getattr(parsed, field)
     sanitized["date_plan"] = valid_slots
+    raw_patch = sanitized.get("date_patch")
+    if raw_patch is None:
+        return sanitized, rejected
+    if not isinstance(raw_patch, dict):
+        sanitized["date_patch"] = None
+        rejected["date_patch"] = "invalid_schema"
+        return sanitized, rejected
+
+    valid_patch: dict[str, Any] = {}
+    for field, value in raw_patch.items():
+        # Provenance is assigned only after deterministic verification.
+        if field == "source_by_field":
+            continue
+        if field not in DatePlanPatch.model_fields:
+            rejected[f"date_patch.{field}"] = "unknown_field"
+            continue
+        try:
+            parsed = DatePlanPatch.model_validate({field: value})
+        except ValidationError:
+            rejected[f"date_patch.{field}"] = "invalid_schema"
+            continue
+        valid_patch[field] = getattr(parsed, field)
+    sanitized["date_patch"] = valid_patch
     return sanitized, rejected
 
 
@@ -286,10 +315,12 @@ AdviceGoal：initiate、understand、progress、repair、communicate、set_bound
    - update_constraint：修改预算、日期、交通等约束；
    - replan：用户明确要求重新规划、换一套或全部重排。
    “增加到行程中”属于 add，不能因为出现新关键词就自动 replan。
-8. date_plan 只能提取对话明确提供的 city、area、plan_mode、date、end_date、day_count、
+8. date_patch 只能提取 latest_query 当前轮明确提供或修改的
+   city、area、plan_mode、date、end_date、day_count、
    nights、target_day、start_time、budget、budget_scope、preferences、dining_keywords、
    activity_keywords、meal_keywords、schedule_hints、replace_place_names、transport_mode、
-    notes、constraints、lodging_notes。不得猜测地点、预算、日期或时间。
+    notes、constraints、lodging_notes。不得猜测地点、预算、日期或时间，也不得把 runtime_context
+    中已经存在但本轮未提到的值重复写入 date_patch。
     date 和 end_date 用 YYYY-MM-DD，
    start_time 用 ISO-8601；单日使用 single_day，多日使用 multi_day；“每天 500”使用
    per_day，默认总预算使用 total；target_day 只提取“第二天”等明确指定的目标天；
@@ -297,7 +328,7 @@ AdviceGoal：initiate、understand、progress、repair、communicate、set_bound
    meal_keywords 的键只能使用 breakfast、lunch、dinner，值是用户明确提到的餐饮关键词；
    schedule_hints 只记录明确的时间或先后提示，例如“下午”“看完电影后”。
    transport_mode 只能是 walking、transit、driving、cycling 或 null。
-9. evidence_spans 必须逐字来自 latest_query 或 recent_messages，最多 8 条。每一个 date_plan
+9. evidence_spans 必须逐字来自 latest_query 或 recent_messages，最多 8 条。每一个 date_patch
    字段都必须有对应的用户原文依据；无法确认的字段留空，不得因为默认常识补齐。
 10. task_confidence 和 scenario_confidence 使用 0 到 1。确实需要用户补充才能路由时，
    needs_clarification 才为 true。
@@ -309,7 +340,8 @@ AdviceGoal：initiate、understand、progress、repair、communicate、set_bound
 
 必须输出字段：task_type、secondary_tasks、task_confidence、primary_goal、secondary_goals、
 primary_scenario、secondary_scenarios、scenario_confidence、needs_clarification、
-evidence_spans、date_plan、date_request_mode、date_intent、date_mutation。数组无内容时输出 []，
+evidence_spans、date_patch、date_request_mode、date_intent、date_mutation。为兼容旧调用方可以同时输出
+date_plan，但 date_patch 是当前轮增量；数组无内容时输出 []，
 可空标量输出 null。
 """.strip()
 
