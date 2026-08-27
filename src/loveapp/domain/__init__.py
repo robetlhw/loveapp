@@ -3,8 +3,14 @@ from loveapp.domain.advice import (
     AdviceResponse,
     RelationshipContext,
 )
+from loveapp.domain.date_operations import (
+    DateOperationBatch,
+    DateRequirementMatch,
+    DateStopRequirement,
+    RequirementStatus,
+)
 from loveapp.domain.date_plan import DatePlan, DatePlanRequest
-from loveapp.domain.date_task import DatePlanningTaskState
+from loveapp.domain.date_task import DatePlanningTaskState, DateTaskDiff
 from loveapp.domain.enums import (
     AdviceGoal,
     AdviceScenario,
@@ -26,12 +32,16 @@ __all__ = [
     "AdviceRequest",
     "AdviceResponse",
     "AdviceScenario",
+    "DateOperationBatch",
     "DatePlan",
     "DatePlanMutation",
     "DatePlanRequest",
     "DatePlanningStatus",
     "DatePlanningTaskState",
     "DateRequestMode",
+    "DateRequirementMatch",
+    "DateStopRequirement",
+    "DateTaskDiff",
     "DateTaskIntent",
     "KnowledgeDocument",
     "PlanStatus",
@@ -39,6 +49,7 @@ __all__ = [
     "RelationshipEvidenceProfile",
     "RelationshipPlan",
     "RelationshipStage",
+    "RequirementStatus",
     "RiskLevel",
     "TaskType",
     "WeatherForecast",

@@ -69,6 +69,12 @@ def looks_like_date_modification_semantics(text: str) -> bool:
     )
 
 
+def has_current_plan_reference(text: str, current_plan: DatePlan | None) -> bool:
+    """Return whether the current turn names or points at a committed plan item."""
+
+    return _reference_candidates(_normalize(text), current_plan).recognized
+
+
 def interpret_date_modification(
     text: str,
     current_plan: DatePlan | None,

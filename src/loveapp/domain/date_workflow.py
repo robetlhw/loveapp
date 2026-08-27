@@ -1,8 +1,9 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from loveapp.domain.conversation import ConversationRequest
+from loveapp.domain.date_operations import DateRequirementMatch
 from loveapp.domain.date_plan import DatePlan
-from loveapp.domain.date_task import DatePlanningTaskState
+from loveapp.domain.date_task import DatePlanningTaskState, DateTaskDiff
 from loveapp.domain.routing import RouteResult
 from loveapp.domain.runtime_context import RuntimeContext
 
@@ -23,3 +24,6 @@ class DatePlanningWorkflowResult(BaseModel):
     needs_clarification: bool = False
     cancelled: bool = False
     plan_changed: bool = False
+    plan_committed: bool = False
+    requirement_satisfaction: list[DateRequirementMatch] = Field(default_factory=list)
+    task_diff: DateTaskDiff | None = None

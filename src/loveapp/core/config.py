@@ -39,6 +39,14 @@ class Settings(BaseSettings):
     router_live_eval_enabled: bool = False
     router_prompt_version: str = "routing-v3.0"
 
+    date_semantic_provider: Literal["auto", "llm", "disabled"] = "auto"
+    date_semantic_model: str = ""
+    date_semantic_max_tokens: int = Field(default=2048, ge=256, le=8192)
+    date_semantic_timeout_seconds: float = Field(default=20, ge=1, le=120)
+    date_semantic_max_retries: int = Field(default=0, ge=0, le=3)
+    date_semantic_thinking: Literal["enabled", "disabled"] = "disabled"
+    date_semantic_prompt_version: str = "date-semantic-v1.0"
+
     rag_backend: Literal["memory", "qdrant"] = "qdrant"
     rag_min_score: float = 0.45
     qdrant_url: str = "http://localhost:6333"

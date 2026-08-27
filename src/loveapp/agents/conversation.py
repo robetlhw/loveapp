@@ -31,8 +31,9 @@ from loveapp.domain.conversation import (
     ConversationRequest,
     ConversationTurnResult,
 )
+from loveapp.domain.date_operations import DateRequirementMatch, RequirementStatus
 from loveapp.domain.date_plan import DatePlan, DatePlanRequest
-from loveapp.domain.date_task import DatePlanningTaskState
+from loveapp.domain.date_task import DatePlanningTaskState, DateTaskDiff
 from loveapp.domain.date_workflow import DatePlanningWorkflowInput
 from loveapp.domain.enums import (
     AdviceScenario,
@@ -384,7 +385,17 @@ class ConversationAgent:
                         "candidate_count": route.date_operation_candidate_count,
                         "required": route.date_semantic_parse_required,
                         "reason": route.date_semantic_parse_reason,
+                        "trigger_reasons": ",".join(
+                            route.date_semantic_trigger_reasons
+                        ),
                         "date_semantic_llm_used": route.date_semantic_llm_used,
+                        "model": route.date_semantic_model,
+                        "thinking": route.date_semantic_thinking,
+                        "prompt_version": route.date_semantic_prompt_version,
+                        "input_tokens": route.date_semantic_input_tokens,
+                        "output_tokens": route.date_semantic_output_tokens,
+                        "duration_ms": route.date_semantic_duration_ms,
+                        "fallback_reason": route.date_semantic_fallback_reason,
                         "unresolved_references_json": json.dumps(
                             route.date_unresolved_references,
                             ensure_ascii=False,
@@ -501,6 +512,10 @@ class ConversationAgent:
                 route=state["route"],
                 plan=result.plan,
                 changed=result.plan_changed,
+                task_diff=result.task_diff,
+                satisfaction=result.requirement_satisfaction,
+                workflow_message=result.message,
+                plan_committed=result.plan_committed,
             )
         history_message = (
             _date_history_message(response_message, result.plan)
@@ -994,7 +1009,17 @@ def _compose_date_response(
     route: RouteResult,
     plan: DatePlan,
     changed: bool,
+    task_diff: DateTaskDiff | None = None,
+    satisfaction: list[DateRequirementMatch] | None = None,
+    workflow_message: str | None = None,
+    plan_committed: bool = True,
 ) -> str:
+    if not plan_committed:
+        return workflow_message or "新的条件暂时无法提交；已保留上一版有效行程。"
+    if satisfaction and any(
+        match.status != RequirementStatus.FULFILLED for match in satisfaction
+    ):
+        return workflow_message or "新的要求暂时无法满足；已保留上一版有效行程。"
     if current.current_plan is None:
         if plan.items:
             if plan.plan_mode == DatePlanMode.MULTI_DAY:
@@ -1011,6 +1036,17 @@ def _compose_date_response(
             "缺少的条件我会明确标出来，后续补充后可以继续完善。"
         )
     if not changed:
+        budget_change = task_diff.changes.get("budget") if task_diff is not None else None
+        if budget_change is not None:
+            return (
+                f"预算已从{budget_change.before or '未设置'}元调整为{budget_change.after}元。"
+                "当前行程仍满足新预算，因此地点无需调整。下面保留当前完整安排供你确认。"
+            )
+        if task_diff is not None and task_diff.changed:
+            return (
+                f"已更新约会条件：{'、'.join(task_diff.changed_fields)}。"
+                "当前行程仍满足这些要求，因此地点无需调整。"
+            )
         return (
             "我核对了你刚补充的条件，现有行程没有需要替换的节点，因此先保留当前版本。"
             "下面把完整安排再列一次，方便你确认顺序和费用。"

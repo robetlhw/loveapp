@@ -56,6 +56,8 @@ class DateOperationResolver:
         *,
         proposed_operations: list[DatePlanOperation] | None = None,
         proposed_unresolved_references: list[str] | None = None,
+        preferred_constraint_operations: list[DatePlanOperation] | None = None,
+        allow_semantic_constraint_corrections: bool = False,
     ) -> DateOperationResolution:
         deterministic = _deterministic_operations(text, runtime_context, current_turn_patch)
         interpretation = (
@@ -66,20 +68,34 @@ class DateOperationResolver:
             )
             else DateSemanticParseResult()
         )
+        candidate_operations = [
+            *deterministic,
+            *interpretation.operations,
+            *(proposed_operations or []),
+        ]
+        preferred_constraints = {
+            operation.constraint_field: operation
+            for operation in (preferred_constraint_operations or [])
+            if operation.type == DateOperationType.UPDATE_CONSTRAINT
+            and operation.constraint_field is not None
+        }
+        if preferred_constraints:
+            candidate_operations = [
+                operation
+                for operation in candidate_operations
+                if operation.type != DateOperationType.UPDATE_CONSTRAINT
+                or operation.constraint_field not in preferred_constraints
+                or operation == preferred_constraints[operation.constraint_field]
+            ]
         candidates = _dedupe_operations(
-            tuple(
-                [
-                    *deterministic,
-                    *interpretation.operations,
-                    *(proposed_operations or []),
-                ]
-            )
+            tuple(candidate_operations)
         )
         verification = self._verifier.verify(
             candidates,
             text,
             runtime_context,
             current_turn_patch,
+            allow_semantic_constraint_corrections=allow_semantic_constraint_corrections,
         )
         unresolved = tuple(
             dict.fromkeys(
@@ -91,12 +107,29 @@ class DateOperationResolver:
         )
         accepted: list[DatePlanOperation] = []
         rejected = list(verification.rejected)
+        if unresolved:
+            rejected.extend(
+                RejectedDateOperation(item.operation, "plan_reference_unresolved")
+                for item in verification.rejected
+                if item.operation.type in _REFERENCE_TARGETED_MUTATIONS
+                and item.reason == "target_without_source_or_unique_context_evidence"
+            )
         for operation in verification.accepted:
             if unresolved and operation.type in _REFERENCE_TARGETED_MUTATIONS:
                 rejected.append(RejectedDateOperation(operation, "plan_reference_unresolved"))
             else:
                 accepted.append(operation)
-        operations = tuple(_dedupe_operations(tuple(accepted)))
+        operations = tuple(
+            _dedupe_operations(
+                tuple(
+                    _prefer_grouped_additions(
+                        accepted,
+                        deterministic,
+                        text,
+                    )
+                )
+            )
+        )
         return DateOperationResolution(
             candidates=tuple(candidates),
             operations=operations,
@@ -137,17 +170,86 @@ def date_semantic_parse_reasons(
     has_temporal_binding = bool(
         re.search(r"(?:之前|之后|前|后|上午|中午|下午|晚上|早饭|午饭|晚饭)", text)
     )
+    budget_values = re.findall(r"(?<!\d)\d{2,6}(?!\d)", text) if "预算" in text else []
+    relative_scalar_update = _RELATIVE_BUDGET_UPDATE.search(text) is not None
     reasons: list[str] = []
     if len(clauses) > 1 and stop_operations:
         reasons.append("multiple_clauses")
-    if len(operations) > 1:
+    if len(operations) > 1 and not _is_single_budget_constraint_bundle(operations):
         reasons.append("multiple_operations")
     if has_temporal_binding and stop_operations:
         reasons.append("temporal_relation")
+    if len(budget_values) > 1:
+        reasons.append("multiple_numeric_candidates")
+    if relative_scalar_update:
+        reasons.append("relative_scalar_update")
+    if _stop_alternative_expressions(text):
+        reasons.append("alternative_choice")
     reasons.extend(detection.reasons)
     if detection.is_candidate and not stop_operations:
         reasons.append("deterministic_parse_incomplete")
+    if not deterministic_date_parse_is_complete(text, runtime_context, deterministic_result):
+        reasons.append("partial_parse")
     return tuple(dict.fromkeys(reasons))
+
+
+def _is_single_budget_constraint_bundle(
+    operations: tuple[DatePlanOperation, ...],
+) -> bool:
+    return all(
+        operation.type == DateOperationType.UPDATE_CONSTRAINT
+        and operation.constraint_field
+        in {DateConstraintField.BUDGET, DateConstraintField.BUDGET_SCOPE}
+        for operation in operations
+    )
+
+
+def deterministic_date_parse_is_complete(
+    text: str,
+    runtime_context: RuntimeContext | None,
+    deterministic_result: DateOperationResolution,
+) -> bool:
+    if deterministic_result.unresolved_references:
+        return False
+    if deterministic_result.rejected and not deterministic_result.operations:
+        return False
+    operations = deterministic_result.operations
+    detection = detect_date_modification(text, _current_plan(runtime_context))
+    stop_operations = [
+        operation for operation in operations if operation.type in _STOP_OPERATIONS
+    ]
+    if detection.is_candidate and not stop_operations:
+        return False
+    relative_match = _RELATIVE_BUDGET_UPDATE.search(text)
+    if relative_match is not None:
+        expected = int(relative_match.group("value"))
+        if not any(
+            operation.type == DateOperationType.UPDATE_CONSTRAINT
+            and operation.constraint_field == DateConstraintField.BUDGET
+            and operation.constraint_value == expected
+            for operation in operations
+        ):
+            return False
+    alternative_expressions = _stop_alternative_expressions(text)
+    if alternative_expressions and not _alternative_expressions_are_covered(
+        alternative_expressions,
+        operations,
+    ):
+        return False
+    for clause in split_date_clauses(text):
+        clause_detection = detect_date_modification(
+            clause.text,
+            _current_plan(runtime_context),
+        )
+        if clause_detection.requests_replacement and not any(
+            operation.type == DateOperationType.REPLACE_STOP for operation in operations
+        ):
+            return False
+        if _EXPLICIT_MOVE_CUE.search(clause.text) is not None and not any(
+            operation.type == DateOperationType.MOVE_STOP for operation in operations
+        ):
+            return False
+    return True
 
 
 def _deterministic_operations(
@@ -304,7 +406,7 @@ def _patch_replacement_operations(
     ]
     if len(compatible_payloads) != 1:
         return [], payload_keywords
-    desired, source_span = compatible_payloads[0]
+    desired, _source_span = compatible_payloads[0]
     used_keywords = {
         *target_keywords,
         *(value for value in (desired.keyword, desired.place_name) if value is not None),
@@ -314,7 +416,7 @@ def _patch_replacement_operations(
             type=DateOperationType.REPLACE_STOP,
             target=target_reference,
             payload=desired,
-            source_span=source_span,
+            source_span=text,
             confidence=1,
         )
     ], used_keywords
@@ -692,6 +794,155 @@ def _dedupe_operations(operations: tuple[DatePlanOperation, ...]) -> list[DatePl
     return result
 
 
+def _prefer_grouped_additions(
+    operations: list[DatePlanOperation],
+    deterministic: list[DatePlanOperation],
+    text: str,
+) -> list[DatePlanOperation]:
+    deterministic_ids = {id(operation) for operation in deterministic}
+    grouped = [
+        operation
+        for operation in operations
+        if operation.type == DateOperationType.ADD_STOP
+        and operation.payload is not None
+        and operation.alternative_group is not None
+    ]
+    return [
+        operation
+        for operation in operations
+        if not (
+            id(operation) in deterministic_ids
+            and
+            operation.type == DateOperationType.ADD_STOP
+            and operation.payload is not None
+            and operation.alternative_group is None
+            and any(
+                _grouped_addition_refines(operation, candidate, text)
+                for candidate in grouped
+            )
+        )
+    ]
+
+
+def _grouped_addition_refines(
+    deterministic: DatePlanOperation,
+    grouped: DatePlanOperation,
+    text: str,
+) -> bool:
+    current = deterministic.payload
+    incoming = grouped.payload
+    if current is None or incoming is None:
+        return False
+    current_value = current.keyword or current.place_name
+    incoming_value = incoming.keyword or incoming.place_name
+    if (
+        current.kind != incoming.kind
+        or current_value is None
+        or incoming_value is None
+        or _normalize(current_value) != _normalize(incoming_value)
+        or not _source_spans_overlap(text, deterministic.source_span, grouped.source_span)
+    ):
+        return False
+    for current_field, incoming_field in (
+        (current.keyword, incoming.keyword),
+        (current.place_name, incoming.place_name),
+        (current.meal_type, incoming.meal_type),
+        (current.target_day, incoming.target_day),
+        (current.time_window, incoming.time_window),
+        (current.after, incoming.after),
+        (current.before, incoming.before),
+    ):
+        if current_field is not None and current_field != incoming_field:
+            return False
+    if current.generic_replacement and not incoming.generic_replacement:
+        return False
+    return set(current.replacement_preferences).issubset(incoming.replacement_preferences)
+
+
+def _source_spans_overlap(
+    text: str,
+    first: str | None,
+    second: str | None,
+) -> bool:
+    if first is None or second is None:
+        return False
+    first_ranges = _source_span_ranges(text, first)
+    second_ranges = _source_span_ranges(text, second)
+    overlaps = [
+        (first_range, second_range)
+        for first_range in first_ranges
+        for second_range in second_ranges
+        if max(first_range[0], second_range[0]) < min(first_range[1], second_range[1])
+    ]
+    return len(overlaps) == 1
+
+
+def _source_span_ranges(text: str, span: str) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    while (position := text.find(span, start)) >= 0:
+        ranges.append((position, position + len(span)))
+        start = position + 1
+    return ranges
+
+
+def _alternative_expressions_are_covered(
+    expressions: tuple[str, ...],
+    operations: tuple[DatePlanOperation, ...],
+) -> bool:
+    groups: dict[str, list[DatePlanOperation]] = {}
+    for operation in operations:
+        if (
+            operation.type == DateOperationType.ADD_STOP
+            and operation.alternative_group is not None
+            and operation.payload is not None
+        ):
+            groups.setdefault(operation.alternative_group, []).append(operation)
+    complete_groups = [members for members in groups.values() if len(members) >= 2]
+    return all(
+        any(_group_is_within_expression(group, expression) for group in complete_groups)
+        for expression in expressions
+    )
+
+
+def _group_is_within_expression(
+    group: list[DatePlanOperation],
+    expression: str,
+) -> bool:
+    normalized = _normalize(expression)
+    return all(
+        operation.payload is not None
+        and (
+            value := operation.payload.keyword or operation.payload.place_name
+        )
+        is not None
+        and any(
+            _normalize(alias) in normalized
+            for alias in _ALIASES.get(value, (value,))
+        )
+        for operation in group
+    )
+
+
+def _stop_alternative_expressions(text: str) -> tuple[str, ...]:
+    matches: list[tuple[int, int, str]] = []
+    for pattern in (_INFIX_STOP_ALTERNATIVE, _POSTFIX_STOP_ALTERNATIVE):
+        for match in pattern.finditer(text):
+            left = match.group("left")
+            right = match.group("right")
+            if not (_looks_like_stop_phrase(left) and _looks_like_stop_phrase(right)):
+                continue
+            span = match.span("expression")
+            if any(span[0] < end and start < span[1] for start, end, _ in matches):
+                continue
+            matches.append((*span, match.group("expression")))
+    return tuple(value for _, _, value in sorted(matches))
+
+
+def _looks_like_stop_phrase(value: str) -> bool:
+    return _STOP_CHOICE_VALUE_CUE.search(value) is not None
+
+
 def _normalize(value: str) -> str:
     return re.sub(r"\s+", "", unicodedata.normalize("NFKC", value).casefold())
 
@@ -702,7 +953,32 @@ def _normalized(value: str) -> str:
 
 _REPLAN_CUE = re.compile(r"重新.{0,4}(?:规划|安排)|换一套|全部重排|从头安排|重新来")
 _REMOVE_CUE = re.compile(r"删除|删掉|去掉|移除|取消|不去|不要")
+_STOP_CHOICE_LEFT_FRAGMENT = r"[^，,。；;！？!?\n]{1,30}?"
+_STOP_CHOICE_RIGHT_FRAGMENT = r"[^，,。；;！？!?\n]{1,30}"
+_INFIX_STOP_ALTERNATIVE = re.compile(
+    rf"(?P<expression>(?P<left>{_STOP_CHOICE_LEFT_FRAGMENT})"
+    rf"(?:或者|或是|要么|还是)(?P<right>{_STOP_CHOICE_RIGHT_FRAGMENT}))"
+)
+_POSTFIX_STOP_ALTERNATIVE = re.compile(
+    rf"(?P<expression>(?P<left>{_STOP_CHOICE_LEFT_FRAGMENT})[，,、]"
+    rf"(?P<right>{_STOP_CHOICE_LEFT_FRAGMENT})"
+    rf"(?:也行|也可以|都可以|均可|任选|二选一))"
+)
+_STOP_CHOICE_VALUE_CUE = re.compile(
+    r"火锅|烧烤|烤肉|日料|西餐|咖啡|电影|影院|剧场|景点|公园|展览|活动|"
+    r"[\u4e00-\u9fff]{1,12}(?:馆|店|餐厅|饭店|乐园)"
+)
 _REPLACE_CUE = re.compile(r"替换|更换|换成|换为|换一个|换一家|换个|改成|改为")
+_RELATIVE_BUDGET_UPDATE = re.compile(
+    r"(?:总预算|预算)\s*从\s*\d{2,6}\s*(?:元|块)?\s*"
+    r"(?:提高|增加|上调|涨|降低|下降|下调|降)\s*(?:到|至|为)\s*"
+    r"(?P<value>\d{2,6})\s*(?:元|块)?"
+)
+_EXPLICIT_MOVE_CUE = re.compile(
+    r"(?:电影|影院|餐厅|饭店|景点|活动|第\s*[一二三四五1-5]\s*个.{0,8})"
+    r".{0,8}(?:放(?:到)?|移到|挪到|提前|推后).{0,8}"
+    r"(?:前|后|上午|下午|晚上|早饭|午饭|晚饭)"
+)
 _STOP_OPERATIONS = {
     DateOperationType.ADD_STOP,
     DateOperationType.REMOVE_STOP,

@@ -2,7 +2,10 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from loveapp.application.date_planning.role_completion import complete_date_plan_roles
-from loveapp.application.date_planning.state_projection import inherit_desired_stop_role
+from loveapp.application.date_planning.state_projection import (
+    derive_legacy_slots,
+    inherit_desired_stop_role,
+)
 from loveapp.application.date_planning.structured_stops import (
     has_placement_requirement,
     item_matches_reference,
@@ -10,8 +13,10 @@ from loveapp.application.date_planning.structured_stops import (
 )
 from loveapp.core.timing import ExecutionTrace
 from loveapp.domain.date_operations import (
+    DateOperationBatch,
     DateOperationType,
     DatePlanOperation,
+    DateStopRequirement,
     DesiredDateStop,
     MealType,
     StopKind,
@@ -59,6 +64,14 @@ class DatePlanOperationExecution:
     effective_mutation: DatePlanMutation
 
 
+@dataclass(frozen=True)
+class DateOperationExecutionContext:
+    operation: DatePlanOperation
+    base_request: DatePlanRequest
+    local_required_stops: tuple[DesiredDateStop, ...] = ()
+    sibling_reserved_requirement_ids: tuple[str, ...] = ()
+
+
 class DateOperationExecutor:
     """Apply verified operations without changing the committed task snapshot."""
 
@@ -73,8 +86,18 @@ class DateOperationExecutor:
         *,
         trace: ExecutionTrace | None = None,
         required_mutation: DatePlanMutation = DatePlanMutation.NONE,
+        requirements: list[DateStopRequirement] | None = None,
+        existing_requirements: list[DateStopRequirement] | None = None,
     ) -> DatePlanOperationExecution:
         ordered = _ordered_operations(operations)
+        contexts = _operation_execution_contexts(
+            request,
+            ordered,
+            requirements or [],
+            existing_requirement_ids={
+                requirement.id for requirement in existing_requirements or []
+            },
+        )
         if existing_plan is None:
             return await self._create_initial_plan(
                 ordered,
@@ -87,6 +110,16 @@ class DateOperationExecutor:
         applied: list[DatePlanOperation] = []
         rejected: list[RejectedDatePlanOperation] = []
         effective_mutation = DatePlanMutation.NONE
+        alternative_groups = _explicit_alternative_add_groups(ordered)
+        satisfied_alternative_groups = {
+            group_id
+            for group_id, alternatives in alternative_groups.items()
+            if any(
+                operation.payload is not None
+                and _desired_stop_is_satisfied(plan, operation.payload)
+                for operation in alternatives
+            )
+        }
 
         constraint_operations = [
             operation
@@ -106,9 +139,21 @@ class DateOperationExecutor:
         for operation in ordered:
             if operation.type == DateOperationType.UPDATE_CONSTRAINT:
                 continue
+            alternative_group = (
+                operation.alternative_group
+                if operation.alternative_group in alternative_groups
+                else None
+            )
+            if alternative_group in satisfied_alternative_groups:
+                rejected.append(
+                    RejectedDatePlanOperation(operation, "alternative_not_selected")
+                )
+                continue
+            context = contexts[id(operation)]
+            local_request = _request_for_execution_context(context)
             if operation.type == DateOperationType.REPLAN:
                 plan = await self._planner.plan(
-                    _request_with_add_operations(request, ordered),
+                    _request_with_add_operations(local_request, ordered),
                     trace=trace,
                     existing_plan=plan,
                     mutation=DatePlanMutation.REPLAN,
@@ -117,16 +162,24 @@ class DateOperationExecutor:
                 effective_mutation = DatePlanMutation.REPLAN
                 continue
             if operation.type == DateOperationType.REMOVE_STOP:
-                candidate, reason = await self._remove(plan, operation, request, trace=trace)
+                candidate, reason = await self._remove(
+                    plan, operation, local_request, trace=trace
+                )
                 mutation = DatePlanMutation.REMOVE
             elif operation.type == DateOperationType.REPLACE_STOP:
-                candidate, reason = await self._replace(plan, operation, request, trace=trace)
+                candidate, reason = await self._replace(
+                    plan, operation, local_request, trace=trace
+                )
                 mutation = DatePlanMutation.REPLACE
             elif operation.type == DateOperationType.ADD_STOP:
-                candidate, reason = await self._add(plan, operation, request, trace=trace)
+                candidate, reason = await self._add(
+                    plan, operation, local_request, trace=trace
+                )
                 mutation = DatePlanMutation.ADD
             elif operation.type == DateOperationType.MOVE_STOP:
-                candidate, reason = await self._move(plan, operation, request, trace=trace)
+                candidate, reason = await self._move(
+                    plan, operation, local_request, trace=trace
+                )
                 mutation = DatePlanMutation.REORDER
             else:  # pragma: no cover - enum exhaustiveness guard
                 candidate, reason = plan, "unsupported_operation"
@@ -136,6 +189,8 @@ class DateOperationExecutor:
                 continue
             plan = candidate
             applied.append(operation)
+            if alternative_group is not None:
+                satisfied_alternative_groups.add(alternative_group)
             effective_mutation = mutation
 
         if (
@@ -155,6 +210,27 @@ class DateOperationExecutor:
             applied=tuple(applied),
             rejected=tuple(rejected),
             effective_mutation=effective_mutation,
+        )
+
+    async def apply_batch(
+        self,
+        existing_plan: DatePlan | None,
+        batch: DateOperationBatch,
+        request: DatePlanRequest,
+        *,
+        trace: ExecutionTrace | None = None,
+        required_mutation: DatePlanMutation = DatePlanMutation.NONE,
+        requirements: list[DateStopRequirement] | None = None,
+        existing_requirements: list[DateStopRequirement] | None = None,
+    ) -> DatePlanOperationExecution:
+        return await self.apply(
+            existing_plan,
+            batch.operations,
+            request,
+            trace=trace,
+            required_mutation=required_mutation,
+            requirements=requirements,
+            existing_requirements=existing_requirements,
         )
 
     async def _create_initial_plan(
@@ -199,10 +275,19 @@ class DateOperationExecutor:
                 applied.append(operation)
                 continue
             matches = list(match_desired_stop(plan, operation.payload))
-            if len(matches) != 1:
+            if not matches:
                 rejected.append(RejectedDatePlanOperation(operation, "stop_not_added"))
                 continue
-            if has_placement_requirement(operation.payload) and not matches[0].placement_satisfied:
+            placed = [match for match in matches if match.placement_satisfied]
+            if has_placement_requirement(operation.payload) and not placed:
+                if len(matches) != 1:
+                    rejected.append(
+                        RejectedDatePlanOperation(
+                            operation,
+                            "placement_target_not_unique",
+                        )
+                    )
+                    continue
                 move = DatePlanOperation(
                     type=DateOperationType.MOVE_STOP,
                     target=StopReference(place_id=matches[0].item.place.id),
@@ -266,13 +351,29 @@ class DateOperationExecutor:
         if desired.generic_replacement:
             if desired.kind in {StopKind.DINING, StopKind.CAFE}:
                 specific_request = specific_request.model_copy(
-                    update={"dining_keywords": []}
+                    update={
+                        "dining_keywords": [],
+                        "requirements": [
+                            requirement
+                            for requirement in specific_request.requirements
+                            if requirement.alternatives[0].kind
+                            not in {StopKind.DINING, StopKind.CAFE}
+                        ],
+                    }
                 )
                 activity_focus = []
                 dining_focus = None
             else:
                 specific_request = specific_request.model_copy(
-                    update={"activity_keywords": []}
+                    update={
+                        "activity_keywords": [],
+                        "requirements": [
+                            requirement
+                            for requirement in specific_request.requirements
+                            if requirement.alternatives[0].kind
+                            in {StopKind.DINING, StopKind.CAFE}
+                        ],
+                    }
                 )
                 activity_focus = None
                 dining_focus = []
@@ -411,6 +512,104 @@ class DateOperationExecutor:
         return rebuilt, None
 
 
+def _operation_execution_contexts(
+    request: DatePlanRequest,
+    operations: list[DatePlanOperation],
+    requirements: list[DateStopRequirement],
+    *,
+    existing_requirement_ids: set[str] | None = None,
+) -> dict[int, DateOperationExecutionContext]:
+    existing_ids = existing_requirement_ids or set()
+    additions = [
+        operation
+        for operation in operations
+        if operation.type == DateOperationType.ADD_STOP and operation.payload is not None
+    ]
+    contexts: dict[int, DateOperationExecutionContext] = {}
+    for operation in operations:
+        sibling_additions = [
+            addition.payload
+            for addition in additions
+            if addition is not operation and addition.payload is not None
+        ]
+        reserved_ids = [
+            requirement.id
+            for requirement in requirements
+            if requirement.id not in existing_ids
+            if any(
+                _same_required_stop(alternative, sibling)
+                for alternative in requirement.alternatives
+                for sibling in sibling_additions
+            )
+        ]
+        local_requirements = [
+            requirement
+            for requirement in requirements
+            if requirement.id not in reserved_ids
+        ]
+        contexts[id(operation)] = DateOperationExecutionContext(
+            operation=operation,
+            base_request=request,
+            local_required_stops=tuple(
+                requirement.alternatives[0] for requirement in local_requirements
+            ),
+            sibling_reserved_requirement_ids=tuple(reserved_ids),
+        )
+    return contexts
+
+
+def _explicit_alternative_add_groups(
+    operations: list[DatePlanOperation],
+) -> dict[str, list[DatePlanOperation]]:
+    groups: dict[str, list[DatePlanOperation]] = {}
+    for operation in operations:
+        if (
+            operation.type == DateOperationType.ADD_STOP
+            and operation.payload is not None
+            and operation.alternative_group is not None
+        ):
+            groups.setdefault(operation.alternative_group, []).append(operation)
+    return {group_id: group for group_id, group in groups.items() if len(group) > 1}
+
+
+def _desired_stop_is_satisfied(plan: DatePlan, desired: DesiredDateStop) -> bool:
+    return any(match.placement_satisfied for match in match_desired_stop(plan, desired))
+
+
+def _request_for_execution_context(
+    context: DateOperationExecutionContext,
+) -> DatePlanRequest:
+    if not context.base_request.requirements:
+        return context.base_request
+    local_requirements = [
+        requirement
+        for requirement in context.base_request.requirements
+        if requirement.id not in context.sibling_reserved_requirement_ids
+    ]
+    legacy = derive_legacy_slots(list(context.local_required_stops))
+    return context.base_request.model_copy(
+        update={
+            "requirements": local_requirements,
+            "dining_keywords": legacy.dining_keywords,
+            "meal_keywords": legacy.meal_keywords,
+            "activity_keywords": legacy.activity_keywords,
+            "schedule_hints": legacy.schedule_hints,
+        }
+    )
+
+
+def _same_required_stop(first: DesiredDateStop, second: DesiredDateStop) -> bool:
+    first_value = (first.keyword or first.place_name or "").casefold().replace(" ", "")
+    second_value = (second.keyword or second.place_name or "").casefold().replace(" ", "")
+    return bool(
+        first_value
+        and first_value == second_value
+        and first.kind == second.kind
+        and first.meal_type == second.meal_type
+        and first.target_day == second.target_day
+    )
+
+
 def _ordered_operations(operations: list[DatePlanOperation]) -> list[DatePlanOperation]:
     order = {
         DateOperationType.UPDATE_CONSTRAINT: 0,
@@ -468,6 +667,7 @@ def _request_for_existing_plan_constraints(
             "activity_keywords": activity_keywords,
             "meal_keywords": meal_keywords,
             "schedule_hints": schedule_hints[:8],
+            "requirements": [],
             "replace_place_names": [],
             "excluded_keywords": [],
         }

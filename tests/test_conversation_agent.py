@@ -541,6 +541,50 @@ async def test_multi_turn_date_addition_keeps_the_previous_plan(
     assert second.date_task_state.current_plan is not None
 
 
+async def test_invalid_budget_keeps_last_plan_and_reports_the_failed_commit(
+    app_settings: Settings,
+) -> None:
+    container = build_container(app_settings)
+    try:
+        first = await container.conversation_agent.chat(
+            ConversationRequest(
+                user_id="invalid-budget-user",
+                relationship_id="invalid-budget-relationship",
+                conversation_id="invalid-budget-conversation",
+                query=(
+                    "帮我安排一次约会，地点在上海静安区，周六，预算1000元，"
+                    "下午看电影，晚饭吃西餐"
+                ),
+            )
+        )
+        assert first.date_plan is not None
+        assert first.date_task_state is not None
+        assert first.date_plan.total_estimated_cost > 50
+        first_ids = [item.place.id for item in first.date_plan.items]
+        first_version = first.date_task_state.plan_version
+
+        second = await container.conversation_agent.chat(
+            ConversationRequest(
+                user_id="invalid-budget-user",
+                relationship_id="invalid-budget-relationship",
+                conversation_id="invalid-budget-conversation",
+                active_task=first.active_task,
+                query="把预算改为50元",
+            )
+        )
+    finally:
+        await container.aclose()
+
+    assert second.date_plan is not None
+    assert [item.place.id for item in second.date_plan.items] == first_ids
+    assert second.date_task_state is not None
+    assert second.date_task_state.budget == 50
+    assert second.date_task_state.plan_version == first_version
+    assert second.message is not None
+    assert "无法满足" in second.message
+    assert "仍满足新预算" not in second.message
+
+
 async def test_implicit_multi_stop_update_preserves_plan_and_schedule_semantics(
     app_settings: Settings,
 ) -> None:

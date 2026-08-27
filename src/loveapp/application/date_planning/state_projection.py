@@ -2,15 +2,18 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
+from loveapp.application.date_planning.requirements import primary_desired_stops
 from loveapp.domain.date_operations import (
     DateOperationType,
     DatePlanOperation,
+    DateStopRequirement,
     DesiredDateStop,
     MealType,
     StopKind,
     StopReference,
     TemporalAnchor,
     TimeWindow,
+    desired_stops_from_legacy_slots,
 )
 from loveapp.domain.date_plan import DatePlan, DatePlanItem
 from loveapp.domain.date_task import DatePlanningTaskState
@@ -82,17 +85,115 @@ class DateRequirementProjector:
                         )
         return _dedupe_stops(projected)
 
+    def apply_requirement_operations(
+        self,
+        requirements: list[DateStopRequirement],
+        operations: list[DatePlanOperation] | tuple[DatePlanOperation, ...],
+        *,
+        current_plan: DatePlan | None = None,
+        source_text: str | None = None,
+    ) -> list[DateStopRequirement]:
+        """Project the verified request batch, independent of execution success."""
+
+        projected = list(requirements)
+        grouped_adds = _alternative_add_groups(operations, source_text)
+        grouped_ids = {id(operation) for group in grouped_adds for operation in group}
+        for group in grouped_adds:
+            alternatives = [
+                operation.payload for operation in group if operation.payload is not None
+            ]
+            projected = _add_or_merge_requirement(
+                projected,
+                DateStopRequirement(
+                    alternatives=alternatives,
+                    min_satisfied=1,
+                    max_satisfied=1,
+                    source_span=_shared_source_span(group, source_text),
+                ),
+            )
+
+        for operation in operations:
+            if id(operation) in grouped_ids:
+                continue
+            if operation.type == DateOperationType.ADD_STOP and operation.payload is not None:
+                projected = _add_or_merge_requirement(
+                    projected,
+                    _single_requirement(operation.payload, operation.source_span),
+                )
+            elif operation.type == DateOperationType.REMOVE_STOP and operation.target is not None:
+                index = _target_requirement_index(projected, operation.target, current_plan)
+                if index is not None:
+                    projected.pop(index)
+            elif operation.type == DateOperationType.REPLACE_STOP and operation.payload is not None:
+                index = _target_requirement_index(projected, operation.target, current_plan)
+                target_item = _target_item(operation.target, current_plan)
+                previous = (
+                    projected[index].alternatives[0]
+                    if index is not None
+                    else target_item
+                )
+                inherited = (
+                    inherit_desired_stop_role(operation.payload, previous)
+                    if previous is not None
+                    else operation.payload
+                )
+                if (
+                    inherited.generic_replacement
+                    and inherited.keyword is None
+                    and inherited.place_name is None
+                    and inherited.meal_type is None
+                ):
+                    if index is not None:
+                        projected.pop(index)
+                    continue
+                if index is None:
+                    projected = _add_or_merge_requirement(
+                        projected,
+                        _single_requirement(inherited, operation.source_span),
+                    )
+                else:
+                    current = projected[index]
+                    projected[index] = current.model_copy(
+                        update={
+                            "alternatives": [inherited],
+                            "source_span": operation.source_span or current.source_span,
+                        }
+                    )
+            elif operation.type == DateOperationType.MOVE_STOP and operation.payload is not None:
+                index = _target_requirement_index(projected, operation.target, current_plan)
+                if index is not None:
+                    current = projected[index]
+                    projected[index] = current.model_copy(
+                        update={
+                            "alternatives": [
+                                _apply_placement(alternative, operation.payload)
+                                for alternative in current.alternatives
+                            ],
+                            "source_span": operation.source_span or current.source_span,
+                        }
+                    )
+                else:
+                    target_item = _target_item(operation.target, current_plan)
+                    if target_item is not None:
+                        projected = _add_or_merge_requirement(
+                            projected,
+                            _single_requirement(
+                                _apply_placement(
+                                    _desired_stop_for_item(target_item),
+                                    operation.payload,
+                                ),
+                                operation.source_span,
+                            ),
+                        )
+        return _dedupe_requirements(projected)
+
 
 def desired_stops_for_state(state: DatePlanningTaskState) -> list[DesiredDateStop]:
-    if state.desired_stops:
-        return list(state.desired_stops)
-    return desired_stops_from_legacy(
-        dining_keywords=state.dining_keywords,
-        meal_keywords=state.meal_keywords,
-        activity_keywords=state.activity_keywords,
-        schedule_hints=state.schedule_hints,
-        target_day=state.target_day,
-    )
+    return primary_desired_stops(requirements_for_state(state))
+
+
+def requirements_for_state(state: DatePlanningTaskState) -> list[DateStopRequirement]:
+    return list(state.requirements)
 
 
 def desired_stops_from_plan(plan: DatePlan | None) -> list[DesiredDateStop]:
@@ -137,43 +238,15 @@ def desired_stops_from_legacy(
     schedule_hints: list[str],
     target_day: int | None = None,
 ) -> list[DesiredDateStop]:
-    meal_by_keyword = {
-        keyword: MealType(meal_type)
-        for meal_type, keywords in meal_keywords.items()
-        if meal_type in MealType._value2member_map_
-        for keyword in keywords
-    }
-    result = [
-        DesiredDateStop(
-            kind=StopKind.CAFE if "咖啡" in keyword else StopKind.DINING,
-            keyword=keyword,
-            meal_type=meal_by_keyword.get(keyword),
+    return _dedupe_stops(
+        desired_stops_from_legacy_slots(
+            dining_keywords=dining_keywords,
+            meal_keywords=meal_keywords,
+            activity_keywords=activity_keywords,
+            schedule_hints=schedule_hints,
             target_day=target_day,
         )
-        for keyword in dining_keywords
-    ]
-    has_unique_after_dinner_target = len(activity_keywords) == 1 and (
-        "晚饭后" in schedule_hints or "晚餐后" in schedule_hints
     )
-    result.extend(
-        DesiredDateStop(
-            kind=StopKind.ACTIVITY,
-            keyword=keyword,
-            target_day=target_day,
-            time_window=(
-                TimeWindow(label="晚饭后")
-                if has_unique_after_dinner_target
-                else None
-            ),
-            after=(
-                TemporalAnchor.DINNER
-                if has_unique_after_dinner_target
-                else None
-            ),
-        )
-        for keyword in activity_keywords
-    )
-    return _dedupe_stops(result)
 
 
 def derive_legacy_slots(desired_stops: list[DesiredDateStop]) -> LegacyDateRequirementSlots:
@@ -204,13 +277,16 @@ def derive_legacy_slots(desired_stops: list[DesiredDateStop]) -> LegacyDateRequi
 
 def project_requirements_to_state(
     state: DatePlanningTaskState,
-    desired_stops: list[DesiredDateStop],
+    requirements: list[DateStopRequirement] | list[DesiredDateStop],
 ) -> DatePlanningTaskState:
-    canonical = _dedupe_stops(desired_stops)
-    legacy = derive_legacy_slots(canonical)
+    canonical = _normalize_requirements(requirements)
+    desired_stops = primary_desired_stops(canonical)
+    legacy = derive_legacy_slots(desired_stops)
     return state.model_copy(
         update={
-            "desired_stops": canonical,
+            "requirements": canonical,
+            "requirement_schema_version": 1,
+            "desired_stops": desired_stops,
             "dining_keywords": legacy.dining_keywords,
             "meal_keywords": legacy.meal_keywords,
             "activity_keywords": legacy.activity_keywords,
@@ -354,7 +430,13 @@ def _same_stop_identity(first: DesiredDateStop, second: DesiredDateStop) -> bool
         return False
     first_value = _normalize(first.keyword or first.place_name or "")
     second_value = _normalize(second.keyword or second.place_name or "")
-    return bool(first_value and second_value and first_value == second_value)
+    return bool(
+        first_value
+        and second_value
+        and first_value == second_value
+        and first.meal_type == second.meal_type
+        and first.target_day == second.target_day
+    )
 
 
 def _dedupe_stops(stops: list[DesiredDateStop]) -> list[DesiredDateStop]:
@@ -362,6 +444,210 @@ def _dedupe_stops(stops: list[DesiredDateStop]) -> list[DesiredDateStop]:
     for stop in stops:
         result = _add_or_merge(result, stop)
     return result
+
+
+def _normalize_requirements(
+    values: list[DateStopRequirement] | list[DesiredDateStop],
+) -> list[DateStopRequirement]:
+    if not values:
+        return []
+    requirements = (
+        list(values)
+        if isinstance(values[0], DateStopRequirement)
+        else [_single_requirement(stop) for stop in values if isinstance(stop, DesiredDateStop)]
+    )
+    return _dedupe_requirements(requirements)
+
+
+def _single_requirement(
+    stop: DesiredDateStop,
+    source_span: str | None = None,
+) -> DateStopRequirement:
+    return DateStopRequirement(
+        alternatives=[stop],
+        source_span=source_span,
+    )
+
+
+def _dedupe_requirements(
+    requirements: list[DateStopRequirement],
+) -> list[DateStopRequirement]:
+    result: list[DateStopRequirement] = []
+    for incoming in requirements:
+        index = next(
+            (
+                index
+                for index, current in enumerate(result)
+                if _same_requirement_identity(current, incoming)
+            ),
+            None,
+        )
+        if index is None:
+            result.append(incoming)
+            continue
+        current = result[index]
+        alternatives = list(current.alternatives)
+        for alternative in incoming.alternatives:
+            match = next(
+                (
+                    offset
+                    for offset, existing in enumerate(alternatives)
+                    if _same_stop_identity(existing, alternative)
+                ),
+                None,
+            )
+            if match is None:
+                alternatives.append(alternative)
+            else:
+                alternatives[match] = _apply_placement(alternatives[match], alternative)
+        result[index] = current.model_copy(
+            update={
+                "alternatives": alternatives,
+                "source_span": incoming.source_span or current.source_span,
+            }
+        )
+    return result
+
+
+def _same_requirement_identity(
+    first: DateStopRequirement,
+    second: DateStopRequirement,
+) -> bool:
+    if first.id == second.id:
+        return True
+    if len(first.alternatives) == len(second.alternatives) == 1:
+        return _same_stop_identity(first.alternatives[0], second.alternatives[0])
+    return (
+        first.min_satisfied == second.min_satisfied
+        and first.max_satisfied == second.max_satisfied
+        and {_stop_identity_key(stop) for stop in first.alternatives}
+        == {_stop_identity_key(stop) for stop in second.alternatives}
+    )
+
+
+def _stop_identity_key(stop: DesiredDateStop) -> tuple[object, ...]:
+    return (
+        stop.kind,
+        _normalize(stop.keyword or stop.place_name or ""),
+        stop.meal_type,
+        stop.target_day,
+    )
+
+
+def _add_or_merge_requirement(
+    current: list[DateStopRequirement],
+    incoming: DateStopRequirement,
+) -> list[DateStopRequirement]:
+    return _dedupe_requirements([*current, incoming])
+
+
+def _target_requirement_index(
+    requirements: list[DateStopRequirement],
+    reference: StopReference | None,
+    current_plan: DatePlan | None,
+) -> int | None:
+    if reference is None:
+        return None
+    ordered = (
+        sorted(current_plan.items, key=lambda item: (item.day_index, item.order))
+        if current_plan is not None
+        else []
+    )
+    if reference.ordinal is not None and ordered:
+        target = ordered[reference.ordinal - 1] if reference.ordinal <= len(ordered) else None
+        if target is None:
+            return None
+        reference_values = [
+            _normalize(value)
+            for value in (target.slot_keyword, target.place.name)
+            if value is not None
+        ]
+    elif reference.ordinal is not None and reference.ordinal <= len(requirements):
+        return reference.ordinal - 1
+    else:
+        reference_values = [
+            _normalize(value)
+            for value in (reference.keyword, reference.place_name)
+            if value is not None
+        ]
+        if reference.place_id is not None and current_plan is not None:
+            target = next(
+                (item for item in current_plan.items if item.place.id == reference.place_id),
+                None,
+            )
+            if target is not None:
+                reference_values.extend(
+                    _normalize(value)
+                    for value in (target.slot_keyword, target.place.name)
+                    if value is not None
+                )
+    matches = [
+        index
+        for index, requirement in enumerate(requirements)
+        if any(
+            _stop_matches_reference(alternative, reference, reference_values)
+            for alternative in requirement.alternatives
+        )
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _alternative_add_groups(
+    operations: list[DatePlanOperation] | tuple[DatePlanOperation, ...],
+    source_text: str | None,
+) -> list[list[DatePlanOperation]]:
+    additions = [
+        operation
+        for operation in operations
+        if operation.type == DateOperationType.ADD_STOP and operation.payload is not None
+    ]
+    if len(additions) < 2:
+        return []
+    explicit_groups: dict[str, list[DatePlanOperation]] = {}
+    for operation in additions:
+        if operation.alternative_group is not None:
+            explicit_groups.setdefault(operation.alternative_group, []).append(operation)
+    result = [group for group in explicit_groups.values() if len(group) > 1]
+    explicitly_grouped = {id(operation) for group in result for operation in group}
+    implicit = [operation for operation in additions if id(operation) not in explicitly_grouped]
+    source_spans = list(
+        dict.fromkeys(operation.source_span for operation in implicit if operation.source_span)
+    )
+    evidence = source_spans[0] if len(source_spans) == 1 else ""
+    if not evidence and not source_spans:
+        evidence = source_text or ""
+    if _ALTERNATIVE_CUE.search(evidence) is None:
+        return result
+    groups: dict[tuple[object, ...], list[DatePlanOperation]] = {}
+    for operation in implicit:
+        payload = operation.payload
+        if payload is None:
+            continue
+        signature = (
+            payload.kind,
+            payload.meal_type,
+            payload.target_day,
+            payload.time_window.model_dump_json() if payload.time_window else None,
+            str(payload.after),
+            str(payload.before),
+        )
+        groups.setdefault(signature, []).append(operation)
+    result.extend(group for group in groups.values() if len(group) > 1)
+    return result
+
+
+def _shared_source_span(
+    operations: list[DatePlanOperation],
+    source_text: str | None,
+) -> str | None:
+    spans = list(
+        dict.fromkeys(
+            operation.source_span for operation in operations if operation.source_span
+        )
+    )
+    if len(spans) == 1:
+        return spans[0]
+    return source_text
 
 
 def _desired_stop_for_item(item: DatePlanItem) -> DesiredDateStop:
@@ -406,6 +692,9 @@ def _placement_hints(stop: DesiredDateStop) -> list[str]:
         if value:
             hints.append(f"{value}前")
     return list(dict.fromkeys(hints))
+
+
+_ALTERNATIVE_CUE = re.compile(r"(?:或者|或是|还是|也行|也可以|均可|任选|二选一)")
 
 
 def _normalize(value: str) -> str:

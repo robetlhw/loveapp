@@ -5,13 +5,19 @@ from itertools import pairwise
 
 from pydantic import BaseModel, Field
 
+from loveapp.application.date_planning.requirements import DateRequirementMatcher
 from loveapp.application.date_planning.structured_stops import match_desired_stop
 from loveapp.domain.date_constraints import (
     ConstraintStrength,
     DateConstraint,
     DateConstraintKind,
 )
-from loveapp.domain.date_operations import DesiredDateStop
+from loveapp.domain.date_operations import (
+    DateRequirementMatch,
+    DateStopRequirement,
+    DesiredDateStop,
+    RequirementStatus,
+)
 from loveapp.domain.date_plan import DatePlan, DatePlanItem, DatePlanRequest, Place
 
 
@@ -43,15 +49,38 @@ class DatePlanValidator:
         plan: DatePlan,
         request: DatePlanRequest,
         constraints: list[DateConstraint],
+        *,
+        requirements: list[DateStopRequirement] | None = None,
+        satisfaction: list[DateRequirementMatch] | None = None,
     ) -> PlanValidationResult:
         issues: list[PlanValidationIssue] = []
         issues.extend(self._validate_budget(plan, request))
         issues.extend(self._validate_required_keywords(plan, constraints))
+        if requirements is not None:
+            matches = satisfaction or DateRequirementMatcher().match(requirements, plan)
+            issues.extend(self._validate_requirement_satisfaction(matches))
         issues.extend(self._validate_exclusions(plan, constraints))
         issues.extend(self._validate_duplicates(plan))
         issues.extend(self._validate_days(plan, request))
         issues.extend(self._validate_order_and_routes(plan))
         return PlanValidationResult(issues=issues)
+
+    def _validate_requirement_satisfaction(
+        self,
+        matches: list[DateRequirementMatch],
+    ) -> list[PlanValidationIssue]:
+        issues: list[PlanValidationIssue] = []
+        for match in matches:
+            if match.status == RequirementStatus.FULFILLED:
+                continue
+            issues.append(
+                _error(
+                    match.reason_code or "required_stop_unsatisfied",
+                    "当前方案尚未满足一项明确的用户要求。",
+                    match.matched_place_ids,
+                )
+            )
+        return issues
 
     def _validate_budget(
         self, plan: DatePlan, request: DatePlanRequest
@@ -86,6 +115,8 @@ class DatePlanValidator:
         issues = []
         for constraint in constraints:
             if constraint.strength != ConstraintStrength.REQUIRED:
+                continue
+            if isinstance(constraint.value, DateStopRequirement):
                 continue
             if isinstance(constraint.value, DesiredDateStop):
                 matches = match_desired_stop(plan, constraint.value)

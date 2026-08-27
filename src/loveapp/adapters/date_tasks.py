@@ -4,6 +4,7 @@ from pathlib import Path
 
 import aiosqlite
 
+from loveapp.application.date_planning.state_projection import project_requirements_to_state
 from loveapp.domain.date_task import DatePlanningTaskState
 
 
@@ -19,9 +20,13 @@ class InMemoryDatePlanningTaskStore:
         conversation_id: str,
     ) -> DatePlanningTaskState | None:
         state = self._states.get((user_id, relationship_id, conversation_id))
-        return state.model_copy(deep=True) if state else None
+        if state is None:
+            return None
+        normalized = project_requirements_to_state(state, state.requirements)
+        return normalized.model_copy(deep=True)
 
     async def save(self, state: DatePlanningTaskState) -> DatePlanningTaskState:
+        state = project_requirements_to_state(state, state.requirements)
         copied = state.model_copy(deep=True)
         self._states[(state.user_id, state.relationship_id, state.conversation_id)] = copied
         return copied.model_copy(deep=True)
@@ -91,10 +96,12 @@ class SQLiteDatePlanningTaskStore:
             await cursor.close()
         if row is None:
             return None
-        return DatePlanningTaskState.model_validate_json(row["state_json"])
+        state = DatePlanningTaskState.model_validate_json(row["state_json"])
+        return project_requirements_to_state(state, state.requirements)
 
     async def save(self, state: DatePlanningTaskState) -> DatePlanningTaskState:
         await self._initialize()
+        state = project_requirements_to_state(state, state.requirements)
         payload = state.model_dump(mode="json")
         async with aiosqlite.connect(self._database_path) as connection:
             await connection.execute(

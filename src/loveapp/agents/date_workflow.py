@@ -1,3 +1,4 @@
+import inspect
 import json
 from datetime import timedelta
 
@@ -7,20 +8,40 @@ from loveapp.application.date_planning import (
     DatePlanPatchApplier,
     DatePlanValidator,
 )
-from loveapp.application.date_planning.plan_diff import DatePlanDiff, diff_date_plans
+from loveapp.application.date_planning.operations import (
+    DatePlanOperationExecution,
+    RejectedDatePlanOperation,
+)
+from loveapp.application.date_planning.plan_diff import (
+    DatePlanDiff,
+    diff_date_plans,
+    diff_date_tasks,
+)
+from loveapp.application.date_planning.requirements import (
+    DateRequirementMatcher,
+    all_desired_stop_alternatives,
+)
 from loveapp.application.date_planning.role_completion import complete_date_plan_roles
 from loveapp.application.date_planning.state_projection import (
     DateRequirementProjector,
-    desired_stops_for_state,
     desired_stops_from_legacy,
     project_requirements_to_state,
+    requirements_for_state,
 )
+from loveapp.application.date_planning.structured_stops import match_desired_stop
 from loveapp.core.timing import ExecutionTrace
-from loveapp.domain.date_constraints import build_date_constraints
-from loveapp.domain.date_operations import DateOperationType, DatePlanOperation, DesiredDateStop
+from loveapp.domain.date_constraints import DateConstraint, build_date_constraints
+from loveapp.domain.date_operations import (
+    DateOperationBatch,
+    DateOperationType,
+    DatePlanOperation,
+    DateRequirementMatch,
+    DateStopRequirement,
+    RequirementStatus,
+)
 from loveapp.domain.date_patch import DatePlanPatch
 from loveapp.domain.date_plan import DatePlan, DatePlanRequest
-from loveapp.domain.date_task import DatePlanningTaskState
+from loveapp.domain.date_task import DatePlanningTaskState, DateTaskDiff
 from loveapp.domain.date_workflow import DatePlanningWorkflowInput, DatePlanningWorkflowResult
 from loveapp.domain.enums import (
     BudgetScope,
@@ -49,6 +70,7 @@ class DatePlanningWorkflow:
         patch_applier: DatePlanPatchApplier | None = None,
         operation_executor: DateOperationExecutor | None = None,
         requirement_projector: DateRequirementProjector | None = None,
+        requirement_matcher: DateRequirementMatcher | None = None,
     ) -> None:
         self._planner = planner
         self._task_store = task_store
@@ -56,6 +78,7 @@ class DatePlanningWorkflow:
         self._patch_applier = patch_applier or DatePlanPatchApplier()
         self._operation_executor = operation_executor or DateOperationExecutor(planner)
         self._requirement_projector = requirement_projector or DateRequirementProjector()
+        self._requirement_matcher = requirement_matcher or DateRequirementMatcher()
 
     async def run(
         self,
@@ -118,14 +141,15 @@ class DatePlanningWorkflow:
                     )
             else:
                 merged = _merge_date_task_state(current, route.date_plan, route.date_mutation)
-            desired_before = desired_stops_for_state(current)
-            desired_candidate = self._project_turn_requirements(
-                desired_before,
+            requirements_before = requirements_for_state(current)
+            candidate_requirements = self._project_turn_requirements(
+                requirements_before,
                 current,
                 current_turn_slots,
                 route.date_operations,
+                source_text=request.query,
             )
-            merged = project_requirements_to_state(merged, desired_candidate)
+            merged = project_requirements_to_state(merged, candidate_requirements)
             merged = merged.model_copy(
                 update={
                     "status": DatePlanningStatus.COLLECTING,
@@ -133,12 +157,22 @@ class DatePlanningWorkflow:
                     "updated_at": utc_now(),
                 }
             )
+            operation_batch = DateOperationBatch(
+                operations=list(route.date_operations),
+                source_text=request.query,
+                unresolved_references=list(route.date_unresolved_references),
+            )
+            _record_operation_batch(trace, operation_batch)
             if _should_clarify_date_task(current, merged):
                 _record_requirement_projection(
                     trace,
-                    desired_before,
-                    merged.desired_stops,
-                    committed=False,
+                    requirements_before,
+                    candidate_requirements,
+                    committed=True,
+                )
+                satisfaction = self._requirement_matcher.match(
+                    candidate_requirements,
+                    current.current_plan,
                 )
                 clarified = merged.model_copy(
                     update={
@@ -146,6 +180,8 @@ class DatePlanningWorkflow:
                             dict.fromkeys([*current.asked_fields, *merged.missing_fields])
                         ),
                         "clarification_round": current.clarification_round + 1,
+                        "last_operations": operation_batch.operations,
+                        "requirement_satisfaction": satisfaction,
                         "updated_at": utc_now(),
                     }
                 )
@@ -153,27 +189,62 @@ class DatePlanningWorkflow:
                 if "city" in merged.missing_fields and current.clarification_round > 0:
                     clarified = clarified.model_copy(update={"fallback_used": True})
                     draft = _fallback_date_draft(clarified)
+                task_diff = diff_date_tasks(current, clarified)
+                clarified = clarified.model_copy(update={"last_task_diff": task_diff})
+                _record_requirement_satisfaction(trace, satisfaction)
+                _record_task_diff(trace, task_diff)
+                _record_plan_diff(
+                    trace,
+                    diff_date_plans(current.current_plan, current.current_plan),
+                    plan_changed=False,
+                )
                 saved = await self._save(clarified, trace)
                 return DatePlanningWorkflowResult(
                     message=_clarification_message(saved),
                     task_state=saved,
                     needs_clarification=True,
                     plan=draft,
+                    requirement_satisfaction=satisfaction,
+                    task_diff=task_diff,
                 )
             if "city" in merged.missing_fields:
                 _record_requirement_projection(
                     trace,
-                    desired_before,
-                    merged.desired_stops,
-                    committed=False,
+                    requirements_before,
+                    candidate_requirements,
+                    committed=True,
+                )
+                satisfaction = self._requirement_matcher.match(
+                    candidate_requirements,
+                    current.current_plan,
+                )
+                candidate_state = merged.model_copy(
+                    update={
+                        "last_operations": operation_batch.operations,
+                        "requirement_satisfaction": satisfaction,
+                        "updated_at": utc_now(),
+                    }
+                )
+                task_diff = diff_date_tasks(current, candidate_state)
+                candidate_state = candidate_state.model_copy(
+                    update={"last_task_diff": task_diff}
+                )
+                _record_requirement_satisfaction(trace, satisfaction)
+                _record_task_diff(trace, task_diff)
+                _record_plan_diff(
+                    trace,
+                    diff_date_plans(current.current_plan, current.current_plan),
+                    plan_changed=False,
                 )
                 saved = await self._save(
-                    merged.model_copy(update={"updated_at": utc_now()}),
+                    candidate_state,
                     trace,
                 )
                 return DatePlanningWorkflowResult(
                     message=_city_required_message(current.clarification_round),
                     task_state=saved,
+                    requirement_satisfaction=satisfaction,
+                    task_diff=task_diff,
                 )
 
             mutation = route.date_mutation
@@ -189,24 +260,28 @@ class DatePlanningWorkflow:
                 else merged.budget_scope
             )
             plan_request = _build_request(request, merged, current_turn_slots, budget_scope)
-            applied_operations = None
+            blocking_rejections: tuple[RejectedDatePlanOperation, ...] = ()
             if route.date_operations:
                 with trace.measure("date_operation_execute") as details:
-                    execution = await self._operation_executor.apply(
+                    execution = await _execute_operation_batch(
+                        self._operation_executor,
                         current.current_plan,
-                        route.date_operations,
+                        operation_batch,
                         plan_request,
-                        trace=trace,
-                        required_mutation=mutation,
+                        candidate_requirements,
+                        requirements_before,
+                        trace,
+                        mutation,
                     )
                     plan = execution.plan
-                    applied_operations = execution.applied
                     mutation = execution.effective_mutation
                     details.update(
                         {
                             "requested_count": len(route.date_operations),
                             "applied_count": len(execution.applied),
                             "rejected_count": len(execution.rejected),
+                            "date_operation_applied_count": len(execution.applied),
+                            "date_operation_rejected_count": len(execution.rejected),
                             "rejections_json": json.dumps(
                                 [
                                     {
@@ -220,6 +295,7 @@ class DatePlanningWorkflow:
                             ),
                         }
                     )
+                blocking_rejections = _blocking_operation_rejections(execution)
             else:
                 plan = await self._planner.plan(
                     plan_request,
@@ -237,31 +313,39 @@ class DatePlanningWorkflow:
                         else None
                     ),
                 )
-            if applied_operations is not None:
-                committed_desired = self._requirement_projector.apply_operations(
-                    desired_before,
-                    applied_operations,
-                    current_plan=current.current_plan,
-                )
-                merged = project_requirements_to_state(merged, committed_desired)
-                plan_request = _build_request(
-                    request,
-                    merged,
-                    current_turn_slots,
-                    budget_scope,
-                )
             _record_requirement_projection(
                 trace,
-                desired_before,
-                merged.desired_stops,
+                requirements_before,
+                candidate_requirements,
                 committed=True,
             )
+            if blocking_rejections:
+                return await self._invalid_plan_result(
+                    current=current,
+                    merged=merged,
+                    candidate_plan=plan,
+                    mutation=mutation,
+                    operation_batch=operation_batch,
+                    validation_codes=[
+                        f"operation_rejected:{item.reason}" for item in blocking_rejections
+                    ],
+                    trace=trace,
+                )
             with trace.measure("date_plan_role_completion") as details:
-                completion = complete_date_plan_roles(plan, merged.desired_stops)
+                completion = complete_date_plan_roles(
+                    plan,
+                    all_desired_stop_alternatives(candidate_requirements),
+                )
                 details.update(
                     {
                         "inferred_dinner_items": len(completion.inferred_dinner_item_ids),
-                        "inferred_ids": ",".join(completion.inferred_dinner_item_ids),
+                        "inferred_lunch_items": len(completion.inferred_lunch_item_ids),
+                        "inferred_ids": ",".join(
+                            [
+                                *completion.inferred_lunch_item_ids,
+                                *completion.inferred_dinner_item_ids,
+                            ]
+                        ),
                         "unresolved_roles": len(completion.unresolved_roles),
                         "unresolved_json": json.dumps(
                             completion.unresolved_roles,
@@ -281,10 +365,24 @@ class DatePlanningWorkflow:
                 )
             constraints = build_date_constraints(
                 plan_request,
-                desired_stops=merged.desired_stops,
+                requirements=candidate_requirements,
             )
+            satisfaction = self._requirement_matcher.match(candidate_requirements, plan)
+            plan = _apply_requirement_match_reasons(
+                plan,
+                candidate_requirements,
+                satisfaction,
+            )
+            _record_requirement_satisfaction(trace, satisfaction)
             with trace.measure("date_plan_validation") as details:
-                validation = self._validator.validate(plan, plan_request, constraints)
+                validation = _validate_candidate_plan(
+                    self._validator,
+                    plan,
+                    plan_request,
+                    constraints,
+                    candidate_requirements,
+                    satisfaction,
+                )
                 details["valid"] = validation.valid
                 details["issue_codes"] = ",".join(issue.code for issue in validation.issues)
             if not validation.valid:
@@ -293,20 +391,34 @@ class DatePlanningWorkflow:
                     merged=merged,
                     candidate_plan=plan,
                     mutation=mutation,
+                    operation_batch=operation_batch,
                     validation_codes=[issue.code for issue in validation.issues],
                     trace=trace,
                 )
             persisted_plan = plan if plan.items else current.current_plan
             if not _has_executable_plan(persisted_plan):
+                candidate_state = merged.model_copy(
+                    update={
+                        "status": DatePlanningStatus.COLLECTING,
+                        "missing_fields": _missing_task_fields(merged),
+                        "last_mutation": mutation,
+                        "last_operations": operation_batch.operations,
+                        "requirement_satisfaction": satisfaction,
+                        "updated_at": utc_now(),
+                    }
+                )
+                task_diff = diff_date_tasks(current, candidate_state)
+                candidate_state = candidate_state.model_copy(
+                    update={"last_task_diff": task_diff}
+                )
+                _record_task_diff(trace, task_diff)
+                _record_plan_diff(
+                    trace,
+                    diff_date_plans(current.current_plan, persisted_plan),
+                    plan_changed=False,
+                )
                 saved = await self._save(
-                    merged.model_copy(
-                        update={
-                            "status": DatePlanningStatus.COLLECTING,
-                            "missing_fields": _missing_task_fields(merged),
-                            "last_mutation": mutation,
-                            "updated_at": utc_now(),
-                        }
-                    ),
+                    candidate_state,
                     trace,
                 )
                 return DatePlanningWorkflowResult(
@@ -314,10 +426,12 @@ class DatePlanningWorkflow:
                     task_state=saved,
                     plan=plan,
                     plan_changed=False,
+                    requirement_satisfaction=satisfaction,
+                    task_diff=task_diff,
                 )
             changed = _date_plan_changed(current.current_plan, persisted_plan)
             plan_diff = diff_date_plans(current.current_plan, persisted_plan)
-            _record_plan_diff(trace, plan_diff)
+            _record_plan_diff(trace, plan_diff, plan_changed=changed)
             _record_plan_item_roles(trace, persisted_plan)
             planned = merged.model_copy(
                 update={
@@ -334,9 +448,14 @@ class DatePlanningWorkflow:
                     "current_plan": persisted_plan,
                     "plan_version": current.plan_version + int(changed),
                     "last_mutation": mutation,
+                    "last_operations": operation_batch.operations,
+                    "requirement_satisfaction": satisfaction,
                     "updated_at": utc_now(),
                 }
             )
+            task_diff = diff_date_tasks(current, planned)
+            planned = planned.model_copy(update={"last_task_diff": task_diff})
+            _record_task_diff(trace, task_diff)
             saved = await self._save(planned, trace)
             return DatePlanningWorkflowResult(
                 message=_compose_response(
@@ -345,24 +464,32 @@ class DatePlanningWorkflow:
                     plan=plan,
                     changed=changed,
                     plan_diff=plan_diff,
+                    task_diff=task_diff,
+                    satisfaction=satisfaction,
                 ),
                 task_state=saved,
                 plan=plan,
                 plan_changed=changed,
+                plan_committed=True,
+                requirement_satisfaction=satisfaction,
+                task_diff=task_diff,
             )
 
     def _project_turn_requirements(
         self,
-        desired_before: list[DesiredDateStop],
+        requirements_before: list[DateStopRequirement],
         current: DatePlanningTaskState,
         slots: DatePlanPatch | DatePlanSlots,
         operations: list[DatePlanOperation],
-    ) -> list[DesiredDateStop]:
+        *,
+        source_text: str,
+    ) -> list[DateStopRequirement]:
         if operations:
-            return self._requirement_projector.apply_operations(
-                desired_before,
+            return self._requirement_projector.apply_requirement_operations(
+                requirements_before,
                 operations,
                 current_plan=current.current_plan,
+                source_text=source_text,
             )
         incoming = desired_stops_from_legacy(
             dining_keywords=slots.dining_keywords,
@@ -372,11 +499,12 @@ class DatePlanningWorkflow:
             target_day=slots.target_day,
         )
         if not incoming:
-            return desired_before
-        return self._requirement_projector.apply_operations(
-            desired_before,
+            return requirements_before
+        return self._requirement_projector.apply_requirement_operations(
+            requirements_before,
             [DatePlanOperation(type=DateOperationType.ADD_STOP, payload=stop) for stop in incoming],
             current_plan=current.current_plan,
+            source_text=source_text,
         )
 
     async def _invalid_plan_result(
@@ -386,47 +514,89 @@ class DatePlanningWorkflow:
         merged: DatePlanningTaskState,
         candidate_plan: DatePlan,
         mutation: DatePlanMutation,
+        operation_batch: DateOperationBatch,
         validation_codes: list[str],
         trace: ExecutionTrace,
     ) -> DatePlanningWorkflowResult:
         if _has_executable_plan(current.current_plan):
-            merged = project_requirements_to_state(
-                merged,
-                desired_stops_for_state(current),
+            satisfaction = self._requirement_matcher.match(
+                requirements_for_state(merged),
+                current.current_plan,
             )
+            candidate_state = merged.model_copy(
+                update={
+                    "status": DatePlanningStatus.PLANNED,
+                    "current_plan": current.current_plan,
+                    "plan_version": current.plan_version,
+                    "last_mutation": mutation,
+                    "last_operations": operation_batch.operations,
+                    "requirement_satisfaction": satisfaction,
+                    "updated_at": utc_now(),
+                }
+            )
+            task_diff = diff_date_tasks(current, candidate_state)
             saved = await self._save(
-                merged.model_copy(
-                    update={
-                        "status": DatePlanningStatus.PLANNED,
-                        "current_plan": current.current_plan,
-                        "plan_version": current.plan_version,
-                        "last_mutation": mutation,
-                        "updated_at": utc_now(),
-                    }
-                ),
+                candidate_state.model_copy(update={"last_task_diff": task_diff}),
                 trace,
+            )
+            _record_task_diff(trace, task_diff)
+            _record_requirement_satisfaction(trace, satisfaction)
+            _record_plan_diff(
+                trace,
+                diff_date_plans(current.current_plan, current.current_plan),
+                plan_changed=False,
+            )
+            _record_candidate_outcome(
+                trace,
+                plan_committed=False,
+                reason="invalid_candidate_kept_last_valid_plan",
+                validation_codes=validation_codes,
             )
             return DatePlanningWorkflowResult(
                 message="新的条件无法满足；已保留上一版有效行程。",
                 task_state=saved,
-                # Return the candidate response for this turn while retaining
-                # the persisted snapshot as the last known-valid plan.
-                plan=candidate_plan,
+                plan=current.current_plan,
                 plan_changed=False,
+                requirement_satisfaction=satisfaction,
+                task_diff=task_diff,
             )
+        satisfaction = self._requirement_matcher.match(
+            requirements_for_state(merged),
+            None,
+        )
+        candidate_state = merged.model_copy(
+            update={
+                "status": DatePlanningStatus.COLLECTING,
+                "last_mutation": mutation,
+                "last_operations": operation_batch.operations,
+                "requirement_satisfaction": satisfaction,
+                "updated_at": utc_now(),
+            }
+        )
+        task_diff = diff_date_tasks(current, candidate_state)
         saved = await self._save(
-            merged.model_copy(
-                update={
-                    "status": DatePlanningStatus.COLLECTING,
-                    "updated_at": utc_now(),
-                }
-            ),
+            candidate_state.model_copy(update={"last_task_diff": task_diff}),
             trace,
+        )
+        _record_task_diff(trace, task_diff)
+        _record_requirement_satisfaction(trace, satisfaction)
+        _record_plan_diff(
+            trace,
+            diff_date_plans(current.current_plan, current.current_plan),
+            plan_changed=False,
+        )
+        _record_candidate_outcome(
+            trace,
+            plan_committed=False,
+            reason="invalid_candidate_without_fallback_plan",
+            validation_codes=validation_codes,
         )
         return DatePlanningWorkflowResult(
             message="当前条件无法生成满足硬约束的行程，请调整地点、预算或明确要求。",
             task_state=saved,
             plan_changed=False,
+            requirement_satisfaction=satisfaction,
+            task_diff=task_diff,
         )
 
     async def _save(
@@ -472,6 +642,7 @@ def _build_request(request, state, slots, budget_scope: BudgetScope) -> DatePlan
         meal_keywords=state.meal_keywords,
         activity_keywords=state.activity_keywords,
         schedule_hints=state.schedule_hints,
+        requirements=state.requirements,
         replace_place_names=slots.replace_place_names,
         excluded_keywords=state.excluded_keywords,
         transport_mode=state.transport_mode or TransportMode.TRANSIT,
@@ -680,19 +851,20 @@ def _trace_patch_values(value, fields: list[str]) -> str:
 
 def _record_requirement_projection(
     trace: ExecutionTrace,
-    before: list[DesiredDateStop],
-    after: list[DesiredDateStop],
+    before: list[DateStopRequirement],
+    after: list[DateStopRequirement],
     *,
     committed: bool,
 ) -> None:
     with trace.measure("date_requirement_projection") as details:
         details.update(
             {
-                "desired_stops_before": len(before),
-                "desired_stops_after": len(after),
+                "date_requirements_before": len(before),
+                "date_requirements_requested": len(after),
+                "date_requirements_committed": len(after) if committed else len(before),
                 "committed": committed,
-                "desired_stops_json": json.dumps(
-                    [stop.model_dump(mode="json") for stop in after],
+                "date_requirements_json": json.dumps(
+                    [requirement.model_dump(mode="json") for requirement in after],
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ),
@@ -700,15 +872,174 @@ def _record_requirement_projection(
         )
 
 
-def _record_plan_diff(trace: ExecutionTrace, plan_diff: DatePlanDiff) -> None:
+def _validate_candidate_plan(
+    validator: DatePlanValidator,
+    plan: DatePlan,
+    request: DatePlanRequest,
+    constraints: list[DateConstraint],
+    requirements: list[DateStopRequirement],
+    satisfaction: list[DateRequirementMatch],
+):
+    parameters = inspect.signature(validator.validate).parameters
+    if "requirements" not in parameters:
+        return validator.validate(plan, request, constraints)
+    return validator.validate(
+        plan,
+        request,
+        constraints,
+        requirements=requirements,
+        satisfaction=satisfaction,
+    )
+
+
+async def _execute_operation_batch(
+    executor: DateOperationExecutor,
+    existing_plan: DatePlan | None,
+    batch: DateOperationBatch,
+    request: DatePlanRequest,
+    requirements: list[DateStopRequirement],
+    existing_requirements: list[DateStopRequirement],
+    trace: ExecutionTrace,
+    mutation: DatePlanMutation,
+):
+    apply_batch = getattr(executor, "apply_batch", None)
+    if apply_batch is not None:
+        parameters = inspect.signature(apply_batch).parameters
+        kwargs = {
+            "trace": trace,
+            "required_mutation": mutation,
+        }
+        if "requirements" in parameters:
+            kwargs["requirements"] = requirements
+        if "existing_requirements" in parameters:
+            kwargs["existing_requirements"] = existing_requirements
+        return await apply_batch(existing_plan, batch, request, **kwargs)
+    parameters = inspect.signature(executor.apply).parameters
+    kwargs = {
+        "trace": trace,
+        "required_mutation": mutation,
+    }
+    if "requirements" in parameters:
+        kwargs["requirements"] = requirements
+    if "existing_requirements" in parameters:
+        kwargs["existing_requirements"] = existing_requirements
+    return await executor.apply(existing_plan, batch.operations, request, **kwargs)
+
+
+def _blocking_operation_rejections(
+    execution: DatePlanOperationExecution,
+) -> tuple[RejectedDatePlanOperation, ...]:
+    satisfied_groups = {
+        operation.alternative_group
+        for operation in execution.applied
+        if operation.alternative_group is not None
+    }
+    blocking: list[RejectedDatePlanOperation] = []
+    for rejected in execution.rejected:
+        operation = rejected.operation
+        if (
+            operation.alternative_group is not None
+            and (
+                rejected.reason == "alternative_not_selected"
+                or operation.alternative_group in satisfied_groups
+            )
+        ):
+            continue
+        if (
+            operation.type == DateOperationType.ADD_STOP
+            and operation.payload is not None
+            and any(
+                match.placement_satisfied
+                for match in match_desired_stop(execution.plan, operation.payload)
+            )
+        ):
+            continue
+        blocking.append(rejected)
+    return tuple(blocking)
+
+
+def _record_operation_batch(
+    trace: ExecutionTrace,
+    batch: DateOperationBatch,
+) -> None:
+    with trace.measure("date_operation_batch") as details:
+        details.update(
+            {
+                "date_operation_batch_count": len(batch.operations),
+                "operation_types": ",".join(operation.type.value for operation in batch.operations),
+                "unresolved_reference_count": len(batch.unresolved_references),
+            }
+        )
+
+
+def _record_requirement_satisfaction(
+    trace: ExecutionTrace,
+    matches: list[DateRequirementMatch],
+) -> None:
+    unsatisfied = [
+        match for match in matches if match.status != RequirementStatus.FULFILLED
+    ]
+    with trace.measure("date_requirement_satisfaction") as details:
+        details.update(
+            {
+                "date_requirement_match_count": len(matches),
+                "date_requirement_unsatisfied_count": len(unsatisfied),
+                "date_requirement_unsatisfied_reasons": ",".join(
+                    dict.fromkeys(
+                        match.reason_code or match.status.value for match in unsatisfied
+                    )
+                ),
+                "matches_json": json.dumps(
+                    [match.model_dump(mode="json") for match in matches],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            }
+        )
+
+
+def _record_task_diff(trace: ExecutionTrace, task_diff: DateTaskDiff) -> None:
+    with trace.measure("date_task_diff") as details:
+        details.update(
+            {
+                "date_task_diff_fields": ",".join(task_diff.changed_fields),
+                "diff_json": task_diff.model_dump_json(),
+            }
+        )
+
+
+def _record_plan_diff(
+    trace: ExecutionTrace,
+    plan_diff: DatePlanDiff,
+    *,
+    plan_changed: bool,
+) -> None:
     with trace.measure("date_plan_diff") as details:
         details.update(
             {
+                "date_plan_changed": plan_changed,
                 "added": len(plan_diff.added_place_ids),
                 "removed": len(plan_diff.removed_place_ids),
                 "moved": len(plan_diff.moved_place_ids),
                 "unchanged": len(plan_diff.unchanged_place_ids),
                 "diff_json": plan_diff.model_dump_json(),
+            }
+        )
+
+
+def _record_candidate_outcome(
+    trace: ExecutionTrace,
+    *,
+    plan_committed: bool,
+    reason: str,
+    validation_codes: list[str],
+) -> None:
+    with trace.measure("date_candidate_commit") as details:
+        details.update(
+            {
+                "plan_committed": plan_committed,
+                "reason": reason,
+                "validation_codes": ",".join(validation_codes),
             }
         )
 
@@ -782,6 +1113,8 @@ def _compose_response(
     plan: DatePlan,
     changed: bool,
     plan_diff: DatePlanDiff,
+    task_diff: DateTaskDiff,
+    satisfaction: list[DateRequirementMatch],
 ) -> str:
     if current.current_plan is None:
         return (
@@ -790,6 +1123,17 @@ def _compose_response(
             else "我已先根据当前信息整理了规划草案，补充条件后可以继续完善。"
         )
     if not changed:
+        budget_change = task_diff.changes.get("budget")
+        if budget_change is not None:
+            return (
+                f"预算已从{budget_change.before or '未设置'}元调整为"
+                f"{budget_change.after}元。当前行程仍满足新预算，因此地点无需调整。"
+            )
+        if task_diff.changed:
+            return (
+                f"已更新约会条件：{'、'.join(task_diff.changed_fields)}。"
+                "当前行程仍满足这些要求，因此地点无需调整。"
+            )
         return "我核对了刚补充的条件，现有行程没有需要替换的节点，因此先保留当前版本。"
     change_kind_count = sum(
         bool(place_ids)
@@ -830,6 +1174,63 @@ def _compose_response(
         moved = _plan_place_names(plan, plan_diff.moved_place_ids)
         return f"收到，我已按新的时段要求调整{'、'.join(moved)}的行程位置。"
     return "收到，我已把新的日期、预算或其他约束纳入核对；现有地点节点保持不变。"
+
+
+def _apply_requirement_match_reasons(
+    plan: DatePlan,
+    requirements: list[DateStopRequirement],
+    matches: list[DateRequirementMatch],
+) -> DatePlan:
+    fulfilled_ids = {
+        match.requirement_id
+        for match in matches
+        if match.status == RequirementStatus.FULFILLED
+    }
+    by_item: dict[tuple[int, int, str], list[str]] = {}
+    for requirement in requirements:
+        if requirement.id not in fulfilled_ids:
+            continue
+        label = "/".join(
+            alternative.keyword or alternative.place_name or alternative.meal_type.value
+            for alternative in requirement.alternatives
+        )
+        for alternative in requirement.alternatives:
+            for stop_match in match_desired_stop(plan, alternative):
+                if not stop_match.placement_satisfied:
+                    continue
+                item = stop_match.item
+                by_item.setdefault(
+                    (item.day_index, item.order, item.place.id),
+                    [],
+                ).append(label)
+    if not by_item:
+        return plan
+    items = []
+    for item in plan.items:
+        matched = list(
+            dict.fromkeys(
+                by_item.get((item.day_index, item.order, item.place.id), [])
+            )
+        )
+        reason = _requirement_match_reason(item.reason, matched)
+        items.append(item.model_copy(update={"reason": reason}))
+    return plan.model_copy(update={"items": items})
+
+
+def _requirement_match_reason(reason: str, matched: list[str]) -> str:
+    if not matched:
+        return reason
+    clauses = [clause.strip().rstrip("。") for clause in reason.split("；")]
+    preserved = [
+        clause
+        for clause in clauses
+        if clause
+        and clause != "适合作为轻松交流的约会节点"
+        and not (clause.startswith("符合你们对") and clause.endswith("的偏好"))
+        and not (clause.startswith("符合") and clause.endswith("要求"))
+    ]
+    exact = [f"符合{label}要求" for label in matched]
+    return f"{'；'.join(dict.fromkeys([*preserved, *exact]))}。"
 
 
 def _plan_place_names(plan: DatePlan | None, place_ids: list[str]) -> list[str]:

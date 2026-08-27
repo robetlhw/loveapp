@@ -16,6 +16,7 @@ from loveapp.application.date_planning.modification_detection import (
 from loveapp.application.date_planning.operation_resolution import (
     DateOperationResolver,
     date_semantic_parse_reasons,
+    deterministic_date_parse_is_complete,
     requires_date_semantic_parse,
 )
 from loveapp.application.route_slot_validation import (
@@ -25,6 +26,7 @@ from loveapp.application.route_slot_validation import (
     validate_current_turn_route_slots,
     validate_route_slots,
 )
+from loveapp.domain.date_operations import DateOperationType, DatePlanOperation
 from loveapp.domain.date_patch import DatePlanPatch, SlotSource
 from loveapp.domain.date_plan import MAX_TRIP_DAYS
 from loveapp.domain.date_task import DatePlanningTaskState
@@ -223,16 +225,37 @@ class HybridRouter:
             route_input.runtime_context,
             deterministic,
         )
+        deterministic_complete = deterministic_date_parse_is_complete(
+            route_input.latest_query,
+            route_input.runtime_context,
+            deterministic,
+        )
+        profile = getattr(self._date_semantic_parser, "semantic_profile", {})
         base_update = {
             "date_clause_count": len(clauses),
             "date_semantic_parse_required": required,
             "date_semantic_parse_reason": "+".join(parse_reasons) or None,
+            "date_semantic_trigger_reasons": list(parse_reasons),
+            **_date_semantic_route_telemetry(
+                profile if isinstance(profile, Mapping) else {}
+            ),
             "date_unresolved_references": list(deterministic.unresolved_references),
         }
         if not required:
-            return result.model_copy(update=base_update)
+            return result.model_copy(
+                update={
+                    **base_update,
+                    "date_semantic_fallback_reason": "deterministic_complete",
+                }
+            )
         if self._date_semantic_parser is None:
-            return result.model_copy(update=base_update)
+            return result.model_copy(
+                update=_date_semantic_failure_update(
+                    base_update,
+                    deterministic_complete=deterministic_complete,
+                    fallback_reason="parser_unavailable",
+                )
+            )
         try:
             parsed = await self._date_semantic_parser.parse_date_operations(
                 route_input.latest_query,
@@ -245,19 +268,54 @@ class HybridRouter:
                 result.date_patch,
                 proposed_operations=[*result.date_operations, *parsed.operations],
                 proposed_unresolved_references=parsed.unresolved_references,
+                preferred_constraint_operations=parsed.operations,
+                allow_semantic_constraint_corrections=True,
             )
         except Exception as exc:
+            telemetry = _date_semantic_telemetry(self._date_semantic_parser)
             return result.model_copy(
-                update={
+                update=_date_semantic_failure_update(
+                    {
                     **base_update,
                     "date_semantic_llm_used": True,
                     "date_semantic_error": str(exc)[:300],
-                }
+                    **_date_semantic_route_telemetry(telemetry),
+                    },
+                    deterministic_complete=deterministic_complete,
+                    fallback_reason="semantic_parse_failed",
+                )
+            )
+        telemetry = _date_semantic_telemetry(self._date_semantic_parser)
+        semantic_complete = deterministic_date_parse_is_complete(
+            route_input.latest_query,
+            route_input.runtime_context,
+            resolution,
+        )
+        if not semantic_complete:
+            return result.model_copy(
+                update=_date_semantic_failure_update(
+                    {
+                        **base_update,
+                        "date_semantic_llm_used": True,
+                        **_date_semantic_route_telemetry(telemetry),
+                        "date_unresolved_references": list(
+                            resolution.unresolved_references
+                        ),
+                    },
+                    deterministic_complete=False,
+                    fallback_reason="semantic_result_incomplete",
+                )
             )
         return result.model_copy(
             update={
                 **base_update,
                 "date_semantic_llm_used": True,
+                **_date_semantic_route_telemetry(telemetry),
+                "date_patch": _apply_verified_semantic_constraints(
+                    result.date_patch,
+                    parsed.operations,
+                    resolution.operations,
+                ),
                 "date_operations": list(resolution.operations),
                 "date_operation_candidate_count": len(resolution.candidates),
                 "date_operation_rejections": [
@@ -540,6 +598,79 @@ def _corrector_telemetry(corrector: RouteCorrector | None) -> Mapping[str, objec
     return telemetry if isinstance(telemetry, Mapping) else {}
 
 
+def _date_semantic_telemetry(parser: DateSemanticParser | None) -> Mapping[str, object]:
+    profile = getattr(parser, "semantic_profile", {})
+    telemetry = getattr(parser, "last_telemetry", {})
+    values: dict[str, object] = {}
+    if isinstance(profile, Mapping):
+        values.update(profile)
+    if isinstance(telemetry, Mapping):
+        values.update(telemetry)
+    return values
+
+
+def _date_semantic_route_telemetry(telemetry: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "date_semantic_model": telemetry.get("model"),
+        "date_semantic_thinking": telemetry.get("thinking"),
+        "date_semantic_prompt_version": telemetry.get("prompt_version"),
+        "date_semantic_input_tokens": telemetry.get("input_tokens"),
+        "date_semantic_output_tokens": telemetry.get("output_tokens"),
+        "date_semantic_duration_ms": telemetry.get("duration_ms"),
+    }
+
+
+def _date_semantic_failure_update(
+    base_update: dict[str, object],
+    *,
+    deterministic_complete: bool,
+    fallback_reason: str,
+) -> dict[str, object]:
+    update = {
+        **base_update,
+        "date_semantic_fallback_reason": fallback_reason,
+    }
+    if deterministic_complete:
+        return update
+    unresolved = list(base_update.get("date_unresolved_references") or [])
+    if not unresolved:
+        unresolved = ["请明确本轮要修改的约会条件或行程节点"]
+    return {
+        **update,
+        "date_operations": [],
+        "date_unresolved_references": unresolved,
+    }
+
+
+def _apply_verified_semantic_constraints(
+    patch: DatePlanPatch,
+    semantic_operations: list[DatePlanOperation],
+    accepted_operations: tuple[DatePlanOperation, ...],
+) -> DatePlanPatch:
+    accepted = list(accepted_operations)
+    updates: dict[str, object] = {}
+    sources = dict(patch.source_by_field)
+    for operation in semantic_operations:
+        if (
+            operation not in accepted
+            or operation.type != DateOperationType.UPDATE_CONSTRAINT
+            or operation.constraint_field is None
+        ):
+            continue
+        field = operation.constraint_field.value
+        updates[field] = operation.constraint_value
+        sources[field] = SlotSource.LLM_VERIFIED
+    if not updates:
+        return patch
+    return DatePlanPatch.model_validate(
+        {
+            **patch.model_dump(exclude={"source_by_field"}),
+            **updates,
+            "source_by_field": sources,
+        }
+    )
+
+
 def route_by_rules(route_input: RouteInput, normalized_query: str | None = None) -> RouteResult:
     text = normalized_query or normalize_route_text(route_input.latest_query)
     latest_date_slots = extract_date_plan_slots(RouteInput(latest_query=route_input.latest_query))
@@ -568,6 +699,7 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
         task_scores.pop(TaskType.OUT_OF_SCOPE, None)
         task_evidence.pop(TaskType.OUT_OF_SCOPE, None)
     date_request_mode = _infer_date_request_mode(route_input, text, latest_date_slots)
+    implicit_date_bundle = _looks_like_implicit_date_plan_bundle(text, latest_date_slots)
     executable_date_request = _is_executable_date_mode(date_request_mode)
     if (
         executable_date_request
@@ -637,8 +769,13 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
             task_scores[TaskType.DATE_PLANNING] = task_scores.get(TaskType.DATE_PLANNING, 0) + 1.5
             task_evidence.setdefault(TaskType.DATE_PLANNING, []).append("复合请求中的后续约会规划")
         else:
-            task_scores[TaskType.DATE_PLANNING] = task_scores.get(TaskType.DATE_PLANNING, 0) + 4
-            task_evidence.setdefault(TaskType.DATE_PLANNING, []).append("明确约会规划请求")
+            bonus = 5 if implicit_date_bundle else 4
+            task_scores[TaskType.DATE_PLANNING] = (
+                task_scores.get(TaskType.DATE_PLANNING, 0) + bonus
+            )
+            task_evidence.setdefault(TaskType.DATE_PLANNING, []).append(
+                "结构化约会条件组合" if implicit_date_bundle else "明确约会规划请求"
+            )
     elif _looks_like_date_candidate(text, None):
         # This is only a semantic-review candidate. Do not put it into the
         # task score, otherwise a weak candidate can become the primary task.
@@ -1848,6 +1985,33 @@ def _is_executable_date_mode(mode: DateRequestMode) -> bool:
     }
 
 
+def _looks_like_implicit_date_plan_bundle(
+    text: str,
+    slots: DatePlanSlots,
+) -> bool:
+    if (
+        slots.budget is None
+        or (slots.city is None and slots.area is None)
+        or _looks_like_advice_request(text)
+        or _looks_like_date_action_evaluation(text)
+        or _is_cancelled_date_request(text)
+    ):
+        return False
+    requested_stops = {
+        *slots.dining_keywords,
+        *slots.activity_keywords,
+    }
+    if len(requested_stops) < 2:
+        return False
+    return (
+        re.search(
+            r"(?:我|我们|对象|女朋友|男朋友|伴侣).{0,8}(?:喜欢|想吃|想去|偏好)",
+            text,
+        )
+        is not None
+    )
+
+
 def _infer_date_request_mode(
     route_input: RouteInput,
     text: str,
@@ -1894,6 +2058,8 @@ def _infer_date_request_mode(
     if _looks_like_place_search_request(request_clause):
         return DateRequestMode.PLACE_SEARCH
     if _looks_like_itinerary_request(text):
+        return DateRequestMode.ITINERARY
+    if _looks_like_implicit_date_plan_bundle(text, latest_slots):
         return DateRequestMode.ITINERARY
     if "约会" in text and _date_slot_signal_count(latest_slots) >= 2:
         return DateRequestMode.ITINERARY
@@ -2865,9 +3031,44 @@ def _extract_date_notes(text: str) -> tuple[list[str], list[str]]:
             notes.append(match.group(0).strip())
     for marker in ("不要", "避免", "不能", "不想"):
         match = re.search(rf"{marker}[^，。；;]{{1,40}}", text)
-        if match:
+        if match and not _is_operation_only_constraint(text, match.group(0)):
             constraints.append(match.group(0).strip())
     return _unique(notes)[:8], _unique(constraints)[:8]
+
+
+def _is_operation_only_constraint(text: str, candidate: str) -> bool:
+    clause = _containing_clause(text, candidate)
+    has_edit = re.search(
+        r"(?:换(?:一个|个|成|为)?|替换|更换|删掉|删除|移除)",
+        clause,
+    ) is not None
+    has_plan_reference = re.search(
+        r"(?:这个|那个|该|当前|原来|之前)?(?:地方|地点|节点|景点|餐厅)|"
+        r"第\s*[一二三四五六七八九十0-9]+\s*个",
+        clause,
+    ) is not None
+    generic_removal = re.search(r"不想\s*(?:去|要)(?:了|这个|那个)?", candidate) is not None
+    return (has_edit and has_plan_reference) or (
+        generic_removal
+        and (
+            has_plan_reference
+            or re.search(r"(?:换(?:一个|个)?|替换|更换)", text) is not None
+        )
+    )
+
+
+def _containing_clause(text: str, candidate: str) -> str:
+    start = text.find(candidate)
+    if start < 0:
+        return candidate
+    clause_start = max(text.rfind(separator, 0, start) for separator in "，,。；;！？!?\n")
+    boundaries = [
+        position
+        for separator in "，,。；;！？!?\n"
+        if (position := text.find(separator, start + len(candidate))) >= 0
+    ]
+    clause_end = min(boundaries, default=len(text))
+    return text[clause_start + 1 : clause_end]
 
 
 def _primary_and_secondary[LabelT](

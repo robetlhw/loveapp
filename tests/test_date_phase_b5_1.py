@@ -24,6 +24,7 @@ from loveapp.domain.date_operations import (
     DateOperationType,
     DatePlanOperation,
     DateReplacementPreference,
+    DateStopRequirement,
     DesiredDateStop,
     MealType,
     StopKind,
@@ -32,7 +33,13 @@ from loveapp.domain.date_operations import (
     TimeWindow,
 )
 from loveapp.domain.date_patch import DatePlanPatch
-from loveapp.domain.date_plan import DatePlan, DatePlanItem, Place, PlaceSearchRequest
+from loveapp.domain.date_plan import (
+    DatePlan,
+    DatePlanItem,
+    DatePlanRequest,
+    Place,
+    PlaceSearchRequest,
+)
 from loveapp.domain.date_task import DatePlanningTaskState
 from loveapp.domain.date_workflow import DatePlanningWorkflowInput
 from loveapp.domain.enums import (
@@ -671,6 +678,257 @@ def test_role_completion_does_not_guess_between_two_dining_candidates() -> None:
     assert completion.inferred_dinner_item_ids == ()
     assert completion.unresolved_roles == ("day_1:dinner_anchor_ambiguous",)
     assert all(item.meal_type is None for item in completion.plan.items)
+
+
+def test_role_completion_maps_two_untyped_meals_to_two_required_anchors() -> None:
+    first = _item("first", "火锅店", PlaceCategory.RESTAURANT, "火锅", order=1)
+    second = _item("second", "烧烤店", PlaceCategory.RESTAURANT, "烧烤", order=2)
+    museum = _item(
+        "museum",
+        "博物馆",
+        PlaceCategory.ATTRACTION,
+        "博物馆",
+        order=3,
+    )
+    attraction = _item(
+        "attraction",
+        "景点",
+        PlaceCategory.ATTRACTION,
+        "景点",
+        order=4,
+    )
+    desired = [
+        DesiredDateStop(
+            kind=StopKind.ACTIVITY,
+            keyword="博物馆",
+            after=TemporalAnchor.LUNCH,
+        ),
+        DesiredDateStop(
+            kind=StopKind.ACTIVITY,
+            keyword="景点",
+            after=TemporalAnchor.DINNER,
+        ),
+    ]
+
+    completion = complete_date_plan_roles(
+        _plan(first, second, museum, attraction),
+        desired,
+    )
+    by_id = {item.place.id: item for item in completion.plan.items}
+
+    assert completion.inferred_lunch_item_ids == ("first",)
+    assert completion.inferred_dinner_item_ids == ("second",)
+    assert completion.unresolved_roles == ()
+    assert by_id["first"].meal_type == "lunch"
+    assert by_id["second"].meal_type == "dinner"
+    assert by_id["first"].order < by_id["museum"].order
+    assert by_id["second"].order < by_id["attraction"].order
+
+
+@pytest.mark.asyncio
+async def test_planner_supplements_two_meal_anchors_with_one_untyped_dining() -> None:
+    planner = DatePlanningAgent(
+        DemoMapProvider(),
+        MemoryService(InMemoryMemoryStore(), NoOpMemoryExtractor()),
+    )
+    hotpot = _place("hotpot", "火锅店", PlaceCategory.RESTAURANT, "火锅")
+    dinner = _place("dinner", "晚餐餐厅", PlaceCategory.RESTAURANT, "西餐")
+    museum = _place("museum", "博物馆", PlaceCategory.ATTRACTION, "博物馆")
+    attraction = _place("attraction", "景点", PlaceCategory.ATTRACTION, "景点")
+    desired = [
+        DesiredDateStop(kind=StopKind.DINING, keyword="火锅"),
+        DesiredDateStop(
+            kind=StopKind.ACTIVITY,
+            keyword="博物馆",
+            after=TemporalAnchor.LUNCH,
+        ),
+        DesiredDateStop(
+            kind=StopKind.ACTIVITY,
+            keyword="景点",
+            after=TemporalAnchor.DINNER,
+        ),
+    ]
+    request = DatePlanRequest(
+        city="上海",
+        budget=1000,
+        dining_keywords=["火锅"],
+        activity_keywords=["博物馆", "景点"],
+        schedule_hints=["午饭后", "晚饭后"],
+        requirements=[
+            DateStopRequirement(id=f"requirement-{index}", alternatives=[stop])
+            for index, stop in enumerate(desired, start=1)
+        ],
+    )
+
+    candidate = await planner._build_keyword_plan(
+        {"request": request},
+        [museum, attraction],
+        [hotpot, dinner],
+        [],
+    )
+
+    assert candidate is not None
+    completion = complete_date_plan_roles(candidate, desired)
+    assert completion.unresolved_roles == ()
+    assert {item.meal_type for item in completion.plan.items} >= {"lunch", "dinner"}
+    assert len(
+        [
+            item
+            for item in candidate.items
+            if item.place.category == PlaceCategory.RESTAURANT
+        ]
+    ) == 2
+
+
+def test_role_completion_prefers_requirement_owned_dining_over_unrelated_cafe() -> None:
+    hotpot = _item("hotpot", "火锅店", PlaceCategory.RESTAURANT, "火锅", order=1)
+    cafe = _item("cafe", "咖啡馆", PlaceCategory.CAFE, "咖啡", order=2)
+    movie = _item(
+        "movie",
+        "电影院",
+        PlaceCategory.ENTERTAINMENT,
+        "电影院",
+        order=3,
+    )
+    desired = [
+        DesiredDateStop(kind=StopKind.DINING, keyword="火锅"),
+        DesiredDateStop(
+            kind=StopKind.ACTIVITY,
+            keyword="电影院",
+            after=TemporalAnchor.DINNER,
+        ),
+    ]
+
+    completion = complete_date_plan_roles(_plan(hotpot, cafe, movie), desired)
+    by_id = {item.place.id: item for item in completion.plan.items}
+
+    assert completion.inferred_dinner_item_ids == ("hotpot",)
+    assert completion.unresolved_roles == ()
+    assert by_id["hotpot"].meal_type == "dinner"
+    assert by_id["cafe"].meal_type is None
+
+
+def test_role_completion_does_not_promote_unrelated_cafe_to_meal_anchor() -> None:
+    cafe = _item("cafe", "咖啡馆", PlaceCategory.CAFE, "咖啡", order=1)
+    movie = _item(
+        "movie",
+        "电影院",
+        PlaceCategory.ENTERTAINMENT,
+        "电影院",
+        order=2,
+    )
+    desired = [
+        DesiredDateStop(
+            kind=StopKind.ACTIVITY,
+            keyword="电影院",
+            after=TemporalAnchor.DINNER,
+        )
+    ]
+
+    completion = complete_date_plan_roles(_plan(cafe, movie), desired)
+
+    assert completion.inferred_dinner_item_ids == ()
+    assert completion.unresolved_roles == ("day_1:dinner_anchor_missing",)
+    assert completion.plan.items[0].meal_type is None
+
+
+def test_role_completion_scopes_same_place_id_inference_to_day() -> None:
+    day_one_dining = _item(
+        "shared-dining",
+        "同一家餐厅",
+        PlaceCategory.RESTAURANT,
+        "餐厅",
+        order=1,
+    )
+    day_one_museum = _item(
+        "museum",
+        "博物馆",
+        PlaceCategory.ATTRACTION,
+        "博物馆",
+        order=2,
+    )
+    day_two_dinner = day_one_dining.model_copy(
+        update={"day_index": 2, "meal_type": "dinner", "time_label": "晚餐"}
+    )
+    desired = [
+        DesiredDateStop(
+            kind=StopKind.ACTIVITY,
+            keyword="博物馆",
+            target_day=1,
+            after=TemporalAnchor.LUNCH,
+        )
+    ]
+    plan = _plan(day_one_dining, day_one_museum, day_two_dinner).model_copy(
+        update={"day_count": 2}
+    )
+
+    completion = complete_date_plan_roles(plan, desired)
+    by_day = {
+        item.day_index: item
+        for item in completion.plan.items
+        if item.place.id == "shared-dining"
+    }
+
+    assert by_day[1].meal_type == "lunch"
+    assert by_day[2].meal_type == "dinner"
+
+
+def test_role_completion_scopes_same_place_id_ordering_to_day() -> None:
+    day_one_lunch = _item(
+        "lunch",
+        "午餐",
+        PlaceCategory.RESTAURANT,
+        "午餐",
+        order=1,
+        meal_type="lunch",
+    )
+    day_one_activity = _item(
+        "shared-activity",
+        "展馆",
+        PlaceCategory.ATTRACTION,
+        "展馆",
+        order=2,
+    )
+    day_one_dinner = _item(
+        "dinner",
+        "晚餐",
+        PlaceCategory.RESTAURANT,
+        "晚餐",
+        order=3,
+        meal_type="dinner",
+    )
+    day_two_dinner = day_one_dinner.model_copy(update={"day_index": 2, "order": 1})
+    day_two_activity = day_one_activity.model_copy(update={"day_index": 2, "order": 2})
+    desired = [
+        DesiredDateStop(
+            kind=StopKind.ACTIVITY,
+            keyword="展馆",
+            target_day=1,
+            after=TemporalAnchor.LUNCH,
+        ),
+        DesiredDateStop(
+            kind=StopKind.ACTIVITY,
+            keyword="展馆",
+            target_day=2,
+            after=TemporalAnchor.DINNER,
+        ),
+    ]
+    plan = _plan(
+        day_one_lunch,
+        day_one_activity,
+        day_one_dinner,
+        day_two_dinner,
+        day_two_activity,
+    ).model_copy(update={"day_count": 2})
+
+    completion = complete_date_plan_roles(plan, desired)
+    ordered = {
+        day: [item.place.id for item in completion.plan.items if item.day_index == day]
+        for day in (1, 2)
+    }
+
+    assert ordered[1] == ["lunch", "shared-activity", "dinner"]
+    assert ordered[2] == ["dinner", "shared-activity"]
 
 
 class _RoleCompletionPlanner:

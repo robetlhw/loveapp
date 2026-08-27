@@ -2,7 +2,7 @@ import asyncio
 import json
 from datetime import date as Date
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import uuid4
 
 import typer
@@ -29,6 +29,7 @@ from loveapp.core.config import get_settings
 from loveapp.core.timing import ExecutionTrace
 from loveapp.domain.advice import AdviceRequest, AdviceResponse, AdviceStreamEvent
 from loveapp.domain.conversation import ConversationRequest
+from loveapp.domain.date_operations import DatePlanOperation, DesiredDateStop, StopReference
 from loveapp.domain.date_plan import DatePlan, DatePlanRequest
 from loveapp.domain.date_task import DatePlanningTaskState
 from loveapp.domain.enums import (
@@ -1065,6 +1066,8 @@ async def _run_chat(
                 _render_route(turn.route, active_task)
                 if turn.date_task_state is not None:
                     _render_date_task_state(turn.date_task_state)
+                _render_date_operation_outcome(trace)
+                _render_date_plan_telemetry(trace)
             if debug_memory and turn.memory_result is not None:
                 console.print()
                 _render_remember_result(turn.memory_result)
@@ -1298,6 +1301,13 @@ def _render_route(route: RouteResult, active_task: TaskType | None) -> None:
         table.add_row("llm_error", route.llm_error)
     console.print(table)
 
+    if (
+        route.task_type == TaskType.DATE_PLANNING
+        or route.date_semantic_parse_required
+        or route.date_semantic_model is not None
+    ):
+        _render_date_semantic(route)
+
     score_table = Table(title="规则得分")
     score_table.add_column("类型")
     score_table.add_column("标签")
@@ -1310,6 +1320,42 @@ def _render_route(route: RouteResult, active_task: TaskType | None) -> None:
         for label, score in sorted(scores.items(), key=lambda item: item[1], reverse=True):
             score_table.add_row(score_type, label.value, f"{score:.2f}")
     console.print(score_table)
+
+
+def _render_date_semantic(route: RouteResult) -> None:
+    table = Table(title="Date Semantic")
+    table.add_column("字段")
+    table.add_column("值")
+    table.add_row("date_semantic_llm_used", "yes" if route.date_semantic_llm_used else "no")
+    table.add_row("date_semantic_model", route.date_semantic_model or "-")
+    table.add_row("date_semantic_thinking", route.date_semantic_thinking or "-")
+    table.add_row("date_semantic_prompt_version", route.date_semantic_prompt_version or "-")
+    table.add_row(
+        "date_semantic_input_tokens",
+        str(route.date_semantic_input_tokens)
+        if route.date_semantic_input_tokens is not None
+        else "-",
+    )
+    table.add_row(
+        "date_semantic_output_tokens",
+        str(route.date_semantic_output_tokens)
+        if route.date_semantic_output_tokens is not None
+        else "-",
+    )
+    table.add_row(
+        "date_semantic_duration_ms",
+        f"{route.date_semantic_duration_ms:.3f}"
+        if route.date_semantic_duration_ms is not None
+        else "-",
+    )
+    table.add_row(
+        "date_semantic_trigger_reasons",
+        ", ".join(route.date_semantic_trigger_reasons) or "-",
+    )
+    table.add_row("date_semantic_fallback_reason", route.date_semantic_fallback_reason or "-")
+    if route.date_semantic_error:
+        table.add_row("date_semantic_error", route.date_semantic_error)
+    console.print(table)
 
 
 def _render_date_task_state(state: DatePlanningTaskState) -> None:
@@ -1368,6 +1414,201 @@ def _render_date_task_state(state: DatePlanningTaskState) -> None:
             ),
         )
     console.print(table)
+    _render_date_requirements(state)
+    _render_requirement_satisfaction(state)
+    _render_date_operation_batch(state)
+    _render_date_task_diff(state)
+
+
+def _render_date_requirements(state: DatePlanningTaskState) -> None:
+    if not state.requirements:
+        return
+    table = Table(title="Date Requirements")
+    table.add_column("ID")
+    table.add_column("Alternatives")
+    table.add_column("Cardinality")
+    table.add_column("Role")
+    table.add_column("Source")
+    for requirement in state.requirements:
+        alternatives = "\n".join(
+            _format_desired_date_stop(stop) for stop in requirement.alternatives
+        )
+        roles = list(
+            dict.fromkeys(
+                role
+                for stop in requirement.alternatives
+                if (role := _format_date_stop_role(stop))
+            )
+        )
+        maximum = "*" if requirement.max_satisfied is None else str(requirement.max_satisfied)
+        table.add_row(
+            requirement.id,
+            alternatives,
+            f"{requirement.min_satisfied}..{maximum}",
+            "\n".join(roles) or "-",
+            requirement.source_span or "-",
+        )
+    console.print(table)
+
+
+def _render_requirement_satisfaction(state: DatePlanningTaskState) -> None:
+    if not state.requirement_satisfaction:
+        return
+    table = Table(title="Requirement Satisfaction")
+    table.add_column("Requirement")
+    table.add_column("Status")
+    table.add_column("Matched Places")
+    table.add_column("Reason")
+    table.add_column("Details")
+    for match in state.requirement_satisfaction:
+        table.add_row(
+            match.requirement_id,
+            match.status.value,
+            ", ".join(match.matched_place_ids) or "-",
+            match.reason_code or "-",
+            match.details or "-",
+        )
+    console.print(table)
+
+
+def _render_date_operation_batch(state: DatePlanningTaskState) -> None:
+    if not state.last_operations:
+        return
+    table = Table(title="Operation Batch")
+    table.add_column("#", justify="right")
+    table.add_column("Type")
+    table.add_column("Target")
+    table.add_column("Payload / Constraint")
+    table.add_column("Source")
+    for index, operation in enumerate(state.last_operations, start=1):
+        table.add_row(
+            str(index),
+            operation.type.value,
+            _format_stop_reference(operation.target),
+            _format_date_operation_payload(operation),
+            operation.source_span or "-",
+        )
+    console.print(table)
+
+
+def _render_date_task_diff(state: DatePlanningTaskState) -> None:
+    if state.last_task_diff is None or not state.last_task_diff.changed:
+        return
+    table = Table(title="Task Diff")
+    table.add_column("Field")
+    table.add_column("Before")
+    table.add_column("After")
+    for field, change in state.last_task_diff.changes.items():
+        table.add_row(
+            field,
+            _format_debug_value(change.before),
+            _format_debug_value(change.after),
+        )
+    console.print(table)
+
+
+def _render_date_operation_outcome(trace: ExecutionTrace) -> None:
+    records = [record for record in trace.snapshot() if record.name == "date_operation_execute"]
+    if not records:
+        return
+    details = records[-1].details
+    table = Table(title="Operation Outcome")
+    table.add_column("Requested", justify="right")
+    table.add_column("Applied", justify="right")
+    table.add_column("Rejected", justify="right")
+    table.add_column("Rejection Reasons")
+    table.add_row(
+        str(details.get("requested_count", 0)),
+        str(details.get("applied_count", 0)),
+        str(details.get("rejected_count", 0)),
+        str(details.get("rejections_json") or "-"),
+    )
+    console.print(table)
+
+
+def _render_date_plan_telemetry(trace: ExecutionTrace) -> None:
+    records = [
+        record
+        for record in trace.snapshot()
+        if "date_plan_changed" in record.details
+    ]
+    if not records:
+        return
+    table = Table(title="Date Plan Telemetry")
+    table.add_column("Stage")
+    table.add_column("date_plan_changed")
+    for record in records:
+        table.add_row(
+            record.name,
+            _format_debug_value(record.details["date_plan_changed"]),
+        )
+    console.print(table)
+
+
+def _format_desired_date_stop(stop: DesiredDateStop) -> str:
+    identity = stop.place_name or stop.keyword or "-"
+    return f"{stop.kind.value}:{identity}"
+
+
+def _format_date_stop_role(stop: DesiredDateStop) -> str:
+    parts: list[str] = []
+    if stop.meal_type is not None:
+        parts.append(f"meal={stop.meal_type.value}")
+    if stop.target_day is not None:
+        parts.append(f"day={stop.target_day}")
+    if stop.time_window is not None:
+        window = stop.time_window.label or (
+            f"{stop.time_window.start or '*'}-{stop.time_window.end or '*'}"
+        )
+        parts.append(f"window={window}")
+    if stop.after is not None:
+        parts.append(f"after={_format_temporal_reference(stop.after)}")
+    if stop.before is not None:
+        parts.append(f"before={_format_temporal_reference(stop.before)}")
+    return ", ".join(parts)
+
+
+def _format_temporal_reference(reference: Any) -> str:
+    value = getattr(reference, "value", None)
+    if value is not None:
+        return str(value)
+    return _format_stop_reference(reference)
+
+
+def _format_stop_reference(reference: StopReference | None) -> str:
+    if reference is None:
+        return "-"
+    parts = [
+        f"{name}={value.value if hasattr(value, 'value') else value}"
+        for name in ("place_id", "place_name", "keyword", "meal_type", "ordinal")
+        if (value := getattr(reference, name)) is not None
+    ]
+    return ", ".join(parts) or "-"
+
+
+def _format_date_operation_payload(operation: DatePlanOperation) -> str:
+    if operation.constraint_field is not None:
+        return (
+            f"{operation.constraint_field.value}="
+            f"{_format_debug_value(operation.constraint_value)}"
+        )
+    if operation.payload is not None:
+        payload = _format_desired_date_stop(operation.payload)
+        role = _format_date_stop_role(operation.payload)
+        return f"{payload} ({role})" if role else payload
+    return "-"
+
+
+def _format_debug_value(value: Any) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, str):
+        return value
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json")
+    return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
 
 
 async def _run_date_plan(request: DatePlanRequest) -> DatePlan:

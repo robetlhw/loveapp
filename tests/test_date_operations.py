@@ -7,6 +7,7 @@ from loveapp.domain.date_operations import (
     DateConstraintField,
     DateOperationType,
     DatePlanOperation,
+    DateStopRequirement,
     DesiredDateStop,
     MealType,
     StopKind,
@@ -206,6 +207,47 @@ async def test_executor_orders_constraint_update_before_stop_add() -> None:
     ]
     assert result.effective_mutation == DatePlanMutation.ADD
     assert any(item.slot_keyword == "烧烤" for item in result.plan.items)
+
+
+@pytest.mark.asyncio
+async def test_sibling_reservation_does_not_remove_existing_requirement() -> None:
+    planner = RecordingOperationPlanner()
+    executor = DateOperationExecutor(planner)
+    existing_movie = DateStopRequirement(
+        id="existing-movie",
+        alternatives=[DesiredDateStop(kind=StopKind.ACTIVITY, keyword="电影院")],
+    )
+    request = _request().model_copy(update={"requirements": [existing_movie]})
+    current = _plan(
+        _item("old-attraction", "景点", PlaceCategory.ATTRACTION, order=1),
+        _item("existing-movie", "电影院", PlaceCategory.ENTERTAINMENT, order=2),
+    )
+    add_movie = DatePlanOperation(
+        type=DateOperationType.ADD_STOP,
+        payload=DesiredDateStop(kind=StopKind.ACTIVITY, keyword="电影院"),
+    )
+    replace_attraction = DatePlanOperation(
+        type=DateOperationType.REPLACE_STOP,
+        target=StopReference(place_id="old-attraction"),
+        payload=DesiredDateStop(kind=StopKind.ACTIVITY, keyword="公园"),
+    )
+
+    await executor.apply(
+        current,
+        [add_movie, replace_attraction],
+        request,
+        requirements=[existing_movie],
+        existing_requirements=[existing_movie],
+    )
+
+    replace_request = next(
+        call.request
+        for call in planner.plan_calls
+        if call.mutation == DatePlanMutation.REPLACE
+    )
+    assert [requirement.id for requirement in replace_request.requirements] == [
+        "existing-movie"
+    ]
 
 
 @pytest.mark.asyncio

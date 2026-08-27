@@ -3,6 +3,8 @@ from datetime import datetime, timedelta
 
 from pydantic import BaseModel, Field, model_validator
 
+from loveapp.domain.date_constants import MAX_TRIP_DAYS
+from loveapp.domain.date_operations import DateStopRequirement
 from loveapp.domain.enums import (
     BudgetScope,
     DatePlanMode,
@@ -11,8 +13,6 @@ from loveapp.domain.enums import (
     TransportMode,
 )
 from loveapp.domain.weather import WeatherForecast
-
-MAX_TRIP_DAYS = 5
 
 
 class DatePlanRequest(BaseModel):
@@ -35,6 +35,7 @@ class DatePlanRequest(BaseModel):
     meal_keywords: dict[str, list[str]] = Field(default_factory=dict)
     activity_keywords: list[str] = Field(default_factory=list, max_length=8)
     schedule_hints: list[str] = Field(default_factory=list, max_length=8)
+    requirements: list[DateStopRequirement] = Field(default_factory=list, max_length=16)
     replace_place_names: list[str] = Field(default_factory=list, max_length=8)
     excluded_keywords: list[str] = Field(default_factory=list, max_length=8)
     transport_mode: TransportMode = TransportMode.TRANSIT

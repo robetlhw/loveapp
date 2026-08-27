@@ -10,6 +10,13 @@ from loveapp.application.date_planning.mutations import DatePlanMutator
 from loveapp.application.date_planning.ranking import DateCandidateOptimizer
 from loveapp.core.timing import ExecutionTrace
 from loveapp.domain.advice import RelationshipContext
+from loveapp.domain.date_operations import (
+    DateStopRequirement,
+    DesiredDateStop,
+    StopKind,
+    StopReference,
+    TemporalAnchor,
+)
 from loveapp.domain.date_plan import (
     DatePlan,
     DatePlanDay,
@@ -213,9 +220,19 @@ class DatePlanningAgent:
             excluded_keywords = state.get("effective_excluded_keywords", request.excluded_keywords)
             focus_dining = state.get("focus_dining_keywords")
             focus_activity = state.get("focus_activity_keywords")
-            dining_keywords = request.dining_keywords if focus_dining is None else focus_dining
+            dining_keywords = (
+                _requirement_search_keywords(request, dining=True)
+                if focus_dining is None and request.requirements
+                else request.dining_keywords
+                if focus_dining is None
+                else focus_dining
+            )
             activity_keywords = (
-                request.activity_keywords if focus_activity is None else focus_activity
+                _requirement_search_keywords(request, dining=False)
+                if focus_activity is None and request.requirements
+                else request.activity_keywords
+                if focus_activity is None
+                else focus_activity
             )
             had_activity_keywords = bool(activity_keywords)
             had_dining_keywords = bool(dining_keywords)
@@ -688,16 +705,16 @@ class DatePlanningAgent:
             )
 
         dining_places = restaurants or (cafes if not request.dining_keywords else [])
-        activity_assignments = _assign_keywords_to_days(
-            request.activity_keywords,
-            request.day_count,
-            request.target_day,
+        activity_groups = _assign_requirement_groups_to_days(
+            request,
+            dining=False,
         )
-        dining_assignments = _assign_keywords_to_days(
-            request.dining_keywords,
-            request.day_count,
-            request.target_day,
+        dining_groups = _assign_requirement_groups_to_days(
+            request,
+            dining=True,
         )
+        activity_assignments = _requirement_group_keywords(activity_groups)
+        dining_assignments = _requirement_group_keywords(dining_groups)
         preferences = state.get("effective_preferences", request.preferences)
         used_ids: set[str] = set()
         selected: list[DatePlanItem] = []
@@ -708,13 +725,17 @@ class DatePlanningAgent:
             day_weather = weather_by_date.get(planned_date) if planned_date else None
             day_items: list[DatePlanItem] = []
 
-            for keyword in activity_assignments.get(day_index, []):
-                candidate = _first_matching_place(activities, keyword, used_ids)
+            for alternatives in activity_groups.get(day_index, []):
+                candidate, desired = _first_matching_alternative(
+                    activities,
+                    alternatives,
+                    used_ids,
+                )
                 if candidate is None:
-                    missing_keywords.append(keyword)
+                    missing_keywords.append(_requirement_group_label(alternatives))
                     continue
                 used_ids.add(candidate.id)
-                day_items.append(
+                item = _apply_requirement_role(
                     _make_date_item(
                         candidate,
                         preferences=preferences,
@@ -722,17 +743,29 @@ class DatePlanningAgent:
                         dining_keywords=request.dining_keywords,
                         meal_keywords=request.meal_keywords,
                         schedule_hints=request.schedule_hints,
-                        slot_keyword=keyword,
-                    ).model_copy(update={"day_index": day_index, "scheduled_date": planned_date})
+                        slot_keyword=(
+                            desired.keyword or desired.place_name if desired is not None else None
+                        ),
+                    ),
+                    desired,
+                )
+                day_items.append(
+                    item.model_copy(
+                        update={"day_index": day_index, "scheduled_date": planned_date}
+                    )
                 )
 
-            for keyword in dining_assignments.get(day_index, []):
-                candidate = _first_matching_place(dining_places, keyword, used_ids)
+            for alternatives in dining_groups.get(day_index, []):
+                candidate, desired = _first_matching_alternative(
+                    dining_places,
+                    alternatives,
+                    used_ids,
+                )
                 if candidate is None:
-                    missing_keywords.append(keyword)
+                    missing_keywords.append(_requirement_group_label(alternatives))
                     continue
                 used_ids.add(candidate.id)
-                day_items.append(
+                item = _apply_requirement_role(
                     _make_date_item(
                         candidate,
                         preferences=preferences,
@@ -740,8 +773,16 @@ class DatePlanningAgent:
                         dining_keywords=request.dining_keywords,
                         meal_keywords=request.meal_keywords,
                         schedule_hints=request.schedule_hints,
-                        slot_keyword=keyword,
-                    ).model_copy(update={"day_index": day_index, "scheduled_date": planned_date})
+                        slot_keyword=(
+                            desired.keyword or desired.place_name if desired is not None else None
+                        ),
+                    ),
+                    desired,
+                )
+                day_items.append(
+                    item.model_copy(
+                        update={"day_index": day_index, "scheduled_date": planned_date}
+                    )
                 )
 
             has_activity = any(not _is_dining_item(item) for item in day_items)
@@ -970,63 +1011,85 @@ class DatePlanningAgent:
 
         request = state["request"]
         preferences = state.get("effective_preferences", request.preferences)
-        selected: list[DatePlanItem] = []
-        used_ids: set[str] = set()
-
-        activity_keywords = request.activity_keywords or [None]
-        for keyword in activity_keywords:
-            candidate = _first_matching_place(activities, keyword, used_ids)
-            if candidate is None:
-                return None
-            used_ids.add(candidate.id)
-            selected.append(
-                _make_date_item(
-                    candidate,
-                    preferences=preferences,
-                    activity_keywords=request.activity_keywords,
-                    dining_keywords=request.dining_keywords,
-                    meal_keywords=request.meal_keywords,
-                    schedule_hints=request.schedule_hints,
-                    slot_keyword=keyword,
-                )
-            )
-
+        activity_requirements = _requirements_for_kind(request, dining=False)
+        activity_groups = (
+            [requirement.alternatives for requirement in activity_requirements]
+            if activity_requirements
+            else [[None]]
+        )
         dining_places = restaurants or (cafes if not request.dining_keywords else [])
-        dining_keywords = request.dining_keywords or [None]
-        for keyword in dining_keywords:
-            candidate = _first_matching_place(dining_places, keyword, used_ids)
-            if candidate is None:
-                return None
-            used_ids.add(candidate.id)
-            selected.append(
-                _make_date_item(
-                    candidate,
-                    preferences=preferences,
-                    activity_keywords=request.activity_keywords,
-                    dining_keywords=request.dining_keywords,
-                    meal_keywords=request.meal_keywords,
-                    schedule_hints=request.schedule_hints,
-                    slot_keyword=keyword,
-                )
-            )
+        dining_requirements = _requirements_for_kind(request, dining=True)
+        dining_groups = (
+            [requirement.alternatives for requirement in dining_requirements]
+            if dining_requirements
+            else [[None]]
+        )
+        selections = _select_requirement_group_places(
+            [
+                *((activities, list(alternatives), False) for alternatives in activity_groups),
+                *((dining_places, list(alternatives), True) for alternatives in dining_groups),
+            ],
+            max_total_cost=(
+                None if request.budget_is_assumed else request.effective_total_budget
+            ),
+        )
+        if selections is None:
+            return None
 
-        if _requires_dinner_anchor(request) and not any(
-            item.meal_type == "dinner" for item in selected
-        ):
-            dinner = _first_matching_place(dining_places, None, used_ids)
-            if dinner is None:
+        selected: list[DatePlanItem] = []
+        used_ids = {candidate.id for candidate, _, _ in selections}
+        for candidate, desired, dining in selections:
+            item = _make_date_item(
+                candidate,
+                preferences=preferences,
+                activity_keywords=(
+                    request.activity_keywords
+                    if dining
+                    else _requirement_search_keywords(request, dining=False)
+                ),
+                dining_keywords=(
+                    _requirement_search_keywords(request, dining=True)
+                    if dining
+                    else request.dining_keywords
+                ),
+                meal_keywords=request.meal_keywords,
+                schedule_hints=request.schedule_hints,
+                slot_keyword=(desired.keyword or desired.place_name) if desired else None,
+            )
+            selected.append(_apply_requirement_role(item, desired))
+
+        required_meal_anchors = _required_meal_anchors(request)
+        assigned_meal_anchors = {
+            item.meal_type for item in selected if _is_dining_item(item)
+        }
+        missing_meal_anchors = [
+            anchor
+            for anchor in ("lunch", "dinner")
+            if anchor in required_meal_anchors and anchor not in assigned_meal_anchors
+        ]
+        untyped_dining_count = sum(
+            _is_dining_item(item) and item.meal_type is None for item in selected
+        )
+        for anchor in missing_meal_anchors[untyped_dining_count:]:
+            meal_place = _first_matching_place(dining_places, None, used_ids)
+            if meal_place is None:
                 return None
-            used_ids.add(dinner.id)
+            used_ids.add(meal_place.id)
             selected.append(
                 _make_date_item(
-                    dinner,
+                    meal_place,
                     preferences=preferences,
                     activity_keywords=request.activity_keywords,
                     dining_keywords=request.dining_keywords,
                     meal_keywords=request.meal_keywords,
                     schedule_hints=request.schedule_hints,
                     slot_keyword=None,
-                ).model_copy(update={"meal_type": "dinner", "time_label": "晚餐"})
+                ).model_copy(
+                    update={
+                        "meal_type": anchor,
+                        "time_label": "午餐" if anchor == "lunch" else "晚餐",
+                    }
+                )
             )
 
         if (
@@ -1475,6 +1538,68 @@ def _assign_keywords_to_days(
     return assignments
 
 
+def _assign_requirement_groups_to_days(
+    request: DatePlanRequest,
+    *,
+    dining: bool,
+) -> dict[int, list[list[DesiredDateStop | None]]]:
+    assignments: dict[int, list[list[DesiredDateStop | None]]] = {
+        day_index: [] for day_index in range(1, request.day_count + 1)
+    }
+    requirements = _requirements_for_kind(request, dining=dining)
+    if requirements:
+        for index, requirement in enumerate(requirements):
+            explicit_days = {
+                alternative.target_day
+                for alternative in requirement.alternatives
+                if alternative.target_day is not None
+            }
+            requested_day = next(iter(explicit_days)) if len(explicit_days) == 1 else None
+            day_index = min(
+                requested_day or request.target_day or (index % request.day_count) + 1,
+                request.day_count,
+            )
+            assignments[day_index].append(list(requirement.alternatives))
+        return assignments
+
+    keywords = request.dining_keywords if dining else request.activity_keywords
+    kind = StopKind.DINING if dining else StopKind.ACTIVITY
+    legacy = _assign_keywords_to_days(keywords, request.day_count, request.target_day)
+    for day_index, values in legacy.items():
+        assignments[day_index].extend(
+            [DesiredDateStop(kind=kind, keyword=keyword, target_day=day_index)]
+            for keyword in values
+        )
+    return assignments
+
+
+def _requirement_group_keywords(
+    assignments: dict[int, list[list[DesiredDateStop | None]]],
+) -> dict[int, list[str]]:
+    return {
+        day_index: list(
+            dict.fromkeys(
+                value
+                for alternatives in groups
+                for alternative in alternatives
+                if alternative is not None
+                if (value := alternative.keyword or alternative.place_name) is not None
+            )
+        )
+        for day_index, groups in assignments.items()
+    }
+
+
+def _requirement_group_label(alternatives: list[DesiredDateStop | None]) -> str:
+    values = [
+        value
+        for alternative in alternatives
+        if alternative is not None
+        if (value := alternative.keyword or alternative.place_name) is not None
+    ]
+    return "/".join(values) or "未指定节点"
+
+
 def _reserved_candidate_ids(
     places: list[Place],
     assignments: dict[int, list[str]],
@@ -1779,8 +1904,148 @@ def _meal_type_for_keyword(
     )
 
 
+def _requirements_for_kind(
+    request: DatePlanRequest,
+    *,
+    dining: bool,
+) -> list[DateStopRequirement]:
+    return [
+        requirement
+        for requirement in request.requirements
+        if (
+            requirement.alternatives[0].kind in {StopKind.DINING, StopKind.CAFE}
+        )
+        == dining
+    ]
+
+
+def _requirement_search_keywords(
+    request: DatePlanRequest,
+    *,
+    dining: bool,
+) -> list[str]:
+    return list(
+        dict.fromkeys(
+            value
+            for requirement in _requirements_for_kind(request, dining=dining)
+            for alternative in requirement.alternatives
+            if (value := alternative.keyword or alternative.place_name) is not None
+        )
+    )
+
+
+def _first_matching_alternative(
+    places: list[Place],
+    alternatives: list[DesiredDateStop] | list[None],
+    excluded_ids: set[str],
+) -> tuple[Place | None, DesiredDateStop | None]:
+    for desired in alternatives:
+        keyword = desired.keyword or desired.place_name if desired is not None else None
+        candidate = _first_matching_place(places, keyword, excluded_ids)
+        if candidate is not None:
+            return candidate, desired
+    return None, None
+
+
+def _select_requirement_group_places(
+    groups: list[
+        tuple[
+            list[Place],
+            list[DesiredDateStop | None],
+            bool,
+        ]
+    ],
+    *,
+    max_total_cost: int | None,
+) -> list[tuple[Place, DesiredDateStop | None, bool]] | None:
+    """Choose one unique place per requirement group without greedy budget loss."""
+
+    def select(
+        index: int,
+        used_ids: set[str],
+        total_cost: int,
+    ) -> list[tuple[Place, DesiredDateStop | None, bool]] | None:
+        if index == len(groups):
+            return []
+        places, alternatives, dining = groups[index]
+        for desired in alternatives:
+            keyword = desired.keyword or desired.place_name if desired is not None else None
+            for place in places:
+                if place.id in used_ids or (
+                    keyword is not None and not _place_matches_keyword(place, keyword)
+                ):
+                    continue
+                estimated_cost = place.estimated_cost_per_person * 2
+                if max_total_cost is not None and total_cost + estimated_cost > max_total_cost:
+                    continue
+                remaining = select(
+                    index + 1,
+                    {*used_ids, place.id},
+                    total_cost + estimated_cost,
+                )
+                if remaining is not None:
+                    return [(place, desired, dining), *remaining]
+        return None
+
+    return select(0, set(), 0)
+
+
+def _apply_requirement_role(
+    item: DatePlanItem,
+    desired: DesiredDateStop | None,
+) -> DatePlanItem:
+    if desired is None:
+        return item
+    after_item = item.after_item
+    if isinstance(desired.after, StopReference):
+        after_item = desired.after.keyword or desired.after.place_name
+    time_label = (
+        desired.time_window.label
+        if desired.time_window is not None and desired.time_window.label is not None
+        else {
+            TemporalAnchor.LUNCH: "午饭后",
+            TemporalAnchor.DINNER: "晚饭后",
+            TemporalAnchor.AFTER_DINNER: "晚饭后",
+            TemporalAnchor.AFTERNOON: "下午",
+            TemporalAnchor.EVENING: "晚上",
+        }.get(desired.after)
+        or item.time_label
+    )
+    return item.model_copy(
+        update={
+            "day_index": desired.target_day or item.day_index,
+            "meal_type": desired.meal_type.value if desired.meal_type else item.meal_type,
+            "time_label": time_label,
+            "after_item": after_item,
+            "slot_keyword": desired.keyword or desired.place_name or item.slot_keyword,
+        }
+    )
+
+
 def _requires_dinner_anchor(request: DatePlanRequest) -> bool:
-    return any("晚饭后" in hint or "晚餐后" in hint for hint in request.schedule_hints)
+    return "dinner" in _required_meal_anchors(request)
+
+
+def _required_meal_anchors(request: DatePlanRequest) -> set[str]:
+    anchors: set[str] = set()
+    for requirement in request.requirements:
+        for stop in requirement.alternatives:
+            label = stop.time_window.label if stop.time_window is not None else None
+            if stop.after == TemporalAnchor.LUNCH or (
+                label is not None and ("午饭后" in label or "午餐后" in label)
+            ):
+                anchors.add("lunch")
+            if (
+                isinstance(stop.after, TemporalAnchor)
+                and stop.after in {TemporalAnchor.DINNER, TemporalAnchor.AFTER_DINNER}
+            ) or (label is not None and ("晚饭后" in label or "晚餐后" in label)):
+                anchors.add("dinner")
+    for hint in request.schedule_hints:
+        if "午饭后" in hint or "午餐后" in hint:
+            anchors.add("lunch")
+        if "晚饭后" in hint or "晚餐后" in hint:
+            anchors.add("dinner")
+    return anchors
 
 
 def _time_label_for_item(
@@ -1833,7 +2098,7 @@ def _sort_plan_items(items: list[DatePlanItem]) -> list[DatePlanItem]:
             rank = 10
         elif item.meal_type == "lunch":
             rank = 20
-        elif item.time_label == "上午":
+        elif item.time_label in {"午饭后", "午餐后"} or item.time_label == "上午":
             rank = 25
         elif item.time_label == "下午":
             rank = 30
@@ -1841,6 +2106,8 @@ def _sort_plan_items(items: list[DatePlanItem]) -> list[DatePlanItem]:
             rank = 35
         elif item.meal_type == "dinner" or item.time_label == "晚餐":
             rank = 50
+        elif item.time_label in {"晚饭后", "晚餐后"}:
+            rank = 60
         elif item.place.category in {PlaceCategory.RESTAURANT, PlaceCategory.CAFE}:
             rank = 45
         else:

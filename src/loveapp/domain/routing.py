@@ -124,7 +124,15 @@ class RouteResult(BaseModel):
     date_clause_count: int = Field(default=0, ge=0)
     date_semantic_parse_required: bool = False
     date_semantic_parse_reason: str | None = None
+    date_semantic_trigger_reasons: list[str] = Field(default_factory=list, max_length=16)
     date_semantic_llm_used: bool = False
+    date_semantic_model: str | None = None
+    date_semantic_thinking: str | None = None
+    date_semantic_prompt_version: str | None = None
+    date_semantic_input_tokens: int | None = Field(default=None, ge=0)
+    date_semantic_output_tokens: int | None = Field(default=None, ge=0)
+    date_semantic_duration_ms: float | None = Field(default=None, ge=0)
+    date_semantic_fallback_reason: str | None = None
     date_semantic_error: str | None = None
     date_unresolved_references: list[str] = Field(default_factory=list, max_length=12)
     date_missing_fields: list[str] = Field(default_factory=list, max_length=8)

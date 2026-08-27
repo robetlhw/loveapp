@@ -147,6 +147,11 @@ def _identity_matches(
         value for value in (desired.keyword, desired.place_name) if value is not None
     ]
     if identity_values:
+        if desired.keyword is not None and item.slot_keyword is not None:
+            aliases = keyword_aliases.get(desired.keyword, (desired.keyword,))
+            normalized_slot = _normalize(item.slot_keyword)
+            if not any(_normalize(alias) == normalized_slot for alias in aliases):
+                return False
         return any(
             item_matches_keyword(item, value, keyword_aliases=keyword_aliases)
             for value in identity_values

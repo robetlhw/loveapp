@@ -3,7 +3,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from loveapp.domain.date_operations import DesiredDateStop, StopKind
+from loveapp.domain.date_operations import DateStopRequirement, DesiredDateStop, StopKind
 from loveapp.domain.date_plan import DatePlanRequest
 
 
@@ -44,6 +44,7 @@ def build_date_constraints(
     request: DatePlanRequest,
     *,
     desired_stops: list[DesiredDateStop] | None = None,
+    requirements: list[DateStopRequirement] | None = None,
 ) -> list[DateConstraint]:
     """Translate the stable request contract into explicit validation inputs."""
 
@@ -59,7 +60,21 @@ def build_date_constraints(
             ),
         )
     ]
-    if desired_stops is None:
+    if requirements is not None:
+        constraints.extend(
+            DateConstraint(
+                kind=(
+                    DateConstraintKind.DINING
+                    if requirement.alternatives[0].kind in {StopKind.DINING, StopKind.CAFE}
+                    else DateConstraintKind.ACTIVITY
+                ),
+                strength=ConstraintStrength.REQUIRED,
+                value=requirement,
+                source=ConstraintSource.USER_EXPLICIT,
+            )
+            for requirement in requirements
+        )
+    elif desired_stops is None:
         constraints.extend(
             DateConstraint(
                 kind=DateConstraintKind.ACTIVITY,

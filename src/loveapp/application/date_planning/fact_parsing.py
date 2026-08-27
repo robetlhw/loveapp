@@ -116,6 +116,22 @@ _BUDGET_PATTERNS: tuple[tuple[BudgetUpdateKind, re.Pattern[str]], ...] = (
     (
         BudgetUpdateKind.INCREASE,
         re.compile(
+            r"(?:总预算|预算)\s*从\s*\d{2,6}\s*(?:元|块)?\s*"
+            r"(?:提高|增加|上调|涨)\s*(?:到|至|为)\s*"
+            r"(?P<value>\d{2,6})\s*(?:元|块)?"
+        ),
+    ),
+    (
+        BudgetUpdateKind.DECREASE,
+        re.compile(
+            r"(?:总预算|预算)\s*从\s*\d{2,6}\s*(?:元|块)?\s*"
+            r"(?:降低|下降|下调|降)\s*(?:到|至|为)\s*"
+            r"(?P<value>\d{2,6})\s*(?:元|块)?"
+        ),
+    ),
+    (
+        BudgetUpdateKind.INCREASE,
+        re.compile(
             r"(?:总预算|预算)\s*(?:提高|增加|上调)\s*(?:到|至|为)?\s*"
             r"(?P<value>\d{2,6})\s*(?:元|块)?"
         ),

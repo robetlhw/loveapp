@@ -78,6 +78,37 @@ def test_rule_router_orders_compound_request_with_direct_first_clause() -> None:
     assert result.primary_scenario == AdviceScenario.CHAT_ANALYSIS
 
 
+def test_structured_date_bundle_activates_a_new_itinerary_without_magic_words() -> None:
+    result = route_by_rules(
+        RouteInput(
+            latest_query="静安区或黄浦区，预算1000，我对象喜欢火锅，我喜欢烧烤。"
+        )
+    )
+
+    assert result.task_type == TaskType.DATE_PLANNING
+    assert result.date_request_mode == DateRequestMode.ITINERARY
+    assert result.date_intent == DateTaskIntent.NEW_REQUEST
+    assert result.date_plan.city == "上海"
+    assert result.date_plan.area == "静安区"
+    assert result.date_plan.budget == 1000
+    assert result.date_plan.dining_keywords == ["火锅", "烧烤"]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "我对象喜欢火锅，我喜欢烧烤。",
+        "我住在静安区，预算1000，最近工作越来越忙。",
+    ],
+)
+def test_partial_preference_or_budget_bundle_does_not_activate_date_planning(
+    query: str,
+) -> None:
+    result = route_by_rules(RouteInput(latest_query=query))
+
+    assert result.task_type != TaskType.DATE_PLANNING
+
+
 def test_rule_router_respects_negation() -> None:
     result = route_by_rules(
         RouteInput(latest_query="我们没有吵架，只是最近聊天少了，我想知道她为什么不回复。")

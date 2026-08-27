@@ -14,6 +14,7 @@ from loveapp.adapters.conversation_states import (
     InMemoryConversationFlowStateStore,
     SQLiteConversationFlowStateStore,
 )
+from loveapp.adapters.date_semantics import OpenAICompatibleDateSemanticParser
 from loveapp.adapters.date_tasks import (
     InMemoryDatePlanningTaskStore,
     SQLiteDatePlanningTaskStore,
@@ -143,6 +144,9 @@ def build_container(settings: Settings | None = None) -> AppContainer:
     route_corrector = _build_route_corrector(settings)
     if route_corrector is not None:
         resources.append(route_corrector)
+    date_semantic_parser = _build_date_semantic_parser(settings)
+    if date_semantic_parser is not None:
+        resources.append(date_semantic_parser)
     router = HybridRouter(
         safety_policy,
         route_corrector,
@@ -150,6 +154,7 @@ def build_container(settings: Settings | None = None) -> AppContainer:
         ambiguity_margin=settings.router_ambiguity_margin,
         clarification_threshold=settings.router_clarification_threshold,
         prompt_version=settings.router_prompt_version,
+        date_semantic_parser=date_semantic_parser,
     )
     advice_agent = AdviceAgent(
         retriever,
@@ -391,6 +396,34 @@ def _build_route_corrector(settings: Settings):
         max_tokens=settings.router_max_tokens,
         thinking=settings.router_thinking,
         prompt_version=settings.router_prompt_version,
+    )
+
+
+def _build_date_semantic_parser(settings: Settings):
+    use_llm = settings.date_semantic_provider == "llm" or (
+        settings.date_semantic_provider == "auto" and settings.llm_provider != "demo"
+    )
+    if not use_llm:
+        return None
+    if not settings.llm_api_key:
+        raise ValueError("LOVEAPP_LLM_API_KEY 未配置，无法启用 Date Semantic。")
+    if not settings.llm_base_url:
+        raise ValueError("LOVEAPP_LLM_BASE_URL 未配置，无法启用 Date Semantic。")
+    model = settings.date_semantic_model or settings.router_model or settings.llm_model
+    if not model:
+        raise ValueError(
+            "LOVEAPP_DATE_SEMANTIC_MODEL、LOVEAPP_ROUTER_MODEL 或 "
+            "LOVEAPP_LLM_MODEL 未配置。"
+        )
+    return OpenAICompatibleDateSemanticParser(
+        api_key=settings.llm_api_key,
+        base_url=settings.llm_base_url,
+        model=model,
+        timeout_seconds=settings.date_semantic_timeout_seconds,
+        max_retries=settings.date_semantic_max_retries,
+        max_tokens=settings.date_semantic_max_tokens,
+        thinking=settings.date_semantic_thinking,
+        prompt_version=settings.date_semantic_prompt_version,
     )
 
 
