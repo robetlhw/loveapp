@@ -1031,7 +1031,10 @@ class DatePlanningAgent:
 
         if (
             not selected
-            or sum(item.estimated_cost for item in selected) > request.effective_total_budget
+            or (
+                not request.budget_is_assumed
+                and sum(item.estimated_cost for item in selected) > request.effective_total_budget
+            )
         ):
             return None
         selected = _sort_plan_items(selected)

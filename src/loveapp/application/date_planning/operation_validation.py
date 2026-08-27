@@ -154,7 +154,8 @@ def _reference_has_evidence(
 
 
 def _reference_scope(text: str) -> str:
-    return _REPLACE_CUE.split(text, maxsplit=1)[0]
+    replacement_cues = list(_REPLACE_CUE.finditer(text))
+    return text[: replacement_cues[-1].start()] if replacement_cues else text
 
 
 def _generic_category_matches(text: str, items: list) -> list:

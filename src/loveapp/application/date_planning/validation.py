@@ -57,6 +57,8 @@ class DatePlanValidator:
         self, plan: DatePlan, request: DatePlanRequest
     ) -> list[PlanValidationIssue]:
         issues = []
+        if request.budget_is_assumed:
+            return issues
         if plan.total_estimated_cost > request.effective_total_budget:
             issues.append(
                 _error(

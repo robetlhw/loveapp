@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Protocol
 
+from loveapp.application.date_planning.role_completion import complete_date_plan_roles
 from loveapp.application.date_planning.state_projection import inherit_desired_stop_role
 from loveapp.application.date_planning.structured_stops import (
     has_placement_requirement,
@@ -264,9 +265,15 @@ class DateOperationExecutor:
         )
         if desired.generic_replacement:
             if desired.kind in {StopKind.DINING, StopKind.CAFE}:
+                specific_request = specific_request.model_copy(
+                    update={"dining_keywords": []}
+                )
                 activity_focus = []
                 dining_focus = None
             else:
+                specific_request = specific_request.model_copy(
+                    update={"activity_keywords": []}
+                )
                 activity_focus = None
                 dining_focus = []
         candidate = await self._planner.plan(
@@ -312,20 +319,30 @@ class DateOperationExecutor:
         desired = operation.payload
         if desired is None:  # model validation protects this boundary
             return plan, "add_payload_missing"
+        working_plan = plan
+        completion = complete_date_plan_roles(plan, [desired])
+        if completion.changed:
+            working_plan = await self._planner.rebuild_plan(
+                plan,
+                request,
+                completion.plan.items,
+                summary=plan.summary,
+                trace=trace,
+            )
         specific_request, activity_focus, dining_focus = _request_for_stop(request, desired)
         candidate = await self._planner.plan(
             specific_request,
             trace=trace,
-            existing_plan=plan,
+            existing_plan=working_plan,
             mutation=DatePlanMutation.ADD,
             focus_activity_keywords=activity_focus,
             focus_dining_keywords=dining_focus,
         )
-        original_ids = {item.place.id for item in plan.items}
+        original_ids = {item.place.id for item in working_plan.items}
         if not any(item.place.id not in original_ids for item in candidate.items):
             return plan, "stop_not_added"
         return await self._apply_desired_placement(
-            original=plan,
+            original=working_plan,
             candidate=candidate,
             desired=desired,
             request=specific_request,

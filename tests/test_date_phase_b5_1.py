@@ -16,6 +16,8 @@ from loveapp.application.date_planning.role_completion import complete_date_plan
 from loveapp.application.memory import MemoryService, NoOpMemoryExtractor
 from loveapp.application.routing import HybridRouter, route_by_rules
 from loveapp.application.runtime_context import RuntimeContextBuilder
+from loveapp.bootstrap import build_container
+from loveapp.core.config import Settings
 from loveapp.core.timing import ExecutionTrace
 from loveapp.domain.conversation import ConversationRequest
 from loveapp.domain.date_operations import (
@@ -30,7 +32,7 @@ from loveapp.domain.date_operations import (
     TimeWindow,
 )
 from loveapp.domain.date_patch import DatePlanPatch
-from loveapp.domain.date_plan import DatePlan, DatePlanItem, Place
+from loveapp.domain.date_plan import DatePlan, DatePlanItem, Place, PlaceSearchRequest
 from loveapp.domain.date_task import DatePlanningTaskState
 from loveapp.domain.date_workflow import DatePlanningWorkflowInput
 from loveapp.domain.enums import (
@@ -128,6 +130,41 @@ def _state(plan: DatePlan) -> DatePlanningTaskState:
     )
 
 
+class _ScenarioBMapProvider(DemoMapProvider):
+    async def search_places(self, request: PlaceSearchRequest) -> list[Place]:
+        places = await super().search_places(request)
+        if request.required_keywords or request.keywords:
+            return places
+        if request.category == PlaceCategory.ATTRACTION:
+            return [
+                _place(
+                    "jing-an-temple",
+                    "静安寺",
+                    PlaceCategory.ATTRACTION,
+                    "静安寺",
+                    "景点",
+                ).model_copy(update={"rating": 5, "estimated_cost_per_person": 0}),
+                _place(
+                    "alternate-activity",
+                    "静安艺术中心",
+                    PlaceCategory.ATTRACTION,
+                    "景点",
+                    "展览",
+                ).model_copy(update={"rating": 4.9, "estimated_cost_per_person": 20}),
+                *places,
+            ]
+        if request.category == PlaceCategory.RESTAURANT:
+            return [
+                _place(
+                    "generic-dinner",
+                    "ShakeShack",
+                    PlaceCategory.RESTAURANT,
+                    "西餐",
+                ).model_copy(update={"rating": 5}),
+            ]
+        return places
+
+
 @pytest.mark.parametrize(
     "query",
     ("能帮我准备一份日程安排吗", "能帮我准备一份日程吗"),
@@ -194,6 +231,109 @@ async def test_recovered_location_seeds_a_new_date_task_without_polluting_patch(
     assert result.task_state.city == "上海"
     assert result.task_state.area == "静安区"
     assert result.needs_clarification is True
+
+
+@pytest.mark.asyncio
+async def test_exact_postponed_activation_scenario_builds_full_plan(
+    app_settings: Settings,
+) -> None:
+    container = build_container(app_settings)
+    try:
+        active_task = None
+        responses = []
+        for query in (
+            "我想带对象去约会，能帮我吗",
+            "想去静安区",
+            "能帮我准备一份日程安排吗",
+            "这周六，午饭吃烧烤，下午看电影，晚上吃火锅",
+        ):
+            response = await container.conversation_agent.chat(
+                ConversationRequest(
+                    user_id="b51-activation-user",
+                    relationship_id="b51-activation-relationship",
+                    conversation_id="b51-activation-conversation",
+                    query=query,
+                    active_task=active_task,
+                )
+            )
+            active_task = response.active_task
+            responses.append(response)
+    finally:
+        await container.aclose()
+
+    activated = responses[2]
+    final = responses[3]
+    assert activated.route.task_type == TaskType.DATE_PLANNING
+    assert activated.date_task_state is not None
+    assert activated.date_task_state.city == "上海"
+    assert activated.date_task_state.area == "静安区"
+    assert final.date_task_state is not None
+    assert final.date_task_state.date == date(2026, 8, 29)
+    assert final.date_plan is not None
+    by_keyword = {
+        item.slot_keyword: item
+        for item in final.date_plan.items
+        if item.slot_keyword is not None
+    }
+    assert by_keyword["烧烤"].meal_type == "lunch"
+    assert by_keyword["电影院"].time_label == "下午"
+    assert by_keyword["火锅"].meal_type == "dinner"
+
+
+@pytest.mark.asyncio
+async def test_exact_natural_language_modification_scenario(
+    app_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container = build_container(app_settings)
+    monkeypatch.setattr(
+        container.date_planning_agent,
+        "_map_provider",
+        _ScenarioBMapProvider(),
+    )
+    try:
+        active_task = None
+        responses = []
+        for query in (
+            "我想带女朋友去静安区玩，能帮我安排一个攻略吗",
+            "时间定在这周六，预算500",
+            "午饭想吃烧烤，吃完晚饭后，想去看个电影",
+            "预算改为600，静安寺我不想去了，换个别的",
+        ):
+            response = await container.conversation_agent.chat(
+                ConversationRequest(
+                    user_id="b51-modification-user",
+                    relationship_id="b51-modification-relationship",
+                    conversation_id="b51-modification-conversation",
+                    query=query,
+                    active_task=active_task,
+                )
+            )
+            active_task = response.active_task
+            responses.append(response)
+    finally:
+        await container.aclose()
+
+    initial_plan = responses[1].date_plan
+    enriched_plan = responses[2].date_plan
+    final = responses[3]
+    assert initial_plan is not None
+    assert "jing-an-temple" in {item.place.id for item in initial_plan.items}
+    assert enriched_plan is not None
+    enriched_by_id = {item.place.id: item for item in enriched_plan.items}
+    assert enriched_by_id["demo-restaurant-8"].meal_type == "lunch"
+    assert enriched_by_id["generic-dinner"].meal_type == "dinner"
+    assert enriched_by_id["generic-dinner"].order < enriched_by_id["demo-entertainment-1"].order
+    assert enriched_by_id["demo-entertainment-1"].time_label == "晚饭后"
+    assert final.route.task_type == TaskType.DATE_PLANNING
+    assert TaskType.RELATIONSHIP_ADVICE not in final.route.secondary_tasks
+    assert final.route.date_operation_rejections == []
+    assert final.date_task_state is not None
+    assert final.date_task_state.budget == 600
+    assert final.date_plan is not None
+    final_ids = {item.place.id for item in final.date_plan.items}
+    assert "jing-an-temple" not in final_ids
+    assert "alternate-activity" in final_ids
 
 
 @pytest.mark.asyncio
@@ -284,6 +424,28 @@ def test_simple_budget_update_does_not_trigger_date_semantic_parser() -> None:
     )
 
     assert requires_date_semantic_parse("预算改为600", runtime, result) is False
+
+
+def test_constraint_update_does_not_hide_later_replacement_target_evidence() -> None:
+    plan = _plan(
+        _item(
+            "temple",
+            "静安寺",
+            PlaceCategory.ATTRACTION,
+            None,
+            order=1,
+        )
+    )
+    result = DateOperationResolver().resolve(
+        "预算改为600，静安寺我不想去了，换个别的",
+        _runtime(plan),
+        DatePlanPatch(budget=600),
+    )
+
+    assert [operation.type for operation in result.operations] == [
+        DateOperationType.UPDATE_CONSTRAINT,
+        DateOperationType.REPLACE_STOP,
+    ]
 
 
 @pytest.mark.asyncio
