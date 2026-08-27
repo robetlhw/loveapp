@@ -9,6 +9,7 @@ from loveapp.application.contextual_memory_updates import (
     resolve_contextual_memory_update,
 )
 from loveapp.application.relationship_events import resolve_contextual_relationship_event
+from loveapp.domain.enums import TaskType
 from loveapp.domain.memory import MemoryGateDecision, MemoryGateReason, MemoryItem, StoredMessage
 from loveapp.domain.relationship_plan import has_retrospective_event_semantics
 
@@ -26,6 +27,7 @@ class MemoryGate:
         *,
         conversation_history: Iterable[StoredMessage] = (),
         existing_memories: Iterable[MemoryItem] = (),
+        active_task: TaskType | None = None,
     ) -> MemoryGateDecision:
         conversation_history = list(conversation_history)
         existing_memories = list(existing_memories)
@@ -80,6 +82,14 @@ class MemoryGate:
                 signals=["explicit remember request"],
                 matched_rule=explicit_remember.rule,
                 matched_span=explicit_remember.span,
+            )
+        task_local_date_constraint = _task_local_date_constraint(normalized, active_task)
+        if task_local_date_constraint is not None:
+            return _skip(
+                MemoryGateReason.OPERATION,
+                "task-local date planning constraint",
+                matched_rule="date_task_local_constraint",
+                matched_span=task_local_date_constraint,
             )
 
         contextual_update = resolve_contextual_memory_update(
@@ -315,6 +325,20 @@ def _is_habitual_not_future(text: str) -> bool:
     return habitual and not explicit_future
 
 
+def _task_local_date_constraint(
+    text: str,
+    active_task: TaskType | None,
+) -> str | None:
+    if active_task != TaskType.DATE_PLANNING or _has_durable_preference_scope(text):
+        return None
+    match = _DATE_TASK_LOCAL_PATTERN.search(text)
+    return match.group(0) if match is not None else None
+
+
+def _has_durable_preference_scope(text: str) -> bool:
+    return _DATE_DURABLE_SCOPE_PATTERN.search(text) is not None
+
+
 _CASUAL_MESSAGES = {
     "你好",
     "您好",
@@ -362,6 +386,16 @@ _PURE_PARTNER_HYPOTHESIS_PATTERNS = (
 _EXPLICIT_REMEMBER_PATTERNS = (
     re.compile(r"(?:请)?记住[：:]?"),
     re.compile(r"记一下[：:]?"),
+)
+
+_DATE_DURABLE_SCOPE_PATTERN = re.compile(
+    r"以后|长期|一贯|平时|通常|一般|每次|每回|一直|总是|从来"
+)
+_DATE_TASK_LOCAL_PATTERN = re.compile(
+    r"(?:这次|本次|这回|当前|今天|明天|后天|周末|下周)?.{0,10}"
+    r"(?:总?预算|\d{2,6}\s*(?:元|块)|城市|区域|商圈|日期|时间|"
+    r"交通方式|步行|地铁|公交|开车|自驾|骑行|餐厅|活动|景点|"
+    r"火锅|烧烤|西餐|日料|电影|博物馆|美术馆)"
 )
 
 # Keep the interaction-decline vocabulary separate from the broader durable
@@ -450,6 +484,10 @@ _DURABLE_SIGNAL_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
             r"(?:我|她|他|对象|伴侣|我们).{0,16}"
             r"(?:喜欢(?!的)|不喜欢|爱吃|不吃|能接受|不能接受|讨厌|偏好|过敏|不能吃|想去|"
             r"勤俭节约|节俭|经济实惠|实惠|精打细算|省钱|消费观(?:念)?|消费习惯)"
+        ),
+        re.compile(
+            r"(?:以后|平时|通常|一般|每次|一直).{0,20}(?:约会|见面)"
+            r".{0,20}(?:预算|消费|花费|喜欢|偏好|不喜欢)"
         ),
     ),
     "temporal_interaction": (

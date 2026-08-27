@@ -1,11 +1,14 @@
 import re
 import unicodedata
 from collections.abc import Iterable, Mapping
-from datetime import date, datetime, timedelta
+from datetime import timedelta
 from time import perf_counter
 
 from loveapp.application.conversation_flow import is_pending_cancellation
-from loveapp.application.date_planning.location import resolve_date_location
+from loveapp.application.date_planning.fact_parsing import (
+    DateFactParser,
+    extract_requested_day_count,
+)
 from loveapp.application.route_slot_validation import (
     SlotValidationResult,
     merge_current_turn_slot_sources,
@@ -19,7 +22,6 @@ from loveapp.domain.date_task import DatePlanningTaskState
 from loveapp.domain.enums import (
     AdviceGoal,
     AdviceScenario,
-    BudgetScope,
     DatePlanMode,
     DatePlanMutation,
     DateRequestMode,
@@ -27,12 +29,13 @@ from loveapp.domain.enums import (
     RiskLevel,
     RouteSource,
     TaskType,
-    TransportMode,
 )
 from loveapp.domain.memory import MessageRole
 from loveapp.domain.routing import DatePlanSlots, RouteCorrection, RouteInput, RouteResult
 from loveapp.ports.routing import RouteCorrector
 from loveapp.safety import SafetyPolicy
+
+_DATE_FACT_PARSER = DateFactParser()
 
 
 class HybridRouter:
@@ -898,6 +901,8 @@ def extract_date_plan_slots(route_input: RouteInput) -> DatePlanSlots:
     texts = [route_input.latest_query, *reversed(user_texts)]
     normalized_texts = [normalize_route_text(text) for text in texts]
     combined = " ".join(normalized_texts)
+    facts = _DATE_FACT_PARSER.parse(combined, route_input.runtime_context)
+    current_facts = _DATE_FACT_PARSER.parse(normalized_texts[0], route_input.runtime_context)
     replace_place_names = _extract_replace_place_names(normalized_texts[0])
     place_search_text = normalized_texts[0]
     for place_name in replace_place_names:
@@ -908,70 +913,21 @@ def extract_date_plan_slots(route_input: RouteInput) -> DatePlanSlots:
     excluded_keywords = _unique([*excluded_keywords, *replace_place_names])
     meal_keywords, schedule_hints = _extract_schedule_slots(normalized_texts[0])
 
-    city = next(
-        (city_name for text in normalized_texts for city_name in _CITY_NAMES if city_name in text),
-        None,
-    )
-    if city is None:
-        city_match = re.search(r"(?:城市|地点)\s*(?:是|:)?\s*([\u4e00-\u9fff]{2,6})", combined)
-        city = city_match.group(1) if city_match else None
-        if city is not None and not _is_city_candidate(city):
-            city = None
-
-    area_match = (
-        re.search(
-            rf"{re.escape(city)}(?:市)?([\u4e00-\u9fff]{{2,6}}(?:区|县|商圈))",
-            combined,
-        )
-        if city
-        else None
-    )
-    if area_match is None:
-        area_match = re.search(
-            r"(?:区域|商圈|地点)\s*(?:是|:)?\s*([\u4e00-\u9fff]{2,8}(?:区|县|商圈))",
-            combined,
-        )
-    area = area_match.group(1) if area_match else None
-    location = resolve_date_location(combined, city=city, area=area)
-    city = location.city
-    area = location.area
-
-    daily_budget_match = re.search(
-        r"(?:(?:每天|每日|一天)\s*(?:预算|控制在)?|"
-        r"预算\s*(?:是|为)?\s*(?:每天|每日|一天))\s*"
-        r"(?:还是|仍然是|依然是|仍是|是|为|:)?\s*(\d{2,6})\s*(?:元|块)?",
-        combined,
-    )
-    budget_match = re.search(
-        r"(?:预算|总共|总价|控制在)\s*(?:是|:)?\s*(\d{2,6})\s*(?:元|块)?",
-        combined,
-    )
-    if daily_budget_match is not None:
-        budget_match = daily_budget_match
-    elif budget_match is None:
-        budget_match = re.search(r"(\d{2,6})\s*(?:元|块)(?:以内|左右)?", combined)
-    budget = int(budget_match.group(1)) if budget_match else None
-    budget_scope = BudgetScope.PER_DAY if daily_budget_match is not None else None
-    if budget is not None and budget_scope is None:
-        budget_scope = BudgetScope.TOTAL
+    city = facts.city
+    area = facts.area
 
     preferences = [value for value in _DATE_PREFERENCES if value in combined]
-    transport_mode = next(
-        (
-            mode
-            for mode, keywords in _TRANSPORT_KEYWORDS.items()
-            if any(keyword in combined for keyword in keywords)
-        ),
-        None,
-    )
-    planned_date, end_date, day_count, nights, plan_mode = _extract_date_window(combined)
-    target_day = _extract_target_day(normalized_texts[0])
-    if target_day is not None:
-        plan_mode = DatePlanMode.MULTI_DAY if target_day > 1 else plan_mode
+    transport_mode = facts.transport_mode
+    planned_date = facts.date
+    end_date = facts.end_date
+    day_count = facts.day_count
+    nights = facts.nights
+    plan_mode = facts.plan_mode
+    target_day = current_facts.target_day
     lodging_notes = _extract_lodging_notes(normalized_texts[0])
-    start_time = _extract_start_time(combined, planned_date)
+    start_time = facts.start_time
     notes, constraints = _extract_date_notes(combined)
-    requested_days = _extract_requested_day_count(
+    requested_days = extract_requested_day_count(
         re.sub(
             r"第\s*(?:[0-9]{1,2}|[一二三四五六七八九十两]{1,3})\s*天",
             "",
@@ -992,8 +948,8 @@ def extract_date_plan_slots(route_input: RouteInput) -> DatePlanSlots:
         nights=nights,
         target_day=target_day,
         start_time=start_time,
-        budget=budget,
-        budget_scope=budget_scope,
+        budget=facts.budget,
+        budget_scope=facts.budget_scope,
         preferences=preferences,
         dining_keywords=dining_keywords,
         meal_keywords=meal_keywords,
@@ -1071,18 +1027,6 @@ def _date_slots_from_task_state(state: DatePlanningTaskState) -> DatePlanSlots:
         transport_mode=state.transport_mode,
         lodging_notes=state.lodging_notes,
     )
-
-
-def _is_city_candidate(value: str) -> bool:
-    normalized = value.strip()
-    return normalized not in {
-        "你看着办",
-        "随便",
-        "都可以",
-        "不限",
-        "暂时不定",
-        "不知道",
-    }
 
 
 def _score_labels[LabelT](
@@ -2368,6 +2312,8 @@ def _infer_date_mutation(
 
     if re.search(r"重新.{0,4}(?:规划|安排)|换一套|全部重排|从头安排|重新来", text):
         return DatePlanMutation.REPLAN
+    if _is_constraint_mutation(text):
+        return DatePlanMutation.UPDATE_CONSTRAINT
     if re.search(r"替换|更换|换成|换为|换一个|换一家|换个|改成|改为", text):
         return DatePlanMutation.REPLACE
     if re.search(r"删除|删掉|去掉|移除|取消(?:第|这个|该)?(?:个)?(?:活动|景点|餐厅|项目)", text):
@@ -2393,6 +2339,18 @@ def _infer_date_mutation(
     if route_input.date_task_state is not None:
         return DatePlanMutation.UPDATE_CONSTRAINT
     return DatePlanMutation.NONE
+
+
+def _is_constraint_mutation(text: str) -> bool:
+    constraint = (
+        r"(?:总?预算|每天预算|每日预算|城市|区域|商圈|日期|时间|出发时间|"
+        r"交通(?:方式)?|天数|行程天数|预算范围)"
+    )
+    action = (
+        r"(?:改(?:为|成|到)|调整(?:到|为)|提高到|增加到|降低到|降到|"
+        r"控制在|设(?:为|成)|换成|换为)"
+    )
+    return re.search(rf"{constraint}.{{0,8}}{action}", text) is not None
 
 
 def _has_unplanned_date_nodes(
@@ -2449,175 +2407,6 @@ def _date_missing_fields(slots: DatePlanSlots) -> list[str]:
     return missing
 
 
-def _extract_date_window(
-    text: str,
-) -> tuple[date | None, date | None, int | None, int | None, DatePlanMode | None]:
-    start_date, end_date = _extract_explicit_date_range(text)
-    duration_text = re.sub(
-        r"第\s*(?:[0-9]{1,2}|[一二三四五六七八九十两]{1,3})\s*天",
-        "",
-        text,
-    )
-    requested_days = _extract_requested_day_count(duration_text)
-    requested_nights = _extract_requested_nights(text)
-
-    if start_date is None:
-        start_date = _extract_date(text)
-
-    if start_date is not None and end_date is not None:
-        day_count = min((end_date - start_date).days + 1, MAX_TRIP_DAYS)
-        end_date = start_date + timedelta(days=day_count - 1)
-    elif requested_days is not None:
-        day_count = min(requested_days, MAX_TRIP_DAYS)
-        if start_date is not None and day_count > 1:
-            end_date = start_date + timedelta(days=day_count - 1)
-    elif any(marker in text for marker in ("多日", "多天", "几天", "几日")):
-        day_count = None
-    elif start_date is not None:
-        day_count = 1
-    else:
-        day_count = None
-
-    if day_count is not None:
-        nights = min(
-            requested_nights if requested_nights is not None else max(day_count - 1, 0),
-            MAX_TRIP_DAYS - 1,
-        )
-    else:
-        nights = requested_nights
-
-    multi_day_signal = (
-        (day_count or 0) > 1
-        or end_date is not None
-        or any(marker in text for marker in ("多日", "多天", "几天", "几日"))
-    )
-    plan_mode = (
-        DatePlanMode.MULTI_DAY
-        if multi_day_signal
-        else DatePlanMode.SINGLE_DAY
-        if start_date is not None or requested_days == 1
-        else None
-    )
-    return start_date, end_date, day_count, nights, plan_mode
-
-
-def _extract_explicit_date_range(text: str) -> tuple[date | None, date | None]:
-    today = date.today()
-
-    relative_match = re.search(
-        r"(今天|明天|后天|大后天)\s*(?:到|至|[-~～—])\s*(今天|明天|后天|大后天)",
-        text,
-    )
-    if relative_match:
-        offsets = {"今天": 0, "明天": 1, "后天": 2, "大后天": 3}
-        start = today + timedelta(days=offsets[relative_match.group(1)])
-        end = today + timedelta(days=offsets[relative_match.group(2)])
-        return (start, end) if end >= start else (None, None)
-
-    weekday_match = re.search(
-        r"(?P<prefix>下周|下星期)?(?:周|星期)(?P<start>[一二三四五六日天])\s*"
-        r"(?:到|至|[-~～—])\s*"
-        r"(?:(?P<end_prefix>下周|下星期)?(?:周|星期))?"
-        r"(?P<end>[一二三四五六日天])",
-        text,
-    )
-    if weekday_match:
-        weekday_values = {
-            "一": 0,
-            "二": 1,
-            "三": 2,
-            "四": 3,
-            "五": 4,
-            "六": 5,
-            "日": 6,
-            "天": 6,
-        }
-        start_weekday = weekday_values[weekday_match.group("start")]
-        end_weekday = weekday_values[weekday_match.group("end")]
-        force_next_week = weekday_match.group("prefix") is not None
-        start = _next_weekday(today, start_weekday, force_next_week=force_next_week)
-        end = start + timedelta(days=(end_weekday - start_weekday) % 7)
-        return start, end
-
-    full_dates = [
-        _safe_date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
-        for match in re.finditer(
-            r"(?<!\d)(20\d{2})[-年](\d{1,2})[-月](\d{1,2})日?(?!\d)",
-            text,
-        )
-    ]
-    valid_full_dates = [value for value in full_dates if value is not None]
-    if len(valid_full_dates) >= 2:
-        start, end = valid_full_dates[:2]
-        return (start, end) if end >= start else (None, None)
-
-    shorthand = re.search(
-        r"(\d{1,2})月(\d{1,2})日?\s*(?:到|至|[-~～—])\s*(\d{1,2})日",
-        text,
-    )
-    if shorthand:
-        start = _safe_date(today.year, int(shorthand.group(1)), int(shorthand.group(2)))
-        end = _safe_date(today.year, int(shorthand.group(1)), int(shorthand.group(3)))
-        if start is not None and end is not None and end >= start:
-            return start, end
-
-    month_dates = [
-        _safe_date(today.year, int(match.group(1)), int(match.group(2)))
-        for match in re.finditer(r"(?<!\d)(\d{1,2})月(\d{1,2})日?", text)
-    ]
-    valid_month_dates = [value for value in month_dates if value is not None]
-    if len(valid_month_dates) >= 2:
-        start, end = valid_month_dates[:2]
-        if end < start:
-            end = _safe_date(start.year + 1, end.month, end.day) or end
-        return start, end
-    return None, None
-
-
-def _next_weekday(today: date, weekday: int, *, force_next_week: bool) -> date:
-    if force_next_week:
-        return today + timedelta(days=7 - today.weekday() + weekday)
-    delta = (weekday - today.weekday()) % 7
-    return today + timedelta(days=delta or 7)
-
-
-def _extract_requested_day_count(text: str) -> int | None:
-    match = re.search(
-        r"([0-9]{1,2}|[一二三四五六七八九十两]{1,3})\s*"
-        r"(?:天(?!后)|日(?=游|行程|旅行|旅游))",
-        text,
-    )
-    return _parse_small_number(match.group(1)) if match else None
-
-
-def _extract_requested_nights(text: str) -> int | None:
-    match = re.search(r"([0-9]{1,2}|[一二三四五六七八九十两]{1,3})\s*(?:夜|晚)", text)
-    return _parse_small_number(match.group(1)) if match else None
-
-
-def _parse_small_number(value: str) -> int | None:
-    if value.isdigit():
-        return int(value)
-    normalized = value.replace("两", "二")
-    digits = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
-    if normalized == "十":
-        return 10
-    if "十" in normalized:
-        tens, ones = normalized.split("十", maxsplit=1)
-        return (digits.get(tens, 1) * 10) + digits.get(ones, 0)
-    return digits.get(normalized)
-
-
-def _extract_target_day(text: str) -> int | None:
-    match = re.search(r"第\s*([0-9]{1,2}|[一二三四五六七八九十两]{1,3})\s*天", text)
-    if match:
-        value = _parse_small_number(match.group(1))
-        return min(value, MAX_TRIP_DAYS) if value else None
-    if "首日" in text or "第一日" in text:
-        return 1
-    return None
-
-
 def _extract_lodging_notes(text: str) -> list[str]:
     return list(
         dict.fromkeys(
@@ -2627,70 +2416,6 @@ def _extract_lodging_notes(text: str) -> list[str]:
             and any(marker in clause for marker in ("酒店", "住宿", "民宿", "大床房", "双床房"))
         )
     )[:8]
-
-
-def _extract_date(text: str) -> date | None:
-    iso_match = re.search(r"\b(20\d{2})[-年](\d{1,2})[-月](\d{1,2})日?\b", text)
-    if iso_match:
-        return _safe_date(int(iso_match.group(1)), int(iso_match.group(2)), int(iso_match.group(3)))
-
-    month_day = re.search(r"(\d{1,2})月(\d{1,2})日?", text)
-    if month_day:
-        current = date.today()
-        return _safe_date(current.year, int(month_day.group(1)), int(month_day.group(2)))
-
-    today = date.today()
-    if "大后天" in text:
-        return today + timedelta(days=3)
-    if "后天" in text:
-        return today + timedelta(days=2)
-    if "明天" in text:
-        return today + timedelta(days=1)
-    if "今天" in text:
-        return today
-    if "下周" in text:
-        weekday = _weekday_in_text(text)
-        days_to_next_monday = 7 - today.weekday()
-        return today + timedelta(days=days_to_next_monday + (weekday if weekday is not None else 5))
-    if "周末" in text:
-        return today + timedelta(days=(5 - today.weekday()) % 7)
-    weekday = _weekday_in_text(text)
-    if weekday is not None:
-        delta = (weekday - today.weekday()) % 7
-        return today + timedelta(days=delta or 7)
-    return None
-
-
-def _weekday_in_text(text: str) -> int | None:
-    match = re.search(r"(?:周|星期)([一二三四五六日天])", text)
-    if not match:
-        return None
-    return {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}[match.group(1)]
-
-
-def _safe_date(year: int, month: int, day: int) -> date | None:
-    try:
-        return date(year, month, day)
-    except ValueError:
-        return None
-
-
-def _extract_start_time(text: str, planned_date: date | None) -> datetime | None:
-    if planned_date is None:
-        return None
-    match = re.search(r"(上午|下午|晚上|中午)?\s*(\d{1,2})(?:点|时|:)(\d{1,2})?", text)
-    if not match:
-        return None
-    period, hour_text, minute_text = match.groups()
-    hour = int(hour_text)
-    minute = int(minute_text or 0)
-    if period in {"下午", "晚上"} and hour < 12:
-        hour += 12
-    if period == "中午" and hour < 11:
-        hour += 12
-    if hour > 23 or minute > 59:
-        return None
-    return datetime(planned_date.year, planned_date.month, planned_date.day, hour, minute)
 
 
 def _extract_place_keywords(text: str) -> tuple[list[str], list[str], list[str]]:
@@ -3548,59 +3273,6 @@ _CASUAL_EXACT = {
 }
 
 
-_CITY_NAMES = tuple(
-    sorted(
-        {
-            "北京",
-            "上海",
-            "广州",
-            "深圳",
-            "杭州",
-            "南京",
-            "苏州",
-            "成都",
-            "重庆",
-            "武汉",
-            "西安",
-            "长沙",
-            "天津",
-            "青岛",
-            "厦门",
-            "郑州",
-            "济南",
-            "合肥",
-            "福州",
-            "昆明",
-            "大连",
-            "宁波",
-            "无锡",
-            "佛山",
-            "东莞",
-            "珠海",
-            "三亚",
-            "沈阳",
-            "哈尔滨",
-            "长春",
-            "石家庄",
-            "南昌",
-            "贵阳",
-            "南宁",
-            "太原",
-            "兰州",
-            "乌鲁木齐",
-            "呼和浩特",
-            "海口",
-            "泉州",
-            "温州",
-            "绍兴",
-            "嘉兴",
-        },
-        key=len,
-        reverse=True,
-    )
-)
-
-
 _DATE_PREFERENCES = (
     "安静",
     "咖啡",
@@ -3633,12 +3305,4 @@ _DATE_KEYWORD_ALIASES = {
     "火锅": ("火锅",),
     "烧烤": ("烧烤",),
     "素食": ("素食", "素菜"),
-}
-
-
-_TRANSPORT_KEYWORDS = {
-    TransportMode.WALKING: ("步行", "走路"),
-    TransportMode.TRANSIT: ("公交", "地铁", "公共交通"),
-    TransportMode.DRIVING: ("开车", "自驾", "驾车"),
-    TransportMode.CYCLING: ("骑车", "骑行", "自行车"),
 }

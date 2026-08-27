@@ -1,3 +1,8 @@
+from loveapp.application.date_planning.fact_parsing import (
+    BudgetUpdateKind,
+    DateFactParser,
+    DateFactParseResult,
+)
 from loveapp.application.date_planning.patching import DatePlanPatchApplier
 from loveapp.application.date_planning.validation import (
     DatePlanValidator,
@@ -7,6 +12,9 @@ from loveapp.application.date_planning.validation import (
 )
 
 __all__ = [
+    "BudgetUpdateKind",
+    "DateFactParseResult",
+    "DateFactParser",
     "DatePlanPatchApplier",
     "DatePlanValidator",
     "PlanValidationIssue",

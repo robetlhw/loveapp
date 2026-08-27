@@ -685,6 +685,11 @@ class ConversationAgent:
             message=message,
             text=request.query,
             trace=state["trace"],
+            active_task=(
+                state["route"].task_type
+                if state.get("route") is not None
+                else request.active_task
+            ),
         )
         return {"current_message": message, "memory_task": memory_task}
 

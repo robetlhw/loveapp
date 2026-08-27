@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from uuid import uuid4
 
 from loveapp.domain.advice import RelationshipContext
-from loveapp.domain.enums import RelationshipStage
+from loveapp.domain.enums import RelationshipStage, TaskType
 from loveapp.domain.memory import (
     AdmissionDecision,
     AtomicExtraction,
@@ -174,6 +174,7 @@ class MemoryService:
         status: MemoryStatus = MemoryStatus.PROPOSED,
         raise_on_extraction_error: bool = False,
         trace: TraceRecorder | None = None,
+        active_task: TaskType | None = None,
     ) -> RememberResult:
         conversation_history = (
             await self.get_conversation_history(
@@ -198,6 +199,7 @@ class MemoryService:
             raise_on_extraction_error=raise_on_extraction_error,
             conversation_history=conversation_history,
             trace=trace,
+            active_task=active_task,
         )
 
     async def remember_recorded_message(
@@ -209,6 +211,7 @@ class MemoryService:
         raise_on_extraction_error: bool = False,
         conversation_history: list[StoredMessage] | None = None,
         trace: TraceRecorder | None = None,
+        active_task: TaskType | None = None,
     ) -> RememberResult:
         retrospective_probe = has_retrospective_event_semantics(text)
         contextual_probe = may_contain_contextual_relationship_event(text)
@@ -236,6 +239,7 @@ class MemoryService:
             text,
             conversation_history=conversation_history or [],
             existing_memories=preloaded_memories or [],
+            active_task=active_task,
         )
         gate_decision = gate_decision.model_copy(
             update={
@@ -984,6 +988,7 @@ class MemoryService:
         status: MemoryStatus = MemoryStatus.PROPOSED,
         conversation_history: list[StoredMessage] | None = None,
         trace: TraceRecorder | None = None,
+        active_task: TaskType | None = None,
         name: str = "loveapp-memory-extraction",
     ) -> asyncio.Task[RememberResult]:
         """Start the shared memory sidecar without blocking the main task.
@@ -999,6 +1004,7 @@ class MemoryService:
                     text=text,
                     status=status,
                     conversation_history=conversation_history,
+                    active_task=active_task,
                 )
 
             with trace.measure("memory_extraction") as details:
@@ -1008,6 +1014,7 @@ class MemoryService:
                     status=status,
                     conversation_history=conversation_history,
                     trace=trace,
+                    active_task=active_task,
                 )
                 if result.gate_decision is not None:
                     details["gate_reason"] = result.gate_decision.reason.value
@@ -1787,14 +1794,17 @@ def _evaluate_gate(
     *,
     conversation_history: list[StoredMessage],
     existing_memories: list[MemoryItem],
+    active_task: TaskType | None,
 ) -> MemoryGateDecision:
     evaluate = gate.evaluate
     if _supports_keyword(evaluate, "conversation_history"):
-        return evaluate(
-            text,
-            conversation_history=conversation_history,
-            existing_memories=existing_memories,
-        )
+        kwargs = {
+            "conversation_history": conversation_history,
+            "existing_memories": existing_memories,
+        }
+        if _supports_keyword(evaluate, "active_task"):
+            kwargs["active_task"] = active_task
+        return evaluate(text, **kwargs)
     return evaluate(text)
 
 
