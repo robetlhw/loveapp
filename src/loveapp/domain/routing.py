@@ -3,6 +3,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from loveapp.domain.date_operations import DatePlanOperation
 from loveapp.domain.date_patch import DatePlanPatch
 from loveapp.domain.date_plan import MAX_TRIP_DAYS
 from loveapp.domain.date_task import DatePlanningTaskState
@@ -87,6 +88,7 @@ class RouteCorrection(BaseModel):
     date_request_mode: DateRequestMode = DateRequestMode.NONE
     date_intent: DateTaskIntent = DateTaskIntent.NONE
     date_mutation: DatePlanMutation = DatePlanMutation.NONE
+    date_operations: list[DatePlanOperation] = Field(default_factory=list, max_length=12)
 
 
 class RouteResult(BaseModel):
@@ -116,6 +118,7 @@ class RouteResult(BaseModel):
     date_request_mode: DateRequestMode = DateRequestMode.NONE
     date_intent: DateTaskIntent = DateTaskIntent.NONE
     date_mutation: DatePlanMutation = DatePlanMutation.NONE
+    date_operations: list[DatePlanOperation] = Field(default_factory=list, max_length=12)
     date_missing_fields: list[str] = Field(default_factory=list, max_length=8)
     source: RouteSource = RouteSource.RULES
     llm_used: bool = False
