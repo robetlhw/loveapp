@@ -7,6 +7,10 @@ from loveapp.application.date_planning.operation_validation import (
     DateOperationVerifier,
     RejectedDateOperation,
 )
+from loveapp.application.date_planning.structured_stops import (
+    has_placement_requirement,
+    match_desired_stop,
+)
 from loveapp.domain.date_operations import (
     DateConstraintField,
     DateOperationType,
@@ -19,6 +23,7 @@ from loveapp.domain.date_operations import (
     TimeWindow,
 )
 from loveapp.domain.date_patch import DatePlanPatch
+from loveapp.domain.date_plan import DatePlan, DatePlanItem
 from loveapp.domain.runtime_context import RuntimeContext
 
 
@@ -84,16 +89,19 @@ def _deterministic_operations(
     for desired, source_span in _desired_stops(text):
         if desired.keyword in excluded:
             continue
-        matching_items = _matching_current_items(runtime_context, desired)
-        if matching_items:
-            if _has_placement_requirement(desired) and not any(
-                _placement_satisfied(item, desired, runtime_context)
-                for item in matching_items
+        matches = match_desired_stop(
+            _current_plan(runtime_context),
+            desired,
+            keyword_aliases=_ALIASES,
+        )
+        if matches:
+            if has_placement_requirement(desired) and not any(
+                match.placement_satisfied for match in matches
             ):
                 operations.append(
                     DatePlanOperation(
                         type=DateOperationType.MOVE_STOP,
-                        target=_reference_for_item(matching_items[0], desired),
+                        target=_reference_for_item(matches[0].item, desired),
                         payload=desired,
                         source_span=source_span,
                         confidence=1,
@@ -206,78 +214,18 @@ def _desired_stops(text: str) -> list[tuple[DesiredDateStop, str]]:
     return desired
 
 
-def _matching_current_items(runtime_context: RuntimeContext | None, desired: DesiredDateStop):
-    plan = (
+def _current_plan(runtime_context: RuntimeContext | None) -> DatePlan | None:
+    return (
         runtime_context.active_date_plan.current_plan
         if runtime_context is not None and runtime_context.active_date_plan is not None
         else None
     )
-    if plan is None:
-        return []
-    return [
-        item
-        for item in plan.items
-        if (desired.target_day is None or item.day_index == desired.target_day)
-        and _item_matches_keyword(item, desired.keyword or desired.place_name or "")
-    ]
 
 
-def _placement_satisfied(
-    item,
+def _reference_for_item(
+    item: DatePlanItem,
     desired: DesiredDateStop,
-    runtime_context: RuntimeContext | None,
-) -> bool:
-    if desired.meal_type is not None and item.meal_type != desired.meal_type.value:
-        return False
-    if (
-        desired.time_window is not None
-        and desired.time_window.label is not None
-        and item.time_label != desired.time_window.label
-    ):
-        return False
-    if desired.after is not None:
-        anchor_order = _anchor_order(item.day_index, desired.after, runtime_context)
-        if anchor_order is None or item.order <= anchor_order:
-            return False
-    if desired.before is not None:
-        anchor_order = _anchor_order(item.day_index, desired.before, runtime_context)
-        if anchor_order is None or item.order >= anchor_order:
-            return False
-    return True
-
-
-def _anchor_order(day_index: int, anchor, runtime_context: RuntimeContext | None) -> int | None:
-    plan = (
-        runtime_context.active_date_plan.current_plan
-        if runtime_context is not None and runtime_context.active_date_plan is not None
-        else None
-    )
-    if plan is None:
-        return None
-    if isinstance(anchor, StopReference):
-        matches = [
-            item
-            for item in plan.items
-            if item.day_index == day_index
-            and _item_matches_reference(item, anchor)
-        ]
-    else:
-        meal_type = {
-            TemporalAnchor.BREAKFAST: MealType.BREAKFAST,
-            TemporalAnchor.LUNCH: MealType.LUNCH,
-            TemporalAnchor.DINNER: MealType.DINNER,
-        }.get(anchor)
-        if meal_type is None:
-            return None
-        matches = [
-            item
-            for item in plan.items
-            if item.day_index == day_index and item.meal_type == meal_type.value
-        ]
-    return matches[0].order if len(matches) == 1 else None
-
-
-def _reference_for_item(item, desired: DesiredDateStop) -> StopReference:
+) -> StopReference:
     return StopReference(
         place_id=item.place.id,
         place_name=item.place.name,
@@ -287,38 +235,6 @@ def _reference_for_item(item, desired: DesiredDateStop) -> StopReference:
             if item.meal_type in MealType._value2member_map_
             else None
         ),
-    )
-
-
-def _item_matches_reference(item, reference: StopReference) -> bool:
-    if reference.place_id is not None and item.place.id == reference.place_id:
-        return True
-    if reference.meal_type is not None and item.meal_type == reference.meal_type.value:
-        return True
-    value = reference.keyword or reference.place_name
-    return value is not None and _item_matches_keyword(item, value)
-
-
-def _item_matches_keyword(item, keyword: str) -> bool:
-    aliases = _ALIASES.get(keyword, (keyword,))
-    haystack = _normalize(
-        " ".join(
-            [
-                item.slot_keyword or "",
-                item.place.name,
-                item.place.type_name or "",
-                *item.place.tags,
-                *item.place.search_keywords,
-            ]
-        )
-    )
-    return any(_normalize(alias) in haystack for alias in aliases)
-
-
-def _has_placement_requirement(stop: DesiredDateStop) -> bool:
-    return any(
-        value is not None
-        for value in (stop.meal_type, stop.target_day, stop.time_window, stop.after, stop.before)
     )
 
 

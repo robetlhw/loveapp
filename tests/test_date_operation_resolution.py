@@ -45,9 +45,13 @@ def _place(place_id: str, name: str, category: PlaceCategory, *tags: str) -> Pla
     )
 
 
-def _runtime_with_movie_before_dinner() -> RuntimeContext:
+def _runtime_with_movie_and_dinner(
+    *,
+    movie_order: int = 1,
+    dinner_order: int = 2,
+) -> RuntimeContext:
     movie = DatePlanItem(
-        order=1,
+        order=movie_order,
         place=_place("movie", "测试电影院", PlaceCategory.ENTERTAINMENT, "电影"),
         duration_minutes=90,
         estimated_cost=100,
@@ -55,7 +59,7 @@ def _runtime_with_movie_before_dinner() -> RuntimeContext:
         slot_keyword="电影院",
     )
     dinner = DatePlanItem(
-        order=2,
+        order=dinner_order,
         place=_place("dinner", "测试餐厅", PlaceCategory.RESTAURANT, "晚餐"),
         duration_minutes=90,
         estimated_cost=200,
@@ -73,7 +77,7 @@ def _runtime_with_movie_before_dinner() -> RuntimeContext:
             current_plan=DatePlan(
                 title="现有计划",
                 summary="电影在晚餐前",
-                items=[movie, dinner],
+                items=sorted([movie, dinner], key=lambda item: item.order),
                 total_estimated_cost=300,
                 total_duration_minutes=180,
                 data_source="test",
@@ -127,7 +131,7 @@ def test_meal_and_temporal_stop_requests_resolve_to_typed_adds() -> None:
 def test_existing_misplaced_stop_resolves_to_move() -> None:
     result = _resolve(
         "晚饭后看电影",
-        runtime_context=_runtime_with_movie_before_dinner(),
+        runtime_context=_runtime_with_movie_and_dinner(),
     )
 
     assert len(result.operations) == 1
@@ -137,6 +141,15 @@ def test_existing_misplaced_stop_resolves_to_move() -> None:
     assert operation.target.place_id == "movie"
     assert operation.payload is not None
     assert operation.payload.after == TemporalAnchor.DINNER
+
+
+def test_existing_correctly_placed_stop_resolves_to_noop() -> None:
+    result = _resolve(
+        "晚饭后看电影",
+        runtime_context=_runtime_with_movie_and_dinner(movie_order=2, dinner_order=1),
+    )
+
+    assert result.operations == ()
 
 
 def test_compound_request_preserves_independent_operations() -> None:
