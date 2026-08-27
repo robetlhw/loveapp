@@ -7,8 +7,8 @@ from loveapp.application.date_planning.validation import (
 )
 
 __all__ = [
-    "DatePlanValidator",
     "DatePlanPatchApplier",
+    "DatePlanValidator",
     "PlanValidationIssue",
     "PlanValidationResult",
     "ValidationSeverity",

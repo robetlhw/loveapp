@@ -448,7 +448,7 @@ async def test_next_turn_waits_for_prior_memory_before_date_planning(
     assert second.date_plan.items[0].place.name.startswith("城市美术馆")
 
 
-async def test_date_task_state_falls_back_once_and_resumes_on_later_city(
+async def test_date_task_state_keeps_collecting_until_a_city_is_provided(
     app_settings: Settings,
 ) -> None:
     container = build_container(app_settings)
@@ -478,6 +478,7 @@ async def test_date_task_state_falls_back_once_and_resumes_on_later_city(
     assert partial.route.date_intent.value == "supplement"
     assert partial.date_plan is not None
     assert partial.date_task_state is not None
+    assert partial.date_task_state.status.value == "collecting"
     assert partial.date_task_state.fallback_used is True
     assert partial.date_task_state.city is None
 

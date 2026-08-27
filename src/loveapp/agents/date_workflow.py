@@ -1,9 +1,11 @@
+import json
 from datetime import timedelta
 
 from loveapp.agents.date_planner import DatePlanningAgent
-from loveapp.application.date_planning import DatePlanValidator
+from loveapp.application.date_planning import DatePlanPatchApplier, DatePlanValidator
 from loveapp.core.timing import ExecutionTrace
 from loveapp.domain.date_constraints import build_date_constraints
+from loveapp.domain.date_patch import DatePlanPatch
 from loveapp.domain.date_plan import DatePlan, DatePlanRequest
 from loveapp.domain.date_task import DatePlanningTaskState
 from loveapp.domain.date_workflow import DatePlanningWorkflowInput, DatePlanningWorkflowResult
@@ -20,6 +22,8 @@ from loveapp.domain.memory import utc_now
 from loveapp.domain.routing import DatePlanSlots
 from loveapp.ports.date_tasks import DatePlanningTaskStore
 
+_MAX_CLARIFICATION_ROUNDS = 3
+
 
 class DatePlanningWorkflow:
     """Owns DatePlan task-state transitions around deterministic planning."""
@@ -29,10 +33,12 @@ class DatePlanningWorkflow:
         planner: DatePlanningAgent,
         task_store: DatePlanningTaskStore,
         validator: DatePlanValidator | None = None,
+        patch_applier: DatePlanPatchApplier | None = None,
     ) -> None:
         self._planner = planner
         self._task_store = task_store
         self._validator = validator or DatePlanValidator()
+        self._patch_applier = patch_applier or DatePlanPatchApplier()
 
     async def run(
         self,
@@ -61,7 +67,33 @@ class DatePlanningWorkflow:
                     cancelled=True,
                 )
 
-            merged = _merge_date_task_state(current, route.date_plan, route.date_mutation)
+            current_turn_slots = route.date_patch or route.date_plan
+            if route.date_patch is not None:
+                with trace.measure("date_patch_apply") as details:
+                    merged = self._patch_applier.apply(
+                        current,
+                        route.date_patch,
+                        mutation=route.date_mutation,
+                    )
+                    fields = _patch_fields(route.date_patch)
+                    details.update(
+                        {
+                            "current_turn_fields": ",".join(fields),
+                            "source_by_field": json.dumps(
+                                {
+                                    field: source.value
+                                    for field, source in route.date_patch.source_by_field.items()
+                                },
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                            "old_values": _trace_patch_values(current, fields),
+                            "patch_values": _trace_patch_values(route.date_patch, fields),
+                            "candidate_values": _trace_patch_values(merged, fields),
+                        }
+                    )
+            else:
+                merged = _merge_date_task_state(current, route.date_plan, route.date_mutation)
             merged = merged.model_copy(
                 update={
                     "status": DatePlanningStatus.COLLECTING,
@@ -79,34 +111,52 @@ class DatePlanningWorkflow:
                         "updated_at": utc_now(),
                     }
                 )
+                draft = None
+                if "city" in merged.missing_fields and current.clarification_round > 0:
+                    clarified = clarified.model_copy(update={"fallback_used": True})
+                    draft = _fallback_date_draft(clarified)
                 saved = await self._save(clarified, trace)
                 return DatePlanningWorkflowResult(
                     message=_clarification_message(saved),
                     task_state=saved,
                     needs_clarification=True,
+                    plan=draft,
+                )
+            if "city" in merged.missing_fields:
+                saved = await self._save(
+                    merged.model_copy(update={"updated_at": utc_now()}),
+                    trace,
+                )
+                return DatePlanningWorkflowResult(
+                    message=_city_required_message(current.clarification_round),
+                    task_state=saved,
                 )
 
             mutation = route.date_mutation
-            if current.current_plan is not None and current.day_count != merged.day_count:
+            if (
+                current.current_plan is not None
+                and current.current_plan.items
+                and current.day_count != merged.day_count
+            ):
                 mutation = DatePlanMutation.REPLAN
             budget_scope = (
                 BudgetScope.PER_DAY
                 if merged.budget is None and (merged.day_count or 1) > 1
                 else merged.budget_scope
             )
-            plan_request = _build_request(request, merged, route.date_plan, budget_scope)
+            plan_request = _build_request(request, merged, current_turn_slots, budget_scope)
             plan = await self._planner.plan(
                 plan_request,
                 trace=trace,
                 existing_plan=current.current_plan,
                 mutation=mutation,
                 focus_activity_keywords=(
-                    route.date_plan.activity_keywords
+                    current_turn_slots.activity_keywords
                     if route.date_mutation in {DatePlanMutation.ADD, DatePlanMutation.REPLACE}
                     else None
                 ),
                 focus_dining_keywords=(
-                    route.date_plan.dining_keywords
+                    current_turn_slots.dining_keywords
                     if route.date_mutation in {DatePlanMutation.ADD, DatePlanMutation.REPLACE}
                     else None
                 ),
@@ -126,6 +176,24 @@ class DatePlanningWorkflow:
                     trace=trace,
                 )
             persisted_plan = plan if plan.items else current.current_plan
+            if not _has_executable_plan(persisted_plan):
+                saved = await self._save(
+                    merged.model_copy(
+                        update={
+                            "status": DatePlanningStatus.COLLECTING,
+                            "missing_fields": _missing_task_fields(merged),
+                            "last_mutation": mutation,
+                            "updated_at": utc_now(),
+                        }
+                    ),
+                    trace,
+                )
+                return DatePlanningWorkflowResult(
+                    message="当前还没有可执行的行程，补充城市或约会条件后可以继续。",
+                    task_state=saved,
+                    plan=plan,
+                    plan_changed=False,
+                )
             changed = _date_plan_changed(current.current_plan, persisted_plan)
             planned = merged.model_copy(
                 update={
@@ -165,7 +233,7 @@ class DatePlanningWorkflow:
         validation_codes: list[str],
         trace: ExecutionTrace,
     ) -> DatePlanningWorkflowResult:
-        if current.current_plan is not None:
+        if _has_executable_plan(current.current_plan):
             saved = await self._save(
                 merged.model_copy(
                     update={
@@ -390,12 +458,66 @@ def _should_clarify_date_task(
 ) -> bool:
     if not merged.missing_fields:
         return False
-    if "city" in merged.missing_fields and "city" not in current.asked_fields:
+    if current.clarification_round >= _MAX_CLARIFICATION_ROUNDS:
+        return False
+    if "city" in merged.missing_fields:
         return True
     if current.clarification_round > 0:
         return False
     return bool({"date_time", "budget"}.intersection(merged.missing_fields)) or (
         "trip_days" in merged.missing_fields and "trip_days" not in current.asked_fields
+    )
+
+
+def _city_required_message(clarification_round: int) -> str:
+    if clarification_round >= _MAX_CLARIFICATION_ROUNDS:
+        return "还需要明确城市才能生成可执行行程；补充城市后我会继续保留已收集的条件。"
+    return "你想在哪座城市安排这次约会？"
+
+
+def _has_executable_plan(plan: DatePlan | None) -> bool:
+    return plan is not None and bool(plan.items)
+
+
+def _fallback_date_draft(state: DatePlanningTaskState) -> DatePlan:
+    return DatePlan(
+        title="约会规划草案",
+        summary="目前先给出通用的约会结构，补充城市后可以继续生成真实地点和路线。",
+        total_estimated_cost=0,
+        total_duration_minutes=180,
+        notes=[
+            "尚未提供城市，已忽略真实地点、路线和营业信息。",
+            *(
+                ["尚未提供日期/时间，已忽略天气和营业时间校验。"]
+                if state.date is None and state.start_time is None
+                else []
+            ),
+            *(["尚未提供预算，暂按 500 元总预算估算。"] if state.budget is None else []),
+        ],
+        data_source="workflow-fallback",
+    )
+
+
+def _patch_fields(patch: DatePlanPatch) -> list[str]:
+    fields = list(patch.source_by_field)
+    if fields:
+        return fields
+    return [
+        name
+        for name, value in patch.model_dump(exclude={"source_by_field"}).items()
+        if value is not None and value != [] and value != {}
+    ]
+
+
+def _trace_patch_values(value, fields: list[str]) -> str:
+    return json.dumps(
+        {
+            field: getattr(value, field, None)
+            for field in fields
+        },
+        ensure_ascii=False,
+        default=str,
+        separators=(",", ":"),
     )
 
 

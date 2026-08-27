@@ -1,10 +1,17 @@
+from datetime import date
+from types import SimpleNamespace
+
 import pytest
 
 from loveapp.adapters.date_tasks import InMemoryDatePlanningTaskStore
 from loveapp.agents.date_workflow import DatePlanningWorkflow
+from loveapp.core.timing import ExecutionTrace
 from loveapp.domain.conversation import ConversationRequest
+from loveapp.domain.date_patch import DatePlanPatch, SlotSource
+from loveapp.domain.date_plan import DatePlan, DatePlanItem, Place
+from loveapp.domain.date_task import DatePlanningTaskState
 from loveapp.domain.date_workflow import DatePlanningWorkflowInput
-from loveapp.domain.enums import DateTaskIntent, TaskType
+from loveapp.domain.enums import DatePlanningStatus, DateTaskIntent, PlaceCategory, TaskType
 from loveapp.domain.routing import DatePlanSlots, RouteResult
 
 
@@ -21,6 +28,55 @@ def _route(*, intent: DateTaskIntent, slots: DatePlanSlots | None = None) -> Rou
         date_intent=intent,
         date_plan=slots or DatePlanSlots(),
     )
+
+
+class PermissiveValidator:
+    def validate(self, plan, request, constraints):
+        del plan, request, constraints
+        return SimpleNamespace(valid=True, issues=[])
+
+
+class RecordingPlanner:
+    def __init__(self, *, empty: bool = False) -> None:
+        self.request = None
+        self.empty = empty
+
+    async def plan(self, request, **kwargs):
+        del kwargs
+        self.request = request
+        if self.empty:
+            return DatePlan(
+                title="empty",
+                summary="empty",
+                total_estimated_cost=0,
+                total_duration_minutes=0,
+                data_source="test",
+            )
+        place = Place(
+            id="test-place",
+            name="测试地点",
+            city=request.city or "上海",
+            address="测试地址",
+            category=PlaceCategory.ATTRACTION,
+            estimated_cost_per_person=50,
+            source="test",
+        )
+        return DatePlan(
+            title="test",
+            summary="test",
+            items=[
+                DatePlanItem(
+                    order=1,
+                    place=place,
+                    duration_minutes=60,
+                    estimated_cost=50,
+                    reason="test",
+                )
+            ],
+            total_estimated_cost=50,
+            total_duration_minutes=60,
+            data_source="test",
+        )
 
 
 @pytest.mark.asyncio
@@ -72,3 +128,127 @@ async def test_workflow_persists_clarification_without_invoking_planner() -> Non
     assert result.task_state.asked_fields == ["city", "date_time"]
     assert result.task_state.budget == 300
     assert result.message == "你想在哪座城市安排这次约会？"
+
+
+@pytest.mark.asyncio
+async def test_workflow_applies_current_turn_patch_over_committed_state() -> None:
+    store = InMemoryDatePlanningTaskStore()
+    planner = RecordingPlanner()
+    workflow = DatePlanningWorkflow(
+        planner,  # type: ignore[arg-type]
+        store,
+        PermissiveValidator(),  # type: ignore[arg-type]
+    )
+    request = ConversationRequest(
+        user_id="workflow-user",
+        relationship_id="workflow-relationship",
+        conversation_id="workflow-patch",
+        query="预算改为600元",
+    )
+    current = DatePlanningTaskState(
+        user_id=request.user_id,
+        relationship_id=request.relationship_id,
+        conversation_id=request.conversation_id,
+        city="上海",
+        area="静安区",
+        date=date(2026, 8, 29),
+        budget=300,
+    )
+    route = _route(intent=DateTaskIntent.SUPPLEMENT).model_copy(
+        update={
+            "date_patch": DatePlanPatch(
+                budget=600,
+                source_by_field={"budget": SlotSource.RULE},
+            )
+        }
+    )
+    trace = ExecutionTrace()
+
+    result = await workflow.run(
+        DatePlanningWorkflowInput(
+            request=request,
+            route=route,
+            current_task_state=current,
+        ),
+        trace=trace,
+    )
+
+    assert planner.request is not None
+    assert planner.request.city == "上海"
+    assert planner.request.area == "静安区"
+    assert planner.request.budget == 600
+    assert result.task_state.budget == 600
+    assert result.task_state.status == DatePlanningStatus.PLANNED
+    patch_trace = next(item for item in trace.snapshot() if item.name == "date_patch_apply")
+    assert patch_trace.details["current_turn_fields"] == "budget"
+
+
+@pytest.mark.asyncio
+async def test_workflow_does_not_persist_empty_plan_as_planned() -> None:
+    store = InMemoryDatePlanningTaskStore()
+    workflow = DatePlanningWorkflow(
+        RecordingPlanner(empty=True),  # type: ignore[arg-type]
+        store,
+        PermissiveValidator(),  # type: ignore[arg-type]
+    )
+    request = ConversationRequest(
+        user_id="workflow-user",
+        relationship_id="workflow-relationship",
+        conversation_id="workflow-empty-plan",
+        query="安排一下",
+    )
+    current = DatePlanningTaskState(
+        user_id=request.user_id,
+        relationship_id=request.relationship_id,
+        conversation_id=request.conversation_id,
+        city="上海",
+    )
+    route = _route(intent=DateTaskIntent.SUPPLEMENT).model_copy(
+        update={"date_patch": DatePlanPatch()}
+    )
+
+    result = await workflow.run(
+        DatePlanningWorkflowInput(
+            request=request,
+            route=route,
+            current_task_state=current,
+        )
+    )
+
+    assert result.task_state.status == DatePlanningStatus.COLLECTING
+    assert result.task_state.current_plan is None
+
+
+@pytest.mark.asyncio
+async def test_city_remains_blocking_after_an_earlier_clarification() -> None:
+    store = InMemoryDatePlanningTaskStore()
+    workflow = DatePlanningWorkflow(UnusedPlanner(), store)  # type: ignore[arg-type]
+    request = ConversationRequest(
+        user_id="workflow-user",
+        relationship_id="workflow-relationship",
+        conversation_id="workflow-repeat-city",
+        query="预算300元",
+    )
+    current = DatePlanningTaskState(
+        user_id=request.user_id,
+        relationship_id=request.relationship_id,
+        conversation_id=request.conversation_id,
+        status=DatePlanningStatus.COLLECTING,
+        clarification_round=1,
+        asked_fields=["city"],
+    )
+    route = _route(intent=DateTaskIntent.SUPPLEMENT).model_copy(
+        update={"date_patch": DatePlanPatch(budget=300)}
+    )
+
+    result = await workflow.run(
+        DatePlanningWorkflowInput(
+            request=request,
+            route=route,
+            current_task_state=current,
+        )
+    )
+
+    assert result.needs_clarification is True
+    assert result.task_state.status == DatePlanningStatus.COLLECTING
+    assert result.task_state.clarification_round == 2
