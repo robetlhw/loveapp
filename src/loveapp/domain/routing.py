@@ -119,6 +119,8 @@ class RouteResult(BaseModel):
     date_intent: DateTaskIntent = DateTaskIntent.NONE
     date_mutation: DatePlanMutation = DatePlanMutation.NONE
     date_operations: list[DatePlanOperation] = Field(default_factory=list, max_length=12)
+    date_operation_candidate_count: int = Field(default=0, ge=0)
+    date_operation_rejections: list[str] = Field(default_factory=list, max_length=24)
     date_missing_fields: list[str] = Field(default_factory=list, max_length=8)
     source: RouteSource = RouteSource.RULES
     llm_used: bool = False

@@ -9,6 +9,7 @@ from loveapp.application.date_planning.fact_parsing import (
     DateFactParser,
     extract_requested_day_count,
 )
+from loveapp.application.date_planning.operation_resolution import DateOperationResolver
 from loveapp.application.route_slot_validation import (
     SlotValidationResult,
     merge_current_turn_slot_sources,
@@ -36,6 +37,7 @@ from loveapp.ports.routing import RouteCorrector
 from loveapp.safety import SafetyPolicy
 
 _DATE_FACT_PARSER = DateFactParser()
+_DATE_OPERATION_RESOLVER = DateOperationResolver()
 
 
 class HybridRouter:
@@ -198,6 +200,10 @@ class HybridRouter:
         )
         date_plan = result.date_plan if date_authorized else DatePlanSlots()
         date_patch = result.date_patch if date_authorized else None
+        date_operations = result.date_operations if date_authorized else []
+        date_operation_rejections = (
+            result.date_operation_rejections if date_authorized else []
+        )
         slot_accepted_fields = result.slot_accepted_fields if date_authorized else {}
         slot_rejected_fields = result.slot_rejected_fields if date_authorized else {}
         slot_field_sources = result.slot_field_sources if date_authorized else {}
@@ -235,6 +241,11 @@ class HybridRouter:
                 "pending_task_cancelled": cancelled,
                 "date_plan": date_plan,
                 "date_patch": date_patch,
+                "date_operations": date_operations,
+                "date_operation_candidate_count": (
+                    result.date_operation_candidate_count if date_authorized else 0
+                ),
+                "date_operation_rejections": date_operation_rejections,
                 "slot_accepted_fields": slot_accepted_fields,
                 "slot_rejected_fields": slot_rejected_fields,
                 "slot_field_sources": slot_field_sources,
@@ -630,6 +641,15 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
         if task_type == TaskType.DATE_PLANNING or TaskType.DATE_PLANNING in secondary_tasks
         else None
     )
+    operation_resolution = (
+        _DATE_OPERATION_RESOLVER.resolve(
+            route_input.latest_query,
+            route_input.runtime_context,
+            date_patch,
+        )
+        if date_patch is not None
+        else None
+    )
     return RouteResult(
         normalized_query=text,
         task_type=task_type,
@@ -649,6 +669,20 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
         date_request_mode=date_request_mode,
         date_intent=date_intent,
         date_mutation=date_mutation,
+        date_operations=(
+            list(operation_resolution.operations) if operation_resolution is not None else []
+        ),
+        date_operation_candidate_count=(
+            len(operation_resolution.candidates) if operation_resolution is not None else 0
+        ),
+        date_operation_rejections=(
+            [
+                f"{item.operation.type.value}:{item.reason}"
+                for item in operation_resolution.rejected
+            ]
+            if operation_resolution is not None
+            else []
+        ),
         date_missing_fields=(
             _date_missing_fields(date_slots) if task_type == TaskType.DATE_PLANNING else []
         ),
@@ -794,9 +828,22 @@ def merge_route_correction(
         current_turn_date_plan,
         current_turn_field_sources,
     )
-    if task_type != TaskType.DATE_PLANNING and TaskType.DATE_PLANNING not in secondary_tasks:
+    date_authorized = (
+        task_type == TaskType.DATE_PLANNING or TaskType.DATE_PLANNING in secondary_tasks
+    )
+    if not date_authorized:
         date_plan = DatePlanSlots()
         date_patch = None
+    operation_resolution = (
+        _DATE_OPERATION_RESOLVER.resolve(
+            route_input.latest_query,
+            route_input.runtime_context,
+            date_patch,
+            proposed_operations=correction.date_operations,
+        )
+        if date_patch is not None
+        else None
+    )
     date_intent = correction.date_intent if allow_task_override else rules.date_intent
     if date_intent == DateTaskIntent.NONE:
         date_intent = rules.date_intent
@@ -872,6 +919,22 @@ def merge_route_correction(
             "date_request_mode": date_request_mode,
             "date_intent": date_intent,
             "date_mutation": date_mutation,
+            "date_operations": (
+                list(operation_resolution.operations)
+                if operation_resolution is not None
+                else []
+            ),
+            "date_operation_candidate_count": (
+                len(operation_resolution.candidates) if operation_resolution is not None else 0
+            ),
+            "date_operation_rejections": (
+                [
+                    f"{item.operation.type.value}:{item.reason}"
+                    for item in operation_resolution.rejected
+                ]
+                if operation_resolution is not None
+                else []
+            ),
             "date_missing_fields": (
                 _date_missing_fields(date_plan) if task_type == TaskType.DATE_PLANNING else []
             ),

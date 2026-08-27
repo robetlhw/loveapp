@@ -358,6 +358,41 @@ class ConversationAgent:
                     ),
                 }
             )
+            with state["trace"].measure("date_fact_parse") as fact_details:
+                fact_details.update(
+                    {
+                        "patch_json": json.dumps(
+                            (
+                                route.date_patch.model_dump(mode="json")
+                                if route.date_patch is not None
+                                else {}
+                            ),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        "source": "deterministic_rule",
+                    }
+                )
+            with state["trace"].measure("date_semantic_parse") as semantic_details:
+                semantic_details["candidate_count"] = route.date_operation_candidate_count
+            with state["trace"].measure("date_operation_verify") as verify_details:
+                verify_details.update(
+                    {
+                        "accepted_count": len(route.date_operations),
+                        "rejected_count": len(route.date_operation_rejections),
+                        "rejections_json": json.dumps(
+                            route.date_operation_rejections,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    }
+                )
+            with state["trace"].measure("date_operation_resolution") as operation_details:
+                operation_details["operations_json"] = json.dumps(
+                    [operation.model_dump(mode="json") for operation in route.date_operations],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
             with state["trace"].measure("route_slot_validation") as slot_details:
                 slot_details.update(
                     {

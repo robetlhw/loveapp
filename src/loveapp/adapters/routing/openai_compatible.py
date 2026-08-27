@@ -5,6 +5,7 @@ from typing import Any, Literal
 from openai import AsyncOpenAI
 from pydantic import SecretStr, ValidationError
 
+from loveapp.domain.date_operations import DatePlanOperation
 from loveapp.domain.date_patch import DatePlanPatch
 from loveapp.domain.routing import DatePlanSlots, RouteCorrection, RouteInput, RouteResult
 
@@ -167,6 +168,10 @@ def _build_prompt(route_input: RouteInput, rule_result: RouteResult) -> str:
             "date_request_mode": rule_result.date_request_mode.value,
             "date_intent": rule_result.date_intent.value,
             "date_mutation": rule_result.date_mutation.value,
+            "date_operations": [
+                operation.model_dump(mode="json")
+                for operation in rule_result.date_operations
+            ],
             "date_missing_fields": rule_result.date_missing_fields,
         },
     }
@@ -205,49 +210,58 @@ def _sanitize_date_plan_payload(payload: dict[str, Any]) -> tuple[dict[str, Any]
     """Drop only malformed nested Slots so a valid route can still be used."""
 
     sanitized = dict(payload)
-    raw_slots = sanitized.get("date_plan")
-    if raw_slots is None:
-        return sanitized, {}
-    if not isinstance(raw_slots, dict):
-        sanitized["date_plan"] = {}
-        return sanitized, {"date_plan": "invalid_schema"}
-
-    valid_slots: dict[str, Any] = {}
     rejected: dict[str, str] = {}
-    for field, value in raw_slots.items():
-        if field not in DatePlanSlots.model_fields:
-            rejected[field] = "unknown_field"
-            continue
-        try:
-            parsed = DatePlanSlots.model_validate({field: value})
-        except ValidationError:
-            rejected[field] = "invalid_schema"
-            continue
-        valid_slots[field] = getattr(parsed, field)
-    sanitized["date_plan"] = valid_slots
+    raw_slots = sanitized.get("date_plan")
+    if raw_slots is not None and not isinstance(raw_slots, dict):
+        sanitized["date_plan"] = {}
+        rejected["date_plan"] = "invalid_schema"
+    elif isinstance(raw_slots, dict):
+        valid_slots: dict[str, Any] = {}
+        for field, value in raw_slots.items():
+            if field not in DatePlanSlots.model_fields:
+                rejected[field] = "unknown_field"
+                continue
+            try:
+                parsed = DatePlanSlots.model_validate({field: value})
+            except ValidationError:
+                rejected[field] = "invalid_schema"
+                continue
+            valid_slots[field] = getattr(parsed, field)
+        sanitized["date_plan"] = valid_slots
+
     raw_patch = sanitized.get("date_patch")
-    if raw_patch is None:
-        return sanitized, rejected
-    if not isinstance(raw_patch, dict):
+    if raw_patch is not None and not isinstance(raw_patch, dict):
         sanitized["date_patch"] = None
         rejected["date_patch"] = "invalid_schema"
-        return sanitized, rejected
+    elif isinstance(raw_patch, dict):
+        valid_patch: dict[str, Any] = {}
+        for field, value in raw_patch.items():
+            # Provenance is assigned only after deterministic verification.
+            if field == "source_by_field":
+                continue
+            if field not in DatePlanPatch.model_fields:
+                rejected[f"date_patch.{field}"] = "unknown_field"
+                continue
+            try:
+                parsed = DatePlanPatch.model_validate({field: value})
+            except ValidationError:
+                rejected[f"date_patch.{field}"] = "invalid_schema"
+                continue
+            valid_patch[field] = getattr(parsed, field)
+        sanitized["date_patch"] = valid_patch
 
-    valid_patch: dict[str, Any] = {}
-    for field, value in raw_patch.items():
-        # Provenance is assigned only after deterministic verification.
-        if field == "source_by_field":
-            continue
-        if field not in DatePlanPatch.model_fields:
-            rejected[f"date_patch.{field}"] = "unknown_field"
-            continue
-        try:
-            parsed = DatePlanPatch.model_validate({field: value})
-        except ValidationError:
-            rejected[f"date_patch.{field}"] = "invalid_schema"
-            continue
-        valid_patch[field] = getattr(parsed, field)
-    sanitized["date_patch"] = valid_patch
+    raw_operations = sanitized.get("date_operations")
+    if raw_operations is not None and not isinstance(raw_operations, list):
+        sanitized["date_operations"] = []
+        rejected["date_operations"] = "invalid_schema"
+    elif isinstance(raw_operations, list):
+        valid_operations: list[DatePlanOperation] = []
+        for index, raw_operation in enumerate(raw_operations):
+            try:
+                valid_operations.append(DatePlanOperation.model_validate(raw_operation))
+            except ValidationError:
+                rejected[f"date_operations.{index}"] = "invalid_schema"
+        sanitized["date_operations"] = valid_operations
     return sanitized, rejected
 
 
@@ -327,7 +341,12 @@ AdviceGoal：initiate、understand、progress、repair、communicate、set_bound
    replace_place_names 只记录用户明确要求删除或换掉的现有地点名称；
    meal_keywords 的键只能使用 breakfast、lunch、dinner，值是用户明确提到的餐饮关键词；
    schedule_hints 只记录明确的时间或先后提示，例如“下午”“看完电影后”。
-   transport_mode 只能是 walking、transit、driving、cycling 或 null。
+    transport_mode 只能是 walking、transit、driving、cycling 或 null。
+   date_operations 用 typed 数组表达复杂业务动作，type 只能是 update_constraint、add_stop、
+   remove_stop、replace_stop、move_stop、replan。每个 operation 的 source_span 必须逐字来自
+   latest_query。stop 使用 target/payload 表达，payload.kind 只能是 dining、activity、cafe、other；
+   meal_type 只能是 breakfast、lunch、dinner；晚饭后等关系放在 after/before。模型只理解动作，
+   不得直接修改 runtime_context，也不得复制历史 operation。
 9. evidence_spans 必须逐字来自 latest_query 或 recent_messages，最多 8 条。每一个 date_patch
    字段都必须有对应的用户原文依据；无法确认的字段留空，不得因为默认常识补齐。
 10. task_confidence 和 scenario_confidence 使用 0 到 1。确实需要用户补充才能路由时，
@@ -340,7 +359,7 @@ AdviceGoal：initiate、understand、progress、repair、communicate、set_bound
 
 必须输出字段：task_type、secondary_tasks、task_confidence、primary_goal、secondary_goals、
 primary_scenario、secondary_scenarios、scenario_confidence、needs_clarification、
-evidence_spans、date_patch、date_request_mode、date_intent、date_mutation。为兼容旧调用方可以同时输出
+evidence_spans、date_patch、date_operations、date_request_mode、date_intent、date_mutation。为兼容旧调用方可以同时输出
 date_plan，但 date_patch 是当前轮增量；数组无内容时输出 []，
 可空标量输出 null。
 """.strip()

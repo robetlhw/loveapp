@@ -280,3 +280,18 @@ def test_route_corrector_parser_drops_only_malformed_slot_fields() -> None:
     assert correction.date_plan.city == "上海"
     assert correction.date_plan.budget is None
     assert rejected == {"budget": "invalid_schema"}
+
+
+def test_route_corrector_parser_drops_only_malformed_date_operations() -> None:
+    correction, rejected = _parse_response_with_slot_rejections(
+        '{"task_type":"date_planning","task_confidence":0.9,'
+        '"date_operations":['
+        '{"type":"add_stop","payload":{"kind":"activity","keyword":"电影"},'
+        '"source_span":"看电影"},'
+        '{"type":"replace_stop","target":{"keyword":"火锅"}}]}',
+        "stop",
+    )
+
+    assert len(correction.date_operations) == 1
+    assert correction.date_operations[0].type.value == "add_stop"
+    assert rejected == {"date_operations.1": "invalid_schema"}
