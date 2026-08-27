@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta
 from time import perf_counter
 
 from loveapp.application.conversation_flow import is_pending_cancellation
+from loveapp.application.date_planning.location import resolve_date_location
 from loveapp.application.route_slot_validation import (
     SlotValidationResult,
     merge_current_turn_slot_sources,
@@ -931,6 +932,9 @@ def extract_date_plan_slots(route_input: RouteInput) -> DatePlanSlots:
             combined,
         )
     area = area_match.group(1) if area_match else None
+    location = resolve_date_location(combined, city=city, area=area)
+    city = location.city
+    area = location.area
 
     daily_budget_match = re.search(
         r"(?:(?:每天|每日|一天)\s*(?:预算|控制在)?|"
