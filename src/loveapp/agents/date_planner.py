@@ -84,6 +84,39 @@ class DatePlanningAgent:
             state.get("daily_weather", []),
         )
 
+    async def rebuild_plan(
+        self,
+        existing_plan: DatePlan,
+        request: DatePlanRequest,
+        items: list[DatePlanItem],
+        *,
+        summary: str,
+        trace: ExecutionTrace | None = None,
+    ) -> DatePlan:
+        active_trace = trace or ExecutionTrace()
+        with active_trace.measure("date_operation_rebuild") as details:
+            rebuilt, route_notes = await self._rebuild_plan_items(
+                items,
+                request.transport_mode,
+                preserve_order=True,
+            )
+            details["item_count"] = len(rebuilt)
+            details["route_note_count"] = len(route_notes)
+        return _make_plan_from_items(
+            existing_plan,
+            request,
+            rebuilt,
+            alternatives=existing_plan.alternatives,
+            weather=request.weather,
+            notes=[
+                _data_source_note(self._map_provider.name),
+                *route_notes,
+                *request.notes,
+                *request.constraints,
+            ],
+            summary=summary,
+        )
+
     def _build_graph(self):
         graph = StateGraph(DatePlanningState)
         graph.add_node("load_memory", self._load_memory)
@@ -1362,13 +1395,16 @@ class DatePlanningAgent:
         self,
         items: list[DatePlanItem],
         mode,
+        *,
+        preserve_order: bool = False,
     ) -> tuple[list[DatePlanItem], list[str]]:
         rebuilt: list[DatePlanItem] = []
         route_notes: list[str] = []
         previous: Place | None = None
         current_day: int | None = None
         day_order = 0
-        for item in _sort_plan_items(items):
+        source_items = items if preserve_order else _sort_plan_items(items)
+        for item in source_items:
             if item.day_index != current_day:
                 current_day = item.day_index
                 previous = None

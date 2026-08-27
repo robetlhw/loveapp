@@ -2,7 +2,11 @@ import json
 from datetime import timedelta
 
 from loveapp.agents.date_planner import DatePlanningAgent
-from loveapp.application.date_planning import DatePlanPatchApplier, DatePlanValidator
+from loveapp.application.date_planning import (
+    DateOperationExecutor,
+    DatePlanPatchApplier,
+    DatePlanValidator,
+)
 from loveapp.core.timing import ExecutionTrace
 from loveapp.domain.date_constraints import build_date_constraints
 from loveapp.domain.date_patch import DatePlanPatch
@@ -34,11 +38,13 @@ class DatePlanningWorkflow:
         task_store: DatePlanningTaskStore,
         validator: DatePlanValidator | None = None,
         patch_applier: DatePlanPatchApplier | None = None,
+        operation_executor: DateOperationExecutor | None = None,
     ) -> None:
         self._planner = planner
         self._task_store = task_store
         self._validator = validator or DatePlanValidator()
         self._patch_applier = patch_applier or DatePlanPatchApplier()
+        self._operation_executor = operation_executor or DateOperationExecutor(planner)
 
     async def run(
         self,
@@ -145,22 +151,54 @@ class DatePlanningWorkflow:
                 else merged.budget_scope
             )
             plan_request = _build_request(request, merged, current_turn_slots, budget_scope)
-            plan = await self._planner.plan(
-                plan_request,
-                trace=trace,
-                existing_plan=current.current_plan,
-                mutation=mutation,
-                focus_activity_keywords=(
-                    current_turn_slots.activity_keywords
-                    if route.date_mutation in {DatePlanMutation.ADD, DatePlanMutation.REPLACE}
-                    else None
-                ),
-                focus_dining_keywords=(
-                    current_turn_slots.dining_keywords
-                    if route.date_mutation in {DatePlanMutation.ADD, DatePlanMutation.REPLACE}
-                    else None
-                ),
-            )
+            if route.date_operations:
+                with trace.measure("date_operation_execute") as details:
+                    execution = await self._operation_executor.apply(
+                        current.current_plan,
+                        route.date_operations,
+                        plan_request,
+                        trace=trace,
+                        required_mutation=mutation,
+                    )
+                    plan = execution.plan
+                    mutation = execution.effective_mutation
+                    details.update(
+                        {
+                            "requested_count": len(route.date_operations),
+                            "applied_count": len(execution.applied),
+                            "rejected_count": len(execution.rejected),
+                            "rejections_json": json.dumps(
+                                [
+                                    {
+                                        "type": item.operation.type.value,
+                                        "reason": item.reason,
+                                    }
+                                    for item in execution.rejected
+                                ],
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        }
+                    )
+            else:
+                plan = await self._planner.plan(
+                    plan_request,
+                    trace=trace,
+                    existing_plan=current.current_plan,
+                    mutation=mutation,
+                    focus_activity_keywords=(
+                        current_turn_slots.activity_keywords
+                        if route.date_mutation
+                        in {DatePlanMutation.ADD, DatePlanMutation.REPLACE}
+                        else None
+                    ),
+                    focus_dining_keywords=(
+                        current_turn_slots.dining_keywords
+                        if route.date_mutation
+                        in {DatePlanMutation.ADD, DatePlanMutation.REPLACE}
+                        else None
+                    ),
+                )
             constraints = build_date_constraints(plan_request)
             with trace.measure("date_plan_validation") as details:
                 validation = self._validator.validate(plan, plan_request, constraints)
@@ -216,7 +254,7 @@ class DatePlanningWorkflow:
             saved = await self._save(planned, trace)
             return DatePlanningWorkflowResult(
                 message=_compose_response(
-                    current=current, mutation=route.date_mutation, plan=plan, changed=changed
+                    current=current, mutation=mutation, plan=plan, changed=changed
                 ),
                 task_state=saved,
                 plan=plan,

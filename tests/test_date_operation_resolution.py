@@ -67,6 +67,10 @@ def _runtime_with_movie_and_dinner(
         meal_type="dinner",
         slot_keyword="西餐",
     )
+    return _runtime_with_plan(movie, dinner)
+
+
+def _runtime_with_plan(*items: DatePlanItem) -> RuntimeContext:
     return RuntimeContext(
         user_id="user",
         relationship_id="relationship",
@@ -77,9 +81,9 @@ def _runtime_with_movie_and_dinner(
             current_plan=DatePlan(
                 title="现有计划",
                 summary="电影在晚餐前",
-                items=sorted([movie, dinner], key=lambda item: item.order),
-                total_estimated_cost=300,
-                total_duration_minutes=180,
+                items=sorted(items, key=lambda item: (item.day_index, item.order)),
+                total_estimated_cost=sum(item.estimated_cost for item in items),
+                total_duration_minutes=sum(item.duration_minutes for item in items),
                 data_source="test",
             )
         ),
@@ -168,6 +172,108 @@ def test_compound_request_preserves_independent_operations() -> None:
     assert result.operations[1].payload.keyword == "烧烤"
     assert result.operations[2].payload is not None
     assert result.operations[2].payload.keyword == "电影院"
+
+
+def test_verified_patch_keywords_outside_rule_vocabulary_become_operations() -> None:
+    result = _resolve(
+        "晚上吃海底捞，中午吃韩国料理",
+        DatePlanPatch(
+            dining_keywords=["韩国料理", "海底捞"],
+            meal_keywords={"lunch": ["韩国料理"], "dinner": ["海底捞"]},
+        ),
+    )
+
+    assert [operation.type for operation in result.operations] == [
+        DateOperationType.ADD_STOP,
+        DateOperationType.ADD_STOP,
+    ]
+    assert [operation.payload.keyword for operation in result.operations if operation.payload] == [
+        "韩国料理",
+        "海底捞",
+    ]
+
+
+def test_named_replacement_and_additional_meal_stay_separate() -> None:
+    park = DatePlanItem(
+        order=1,
+        place=_place("park", "测试公园", PlaceCategory.ATTRACTION, "公园"),
+        duration_minutes=60,
+        estimated_cost=50,
+        reason="公园",
+        time_label="下午",
+        slot_keyword="公园",
+    )
+    korean = DatePlanItem(
+        order=2,
+        place=_place(
+            "korean",
+            "测试韩国料理",
+            PlaceCategory.RESTAURANT,
+            "韩国料理",
+        ),
+        duration_minutes=60,
+        estimated_cost=100,
+        reason="午餐",
+        meal_type="lunch",
+        slot_keyword="韩国料理",
+    )
+    result = _resolve(
+        "晚上吃海底捞，中午吃韩国料理，然后下午不去测试公园，换一个博物馆",
+        DatePlanPatch(
+            dining_keywords=["韩国料理", "海底捞"],
+            meal_keywords={"lunch": ["韩国料理"], "dinner": ["海底捞"]},
+            activity_keywords=["博物馆"],
+            replace_place_names=["测试公园"],
+        ),
+        runtime_context=_runtime_with_plan(park, korean),
+    )
+
+    assert [operation.type for operation in result.operations] == [
+        DateOperationType.REPLACE_STOP,
+        DateOperationType.ADD_STOP,
+    ]
+    replacement, addition = result.operations
+    assert replacement.target is not None
+    assert replacement.target.place_id == "park"
+    assert replacement.payload is not None
+    assert replacement.payload.keyword == "博物馆"
+    assert addition.payload is not None
+    assert addition.payload.keyword == "海底捞"
+
+
+def test_unique_contextual_activity_can_be_replaced_on_target_day() -> None:
+    activity = DatePlanItem(
+        order=1,
+        day_index=2,
+        place=_place("activity", "原活动", PlaceCategory.ATTRACTION, "景点"),
+        duration_minutes=60,
+        estimated_cost=50,
+        reason="activity",
+        slot_keyword="景点",
+    )
+    lunch = DatePlanItem(
+        order=2,
+        day_index=2,
+        place=_place("lunch", "午餐", PlaceCategory.RESTAURANT, "午餐"),
+        duration_minutes=60,
+        estimated_cost=100,
+        reason="lunch",
+        meal_type="lunch",
+        slot_keyword="午餐",
+    )
+    result = _resolve(
+        "第二天下午不去原来的活动了，换成公园",
+        DatePlanPatch(activity_keywords=["公园"], target_day=2),
+        runtime_context=_runtime_with_plan(activity, lunch),
+    )
+
+    assert len(result.operations) == 1
+    operation = result.operations[0]
+    assert operation.type == DateOperationType.REPLACE_STOP
+    assert operation.target is not None
+    assert operation.target.place_id == "activity"
+    assert operation.payload is not None
+    assert operation.payload.keyword == "公园"
 
 
 def test_rule_route_exposes_patch_and_typed_compound_operations() -> None:

@@ -137,7 +137,10 @@ def _reference_has_evidence(
         )
     ]
     has_contextual_reference = bool(
-        re.search(r"那个|这个|该|第\s*[一二三四五六七八九十\d]+\s*个", text)
+        re.search(
+            r"那个|这个|该|原来的|原先的|之前的|第\s*[一二三四五六七八九十\d]+\s*个",
+            text,
+        )
     )
     return len(matches) == 1 and has_contextual_reference
 
@@ -174,7 +177,7 @@ def _normalize(value: str) -> str:
 
 _REPLAN_CUE = re.compile(r"重新.{0,4}(?:规划|安排)|换一套|全部重排|从头安排|重新来")
 _REMOVE_CUE = re.compile(r"删除|删掉|去掉|移除|取消|不去|不要")
-_REPLACE_CUE = re.compile(r"替换|更换|换成|换为|改成|改为")
+_REPLACE_CUE = re.compile(r"替换|更换|换成|换为|换一个|换一家|换个|改成|改为")
 _MOVE_CUE = re.compile(
     r"之前|之后|前|后|上午|中午|下午|晚上|早餐|午饭|午餐|晚饭|晚餐|调整顺序|放到"
 )
