@@ -1,9 +1,9 @@
 from datetime import timedelta
 from typing import Any
 
-from loveapp.domain.enums import DatePlanMode
 from loveapp.domain.date_patch import DatePlanPatch
 from loveapp.domain.date_task import DatePlanningTaskState
+from loveapp.domain.enums import DatePlanMode
 
 
 _SCALAR_FIELDS = (
