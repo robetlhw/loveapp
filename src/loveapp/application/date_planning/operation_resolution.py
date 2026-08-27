@@ -4,6 +4,10 @@ import unicodedata
 from dataclasses import dataclass
 
 from loveapp.application.date_planning.clause_parsing import split_date_clauses
+from loveapp.application.date_planning.modification_detection import (
+    detect_date_modification,
+    interpret_date_modification,
+)
 from loveapp.application.date_planning.operation_validation import (
     DateOperationVerifier,
     RejectedDateOperation,
@@ -16,6 +20,7 @@ from loveapp.domain.date_operations import (
     DateConstraintField,
     DateOperationType,
     DatePlanOperation,
+    DateSemanticParseResult,
     DesiredDateStop,
     MealType,
     StopKind,
@@ -34,6 +39,7 @@ class DateOperationResolution:
     candidates: tuple[DatePlanOperation, ...]
     operations: tuple[DatePlanOperation, ...]
     rejected: tuple[RejectedDateOperation, ...]
+    unresolved_references: tuple[str, ...] = ()
 
 
 class DateOperationResolver:
@@ -49,20 +55,53 @@ class DateOperationResolver:
         current_turn_patch: DatePlanPatch,
         *,
         proposed_operations: list[DatePlanOperation] | None = None,
+        proposed_unresolved_references: list[str] | None = None,
     ) -> DateOperationResolution:
         deterministic = _deterministic_operations(text, runtime_context, current_turn_patch)
-        candidates = _dedupe_operations(tuple([*deterministic, *(proposed_operations or [])]))
+        interpretation = (
+            interpret_date_modification(text, _current_plan(runtime_context))
+            if not any(
+                operation.type == DateOperationType.REPLACE_STOP
+                for operation in deterministic
+            )
+            else DateSemanticParseResult()
+        )
+        candidates = _dedupe_operations(
+            tuple(
+                [
+                    *deterministic,
+                    *interpretation.operations,
+                    *(proposed_operations or []),
+                ]
+            )
+        )
         verification = self._verifier.verify(
             candidates,
             text,
             runtime_context,
             current_turn_patch,
         )
-        operations = tuple(_dedupe_operations(verification.accepted))
+        unresolved = tuple(
+            dict.fromkeys(
+                [
+                    *interpretation.unresolved_references,
+                    *(proposed_unresolved_references or []),
+                ]
+            )
+        )
+        accepted: list[DatePlanOperation] = []
+        rejected = list(verification.rejected)
+        for operation in verification.accepted:
+            if unresolved and operation.type in _REFERENCE_TARGETED_MUTATIONS:
+                rejected.append(RejectedDateOperation(operation, "plan_reference_unresolved"))
+            else:
+                accepted.append(operation)
+        operations = tuple(_dedupe_operations(tuple(accepted)))
         return DateOperationResolution(
             candidates=tuple(candidates),
             operations=operations,
-            rejected=verification.rejected,
+            rejected=tuple(rejected),
+            unresolved_references=unresolved,
         )
 
 
@@ -73,35 +112,42 @@ def requires_date_semantic_parse(
 ) -> bool:
     """Identify complex date semantics independently from task routing."""
 
-    del runtime_context
-    clauses = split_date_clauses(text)
-    operations = deterministic_result.operations
-    has_stop_operation = any(
-        operation.type
-        in {
-            DateOperationType.ADD_STOP,
-            DateOperationType.REMOVE_STOP,
-            DateOperationType.REPLACE_STOP,
-            DateOperationType.MOVE_STOP,
-        }
-        for operation in operations
-    )
-    has_complex_reference = bool(
-        re.search(
-            r"第\s*[一二三四五六七八九十\d]+\s*个|那个|这个|原来的|之前的",
+    return bool(
+        date_semantic_parse_reasons(
             text,
+            runtime_context,
+            deterministic_result,
         )
     )
+
+
+def date_semantic_parse_reasons(
+    text: str,
+    runtime_context: RuntimeContext | None,
+    deterministic_result: DateOperationResolution,
+) -> tuple[str, ...]:
+    """Explain why bounded DatePlan semantic interpretation is required."""
+
+    clauses = split_date_clauses(text)
+    operations = deterministic_result.operations
+    stop_operations = [
+        operation for operation in operations if operation.type in _STOP_OPERATIONS
+    ]
+    detection = detect_date_modification(text, _current_plan(runtime_context))
     has_temporal_binding = bool(
         re.search(r"(?:之前|之后|前|后|上午|中午|下午|晚上|早饭|午饭|晚饭)", text)
     )
-    return has_stop_operation and (
-        len(clauses) > 1
-        or len(operations) > 1
-        or has_complex_reference
-        or has_temporal_binding
-        or bool(re.search(r"(?:换|替换|更换|改).{0,20}(?:喜欢|偏好|想吃|想去)", text))
-    )
+    reasons: list[str] = []
+    if len(clauses) > 1 and stop_operations:
+        reasons.append("multiple_clauses")
+    if len(operations) > 1:
+        reasons.append("multiple_operations")
+    if has_temporal_binding and stop_operations:
+        reasons.append("temporal_relation")
+    reasons.extend(detection.reasons)
+    if detection.is_candidate and not stop_operations:
+        reasons.append("deterministic_parse_incomplete")
+    return tuple(dict.fromkeys(reasons))
 
 
 def _deterministic_operations(
@@ -657,6 +703,17 @@ def _normalized(value: str) -> str:
 _REPLAN_CUE = re.compile(r"重新.{0,4}(?:规划|安排)|换一套|全部重排|从头安排|重新来")
 _REMOVE_CUE = re.compile(r"删除|删掉|去掉|移除|取消|不去|不要")
 _REPLACE_CUE = re.compile(r"替换|更换|换成|换为|换一个|换一家|换个|改成|改为")
+_STOP_OPERATIONS = {
+    DateOperationType.ADD_STOP,
+    DateOperationType.REMOVE_STOP,
+    DateOperationType.REPLACE_STOP,
+    DateOperationType.MOVE_STOP,
+}
+_REFERENCE_TARGETED_MUTATIONS = {
+    DateOperationType.REMOVE_STOP,
+    DateOperationType.REPLACE_STOP,
+    DateOperationType.MOVE_STOP,
+}
 _REPLACEMENT_PATTERN = re.compile(
     r"(?:把|将)?\s*(?P<target>[^，,。；;]{1,24}?)\s*"
     r"(?:替换为|更换为|换成|换为|改成|改为)\s*"

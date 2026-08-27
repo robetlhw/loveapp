@@ -10,8 +10,12 @@ from loveapp.application.date_planning.fact_parsing import (
     DateFactParser,
     extract_requested_day_count,
 )
+from loveapp.application.date_planning.modification_detection import (
+    looks_like_date_modification_semantics,
+)
 from loveapp.application.date_planning.operation_resolution import (
     DateOperationResolver,
+    date_semantic_parse_reasons,
     requires_date_semantic_parse,
 )
 from loveapp.application.route_slot_validation import (
@@ -214,9 +218,16 @@ class HybridRouter:
             route_input.runtime_context,
             deterministic,
         )
+        parse_reasons = date_semantic_parse_reasons(
+            route_input.latest_query,
+            route_input.runtime_context,
+            deterministic,
+        )
         base_update = {
             "date_clause_count": len(clauses),
             "date_semantic_parse_required": required,
+            "date_semantic_parse_reason": "+".join(parse_reasons) or None,
+            "date_unresolved_references": list(deterministic.unresolved_references),
         }
         if not required:
             return result.model_copy(update=base_update)
@@ -233,6 +244,7 @@ class HybridRouter:
                 route_input.runtime_context,
                 result.date_patch,
                 proposed_operations=[*result.date_operations, *parsed.operations],
+                proposed_unresolved_references=parsed.unresolved_references,
             )
         except Exception as exc:
             return result.model_copy(
@@ -251,6 +263,7 @@ class HybridRouter:
                 "date_operation_rejections": [
                     f"{item.operation.type.value}:{item.reason}" for item in resolution.rejected
                 ],
+                "date_unresolved_references": list(resolution.unresolved_references),
             }
         )
 
@@ -324,6 +337,10 @@ class HybridRouter:
                     result.date_operation_candidate_count if date_authorized else 0
                 ),
                 "date_operation_rejections": date_operation_rejections,
+                "date_unresolved_references": (
+                    result.date_unresolved_references if date_authorized else []
+                ),
+                "router_llm_used": result.llm_used,
                 "slot_accepted_fields": slot_accepted_fields,
                 "slot_rejected_fields": slot_rejected_fields,
                 "slot_field_sources": slot_field_sources,
@@ -464,12 +481,21 @@ def _apply_date_plan_focus_guard(
     active_task = route_input.active_task or (
         route_input.runtime_context.active_task if route_input.runtime_context is not None else None
     )
-    if active_task != TaskType.DATE_PLANNING:
+    date_plan_is_focused = (
+        active_task == TaskType.DATE_PLANNING
+        or result.task_type == TaskType.DATE_PLANNING
+        or TaskType.DATE_PLANNING in result.secondary_tasks
+    )
+    if not date_plan_is_focused:
         return result
     has_explicit_operation = bool(result.date_operations) or _looks_like_date_edit_request(
         result.normalized_query
-    )
-    if not has_explicit_operation or _looks_like_explicit_advice_request(result.normalized_query):
+    ) or _is_executable_date_mode(result.date_request_mode)
+    if (
+        not has_explicit_operation
+        or _looks_like_explicit_advice_request(result.normalized_query)
+        or _has_ordered_primary_relationship_request(result.normalized_query)
+    ):
         return result
     secondary = [task for task in result.secondary_tasks if task != TaskType.RELATIONSHIP_ADVICE]
     updates: dict[str, object] = {
@@ -543,6 +569,15 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
         task_evidence.pop(TaskType.OUT_OF_SCOPE, None)
     date_request_mode = _infer_date_request_mode(route_input, text, latest_date_slots)
     executable_date_request = _is_executable_date_mode(date_request_mode)
+    if (
+        executable_date_request
+        and not (
+            route_input.date_task_state is not None
+            and route_input.date_task_state.is_resumable
+        )
+        and route_input.recent_messages
+    ):
+        date_slots = _recover_date_activation_history_slots(route_input)
 
     # Broad date/place phrases are only semantic candidates. A stateful date
     # workflow requires an executable request mode.
@@ -795,6 +830,11 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
             if operation_resolution is not None
             else []
         ),
+        date_unresolved_references=(
+            list(operation_resolution.unresolved_references)
+            if operation_resolution is not None
+            else []
+        ),
         date_missing_fields=(
             _date_missing_fields(date_slots) if task_type == TaskType.DATE_PLANNING else []
         ),
@@ -1044,6 +1084,11 @@ def merge_route_correction(
                 if operation_resolution is not None
                 else []
             ),
+            "date_unresolved_references": (
+                list(operation_resolution.unresolved_references)
+                if operation_resolution is not None
+                else []
+            ),
             "date_missing_fields": (
                 _date_missing_fields(date_plan) if task_type == TaskType.DATE_PLANNING else []
             ),
@@ -1132,6 +1177,31 @@ def extract_date_plan_slots(route_input: RouteInput) -> DatePlanSlots:
         notes=notes,
         constraints=constraints,
         lodging_notes=lodging_notes,
+    )
+
+
+def _recover_date_activation_history_slots(route_input: RouteInput) -> DatePlanSlots:
+    relevant_messages = [
+        message
+        for message in route_input.recent_messages
+        if message.role == MessageRole.USER
+        and _looks_like_date_activation_context(message.content)
+    ][-6:]
+    return extract_date_plan_slots(
+        route_input.model_copy(update={"recent_messages": relevant_messages})
+    )
+
+
+def _looks_like_date_activation_context(text: str) -> bool:
+    normalized = normalize_route_text(text)
+    return (
+        re.search(
+            r"(?:想|打算|准备|计划|希望).{0,8}(?:去|在|安排)|"
+            r"(?:约会|行程|日程).{0,12}(?:地点|城市|区域|商圈|在|去)|"
+            r"(?:地点|城市|区域|商圈).{0,8}(?:定在|选在|想去|考虑)",
+            normalized,
+        )
+        is not None
     )
 
 
@@ -1237,11 +1307,18 @@ def should_clarify_route(
     text = route.normalized_query
     if (
         route.risk_level != RiskLevel.NORMAL
-        or route_input.forced_task is not None
         or _is_exact_casual_chat(text)
         or route.task_type == TaskType.OUT_OF_SCOPE
         or is_pending_cancellation(text, route_input.pending_task)
     ):
+        return False, None, []
+    if route.date_unresolved_references:
+        return (
+            True,
+            "unresolved_date_plan_reference",
+            route.date_unresolved_references[:3],
+        )
+    if route_input.forced_task is not None:
         return False, None, []
     if (
         route_input.date_task_state is not None
@@ -1929,8 +2006,8 @@ def _looks_like_itinerary_request(text: str) -> bool:
     has_plan_target = (
         re.search(
             r"约会.{0,8}(?:安排|计划|规划|攻略)|"
-            r"(?:安排|计划|规划|制定|生成).{0,8}(?:约会|行程|路线|旅行|旅游|旅程)|"
-            r"(?:一份|一个).{0,6}(?:约会计划|约会安排|行程|路线|攻略|旅行计划)",
+            r"(?:安排|计划|规划|制定|生成).{0,8}(?:约会|行程|日程|路线|旅行|旅游|旅程)|"
+            r"(?:一份|一个).{0,6}(?:约会计划|约会安排|行程|日程|路线|攻略|旅行计划)",
             text,
         )
         is not None
@@ -2423,7 +2500,7 @@ def _looks_like_historical_relationship_report(text: str) -> bool:
 
 
 def _looks_like_date_edit_request(text: str) -> bool:
-    return (
+    return looks_like_date_modification_semantics(text) or (
         re.search(
             r"(?:换一个|换一家|换个|换成|换为|替换|更换|改成|改为|"
             r"增加|添加|再加|加一个|加一家|删掉|删除|去掉|移除|重新规划|调整顺序|"
@@ -2942,6 +3019,15 @@ _EXPLICIT_DATE_PLANNING_MARKERS = (
     "帮我规划",
     "请帮我规划",
     "安排一下行程",
+    "准备一份日程",
+    "准备日程",
+    "日程安排",
+    "日程规划",
+    "约会日程",
+    "当天安排",
+    "一天安排",
+    "当天行程",
+    "行程安排",
     "安排到行程",
     "规划一下",
     "规划一份",
@@ -3023,14 +3109,14 @@ _CONCRETE_DATE_PLANNING_MARKERS = (
 
 _DATE_PLANNING_OPERATION_PATTERN = re.compile(r"安排|规划|推荐|生成|制定|找")
 _DATE_PLANNING_TARGET_PATTERN = re.compile(
-    r"约会|行程|餐厅|饭店|地点|场所|景点|电影院|影院|路线|活动|旅游|旅行|旅程"
+    r"约会|行程|日程|餐厅|饭店|地点|场所|景点|电影院|影院|路线|活动|旅游|旅行|旅程"
 )
 _DATE_PLACE_TARGET_PATTERN = re.compile(
     r"餐厅|饭店|餐馆|菜馆|咖啡馆|咖啡店|地点|场所|景点|博物馆|美术馆|展览|"
     r"电影院|影院|公园|商场"
 )
 _DATE_EXECUTION_TARGET_PATTERN = re.compile(
-    r"约会|行程|路线|攻略|餐厅|饭店|餐馆|菜馆|咖啡馆|地点|场所|景点|博物馆|"
+    r"约会|行程|日程|路线|攻略|餐厅|饭店|餐馆|菜馆|咖啡馆|地点|场所|景点|博物馆|"
     r"美术馆|电影院|影院|活动|旅游|旅行|旅程"
 )
 _DATE_CATEGORY_TARGET_PATTERN = re.compile(

@@ -53,6 +53,15 @@ class DateRequirementProjector:
                     if target_item is not None
                     else operation.payload
                 )
+                if (
+                    inherited.generic_replacement
+                    and inherited.keyword is None
+                    and inherited.place_name is None
+                    and inherited.meal_type is None
+                ):
+                    if index is not None:
+                        projected.pop(index)
+                    continue
                 if index is None:
                     projected = _add_or_merge(projected, inherited)
                 else:

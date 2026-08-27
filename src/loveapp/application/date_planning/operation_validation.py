@@ -55,7 +55,8 @@ class DateOperationVerifier:
         normalized = _normalize(text)
         if (
             operation.source_span is not None
-            and _normalize(operation.source_span) not in normalized
+            and _normalize_source_evidence(operation.source_span)
+            not in _normalize_source_evidence(text)
         ):
             return "source_span_not_in_current_turn"
         if operation.type == DateOperationType.UPDATE_CONSTRAINT:
@@ -199,9 +200,16 @@ def _normalize(value: str) -> str:
     return re.sub(r"\s+", "", unicodedata.normalize("NFKC", value).casefold())
 
 
+def _normalize_source_evidence(value: str) -> str:
+    return re.sub(r"[，,。；;！？!?]+", "", _normalize(value))
+
+
 _REPLAN_CUE = re.compile(r"重新.{0,4}(?:规划|安排)|换一套|全部重排|从头安排|重新来")
 _REMOVE_CUE = re.compile(r"删除|删掉|去掉|移除|取消|不去|不要")
-_REPLACE_CUE = re.compile(r"替换|更换|换成|换为|换一个|换一家|换个|改成|改为")
+_REPLACE_CUE = re.compile(
+    r"替换|更换|换掉|换一下|换一换|换成|换为|换一个|换一家|换个|改成|改为|"
+    r"有没有.{0,8}(?:近一点|近一些|附近|其他|别的)"
+)
 _MOVE_CUE = re.compile(
     r"之前|之后|前|后|上午|中午|下午|晚上|早餐|午饭|午餐|晚饭|晚餐|调整顺序|放到"
 )

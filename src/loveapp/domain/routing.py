@@ -123,11 +123,14 @@ class RouteResult(BaseModel):
     date_operation_rejections: list[str] = Field(default_factory=list, max_length=24)
     date_clause_count: int = Field(default=0, ge=0)
     date_semantic_parse_required: bool = False
+    date_semantic_parse_reason: str | None = None
     date_semantic_llm_used: bool = False
     date_semantic_error: str | None = None
+    date_unresolved_references: list[str] = Field(default_factory=list, max_length=12)
     date_missing_fields: list[str] = Field(default_factory=list, max_length=8)
     source: RouteSource = RouteSource.RULES
     llm_used: bool = False
+    router_llm_used: bool = False
     llm_error: str | None = None
     needs_clarification: bool = False
     evidence_spans: list[str] = Field(default_factory=list, max_length=12)

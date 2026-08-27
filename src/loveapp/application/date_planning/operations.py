@@ -262,6 +262,13 @@ class DateOperationExecutor:
             desired,
             replace_place_name=target.place.name,
         )
+        if desired.generic_replacement:
+            if desired.kind in {StopKind.DINING, StopKind.CAFE}:
+                activity_focus = []
+                dining_focus = None
+            else:
+                activity_focus = None
+                dining_focus = []
         candidate = await self._planner.plan(
             specific_request,
             trace=trace,
@@ -273,6 +280,19 @@ class DateOperationExecutor:
         candidate_ids = {item.place.id for item in candidate.items}
         if target.place.id in candidate_ids:
             return plan, "replacement_not_applied"
+        if desired.generic_replacement:
+            original_ids = {item.place.id for item in plan.items}
+            replacement_items = [
+                item
+                for item in candidate.items
+                if item.place.id not in original_ids
+                and _kind_for_item(item) == desired.kind
+            ]
+            if len(replacement_items) != 1:
+                return plan, "generic_replacement_target_not_unique"
+            desired = desired.model_copy(
+                update={"place_name": replacement_items[0].place.name}
+            )
         return await self._apply_desired_placement(
             original=plan,
             candidate=candidate,
@@ -527,6 +547,15 @@ def _unique_target(
     if len(matches) != 1:
         return None, "operation_target_ambiguous"
     return matches[0], None
+
+
+def _kind_for_item(item: DatePlanItem) -> StopKind:
+    return {
+        PlaceCategory.RESTAURANT: StopKind.DINING,
+        PlaceCategory.CAFE: StopKind.CAFE,
+        PlaceCategory.ATTRACTION: StopKind.ACTIVITY,
+        PlaceCategory.ENTERTAINMENT: StopKind.ACTIVITY,
+    }[item.place.category]
 
 
 def _move_items(

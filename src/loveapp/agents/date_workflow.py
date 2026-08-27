@@ -8,6 +8,7 @@ from loveapp.application.date_planning import (
     DatePlanValidator,
 )
 from loveapp.application.date_planning.plan_diff import DatePlanDiff, diff_date_plans
+from loveapp.application.date_planning.role_completion import complete_date_plan_roles
 from loveapp.application.date_planning.state_projection import (
     DateRequirementProjector,
     desired_stops_for_state,
@@ -65,7 +66,14 @@ class DatePlanningWorkflow:
         trace = trace or ExecutionTrace()
         request = workflow_input.request
         route = workflow_input.route
+        is_new_task = workflow_input.current_task_state is None
         current = workflow_input.current_task_state or _new_date_task_state(request)
+        if is_new_task and route.date_intent == DateTaskIntent.NEW_REQUEST:
+            current = _merge_date_task_state(
+                current,
+                route.date_plan,
+                DatePlanMutation.NONE,
+            )
 
         with trace.measure("date_workflow"):
             if route.date_intent == DateTaskIntent.CANCEL:
@@ -248,6 +256,29 @@ class DatePlanningWorkflow:
                 merged.desired_stops,
                 committed=True,
             )
+            with trace.measure("date_plan_role_completion") as details:
+                completion = complete_date_plan_roles(plan, merged.desired_stops)
+                details.update(
+                    {
+                        "inferred_dinner_items": len(completion.inferred_dinner_item_ids),
+                        "inferred_ids": ",".join(completion.inferred_dinner_item_ids),
+                        "unresolved_roles": len(completion.unresolved_roles),
+                        "unresolved_json": json.dumps(
+                            completion.unresolved_roles,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        "reordered": completion.reordered,
+                    }
+                )
+            if completion.changed:
+                plan = await self._planner.rebuild_plan(
+                    plan,
+                    plan_request,
+                    completion.plan.items,
+                    summary=plan.summary,
+                    trace=trace,
+                )
             constraints = build_date_constraints(
                 plan_request,
                 desired_stops=merged.desired_stops,
@@ -683,7 +714,7 @@ def _record_plan_diff(trace: ExecutionTrace, plan_diff: DatePlanDiff) -> None:
 
 
 def _record_plan_item_roles(trace: ExecutionTrace, plan: DatePlan) -> None:
-    with trace.measure("date_plan_item_role_binding") as details:
+    with trace.measure("date_plan_item_role_summary") as details:
         details.update(
             {
                 "lunch_items": sum(item.meal_type == "lunch" for item in plan.items),

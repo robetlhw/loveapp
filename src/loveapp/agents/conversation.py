@@ -352,6 +352,7 @@ class ConversationAgent:
                     "router_input_tokens": route.router_input_tokens,
                     "router_output_tokens": route.router_output_tokens,
                     "router_duration_ms": route.router_duration_ms,
+                    "router_llm_used": route.router_llm_used,
                     "fallback_reason": route.fallback_reason,
                     "date_patch_fields": (
                         ",".join(route.date_patch.source_by_field)
@@ -382,7 +383,13 @@ class ConversationAgent:
                     {
                         "candidate_count": route.date_operation_candidate_count,
                         "required": route.date_semantic_parse_required,
-                        "llm_used": route.date_semantic_llm_used,
+                        "reason": route.date_semantic_parse_reason,
+                        "date_semantic_llm_used": route.date_semantic_llm_used,
+                        "unresolved_references_json": json.dumps(
+                            route.date_unresolved_references,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
                         "error": route.date_semantic_error,
                     }
                 )

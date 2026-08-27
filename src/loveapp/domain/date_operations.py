@@ -51,6 +51,10 @@ class TemporalAnchor(StrEnum):
     EVENING = "evening"
 
 
+class DateReplacementPreference(StrEnum):
+    NEARBY = "nearby"
+
+
 class TimeWindow(BaseModel):
     start: time | None = None
     end: time | None = None
@@ -96,6 +100,11 @@ class DesiredDateStop(BaseModel):
     keyword: str | None = Field(default=None, min_length=1, max_length=120)
     place_name: str | None = Field(default=None, min_length=1, max_length=200)
     meal_type: MealType | None = None
+    generic_replacement: bool = False
+    replacement_preferences: list[DateReplacementPreference] = Field(
+        default_factory=list,
+        max_length=4,
+    )
     target_day: int | None = Field(default=None, ge=1, le=MAX_TRIP_DAYS)
     time_window: TimeWindow | None = None
     after: TemporalReference | None = None
@@ -103,7 +112,12 @@ class DesiredDateStop(BaseModel):
 
     @model_validator(mode="after")
     def validate_stop(self) -> "DesiredDateStop":
-        if self.keyword is None and self.place_name is None and self.meal_type is None:
+        if (
+            self.keyword is None
+            and self.place_name is None
+            and self.meal_type is None
+            and not self.generic_replacement
+        ):
             raise ValueError("a desired stop requires a keyword, place name, or meal type")
         if self.after is not None and self.before is not None and self.after == self.before:
             raise ValueError("a desired stop cannot be before and after the same anchor")
@@ -130,6 +144,8 @@ class DatePlanOperation(BaseModel):
         elif self.type == DateOperationType.ADD_STOP:
             if self.payload is None:
                 raise ValueError("add-stop operations require a payload")
+            if self.payload.generic_replacement:
+                raise ValueError("generic replacements cannot be used as add-stop payloads")
         elif self.type == DateOperationType.REMOVE_STOP:
             if self.target is None:
                 raise ValueError("remove-stop operations require a target")
@@ -145,3 +161,4 @@ class DatePlanOperation(BaseModel):
 
 class DateSemanticParseResult(BaseModel):
     operations: list[DatePlanOperation] = Field(default_factory=list, max_length=12)
+    unresolved_references: list[str] = Field(default_factory=list, max_length=12)

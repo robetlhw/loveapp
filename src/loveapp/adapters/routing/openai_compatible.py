@@ -462,7 +462,7 @@ These are search constraints, not general preferences. Do not invent a venue nam
 
 _DATE_SEMANTIC_SYSTEM_PROMPT = """
 你只负责把当前一轮复杂的约会行程修改解析成 typed DatePlanOperation[]。
-只输出一个 JSON 对象：{"operations": [...]}。
+只输出一个 JSON 对象：{"operations": [...], "unresolved_references": [...]}。
 
 规则：
 - type 只能是 update_constraint、add_stop、remove_stop、replace_stop、move_stop、replan。
@@ -473,6 +473,10 @@ _DATE_SEMANTIC_SYSTEM_PROMPT = """
   breakfast、lunch、dinner。
 - 每个 clause 独立绑定 meal 和时间语义，后一个 clause 的“晚饭”不能修饰前一个 stop。
 - 对 before/after、序号和 target reference 保留结构化语义。
+- “换个别的”可以输出同类 generic replacement：payload 保留 kind，
+  generic_replacement=true；“近一点”使用 replacement_preferences=["nearby"]。
+- 当前计划中有多个目标都符合“那个餐厅”等引用时，不得猜测；operations 不包含该修改，
+  unresolved_references 列出需要用户区分的地点。
 - 不猜测未出现的地点或时段，不复制历史 operation，不修改任何状态或数据库。
 - deterministic_operations 是已有候选，可以补充或纠正，但最终结果仍会经过 verifier。
 """.strip()
