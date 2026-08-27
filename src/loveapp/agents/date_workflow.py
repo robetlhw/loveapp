@@ -7,8 +7,16 @@ from loveapp.application.date_planning import (
     DatePlanPatchApplier,
     DatePlanValidator,
 )
+from loveapp.application.date_planning.plan_diff import DatePlanDiff, diff_date_plans
+from loveapp.application.date_planning.state_projection import (
+    DateRequirementProjector,
+    desired_stops_for_state,
+    desired_stops_from_legacy,
+    project_requirements_to_state,
+)
 from loveapp.core.timing import ExecutionTrace
 from loveapp.domain.date_constraints import build_date_constraints
+from loveapp.domain.date_operations import DateOperationType, DatePlanOperation, DesiredDateStop
 from loveapp.domain.date_patch import DatePlanPatch
 from loveapp.domain.date_plan import DatePlan, DatePlanRequest
 from loveapp.domain.date_task import DatePlanningTaskState
@@ -39,12 +47,14 @@ class DatePlanningWorkflow:
         validator: DatePlanValidator | None = None,
         patch_applier: DatePlanPatchApplier | None = None,
         operation_executor: DateOperationExecutor | None = None,
+        requirement_projector: DateRequirementProjector | None = None,
     ) -> None:
         self._planner = planner
         self._task_store = task_store
         self._validator = validator or DatePlanValidator()
         self._patch_applier = patch_applier or DatePlanPatchApplier()
         self._operation_executor = operation_executor or DateOperationExecutor(planner)
+        self._requirement_projector = requirement_projector or DateRequirementProjector()
 
     async def run(
         self,
@@ -100,6 +110,14 @@ class DatePlanningWorkflow:
                     )
             else:
                 merged = _merge_date_task_state(current, route.date_plan, route.date_mutation)
+            desired_before = desired_stops_for_state(current)
+            desired_candidate = self._project_turn_requirements(
+                desired_before,
+                current,
+                current_turn_slots,
+                route.date_operations,
+            )
+            merged = project_requirements_to_state(merged, desired_candidate)
             merged = merged.model_copy(
                 update={
                     "status": DatePlanningStatus.COLLECTING,
@@ -108,6 +126,12 @@ class DatePlanningWorkflow:
                 }
             )
             if _should_clarify_date_task(current, merged):
+                _record_requirement_projection(
+                    trace,
+                    desired_before,
+                    merged.desired_stops,
+                    committed=False,
+                )
                 clarified = merged.model_copy(
                     update={
                         "asked_fields": list(
@@ -129,6 +153,12 @@ class DatePlanningWorkflow:
                     plan=draft,
                 )
             if "city" in merged.missing_fields:
+                _record_requirement_projection(
+                    trace,
+                    desired_before,
+                    merged.desired_stops,
+                    committed=False,
+                )
                 saved = await self._save(
                     merged.model_copy(update={"updated_at": utc_now()}),
                     trace,
@@ -151,6 +181,7 @@ class DatePlanningWorkflow:
                 else merged.budget_scope
             )
             plan_request = _build_request(request, merged, current_turn_slots, budget_scope)
+            applied_operations = None
             if route.date_operations:
                 with trace.measure("date_operation_execute") as details:
                     execution = await self._operation_executor.apply(
@@ -161,6 +192,7 @@ class DatePlanningWorkflow:
                         required_mutation=mutation,
                     )
                     plan = execution.plan
+                    applied_operations = execution.applied
                     mutation = execution.effective_mutation
                     details.update(
                         {
@@ -188,18 +220,38 @@ class DatePlanningWorkflow:
                     mutation=mutation,
                     focus_activity_keywords=(
                         current_turn_slots.activity_keywords
-                        if route.date_mutation
-                        in {DatePlanMutation.ADD, DatePlanMutation.REPLACE}
+                        if route.date_mutation in {DatePlanMutation.ADD, DatePlanMutation.REPLACE}
                         else None
                     ),
                     focus_dining_keywords=(
                         current_turn_slots.dining_keywords
-                        if route.date_mutation
-                        in {DatePlanMutation.ADD, DatePlanMutation.REPLACE}
+                        if route.date_mutation in {DatePlanMutation.ADD, DatePlanMutation.REPLACE}
                         else None
                     ),
                 )
-            constraints = build_date_constraints(plan_request)
+            if applied_operations is not None:
+                committed_desired = self._requirement_projector.apply_operations(
+                    desired_before,
+                    applied_operations,
+                    current_plan=current.current_plan,
+                )
+                merged = project_requirements_to_state(merged, committed_desired)
+                plan_request = _build_request(
+                    request,
+                    merged,
+                    current_turn_slots,
+                    budget_scope,
+                )
+            _record_requirement_projection(
+                trace,
+                desired_before,
+                merged.desired_stops,
+                committed=True,
+            )
+            constraints = build_date_constraints(
+                plan_request,
+                desired_stops=merged.desired_stops,
+            )
             with trace.measure("date_plan_validation") as details:
                 validation = self._validator.validate(plan, plan_request, constraints)
                 details["valid"] = validation.valid
@@ -233,6 +285,9 @@ class DatePlanningWorkflow:
                     plan_changed=False,
                 )
             changed = _date_plan_changed(current.current_plan, persisted_plan)
+            plan_diff = diff_date_plans(current.current_plan, persisted_plan)
+            _record_plan_diff(trace, plan_diff)
+            _record_plan_item_roles(trace, persisted_plan)
             planned = merged.model_copy(
                 update={
                     "status": DatePlanningStatus.PLANNED,
@@ -254,12 +309,44 @@ class DatePlanningWorkflow:
             saved = await self._save(planned, trace)
             return DatePlanningWorkflowResult(
                 message=_compose_response(
-                    current=current, mutation=mutation, plan=plan, changed=changed
+                    current=current,
+                    mutation=mutation,
+                    plan=plan,
+                    changed=changed,
+                    plan_diff=plan_diff,
                 ),
                 task_state=saved,
                 plan=plan,
                 plan_changed=changed,
             )
+
+    def _project_turn_requirements(
+        self,
+        desired_before: list[DesiredDateStop],
+        current: DatePlanningTaskState,
+        slots: DatePlanPatch | DatePlanSlots,
+        operations: list[DatePlanOperation],
+    ) -> list[DesiredDateStop]:
+        if operations:
+            return self._requirement_projector.apply_operations(
+                desired_before,
+                operations,
+                current_plan=current.current_plan,
+            )
+        incoming = desired_stops_from_legacy(
+            dining_keywords=slots.dining_keywords,
+            meal_keywords=slots.meal_keywords,
+            activity_keywords=slots.activity_keywords,
+            schedule_hints=slots.schedule_hints,
+            target_day=slots.target_day,
+        )
+        if not incoming:
+            return desired_before
+        return self._requirement_projector.apply_operations(
+            desired_before,
+            [DatePlanOperation(type=DateOperationType.ADD_STOP, payload=stop) for stop in incoming],
+            current_plan=current.current_plan,
+        )
 
     async def _invalid_plan_result(
         self,
@@ -272,6 +359,10 @@ class DatePlanningWorkflow:
         trace: ExecutionTrace,
     ) -> DatePlanningWorkflowResult:
         if _has_executable_plan(current.current_plan):
+            merged = project_requirements_to_state(
+                merged,
+                desired_stops_for_state(current),
+            )
             saved = await self._save(
                 merged.model_copy(
                     update={
@@ -549,14 +640,59 @@ def _patch_fields(patch: DatePlanPatch) -> list[str]:
 
 def _trace_patch_values(value, fields: list[str]) -> str:
     return json.dumps(
-        {
-            field: getattr(value, field, None)
-            for field in fields
-        },
+        {field: getattr(value, field, None) for field in fields},
         ensure_ascii=False,
         default=str,
         separators=(",", ":"),
     )
+
+
+def _record_requirement_projection(
+    trace: ExecutionTrace,
+    before: list[DesiredDateStop],
+    after: list[DesiredDateStop],
+    *,
+    committed: bool,
+) -> None:
+    with trace.measure("date_requirement_projection") as details:
+        details.update(
+            {
+                "desired_stops_before": len(before),
+                "desired_stops_after": len(after),
+                "committed": committed,
+                "desired_stops_json": json.dumps(
+                    [stop.model_dump(mode="json") for stop in after],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            }
+        )
+
+
+def _record_plan_diff(trace: ExecutionTrace, plan_diff: DatePlanDiff) -> None:
+    with trace.measure("date_plan_diff") as details:
+        details.update(
+            {
+                "added": len(plan_diff.added_place_ids),
+                "removed": len(plan_diff.removed_place_ids),
+                "moved": len(plan_diff.moved_place_ids),
+                "unchanged": len(plan_diff.unchanged_place_ids),
+                "diff_json": plan_diff.model_dump_json(),
+            }
+        )
+
+
+def _record_plan_item_roles(trace: ExecutionTrace, plan: DatePlan) -> None:
+    with trace.measure("date_plan_item_role_binding") as details:
+        details.update(
+            {
+                "lunch_items": sum(item.meal_type == "lunch" for item in plan.items),
+                "dinner_items": sum(item.meal_type == "dinner" for item in plan.items),
+                "after_dinner_items": sum(
+                    item.time_label in {"晚饭后", "晚餐后"} for item in plan.items
+                ),
+            }
+        )
 
 
 def _clarification_message(state: DatePlanningTaskState) -> str:
@@ -609,7 +745,12 @@ def _date_plan_signature(plan: DatePlan) -> tuple:
 
 
 def _compose_response(
-    *, current: DatePlanningTaskState, mutation: DatePlanMutation, plan: DatePlan, changed: bool
+    *,
+    current: DatePlanningTaskState,
+    mutation: DatePlanMutation,
+    plan: DatePlan,
+    changed: bool,
+    plan_diff: DatePlanDiff,
 ) -> str:
     if current.current_plan is None:
         return (
@@ -619,8 +760,49 @@ def _compose_response(
         )
     if not changed:
         return "我核对了刚补充的条件，现有行程没有需要替换的节点，因此先保留当前版本。"
+    change_kind_count = sum(
+        bool(place_ids)
+        for place_ids in (
+            plan_diff.added_place_ids,
+            plan_diff.removed_place_ids,
+            plan_diff.moved_place_ids,
+        )
+    )
+    if change_kind_count > 1:
+        added = _plan_place_names(plan, plan_diff.added_place_ids)
+        removed = _plan_place_names(current.current_plan, plan_diff.removed_place_ids)
+        moved = _plan_place_names(plan, plan_diff.moved_place_ids)
+        changes: list[str] = []
+        if added and removed:
+            changes.append(f"将{'、'.join(removed)}替换为{'、'.join(added)}")
+        else:
+            if added:
+                changes.append(f"新增了{'、'.join(added)}")
+            if removed:
+                changes.append(f"移除了{'、'.join(removed)}")
+        if moved:
+            changes.append(f"调整了{'、'.join(moved)}的行程位置")
+        return f"新的要求已生效，行程{'；'.join(changes)}。其他未受影响的节点保持不变。"
+    if plan_diff.added_place_ids and plan_diff.removed_place_ids:
+        removed = _plan_place_names(current.current_plan, plan_diff.removed_place_ids)
+        added = _plan_place_names(plan, plan_diff.added_place_ids)
+        return (
+            "新的约束已生效。行程已将"
+            f"{'、'.join(removed) or '原节点'}替换为{'、'.join(added) or '新节点'}，"
+            "其他未受影响的节点保持不变。"
+        )
     if mutation == DatePlanMutation.ADD:
         return "明白了，我保留上一版行程，并补充了新的约会节点。"
     if mutation == DatePlanMutation.REPLACE:
         return "收到，我保留了没有受到影响的节点，并替换了你指定的部分。"
-    return "收到，我已把新的日期、预算或其他约束纳入核对，并保留原有行程节点。"
+    if plan_diff.moved_place_ids:
+        moved = _plan_place_names(plan, plan_diff.moved_place_ids)
+        return f"收到，我已按新的时段要求调整{'、'.join(moved)}的行程位置。"
+    return "收到，我已把新的日期、预算或其他约束纳入核对；现有地点节点保持不变。"
+
+
+def _plan_place_names(plan: DatePlan | None, place_ids: list[str]) -> list[str]:
+    if plan is None:
+        return []
+    names = {item.place.id: item.place.name for item in plan.items}
+    return [names[place_id] for place_id in place_ids if place_id in names]

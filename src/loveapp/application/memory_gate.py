@@ -8,6 +8,7 @@ from loveapp.application.contextual_memory_updates import (
     may_contain_contextual_memory_update,
     resolve_contextual_memory_update,
 )
+from loveapp.application.date_planning.clause_parsing import split_date_clauses
 from loveapp.application.relationship_events import resolve_contextual_relationship_event
 from loveapp.domain.enums import TaskType
 from loveapp.domain.memory import MemoryGateDecision, MemoryGateReason, MemoryItem, StoredMessage
@@ -33,6 +34,7 @@ class MemoryGate:
         existing_memories = list(existing_memories)
         normalized = _normalize(text)
         compact = _compact(normalized)
+        durable_preference_clause = _durable_preference_clause(normalized)
         if compact in _CASUAL_MESSAGES or any(
             pattern.fullmatch(normalized) for pattern in _CASUAL_PATTERNS
         ):
@@ -51,7 +53,7 @@ class MemoryGate:
                 matched_span=hypothetical.span,
             )
         operation = _first_match(normalized, _OPERATION_PATTERNS, "operation")
-        if operation is not None:
+        if operation is not None and durable_preference_clause is None:
             return _skip(
                 MemoryGateReason.OPERATION,
                 "agent operation",
@@ -329,7 +331,11 @@ def _task_local_date_constraint(
     text: str,
     active_task: TaskType | None,
 ) -> str | None:
-    if active_task != TaskType.DATE_PLANNING or _has_durable_preference_scope(text):
+    if (
+        active_task != TaskType.DATE_PLANNING
+        or _has_durable_preference_scope(text)
+        or _durable_preference_clause(text) is not None
+    ):
         return None
     match = _DATE_TASK_LOCAL_PATTERN.search(text)
     return match.group(0) if match is not None else None
@@ -337,6 +343,14 @@ def _task_local_date_constraint(
 
 def _has_durable_preference_scope(text: str) -> bool:
     return _DATE_DURABLE_SCOPE_PATTERN.search(text) is not None
+
+
+def _durable_preference_clause(text: str) -> str | None:
+    preference_patterns = _DURABLE_SIGNAL_PATTERNS["preference"]
+    for clause in split_date_clauses(text):
+        if any(pattern.search(clause.text) for pattern in preference_patterns):
+            return clause.text
+    return None
 
 
 _CASUAL_MESSAGES = {
@@ -388,9 +402,7 @@ _EXPLICIT_REMEMBER_PATTERNS = (
     re.compile(r"记一下[：:]?"),
 )
 
-_DATE_DURABLE_SCOPE_PATTERN = re.compile(
-    r"以后|长期|一贯|平时|通常|一般|每次|每回|一直|总是|从来"
-)
+_DATE_DURABLE_SCOPE_PATTERN = re.compile(r"以后|长期|一贯|平时|通常|一般|每次|每回|一直|总是|从来")
 _DATE_TASK_LOCAL_PATTERN = re.compile(
     r"(?:这次|本次|这回|当前|今天|明天|后天|周末|下周)?.{0,10}"
     r"(?:总?预算|\d{2,6}\s*(?:元|块)|城市|区域|商圈|日期|时间|"

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from loveapp.domain.date_operations import DateOperationType, DatePlanOperation, StopReference
 from loveapp.domain.date_patch import DatePlanPatch
+from loveapp.domain.enums import PlaceCategory
 from loveapp.domain.runtime_context import RuntimeContext
 
 
@@ -100,14 +101,17 @@ def _reference_has_evidence(
     text: str,
     runtime_context: RuntimeContext | None,
 ) -> bool:
+    reference_scope = _reference_scope(text)
     for value in (reference.place_name, reference.keyword):
-        if value is not None and _text_supports_value(value, text):
+        if value is not None and _text_supports_value(value, reference_scope):
             return True
-    if reference.meal_type is not None and _MEAL_TEXT[reference.meal_type.value].search(text):
+    if reference.meal_type is not None and _MEAL_TEXT[reference.meal_type.value].search(
+        reference_scope
+    ):
         return True
     if reference.ordinal is not None and re.search(
         rf"第\s*(?:{reference.ordinal}|{_CHINESE_ORDINALS.get(reference.ordinal, '')})\s*个",
-        text,
+        reference_scope,
     ):
         return True
     plan = (
@@ -136,13 +140,33 @@ def _reference_has_evidence(
             )
         )
     ]
+    category_matches = _generic_category_matches(reference_scope, plan.items)
+    if len(category_matches) == 1 and category_matches[0] in matches:
+        return True
     has_contextual_reference = bool(
         re.search(
             r"那个|这个|该|原来的|原先的|之前的|第\s*[一二三四五六七八九十\d]+\s*个",
-            text,
+            reference_scope,
         )
     )
     return len(matches) == 1 and has_contextual_reference
+
+
+def _reference_scope(text: str) -> str:
+    return _REPLACE_CUE.split(text, maxsplit=1)[0]
+
+
+def _generic_category_matches(text: str, items: list) -> list:
+    categories: set[PlaceCategory] = set()
+    if re.search(r"餐厅|饭店|用餐", text):
+        categories.add(PlaceCategory.RESTAURANT)
+    if re.search(r"咖啡馆|咖啡店", text):
+        categories.add(PlaceCategory.CAFE)
+    if "景点" in text:
+        categories.add(PlaceCategory.ATTRACTION)
+    if "活动" in text:
+        categories.update({PlaceCategory.ATTRACTION, PlaceCategory.ENTERTAINMENT})
+    return [item for item in items if item.place.category in categories]
 
 
 def _item_supports_keyword(item, keyword: str) -> bool:

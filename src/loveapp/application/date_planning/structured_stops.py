@@ -169,7 +169,10 @@ def _time_window_satisfied(
     plan: DatePlan,
 ) -> bool:
     if window.start is not None or window.end is not None:
-        return False
+        expected = window.label or (
+            window.start.strftime("%H:%M") if window.start is not None else None
+        )
+        return expected is not None and _normalize(expected) == _normalize(item.time_label or "")
     label = _normalize(window.label or "")
     if label in {_normalize("晚饭后"), _normalize("晚餐后")}:
         dinner_order = _meal_anchor_order(plan, item.day_index, MealType.DINNER)
@@ -212,11 +215,7 @@ def _anchor_order(
         TemporalAnchor.DINNER: MealType.DINNER,
         TemporalAnchor.AFTER_DINNER: MealType.DINNER,
     }.get(anchor)
-    return (
-        _meal_anchor_order(plan, day_index, meal_type)
-        if meal_type is not None
-        else None
-    )
+    return _meal_anchor_order(plan, day_index, meal_type) if meal_type is not None else None
 
 
 def _meal_anchor_order(

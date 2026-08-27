@@ -3,6 +3,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+from loveapp.domain.date_operations import DesiredDateStop
 from loveapp.domain.date_plan import MAX_TRIP_DAYS, DatePlan
 from loveapp.domain.enums import (
     BudgetScope,
@@ -43,6 +44,7 @@ class DatePlanningTaskState(BaseModel):
     meal_keywords: dict[str, list[str]] = Field(default_factory=dict)
     activity_keywords: list[str] = Field(default_factory=list, max_length=8)
     schedule_hints: list[str] = Field(default_factory=list, max_length=8)
+    desired_stops: list[DesiredDateStop] = Field(default_factory=list, max_length=16)
     excluded_keywords: list[str] = Field(default_factory=list, max_length=8)
     transport_mode: TransportMode | None = None
     notes: list[str] = Field(default_factory=list)

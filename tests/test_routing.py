@@ -70,9 +70,7 @@ def test_rule_router_keeps_primary_and_secondary_advice_intents() -> None:
 
 def test_rule_router_orders_compound_request_with_direct_first_clause() -> None:
     result = route_by_rules(
-        RouteInput(
-            latest_query="先分析她最近为什么冷淡，再帮我推荐一家适合约会的餐厅。"
-        )
+        RouteInput(latest_query="先分析她最近为什么冷淡，再帮我推荐一家适合约会的餐厅。")
     )
 
     assert result.task_type == TaskType.RELATIONSHIP_ADVICE
@@ -105,9 +103,7 @@ def test_scenario_router_recognizes_common_conflict_word_forms(query: str) -> No
 
 
 def test_scenario_router_respects_negated_conflict_word_form() -> None:
-    result = route_by_rules(
-        RouteInput(latest_query="我们没有大吵一架，只是对安排有不同意见。")
-    )
+    result = route_by_rules(RouteInput(latest_query="我们没有大吵一架，只是对安排有不同意见。"))
 
     assert AdviceScenario.CONFLICT not in result.scenario_scores
 
@@ -263,9 +259,7 @@ def test_greeting_does_not_hide_relationship_request() -> None:
 
 def test_rule_router_recognizes_composed_initiation_goal() -> None:
     result = route_by_rules(
-        RouteInput(
-            latest_query="我和班上的女生接触很少，怎么创造聊天搭话的机会？"
-        )
+        RouteInput(latest_query="我和班上的女生接触很少，怎么创造聊天搭话的机会？")
     )
 
     assert result.primary_goal == AdviceGoal.INITIATE
@@ -284,9 +278,7 @@ def test_rule_router_recognizes_inexperience_as_initiation_goal() -> None:
 
 def test_rule_router_treats_date_action_evaluation_as_relationship_advice() -> None:
     result = route_by_rules(
-        RouteInput(
-            latest_query="行，那我打算约她出来看个电影，吃顿饭，逛个街，你看怎么样。"
-        )
+        RouteInput(latest_query="行，那我打算约她出来看个电影，吃顿饭，逛个街，你看怎么样。")
     )
 
     assert result.task_type == TaskType.RELATIONSHIP_ADVICE
@@ -537,11 +529,10 @@ def test_relationship_clarification_answer_is_not_a_date_supplement() -> None:
                     conversation_id="c1",
                     role=MessageRole.ASSISTANT,
                     content=(
-                        "海洋馆作为约会地点本身没有问题。"
-                        "待确认：她之前有没有主动约你单独出去玩过？"
+                        "海洋馆作为约会地点本身没有问题。待确认：她之前有没有主动约你单独出去玩过？"
                     ),
                     created_at=now,
-                )
+                ),
             ],
             active_task=TaskType.DATE_PLANNING,
             date_task_state=state,
@@ -728,17 +719,11 @@ async def test_date_slot_authorization_hides_metadata_for_non_date_workflows(
             task_confidence=0.95,
             primary_scenario=expected_scenario,
             scenario_confidence=0.9,
-            date_plan=(
-                {"city": "杭州"}
-                if query.startswith("她说下周工作特别忙")
-                else {}
-            ),
+            date_plan=({"city": "杭州"} if query.startswith("她说下周工作特别忙") else {}),
         )
     )
 
-    result = await HybridRouter(SafetyPolicy(), corrector).route(
-        RouteInput(latest_query=query)
-    )
+    result = await HybridRouter(SafetyPolicy(), corrector).route(RouteInput(latest_query=query))
 
     assert detected_slots.date is not None
     assert corrector.calls == expected_corrector_calls
@@ -827,9 +812,7 @@ async def test_date_slot_authorization_keeps_metadata_for_secondary_date_task() 
         )
     )
 
-    result = await HybridRouter(SafetyPolicy(), corrector).route(
-        RouteInput(latest_query=query)
-    )
+    result = await HybridRouter(SafetyPolicy(), corrector).route(RouteInput(latest_query=query))
 
     assert corrector.calls == 1
     assert result.task_type == TaskType.RELATIONSHIP_ADVICE
@@ -956,9 +939,7 @@ def test_rule_router_extracts_date_slots() -> None:
 
 def test_rule_router_extracts_exact_place_search_keywords() -> None:
     result = route_by_rules(
-        RouteInput(
-            latest_query="帮我安排约会，地点定在上海静安区，晚饭想吃西餐，也想去博物馆。"
-        )
+        RouteInput(latest_query="帮我安排约会，地点定在上海静安区，晚饭想吃西餐，也想去博物馆。")
     )
 
     assert result.task_type == TaskType.DATE_PLANNING
@@ -970,9 +951,7 @@ def test_rule_router_extracts_exact_place_search_keywords() -> None:
 
 
 def test_rule_router_extracts_explicit_place_exclusion() -> None:
-    result = route_by_rules(
-        RouteInput(latest_query="在上海约会，晚饭不要火锅，想去博物馆。")
-    )
+    result = route_by_rules(RouteInput(latest_query="在上海约会，晚饭不要火锅，想去博物馆。"))
 
     assert result.date_plan.excluded_keywords == ["火锅"]
     assert result.date_plan.activity_keywords == ["博物馆"]
@@ -1049,8 +1028,7 @@ def test_date_slots_preserve_meal_roles_and_relative_timing() -> None:
     slots = extract_date_plan_slots(
         RouteInput(
             latest_query=(
-                "对了，下午准备去看场电影，同时晚饭吃火锅（日料是午餐），"
-                "看完电影想去个景点逛逛"
+                "对了，下午准备去看场电影，同时晚饭吃火锅（日料是午餐），看完电影想去个景点逛逛"
             )
         )
     )
@@ -1074,8 +1052,7 @@ def test_date_slots_extract_named_replacement_and_brand_meals() -> None:
     result = route_by_rules(
         RouteInput(
             latest_query=(
-                "我想晚上吃海底捞，中午吃韩国料理，然后下午不去 "
-                "辅德里公园，换一个博物馆"
+                "我想晚上吃海底捞，中午吃韩国料理，然后下午不去 辅德里公园，换一个博物馆"
             ),
             date_task_state=state,
         )
@@ -1091,7 +1068,7 @@ def test_date_slots_extract_named_replacement_and_brand_meals() -> None:
     }
     assert result.date_plan.activity_keywords == ["博物馆"]
     assert result.date_plan.replace_place_names == ["辅德里公园"]
-    assert result.date_plan.excluded_keywords == ["辅德里公园"]
+    assert result.date_plan.excluded_keywords == []
 
 
 def test_llm_constraint_correction_cannot_erase_implicit_addition() -> None:
@@ -1150,10 +1127,7 @@ def test_llm_constraint_correction_cannot_erase_implicit_addition() -> None:
         plan_version=1,
     )
     route_input = RouteInput(
-        latest_query=(
-            "下午准备去看电影，晚饭吃火锅，日料是午餐，"
-            "看完电影想去个景点逛逛"
-        ),
+        latest_query=("下午准备去看电影，晚饭吃火锅，日料是午餐，看完电影想去个景点逛逛"),
         date_task_state=state,
     )
     rules = route_by_rules(route_input)
@@ -1228,10 +1202,7 @@ async def test_hybrid_router_preserves_explicit_compound_task_order() -> None:
         "请你先判断她是不是对我有好感，然后安排周末约会。",
         "请你帮我先判断她是不是对我有好感，然后安排周末约会。",
         "我想先判断她是不是对我有好感，再帮我安排周末约会。",
-        (
-            "帮我先分析她最近为什么冷淡，她不理我，我们还吵架了，"
-            "再帮我推荐一家适合约会的餐厅。"
-        ),
+        ("帮我先分析她最近为什么冷淡，她不理我，我们还吵架了，再帮我推荐一家适合约会的餐厅。"),
     ),
 )
 async def test_hybrid_router_preserves_prefixed_explicit_compound_task_order(
@@ -1247,9 +1218,7 @@ async def test_hybrid_router_preserves_prefixed_explicit_compound_task_order(
         )
     )
 
-    result = await HybridRouter(SafetyPolicy(), corrector).route(
-        RouteInput(latest_query=query)
-    )
+    result = await HybridRouter(SafetyPolicy(), corrector).route(RouteInput(latest_query=query))
 
     assert result.task_type == TaskType.RELATIONSHIP_ADVICE
     assert result.secondary_tasks == [TaskType.DATE_PLANNING]
@@ -1271,9 +1240,7 @@ async def test_hybrid_router_rejects_llm_date_planning_for_relationship_actions(
             )
         )
 
-        result = await HybridRouter(SafetyPolicy(), corrector).route(
-            RouteInput(latest_query=query)
-        )
+        result = await HybridRouter(SafetyPolicy(), corrector).route(RouteInput(latest_query=query))
 
         assert result.task_type == TaskType.RELATIONSHIP_ADVICE
         assert result.llm_task_type == TaskType.DATE_PLANNING
@@ -1532,9 +1499,7 @@ def test_clarification_repeat_uses_the_configured_threshold() -> None:
 
 def test_rule_router_distinguishes_out_of_scope_from_relationship_context() -> None:
     out_of_scope = route_by_rules(RouteInput(latest_query="帮我写一个 Python 爬虫"))
-    relationship = route_by_rules(
-        RouteInput(latest_query="我和她因为我总写代码吵架了怎么办？")
-    )
+    relationship = route_by_rules(RouteInput(latest_query="我和她因为我总写代码吵架了怎么办？"))
 
     assert out_of_scope.task_type == TaskType.OUT_OF_SCOPE
     assert relationship.task_type == TaskType.RELATIONSHIP_ADVICE

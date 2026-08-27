@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Protocol
 
+from loveapp.application.date_planning.state_projection import inherit_desired_stop_role
 from loveapp.application.date_planning.structured_stops import (
     has_placement_requirement,
     item_matches_reference,
@@ -200,10 +201,7 @@ class DateOperationExecutor:
             if len(matches) != 1:
                 rejected.append(RejectedDatePlanOperation(operation, "stop_not_added"))
                 continue
-            if (
-                has_placement_requirement(operation.payload)
-                and not matches[0].placement_satisfied
-            ):
+            if has_placement_requirement(operation.payload) and not matches[0].placement_satisfied:
                 move = DatePlanOperation(
                     type=DateOperationType.MOVE_STOP,
                     target=StopReference(place_id=matches[0].item.place.id),
@@ -258,6 +256,7 @@ class DateOperationExecutor:
         desired = operation.payload
         if desired is None:  # model validation protects this boundary
             return plan, "replacement_payload_missing"
+        desired = inherit_desired_stop_role(desired, target)
         specific_request, activity_focus, dining_focus = _request_for_stop(
             request,
             desired,
@@ -334,7 +333,10 @@ class DateOperationExecutor:
             matches = list(match_desired_stop(candidate, desired))
         if len(matches) != 1:
             return original, "placement_target_not_unique"
-        if matches[0].placement_satisfied:
+        if matches[0].placement_satisfied and _placement_role_is_materialized(
+            matches[0].item,
+            desired,
+        ):
             return candidate, None
         move = DatePlanOperation(
             type=DateOperationType.MOVE_STOP,
@@ -448,14 +450,10 @@ def _request_for_stop(
     if value is not None:
         if desired.kind in {StopKind.DINING, StopKind.CAFE}:
             dining_focus = [value]
-            updates["dining_keywords"] = list(
-                dict.fromkeys([*request.dining_keywords, value])
-            )
+            updates["dining_keywords"] = list(dict.fromkeys([*request.dining_keywords, value]))
         else:
             activity_focus = [value]
-            updates["activity_keywords"] = list(
-                dict.fromkeys([*request.activity_keywords, value])
-            )
+            updates["activity_keywords"] = list(dict.fromkeys([*request.activity_keywords, value]))
     if desired.meal_type is not None and value is not None:
         meal_keywords = {
             meal: [keyword for keyword in keywords if keyword != value]
@@ -468,9 +466,7 @@ def _request_for_stop(
         updates["meal_keywords"] = meal_keywords
     hints = _placement_hints(desired)
     if hints:
-        updates["schedule_hints"] = list(
-            dict.fromkeys([*request.schedule_hints, *hints])
-        )[:8]
+        updates["schedule_hints"] = list(dict.fromkeys([*request.schedule_hints, *hints]))[:8]
     if desired.target_day is not None:
         updates["target_day"] = desired.target_day
     if replace_place_name is not None:
@@ -508,9 +504,7 @@ def _unique_target(
     ordered = sorted(plan.items, key=lambda item: (item.day_index, item.order))
     if reference.ordinal is not None:
         ordinal_match = (
-            [ordered[reference.ordinal - 1]]
-            if reference.ordinal <= len(ordered)
-            else []
+            [ordered[reference.ordinal - 1]] if reference.ordinal <= len(ordered) else []
         )
         has_other_identity = any(
             value is not None
@@ -522,18 +516,12 @@ def _unique_target(
             )
         )
         matches = (
-            [
-                item
-                for item in ordinal_match
-                if item_matches_reference(item, reference)
-            ]
+            [item for item in ordinal_match if item_matches_reference(item, reference)]
             if has_other_identity
             else ordinal_match
         )
     else:
-        matches = [
-            item for item in ordered if item_matches_reference(item, reference)
-        ]
+        matches = [item for item in ordered if item_matches_reference(item, reference)]
     if not matches:
         return None, "operation_target_not_found"
     if len(matches) != 1:
@@ -551,9 +539,7 @@ def _move_items(
         update={
             "day_index": target_day,
             "meal_type": (
-                desired.meal_type.value
-                if desired.meal_type is not None
-                else target.meal_type
+                desired.meal_type.value if desired.meal_type is not None else target.meal_type
             ),
             "time_label": _desired_time_label(desired) or target.time_label,
             "after_item": None,
@@ -590,8 +576,7 @@ def _move_items(
         index = _ranked_insert_index(day_items, desired)
     day_items.insert(index, moved)
     day_items = [
-        item.model_copy(update={"order": order})
-        for order, item in enumerate(day_items, start=1)
+        item.model_copy(update={"order": order}) for order, item in enumerate(day_items, start=1)
     ]
 
     by_day: dict[int, list[DatePlanItem]] = {}
@@ -636,11 +621,7 @@ def _ranked_insert_index(
 ) -> int:
     desired_rank = _desired_rank(desired)
     return next(
-        (
-            index
-            for index, item in enumerate(items)
-            if _item_rank(item) > desired_rank
-        ),
+        (index for index, item in enumerate(items) if _item_rank(item) > desired_rank),
         len(items),
     )
 
@@ -659,7 +640,10 @@ def _desired_rank(desired: DesiredDateStop) -> int:
         return 30
     if label and ("晚饭后" in label or "晚餐后" in label or "晚上" in label):
         return 60
-    if desired.after in {TemporalAnchor.DINNER, TemporalAnchor.AFTER_DINNER}:
+    if isinstance(desired.after, TemporalAnchor) and desired.after in {
+        TemporalAnchor.DINNER,
+        TemporalAnchor.AFTER_DINNER,
+    }:
         return 60
     return 30
 
@@ -689,9 +673,40 @@ def _desired_time_label(desired: DesiredDateStop) -> str | None:
             MealType.LUNCH: "午餐",
             MealType.DINNER: "晚餐",
         }[desired.meal_type]
-    if desired.after in {TemporalAnchor.DINNER, TemporalAnchor.AFTER_DINNER}:
+    if isinstance(desired.after, TemporalAnchor) and desired.after in {
+        TemporalAnchor.DINNER,
+        TemporalAnchor.AFTER_DINNER,
+    }:
         return "晚饭后"
     return None
+
+
+def _placement_role_is_materialized(
+    item: DatePlanItem,
+    desired: DesiredDateStop,
+) -> bool:
+    if (
+        desired.time_window is not None
+        and desired.time_window.label is not None
+        and item.time_label != desired.time_window.label
+    ):
+        return False
+    if isinstance(desired.after, StopReference):
+        expected = desired.after.keyword or desired.after.place_name
+        actual = item.after_item
+        if expected is None or actual is None:
+            return False
+        normalized_expected = "".join(expected.casefold().split())
+        normalized_actual = "".join(actual.casefold().split())
+        if (
+            normalized_expected not in normalized_actual
+            and normalized_actual not in normalized_expected
+        ):
+            return False
+    elif desired.after in {TemporalAnchor.DINNER, TemporalAnchor.AFTER_DINNER}:
+        if item.time_label not in {"晚饭后", "晚餐后"}:
+            return False
+    return True
 
 
 def _renumber_items(items: list[DatePlanItem]) -> list[DatePlanItem]:

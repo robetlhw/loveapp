@@ -5,9 +5,13 @@ from typing import Any, Literal
 from openai import AsyncOpenAI
 from pydantic import SecretStr, ValidationError
 
-from loveapp.domain.date_operations import DatePlanOperation
+from loveapp.domain.date_operations import (
+    DatePlanOperation,
+    DateSemanticParseResult,
+)
 from loveapp.domain.date_patch import DatePlanPatch
 from loveapp.domain.routing import DatePlanSlots, RouteCorrection, RouteInput, RouteResult
+from loveapp.domain.runtime_context import RuntimeContext
 
 
 class OpenAICompatibleRouteCorrector:
@@ -28,6 +32,7 @@ class OpenAICompatibleRouteCorrector:
         self._thinking = thinking
         self._prompt_version = prompt_version
         self.last_telemetry: dict[str, Any] = {}
+        self.last_semantic_telemetry: dict[str, Any] = {}
         self._client = AsyncOpenAI(
             api_key=api_key.get_secret_value(),
             base_url=base_url,
@@ -115,6 +120,60 @@ class OpenAICompatibleRouteCorrector:
     async def aclose(self) -> None:
         await self._client.close()
 
+    async def parse_date_operations(
+        self,
+        text: str,
+        runtime_context: RuntimeContext | None,
+        deterministic_operations: tuple[DatePlanOperation, ...],
+    ) -> DateSemanticParseResult:
+        """Parse only typed DatePlan operations, independently of task routing."""
+
+        started = perf_counter()
+        self.last_semantic_telemetry = {
+            "model": self._model,
+            "input_tokens": None,
+            "output_tokens": None,
+            "duration_ms": None,
+        }
+        payload = {
+            "latest_query": text,
+            "runtime_context": (
+                runtime_context.model_dump(mode="json") if runtime_context is not None else None
+            ),
+            "deterministic_operations": [
+                operation.model_dump(mode="json") for operation in deterministic_operations
+            ],
+        }
+        request_kwargs = {
+            "model": self._model,
+            "messages": [
+                {"role": "system", "content": _DATE_SEMANTIC_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": json.dumps(payload, ensure_ascii=False),
+                },
+            ],
+            "response_format": {"type": "json_object"},
+            "temperature": 0,
+            "max_tokens": self._max_tokens,
+        }
+        if self._thinking is not None:
+            request_kwargs["extra_body"] = {"thinking": {"type": self._thinking}}
+        completion = await self._client.chat.completions.create(**request_kwargs)
+        usage = getattr(completion, "usage", None)
+        self.last_semantic_telemetry.update(
+            {
+                "input_tokens": getattr(usage, "prompt_tokens", None),
+                "output_tokens": getattr(usage, "completion_tokens", None),
+                "duration_ms": round((perf_counter() - started) * 1000, 3),
+            }
+        )
+        choice = completion.choices[0]
+        return _parse_date_semantic_response(
+            choice.message.content,
+            choice.finish_reason,
+        )
+
 
 def _accumulate_token_count(
     total: object,
@@ -161,16 +220,13 @@ def _build_prompt(route_input: RouteInput, rule_result: RouteResult) -> str:
             "scenario_confidence": rule_result.scenario_confidence,
             "date_plan": rule_result.date_plan.model_dump(mode="json"),
             "date_patch": (
-                rule_result.date_patch.model_dump(mode="json")
-                if rule_result.date_patch
-                else None
+                rule_result.date_patch.model_dump(mode="json") if rule_result.date_patch else None
             ),
             "date_request_mode": rule_result.date_request_mode.value,
             "date_intent": rule_result.date_intent.value,
             "date_mutation": rule_result.date_mutation.value,
             "date_operations": [
-                operation.model_dump(mode="json")
-                for operation in rule_result.date_operations
+                operation.model_dump(mode="json") for operation in rule_result.date_operations
             ],
             "date_missing_fields": rule_result.date_missing_fields,
         },
@@ -181,6 +237,23 @@ def _build_prompt(route_input: RouteInput, rule_result: RouteResult) -> str:
 def _parse_response(content: str | None, finish_reason: str | None) -> RouteCorrection:
     correction, _ = _parse_response_with_slot_rejections(content, finish_reason)
     return correction
+
+
+def _parse_date_semantic_response(
+    content: str | None,
+    finish_reason: str | None,
+) -> DateSemanticParseResult:
+    if not content:
+        raise ValueError(f"日期语义模型没有返回正文，finish_reason={finish_reason or 'unknown'}。")
+    cleaned = content.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        cleaned = "\n".join(lines[1:-1])
+    try:
+        payload = json.loads(cleaned)
+        return DateSemanticParseResult.model_validate(payload)
+    except (ValidationError, json.JSONDecodeError) as exc:
+        raise ValueError("日期语义模型返回内容不符合 typed operation 结构。") from exc
 
 
 def _parse_response_with_slot_rejections(
@@ -384,4 +457,22 @@ These are search constraints, not general preferences. Do not invent a venue nam
   "看完电影后"; do not infer an exact clock time.
 - replace_place_names: exact existing place names that the user explicitly
   wants removed or replaced, such as 辅德里公园 in "不去辅德里公园，换一个博物馆".
+""".strip()
+
+
+_DATE_SEMANTIC_SYSTEM_PROMPT = """
+你只负责把当前一轮复杂的约会行程修改解析成 typed DatePlanOperation[]。
+只输出一个 JSON 对象：{"operations": [...]}。
+
+规则：
+- type 只能是 update_constraint、add_stop、remove_stop、replace_stop、move_stop、replan。
+- constraint 只能进入 constraint_field/constraint_value，不能成为 StopReference。
+- replacement target 与 user exclusion 是不同概念；不要把 target 写成 exclusion。
+- 每个 operation 的 source_span 必须逐字来自 latest_query。
+- payload.kind 只能是 dining、activity、cafe、other；meal_type 只能是
+  breakfast、lunch、dinner。
+- 每个 clause 独立绑定 meal 和时间语义，后一个 clause 的“晚饭”不能修饰前一个 stop。
+- 对 before/after、序号和 target reference 保留结构化语义。
+- 不猜测未出现的地点或时段，不复制历史 operation，不修改任何状态或数据库。
+- deterministic_operations 是已有候选，可以补充或纠正，但最终结果仍会经过 verifier。
 """.strip()

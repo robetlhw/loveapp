@@ -3,6 +3,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from loveapp.domain.date_operations import DesiredDateStop, StopKind
 from loveapp.domain.date_plan import DatePlanRequest
 
 
@@ -39,7 +40,11 @@ class DateConstraint(BaseModel):
     weight: float = Field(default=1.0, ge=0)
 
 
-def build_date_constraints(request: DatePlanRequest) -> list[DateConstraint]:
+def build_date_constraints(
+    request: DatePlanRequest,
+    *,
+    desired_stops: list[DesiredDateStop] | None = None,
+) -> list[DateConstraint]:
     """Translate the stable request contract into explicit validation inputs."""
 
     constraints = [
@@ -54,24 +59,39 @@ def build_date_constraints(request: DatePlanRequest) -> list[DateConstraint]:
             ),
         )
     ]
-    constraints.extend(
-        DateConstraint(
-            kind=DateConstraintKind.ACTIVITY,
-            strength=ConstraintStrength.REQUIRED,
-            value=keyword,
-            source=ConstraintSource.USER_EXPLICIT,
+    if desired_stops is None:
+        constraints.extend(
+            DateConstraint(
+                kind=DateConstraintKind.ACTIVITY,
+                strength=ConstraintStrength.REQUIRED,
+                value=keyword,
+                source=ConstraintSource.USER_EXPLICIT,
+            )
+            for keyword in request.activity_keywords
         )
-        for keyword in request.activity_keywords
-    )
-    constraints.extend(
-        DateConstraint(
-            kind=DateConstraintKind.DINING,
-            strength=ConstraintStrength.REQUIRED,
-            value=keyword,
-            source=ConstraintSource.USER_EXPLICIT,
+        constraints.extend(
+            DateConstraint(
+                kind=DateConstraintKind.DINING,
+                strength=ConstraintStrength.REQUIRED,
+                value=keyword,
+                source=ConstraintSource.USER_EXPLICIT,
+            )
+            for keyword in request.dining_keywords
         )
-        for keyword in request.dining_keywords
-    )
+    else:
+        constraints.extend(
+            DateConstraint(
+                kind=(
+                    DateConstraintKind.DINING
+                    if stop.kind in {StopKind.DINING, StopKind.CAFE}
+                    else DateConstraintKind.ACTIVITY
+                ),
+                strength=ConstraintStrength.REQUIRED,
+                value=stop,
+                source=ConstraintSource.USER_EXPLICIT,
+            )
+            for stop in desired_stops
+        )
     constraints.extend(
         DateConstraint(
             kind=DateConstraintKind.EXCLUSION,

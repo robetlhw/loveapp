@@ -121,6 +121,10 @@ class RouteResult(BaseModel):
     date_operations: list[DatePlanOperation] = Field(default_factory=list, max_length=12)
     date_operation_candidate_count: int = Field(default=0, ge=0)
     date_operation_rejections: list[str] = Field(default_factory=list, max_length=24)
+    date_clause_count: int = Field(default=0, ge=0)
+    date_semantic_parse_required: bool = False
+    date_semantic_llm_used: bool = False
+    date_semantic_error: str | None = None
     date_missing_fields: list[str] = Field(default_factory=list, max_length=8)
     source: RouteSource = RouteSource.RULES
     llm_used: bool = False

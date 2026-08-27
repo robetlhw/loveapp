@@ -5,11 +5,15 @@ from datetime import timedelta
 from time import perf_counter
 
 from loveapp.application.conversation_flow import is_pending_cancellation
+from loveapp.application.date_planning.clause_parsing import split_date_clauses
 from loveapp.application.date_planning.fact_parsing import (
     DateFactParser,
     extract_requested_day_count,
 )
-from loveapp.application.date_planning.operation_resolution import DateOperationResolver
+from loveapp.application.date_planning.operation_resolution import (
+    DateOperationResolver,
+    requires_date_semantic_parse,
+)
 from loveapp.application.route_slot_validation import (
     SlotValidationResult,
     merge_current_turn_slot_sources,
@@ -33,6 +37,7 @@ from loveapp.domain.enums import (
 )
 from loveapp.domain.memory import MessageRole
 from loveapp.domain.routing import DatePlanSlots, RouteCorrection, RouteInput, RouteResult
+from loveapp.ports.date_semantics import DateSemanticParser
 from loveapp.ports.routing import RouteCorrector
 from loveapp.safety import SafetyPolicy
 
@@ -50,6 +55,7 @@ class HybridRouter:
         ambiguity_margin: float = 0.16,
         clarification_threshold: float = 0.68,
         prompt_version: str = "routing-v3.0",
+        date_semantic_parser: DateSemanticParser | None = None,
     ) -> None:
         self._safety_policy = safety_policy
         self._corrector = corrector
@@ -57,6 +63,9 @@ class HybridRouter:
         self._ambiguity_margin = ambiguity_margin
         self._clarification_threshold = clarification_threshold
         self._prompt_version = prompt_version
+        self._date_semantic_parser = date_semantic_parser or (
+            corrector if hasattr(corrector, "parse_date_operations") else None
+        )
 
     async def route(self, route_input: RouteInput) -> RouteResult:
         normalized = normalize_route_text(route_input.latest_query)
@@ -76,15 +85,15 @@ class HybridRouter:
             }
         )
         if safety.risk_level != RiskLevel.NORMAL or self._corrector is None:
-            return self._finalize_route_metadata(route_input, result)
+            return await self._finalize_route(route_input, result)
         # Exact casual messages are a deterministic fast path.  This guard is
         # intentionally after the safety scan so a safety rule always wins.
         if _is_exact_casual_chat(normalized):
-            return self._finalize_route_metadata(route_input, result)
+            return await self._finalize_route(route_input, result)
         if _is_clear_out_of_scope(result):
-            return self._finalize_route_metadata(route_input, result)
+            return await self._finalize_route(route_input, result)
         if not self._needs_llm_correction(route_input, result):
-            return self._finalize_route_metadata(route_input, result)
+            return await self._finalize_route(route_input, result)
 
         started = perf_counter()
         try:
@@ -94,7 +103,7 @@ class HybridRouter:
             duration_ms = telemetry.get("duration_ms")
             if not isinstance(duration_ms, (int, float)) or duration_ms < 0:
                 duration_ms = round((perf_counter() - started) * 1000, 3)
-            return self._finalize_route_metadata(
+            return await self._finalize_route(
                 route_input,
                 result.model_copy(
                     update={
@@ -128,11 +137,9 @@ class HybridRouter:
             latest_rule_slots,
             correction_slots,
         )
-        current_turn_date_plan, _, current_turn_field_sources = (
-            merge_current_turn_slot_sources(
-                latest_rule_slots,
-                current_turn_slot_validation.validated_slots,
-            )
+        current_turn_date_plan, _, current_turn_field_sources = merge_current_turn_slot_sources(
+            latest_rule_slots,
+            current_turn_slot_validation.validated_slots,
         )
         merged = merge_route_correction(
             route_input,
@@ -171,13 +178,88 @@ class HybridRouter:
                 ),
             }
         )
-        return self._finalize_route_metadata(route_input, merged)
+        return await self._finalize_route(route_input, merged)
+
+    async def _finalize_route(
+        self,
+        route_input: RouteInput,
+        result: RouteResult,
+    ) -> RouteResult:
+        result = await self._apply_date_semantic_parse(route_input, result)
+        return self._finalize_route_metadata(route_input, result)
+
+    async def _apply_date_semantic_parse(
+        self,
+        route_input: RouteInput,
+        result: RouteResult,
+    ) -> RouteResult:
+        clauses = split_date_clauses(route_input.latest_query)
+        date_authorized = (
+            result.risk_level == RiskLevel.NORMAL
+            and (
+                result.task_type == TaskType.DATE_PLANNING
+                or TaskType.DATE_PLANNING in result.secondary_tasks
+            )
+            and result.date_patch is not None
+        )
+        if not date_authorized:
+            return result.model_copy(update={"date_clause_count": len(clauses)})
+        deterministic = _DATE_OPERATION_RESOLVER.resolve(
+            route_input.latest_query,
+            route_input.runtime_context,
+            result.date_patch,
+        )
+        required = requires_date_semantic_parse(
+            route_input.latest_query,
+            route_input.runtime_context,
+            deterministic,
+        )
+        base_update = {
+            "date_clause_count": len(clauses),
+            "date_semantic_parse_required": required,
+        }
+        if not required:
+            return result.model_copy(update=base_update)
+        if self._date_semantic_parser is None:
+            return result.model_copy(update=base_update)
+        try:
+            parsed = await self._date_semantic_parser.parse_date_operations(
+                route_input.latest_query,
+                route_input.runtime_context,
+                deterministic.operations,
+            )
+            resolution = _DATE_OPERATION_RESOLVER.resolve(
+                route_input.latest_query,
+                route_input.runtime_context,
+                result.date_patch,
+                proposed_operations=[*result.date_operations, *parsed.operations],
+            )
+        except Exception as exc:
+            return result.model_copy(
+                update={
+                    **base_update,
+                    "date_semantic_llm_used": True,
+                    "date_semantic_error": str(exc)[:300],
+                }
+            )
+        return result.model_copy(
+            update={
+                **base_update,
+                "date_semantic_llm_used": True,
+                "date_operations": list(resolution.operations),
+                "date_operation_candidate_count": len(resolution.candidates),
+                "date_operation_rejections": [
+                    f"{item.operation.type.value}:{item.reason}" for item in resolution.rejected
+                ],
+            }
+        )
 
     def _finalize_route_metadata(
         self,
         route_input: RouteInput,
         result: RouteResult,
     ) -> RouteResult:
+        result = _apply_date_plan_focus_guard(route_input, result)
         clarify, reason, options = should_clarify_route(
             route_input,
             result,
@@ -201,16 +283,12 @@ class HybridRouter:
         date_plan = result.date_plan if date_authorized else DatePlanSlots()
         date_patch = result.date_patch if date_authorized else None
         date_operations = result.date_operations if date_authorized else []
-        date_operation_rejections = (
-            result.date_operation_rejections if date_authorized else []
-        )
+        date_operation_rejections = result.date_operation_rejections if date_authorized else []
         slot_accepted_fields = result.slot_accepted_fields if date_authorized else {}
         slot_rejected_fields = result.slot_rejected_fields if date_authorized else {}
         slot_field_sources = result.slot_field_sources if date_authorized else {}
         if date_authorized and not slot_accepted_fields and _date_slots_have_values(date_plan):
-            rule_slots = extract_date_plan_slots(
-                RouteInput(latest_query=route_input.latest_query)
-            )
+            rule_slots = extract_date_plan_slots(RouteInput(latest_query=route_input.latest_query))
             task_slots = (
                 _date_slots_from_task_state(route_input.date_task_state)
                 if route_input.date_task_state is not None
@@ -334,10 +412,10 @@ class HybridRouter:
         if rules.task_type == TaskType.OUT_OF_SCOPE and _is_clear_out_of_scope(rules):
             return correction.task_type == TaskType.OUT_OF_SCOPE
         if correction.task_type == TaskType.OUT_OF_SCOPE:
-            return (
-                rules.task_type in {TaskType.GENERAL_CHAT, TaskType.OUT_OF_SCOPE}
-                and not _has_explicit_business_request(rules.normalized_query)
-            )
+            return rules.task_type in {
+                TaskType.GENERAL_CHAT,
+                TaskType.OUT_OF_SCOPE,
+            } and not _has_explicit_business_request(rules.normalized_query)
         if correction.task_type == TaskType.DATE_PLANNING:
             correction_mode = _resolved_correction_date_mode(
                 route_input,
@@ -379,6 +457,52 @@ class HybridRouter:
         )
 
 
+def _apply_date_plan_focus_guard(
+    route_input: RouteInput,
+    result: RouteResult,
+) -> RouteResult:
+    active_task = route_input.active_task or (
+        route_input.runtime_context.active_task if route_input.runtime_context is not None else None
+    )
+    if active_task != TaskType.DATE_PLANNING:
+        return result
+    has_explicit_operation = bool(result.date_operations) or _looks_like_date_edit_request(
+        result.normalized_query
+    )
+    if not has_explicit_operation or _looks_like_explicit_advice_request(result.normalized_query):
+        return result
+    secondary = [task for task in result.secondary_tasks if task != TaskType.RELATIONSHIP_ADVICE]
+    updates: dict[str, object] = {
+        "secondary_tasks": secondary,
+        "task_guard_applied": (result.task_guard_applied or secondary != result.secondary_tasks),
+    }
+    if result.task_type == TaskType.RELATIONSHIP_ADVICE and (
+        result.date_patch is not None or _date_slots_have_values(result.date_plan)
+    ):
+        updates.update(
+            {
+                "task_type": TaskType.DATE_PLANNING,
+                "primary_scenario": None,
+                "secondary_scenarios": [],
+                "primary_goal": None,
+                "secondary_goals": [],
+                "scenario_confidence": None,
+                "task_guard_applied": True,
+            }
+        )
+    return result.model_copy(update=updates)
+
+
+def _looks_like_explicit_advice_request(text: str) -> bool:
+    return bool(
+        re.search(
+            r"我该怎么|该怎么|怎么哄|怎么办|如何处理|给我.{0,4}建议|"
+            r"帮我分析|你怎么看|为什么.{0,12}(?:生气|不高兴|冷淡)",
+            text,
+        )
+    )
+
+
 def normalize_route_text(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", text).casefold()
     normalized = re.sub(r"\s+", " ", normalized)
@@ -408,12 +532,11 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
             task_scores.get(TaskType.RELATIONSHIP_ADVICE, 0),
             4,
         )
-        task_evidence.setdefault(TaskType.RELATIONSHIP_ADVICE, []).append(
-            "明确关系咨询请求"
-        )
-    if _has_relationship_semantic_request(text) and task_scores.get(
-        TaskType.RELATIONSHIP_ADVICE, 0
-    ) >= 4:
+        task_evidence.setdefault(TaskType.RELATIONSHIP_ADVICE, []).append("明确关系咨询请求")
+    if (
+        _has_relationship_semantic_request(text)
+        and task_scores.get(TaskType.RELATIONSHIP_ADVICE, 0) >= 4
+    ):
         # A technical noun can be part of a real relationship problem. Do not
         # let "代码" alone outrank an explicit conflict or communication request.
         task_scores.pop(TaskType.OUT_OF_SCOPE, None)
@@ -476,12 +599,8 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
         # secondary candidate for the compound-task resolver instead of
         # letting it steal the primary task.
         if _has_ordered_primary_relationship_request(text):
-            task_scores[TaskType.DATE_PLANNING] = (
-                task_scores.get(TaskType.DATE_PLANNING, 0) + 1.5
-            )
-            task_evidence.setdefault(TaskType.DATE_PLANNING, []).append(
-                "复合请求中的后续约会规划"
-            )
+            task_scores[TaskType.DATE_PLANNING] = task_scores.get(TaskType.DATE_PLANNING, 0) + 1.5
+            task_evidence.setdefault(TaskType.DATE_PLANNING, []).append("复合请求中的后续约会规划")
         else:
             task_scores[TaskType.DATE_PLANNING] = task_scores.get(TaskType.DATE_PLANNING, 0) + 4
             task_evidence.setdefault(TaskType.DATE_PLANNING, []).append("明确约会规划请求")
@@ -602,11 +721,7 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
             goal_evidence.setdefault(AdviceGoal.PROGRESS, []).append("评估下一步互动")
         if relationship_follow_up:
             strongest_other = max(
-                (
-                    score
-                    for goal, score in goal_scores.items()
-                    if goal != AdviceGoal.UNDERSTAND
-                ),
+                (score for goal, score in goal_scores.items() if goal != AdviceGoal.UNDERSTAND),
                 default=0,
             )
             goal_scores[AdviceGoal.UNDERSTAND] = max(
@@ -676,10 +791,7 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
             len(operation_resolution.candidates) if operation_resolution is not None else 0
         ),
         date_operation_rejections=(
-            [
-                f"{item.operation.type.value}:{item.reason}"
-                for item in operation_resolution.rejected
-            ]
+            [f"{item.operation.type.value}:{item.reason}" for item in operation_resolution.rejected]
             if operation_resolution is not None
             else []
         ),
@@ -791,8 +903,7 @@ def merge_route_correction(
     correction_secondary_tasks = [
         task
         for task in correction.secondary_tasks
-        if task != TaskType.DATE_PLANNING
-        or _has_verified_date_task_signal(route_input, rules)
+        if task != TaskType.DATE_PLANNING or _has_verified_date_task_signal(route_input, rules)
     ]
     secondary_task_guard_applied = len(correction_secondary_tasks) != len(
         correction.secondary_tasks
@@ -920,9 +1031,7 @@ def merge_route_correction(
             "date_intent": date_intent,
             "date_mutation": date_mutation,
             "date_operations": (
-                list(operation_resolution.operations)
-                if operation_resolution is not None
-                else []
+                list(operation_resolution.operations) if operation_resolution is not None else []
             ),
             "date_operation_candidate_count": (
                 len(operation_resolution.candidates) if operation_resolution is not None else 0
@@ -973,7 +1082,6 @@ def extract_date_plan_slots(route_input: RouteInput) -> DatePlanSlots:
     dining_keywords, activity_keywords, excluded_keywords = _extract_place_keywords(
         place_search_text
     )
-    excluded_keywords = _unique([*excluded_keywords, *replace_place_names])
     meal_keywords, schedule_hints = _extract_schedule_slots(normalized_texts[0])
 
     city = facts.city
@@ -1036,9 +1144,7 @@ def _date_slots_from_correction(correction: RouteCorrection) -> DatePlanSlots:
 def _date_slots_from_patch(patch: DatePlanPatch | None) -> DatePlanSlots:
     if patch is None:
         return DatePlanSlots()
-    return DatePlanSlots.model_validate(
-        patch.model_dump(exclude={"source_by_field"})
-    )
+    return DatePlanSlots.model_validate(patch.model_dump(exclude={"source_by_field"}))
 
 
 def _date_plan_patch_from_slots(
@@ -1155,8 +1261,7 @@ def should_clarify_route(
     if active_task_is_reliable:
         return False, None, []
     is_ambiguous = _looks_underspecified_route(text) or (
-        route.needs_clarification
-        and route.task_confidence < clarification_threshold
+        route.needs_clarification and route.task_confidence < clarification_threshold
     )
     if not is_ambiguous:
         return False, None, []
@@ -1204,15 +1309,8 @@ def _active_task_has_context(route_input: RouteInput, route: RouteResult) -> boo
         )
     if route_input.active_task == TaskType.DATE_PLANNING:
         return (
-            (
-                route_input.date_task_state is not None
-                and route_input.date_task_state.is_resumable
-            )
-            or any(
-                marker in context
-                for marker in ("约会", "行程", "城市", "预算", "地点", "餐厅")
-            )
-        )
+            route_input.date_task_state is not None and route_input.date_task_state.is_resumable
+        ) or any(marker in context for marker in ("约会", "行程", "城市", "预算", "地点", "餐厅"))
     return False
 
 
@@ -1267,11 +1365,7 @@ def _clarification_options(route_input: RouteInput, route: RouteResult) -> list[
     candidates = {
         route.task_type,
         *route.secondary_tasks,
-        *(
-            task
-            for task, score in route.task_scores.items()
-            if score >= 1.5
-        ),
+        *(task for task, score in route.task_scores.items() if score >= 1.5),
     }
     if {
         TaskType.RELATIONSHIP_ADVICE,
@@ -1398,21 +1492,18 @@ def _has_general_relationship_request(text: str) -> bool:
 
 
 def _has_relationship_semantic_request(text: str) -> bool:
-    return (
-        any(marker in text for marker in ("她", "他", "对方", "关系"))
-        and any(
-            marker in text
-            for marker in (
-                "吵架",
-                "冷战",
-                "分手",
-                "沟通",
-                "回复",
-                "不理",
-                "怎么办",
-                "怎么说",
-                "怎么做",
-            )
+    return any(marker in text for marker in ("她", "他", "对方", "关系")) and any(
+        marker in text
+        for marker in (
+            "吵架",
+            "冷战",
+            "分手",
+            "沟通",
+            "回复",
+            "不理",
+            "怎么办",
+            "怎么说",
+            "怎么做",
         )
     )
 
@@ -1750,11 +1841,14 @@ def _last_request_clause(text: str) -> str:
 
 def _looks_like_date_category_recommendation(clause: str) -> bool:
     has_category = _DATE_CATEGORY_TARGET_PATTERN.search(clause) is not None
-    has_category_comparison = re.search(
-        r"(?:吃|喝|去|选).{0,10}(?:还是|或者|or).{0,10}"
-        r"(?:吃|喝|去|选|火锅|咖啡|电影|展览|散步)",
-        clause,
-    ) is not None
+    has_category_comparison = (
+        re.search(
+            r"(?:吃|喝|去|选).{0,10}(?:还是|或者|or).{0,10}"
+            r"(?:吃|喝|去|选|火锅|咖啡|电影|展览|散步)",
+            clause,
+        )
+        is not None
+    )
     has_request = (
         re.search(
             r"推荐|建议|选(?:择)?|哪(?:种|类|些)|什么|吃啥|吃什么|适合|更自然|尴尬",
@@ -2516,7 +2610,7 @@ def _extract_place_keywords(text: str) -> tuple[list[str], list[str], list[str]]
 def _extract_replace_place_names(text: str) -> list[str]:
     patterns = (
         r"(?:不去|不想去|不要去|不再去|取消)\s*"
-        r"([^，,。；;]{2,40}?)(?=\s*(?:，|,|。|；|;|然后|再|换|改|$))",
+        r"([^，,。；;]{2,40}?)(?=\s*(?:，|,|。|；|;|然后|再)?\s*(?:换|改))",
         r"(?:把|将)\s*([^，,。；;]{2,40}?)\s*"
         r"(?:换成|换为|替换为|改成|改为)",
     )
@@ -2533,7 +2627,11 @@ def _extract_replace_place_names(text: str) -> list[str]:
             value = re.sub(r"^(?:原来的|原先的|之前的|当前的|这个|那个|该)", "", value)
             value = value.removesuffix("了")
             value = value.strip(" ，,。；;")
-            if value and value not in {"活动", "安排", "景点", "餐厅", "用餐"}:
+            if (
+                value
+                and value not in {"活动", "安排", "景点", "餐厅", "用餐"}
+                and not _is_constraint_reference(value)
+            ):
                 names.append(value)
     return _unique(names)[:8]
 
@@ -2560,22 +2658,26 @@ def _extract_schedule_slots(text: str) -> tuple[dict[str, list[str]], list[str]]
         "韩国料理": ("韩国料理", "韩餐", "韩国烤肉"),
         "海底捞": ("海底捞",),
     }
-    marker_positions = [
-        (meal_type, marker, position)
-        for meal_type, markers in meal_markers.items()
-        for marker in markers
-        for position in _all_positions(text, marker)
-    ]
     meal_keywords: dict[str, list[str]] = {}
-    for keyword, aliases in cuisine_aliases.items():
-        for alias in aliases:
-            for position in _all_positions(text, alias):
-                nearest = _nearest_meal_marker(text, position, marker_positions)
-                if nearest is None:
-                    continue
-                meal_type, _, _ = nearest
-                meal_keywords.setdefault(meal_type, []).append(keyword)
-                break
+    clauses = split_date_clauses(text)
+    for parsed_clause in clauses:
+        clause = parsed_clause.text
+        marker_positions = [
+            (meal_type, marker, position)
+            for meal_type, markers in meal_markers.items()
+            for marker in markers
+            for position in _all_positions(clause, marker)
+        ]
+        clock_meal_type = _meal_type_from_clock(clause)
+        for keyword, aliases in cuisine_aliases.items():
+            for alias in aliases:
+                for position in _all_positions(clause, alias):
+                    nearest = _nearest_meal_marker(clause, position, marker_positions)
+                    meal_type = nearest[0] if nearest is not None else clock_meal_type
+                    if meal_type is None:
+                        continue
+                    meal_keywords.setdefault(meal_type, []).append(keyword)
+                    break
 
     schedule_hints: list[str] = []
     for marker in ("上午", "中午", "下午", "晚上", "午餐", "午饭", "晚餐", "晚饭"):
@@ -2620,6 +2722,50 @@ def _nearest_meal_marker(
     if not candidates:
         return None
     return min(candidates, key=lambda value: value[0])[1]
+
+
+def _meal_type_from_clock(text: str) -> str | None:
+    match = re.search(r"(?<!\d)(\d{1,2})(?:点|时|:)(\d{1,2})?(?!\d)", text)
+    if match is None:
+        return None
+    hour = int(match.group(1))
+    if 6 <= hour <= 10:
+        return "breakfast"
+    if 11 <= hour <= 14:
+        return "lunch"
+    if 17 <= hour <= 21:
+        return "dinner"
+    return None
+
+
+def _normalize_constraint_reference(value: str) -> str:
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", value).casefold())
+
+
+def _is_constraint_reference(value: str) -> bool:
+    normalized = _normalize_constraint_reference(value)
+    return normalized in _CONSTRAINT_REFERENCE_TERMS or bool(
+        re.fullmatch(
+            r"(?:总?预算(?:上限|范围)?|日期|时间|城市|区域|商圈|交通(?:方式)?|"
+            r"行程天数|天数|出发时间|开始时间)",
+            normalized,
+        )
+    )
+
+
+_CONSTRAINT_REFERENCE_TERMS = {
+    "预算",
+    "总预算",
+    "日期",
+    "时间",
+    "城市",
+    "区域",
+    "商圈",
+    "交通",
+    "交通方式",
+    "天数",
+    "行程天数",
+}
 
 
 def _is_negated_place_keyword(text: str, aliases: tuple[str, ...]) -> bool:

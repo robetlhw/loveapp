@@ -5,11 +5,13 @@ from itertools import pairwise
 
 from pydantic import BaseModel, Field
 
+from loveapp.application.date_planning.structured_stops import match_desired_stop
 from loveapp.domain.date_constraints import (
     ConstraintStrength,
     DateConstraint,
     DateConstraintKind,
 )
+from loveapp.domain.date_operations import DesiredDateStop
 from loveapp.domain.date_plan import DatePlan, DatePlanItem, DatePlanRequest, Place
 
 
@@ -82,6 +84,25 @@ class DatePlanValidator:
         issues = []
         for constraint in constraints:
             if constraint.strength != ConstraintStrength.REQUIRED:
+                continue
+            if isinstance(constraint.value, DesiredDateStop):
+                matches = match_desired_stop(plan, constraint.value)
+                if not matches:
+                    value = constraint.value.keyword or constraint.value.place_name or "用餐节点"
+                    issues.append(
+                        _error(
+                            "required_stop_missing",
+                            f"未满足明确要求：{value}。",
+                        )
+                    )
+                elif not any(match.placement_satisfied for match in matches):
+                    issues.append(
+                        _error(
+                            "required_stop_role_mismatch",
+                            "地点已找到，但没有满足明确的餐次或先后顺序要求。",
+                            [match.item.place.id for match in matches],
+                        )
+                    )
                 continue
             keyword = str(constraint.value).strip()
             if keyword and not any(_item_matches_keyword(item, keyword) for item in plan.items):

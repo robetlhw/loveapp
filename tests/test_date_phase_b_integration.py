@@ -177,6 +177,8 @@ async def test_compound_operations_update_add_and_move_existing_plan() -> None:
     assert by_id["phase-b-barbecue"].meal_type == "lunch"
     assert by_id["existing-dinner"].order < by_id["existing-movie"].order
     assert by_id["existing-movie"].time_label == "晚饭后"
+    assert "测试烧烤店" in result.message
+    assert "现有电影院" in result.message
     execution_trace = next(
         item for item in trace.snapshot() if item.name == "date_operation_execute"
     )
@@ -190,10 +192,7 @@ async def test_compound_operations_create_structured_new_plan() -> None:
         user_id="phase-b-user",
         relationship_id="phase-b-relationship",
         conversation_id="phase-b-new",
-        query=(
-            "帮我安排周六上海静安区的约会，预算600元，"
-            "加一顿烧烤午饭，晚饭后看电影"
-        ),
+        query=("帮我安排周六上海静安区的约会，预算600元，加一顿烧烤午饭，晚饭后看电影"),
     )
     runtime_context = await RuntimeContextBuilder(store).build(
         request,
@@ -220,10 +219,14 @@ async def test_compound_operations_create_structured_new_plan() -> None:
     assert len(route.date_operations) >= 4
     assert result.plan is not None
     by_keyword = {
-        item.slot_keyword: item
-        for item in result.plan.items
-        if item.slot_keyword is not None
+        item.slot_keyword: item for item in result.plan.items if item.slot_keyword is not None
     }
     assert by_keyword["烧烤"].meal_type == "lunch"
     assert by_keyword["电影院"].time_label == "晚饭后"
     assert by_keyword["烧烤"].order < by_keyword["电影院"].order
+    assert [stop.keyword for stop in result.task_state.desired_stops] == [
+        "烧烤",
+        "电影院",
+    ]
+    assert result.task_state.meal_keywords == {"lunch": ["烧烤"]}
+    assert result.task_state.schedule_hints == ["晚饭后"]

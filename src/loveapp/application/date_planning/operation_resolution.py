@@ -3,6 +3,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
+from loveapp.application.date_planning.clause_parsing import split_date_clauses
 from loveapp.application.date_planning.operation_validation import (
     DateOperationVerifier,
     RejectedDateOperation,
@@ -50,9 +51,7 @@ class DateOperationResolver:
         proposed_operations: list[DatePlanOperation] | None = None,
     ) -> DateOperationResolution:
         deterministic = _deterministic_operations(text, runtime_context, current_turn_patch)
-        candidates = _dedupe_operations(
-            tuple([*deterministic, *(proposed_operations or [])])
-        )
+        candidates = _dedupe_operations(tuple([*deterministic, *(proposed_operations or [])]))
         verification = self._verifier.verify(
             candidates,
             text,
@@ -65,6 +64,44 @@ class DateOperationResolver:
             operations=operations,
             rejected=verification.rejected,
         )
+
+
+def requires_date_semantic_parse(
+    text: str,
+    runtime_context: RuntimeContext | None,
+    deterministic_result: DateOperationResolution,
+) -> bool:
+    """Identify complex date semantics independently from task routing."""
+
+    del runtime_context
+    clauses = split_date_clauses(text)
+    operations = deterministic_result.operations
+    has_stop_operation = any(
+        operation.type
+        in {
+            DateOperationType.ADD_STOP,
+            DateOperationType.REMOVE_STOP,
+            DateOperationType.REPLACE_STOP,
+            DateOperationType.MOVE_STOP,
+        }
+        for operation in operations
+    )
+    has_complex_reference = bool(
+        re.search(
+            r"第\s*[一二三四五六七八九十\d]+\s*个|那个|这个|原来的|之前的",
+            text,
+        )
+    )
+    has_temporal_binding = bool(
+        re.search(r"(?:之前|之后|前|后|上午|中午|下午|晚上|早饭|午饭|晚饭)", text)
+    )
+    return has_stop_operation and (
+        len(clauses) > 1
+        or len(operations) > 1
+        or has_complex_reference
+        or has_temporal_binding
+        or bool(re.search(r"(?:换|替换|更换|改).{0,20}(?:喜欢|偏好|想吃|想去)", text))
+    )
 
 
 def _deterministic_operations(
@@ -99,7 +136,11 @@ def _deterministic_operations(
     )
     operations.extend(removal_operations)
 
-    excluded = {*replacement_keywords, *removal_keywords}
+    excluded = {
+        *replacement_keywords,
+        *removal_keywords,
+        *patch.excluded_keywords,
+    }
     desired_stops = [*_desired_stops(text), *_patch_desired_stops(text, patch)]
     for desired, source_span in desired_stops:
         if desired.keyword in excluded:
@@ -171,12 +212,12 @@ def _replacement_operations(text: str) -> tuple[list[DatePlanOperation], set[str
                     kind=replacement_kind,
                     keyword=replacement_keyword,
                     meal_type=(
-                        _meal_type(match.group(0))
+                        _meal_type_for_stop(match.group(0), replacement_keyword)
                         if replacement_kind in {StopKind.DINING, StopKind.CAFE}
                         else None
                     ),
-                    after=_after_anchor(match.group(0)),
-                    before=_before_anchor(match.group(0)),
+                    after=_after_anchor(match.group(0), replacement_keyword),
+                    before=_before_anchor(match.group(0), replacement_keyword),
                 ),
                 source_span=match.group(0),
                 confidence=1,
@@ -194,10 +235,20 @@ def _patch_replacement_operations(
 ) -> tuple[list[DatePlanOperation], set[str]]:
     if has_explicit_replacement or _REPLACE_CUE.search(text) is None:
         return [], set()
-    payloads = _patch_desired_stops(text, patch)
+    payloads = [
+        (desired, source_span)
+        for desired, source_span in _patch_desired_stops(text, patch)
+        if _REPLACE_CUE.search(source_span) is not None
+    ]
+    payload_keywords = {
+        value
+        for desired, _source_span in payloads
+        for value in (desired.keyword, desired.place_name)
+        if value is not None
+    }
     target = _replacement_target(runtime_context, patch, payloads)
     if target is None:
-        return [], set()
+        return [], payload_keywords
     target_reference, target_kind, target_keywords = target
     compatible_payloads = [
         (desired, source_span)
@@ -206,7 +257,7 @@ def _patch_replacement_operations(
         or {desired.kind, target_kind} <= {StopKind.DINING, StopKind.CAFE}
     ]
     if len(compatible_payloads) != 1:
-        return [], set()
+        return [], payload_keywords
     desired, source_span = compatible_payloads[0]
     used_keywords = {
         *target_keywords,
@@ -250,9 +301,7 @@ def _replacement_target(
                 {target_name, item.slot_keyword or ""} - {""},
             )
         if not matches and len(payload_kinds) == 1:
-            return StopReference(place_name=target_name), next(iter(payload_kinds)), {
-                target_name
-            }
+            return StopReference(place_name=target_name), next(iter(payload_kinds)), {target_name}
         return None
     if plan is None or len(payload_kinds) != 1:
         return None
@@ -304,22 +353,28 @@ def _removal_operations(
 
 def _desired_stops(text: str) -> list[tuple[DesiredDateStop, str]]:
     desired: list[tuple[DesiredDateStop, str]] = []
-    for clause in _clauses(text):
+    for parsed_clause in split_date_clauses(text):
+        clause = parsed_clause.text
         for keyword, kind in _stops_in_text(clause):
+            time_window = _time_window(clause)
             desired.append(
                 (
                     DesiredDateStop(
                         kind=kind,
                         keyword=keyword,
                         meal_type=(
-                            _meal_type(clause)
+                            _meal_type_for_stop(
+                                clause,
+                                keyword,
+                                time_window=time_window,
+                            )
                             if kind in {StopKind.DINING, StopKind.CAFE}
                             else None
                         ),
                         target_day=_target_day(clause),
-                        time_window=_time_window(clause),
-                        after=_after_anchor(clause),
-                        before=_before_anchor(clause),
+                        time_window=time_window,
+                        after=_after_anchor(clause, keyword),
+                        before=_before_anchor(clause, keyword),
                     ),
                     clause,
                 )
@@ -338,26 +393,35 @@ def _patch_desired_stops(
     ):
         for keyword in keywords:
             clause = next(
-                (candidate for candidate in _clauses(text) if keyword in candidate),
+                (
+                    candidate.text
+                    for candidate in split_date_clauses(text)
+                    if keyword in candidate.text
+                ),
                 text,
             )
+            time_window = _time_window(clause)
             meal_type = _patch_meal_type(keyword, patch) or (
-                _meal_type(clause) if kind == StopKind.DINING else None
+                _meal_type_for_stop(
+                    clause,
+                    keyword,
+                    time_window=time_window,
+                )
+                if kind == StopKind.DINING
+                else None
             )
             desired.append(
                 (
                     DesiredDateStop(
                         kind=(
-                            StopKind.CAFE
-                            if kind == StopKind.DINING and "咖啡" in keyword
-                            else kind
+                            StopKind.CAFE if kind == StopKind.DINING and "咖啡" in keyword else kind
                         ),
                         keyword=keyword,
                         meal_type=meal_type,
                         target_day=patch.target_day,
-                        time_window=_time_window(clause),
-                        after=_after_anchor(clause),
-                        before=_before_anchor(clause),
+                        time_window=time_window,
+                        after=_after_anchor(clause, keyword),
+                        before=_before_anchor(clause, keyword),
                     ),
                     clause,
                 )
@@ -393,9 +457,7 @@ def _reference_for_item(
         place_name=item.place.name,
         keyword=desired.keyword,
         meal_type=(
-            MealType(item.meal_type)
-            if item.meal_type in MealType._value2member_map_
-            else None
+            MealType(item.meal_type) if item.meal_type in MealType._value2member_map_ else None
         ),
     )
 
@@ -406,9 +468,7 @@ def _reference_for_existing_item(item: DatePlanItem) -> StopReference:
         place_name=item.place.name,
         keyword=item.slot_keyword,
         meal_type=(
-            MealType(item.meal_type)
-            if item.meal_type in MealType._value2member_map_
-            else None
+            MealType(item.meal_type) if item.meal_type in MealType._value2member_map_ else None
         ),
     )
 
@@ -422,38 +482,70 @@ def _kind_for_item(item: DatePlanItem) -> StopKind:
     }[item.place.category]
 
 
-def _meal_type(text: str) -> MealType | None:
-    if re.search(r"早餐|早饭|早上", text):
-        return MealType.BREAKFAST
-    if re.search(r"午餐|午饭|中饭|中午", text):
-        return MealType.LUNCH
-    if re.search(r"晚餐|晚饭|晚上", text):
-        return MealType.DINNER
+def _meal_type_for_stop(
+    text: str,
+    keyword: str,
+    *,
+    time_window: TimeWindow | None = None,
+) -> MealType | None:
+    keyword_positions = [match.start() for match in re.finditer(re.escape(keyword), text)]
+    marker_positions = [
+        (match.start(), meal_type)
+        for meal_type, pattern in _MEAL_MARKER_PATTERNS
+        for match in pattern.finditer(text)
+    ]
+    if keyword_positions and marker_positions:
+        _, meal_type = min(
+            marker_positions,
+            key=lambda item: min(abs(item[0] - position) for position in keyword_positions),
+        )
+        return meal_type
+    clock = time_window.start if time_window is not None else None
+    if clock is not None:
+        if 6 <= clock.hour <= 10:
+            return MealType.BREAKFAST
+        if 11 <= clock.hour <= 14:
+            return MealType.LUNCH
+        if 17 <= clock.hour <= 21:
+            return MealType.DINNER
     return None
 
 
-def _after_anchor(text: str) -> TemporalAnchor | None:
+_MEAL_MARKER_PATTERNS = (
+    (MealType.BREAKFAST, re.compile(r"早餐|早饭|早上")),
+    (MealType.LUNCH, re.compile(r"午餐|午饭|中饭|中午")),
+    (MealType.DINNER, re.compile(r"晚餐|晚饭|晚上")),
+)
+
+
+def _after_anchor(
+    text: str,
+    keyword: str,
+) -> TemporalAnchor | StopReference | None:
     if re.search(r"(?:晚饭|晚餐|晚宴)\s*(?:后|之后)", text):
         return TemporalAnchor.DINNER
     if re.search(r"(?:午饭|午餐|中饭)\s*(?:后|之后)", text):
         return TemporalAnchor.LUNCH
     if re.search(r"(?:早餐|早饭)\s*(?:后|之后)", text):
         return TemporalAnchor.BREAKFAST
-    return None
+    return _relative_stop_reference(text, keyword, after=True)
 
 
-def _before_anchor(text: str) -> TemporalAnchor | None:
+def _before_anchor(
+    text: str,
+    keyword: str,
+) -> TemporalAnchor | StopReference | None:
     if re.search(r"(?:晚饭|晚餐|晚宴)\s*(?:前|之前)", text):
         return TemporalAnchor.DINNER
     if re.search(r"(?:午饭|午餐|中饭)\s*(?:前|之前)", text):
         return TemporalAnchor.LUNCH
     if re.search(r"(?:早餐|早饭)\s*(?:前|之前)", text):
         return TemporalAnchor.BREAKFAST
-    return None
+    return _relative_stop_reference(text, keyword, after=False)
 
 
 def _time_window(text: str) -> TimeWindow | None:
-    if re.search(r"晚饭|晚餐", text) and _after_anchor(text) is not None:
+    if re.search(r"(?:晚饭|晚餐)\s*(?:后|之后)", text):
         return TimeWindow(label="晚饭后")
     if "下午" in text:
         return TimeWindow(label="下午")
@@ -461,7 +553,52 @@ def _time_window(text: str) -> TimeWindow | None:
         return TimeWindow(label="晚上")
     if "上午" in text:
         return TimeWindow(label="上午")
+    clock = re.search(r"(?<!\d)(\d{1,2})(?:点|时|:)(\d{1,2})?(?!\d)", text)
+    if clock is not None:
+        from datetime import time
+
+        hour = int(clock.group(1))
+        minute = int(clock.group(2) or 0)
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return TimeWindow(start=time(hour, minute), label=f"{hour:02d}:{minute:02d}")
     return None
+
+
+def _relative_stop_reference(
+    text: str,
+    keyword: str,
+    *,
+    after: bool,
+) -> StopReference | None:
+    target_aliases = _aliases_for_stop(keyword)
+    for anchor_keyword, _kind, anchor_aliases in _STOP_SPECS:
+        if anchor_keyword == keyword:
+            continue
+        for anchor_alias in anchor_aliases:
+            for target_alias in target_aliases:
+                escaped_anchor = re.escape(anchor_alias)
+                escaped_target = re.escape(target_alias)
+                if after:
+                    patterns = (
+                        rf"(?:看完|吃完|逛完|结束)\s*{escaped_anchor}.{{0,24}}{escaped_target}",
+                        rf"{escaped_anchor}\s*(?:后|之后|结束后).{{0,24}}{escaped_target}",
+                        rf"{escaped_target}.{{0,24}}{escaped_anchor}\s*(?:后|之后|结束后)",
+                    )
+                else:
+                    patterns = (
+                        rf"{escaped_anchor}\s*(?:前|之前|开始前).{{0,24}}{escaped_target}",
+                        rf"{escaped_target}.{{0,24}}{escaped_anchor}\s*(?:前|之前|开始前)",
+                    )
+                if any(re.search(pattern, text) for pattern in patterns):
+                    return StopReference(keyword=anchor_keyword)
+    return None
+
+
+def _aliases_for_stop(keyword: str) -> tuple[str, ...]:
+    return next(
+        (aliases for canonical, _kind, aliases in _STOP_SPECS if canonical == keyword),
+        (keyword,),
+    )
 
 
 def _target_day(text: str) -> int | None:
@@ -491,7 +628,7 @@ def _stops_in_text(text: str) -> list[tuple[str, StopKind]]:
 
 
 def _clauses(text: str) -> list[str]:
-    return [clause.strip() for clause in re.split(r"[，,。；;！？!?]+", text) if clause.strip()]
+    return [clause.text for clause in split_date_clauses(text)]
 
 
 def _dedupe_operations(operations: tuple[DatePlanOperation, ...]) -> list[DatePlanOperation]:

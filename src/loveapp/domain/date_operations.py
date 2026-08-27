@@ -110,9 +110,7 @@ class DesiredDateStop(BaseModel):
         return self
 
 
-type DateConstraintValue = (
-    int | str | date | datetime | BudgetScope | DatePlanMode | TransportMode
-)
+type DateConstraintValue = int | str | date | datetime | BudgetScope | DatePlanMode | TransportMode
 
 
 class DatePlanOperation(BaseModel):
@@ -143,3 +141,7 @@ class DatePlanOperation(BaseModel):
         ):
             raise ValueError("move-stop operations require a target and desired placement")
         return self
+
+
+class DateSemanticParseResult(BaseModel):
+    operations: list[DatePlanOperation] = Field(default_factory=list, max_length=12)

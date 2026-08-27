@@ -245,7 +245,10 @@ class DatePlanningAgent:
             details["excluded_keywords"] = ",".join(excluded_keywords) or None
             per_person_budget = max(request.effective_daily_budget // 2, 1)
 
-            async def search(category: PlaceCategory, keywords: list[str]) -> list[Place]:
+            async def search(
+                category: PlaceCategory,
+                keywords: list[str | None],
+            ) -> list[Place]:
                 # Each explicit term describes one possible stop.  Sending
                 # all terms as required_keywords would ask the map provider
                 # for one place that is simultaneously a cinema, attraction,
@@ -304,6 +307,9 @@ class DatePlanningAgent:
             ) -> list[Place]:
                 return await search(category, keywords) if enabled else []
 
+            restaurant_search_keywords: list[str | None] = list(dining_keywords)
+            if _requires_dinner_anchor(request) and None not in restaurant_search_keywords:
+                restaurant_search_keywords.append(None)
             attractions, entertainment, restaurants, cafes = await asyncio.gather(
                 search_or_empty(
                     PlaceCategory.ATTRACTION,
@@ -325,7 +331,7 @@ class DatePlanningAgent:
                 ),
                 search_or_empty(
                     PlaceCategory.RESTAURANT,
-                    dining_keywords,
+                    restaurant_search_keywords,
                     enabled=(explicit_dining or (focus_dining is None and not had_dining_keywords)),
                 ),
                 search_or_empty(
@@ -1004,6 +1010,25 @@ class DatePlanningAgent:
                 )
             )
 
+        if _requires_dinner_anchor(request) and not any(
+            item.meal_type == "dinner" for item in selected
+        ):
+            dinner = _first_matching_place(dining_places, None, used_ids)
+            if dinner is None:
+                return None
+            used_ids.add(dinner.id)
+            selected.append(
+                _make_date_item(
+                    dinner,
+                    preferences=preferences,
+                    activity_keywords=request.activity_keywords,
+                    dining_keywords=request.dining_keywords,
+                    meal_keywords=request.meal_keywords,
+                    schedule_hints=request.schedule_hints,
+                    slot_keyword=None,
+                ).model_copy(update={"meal_type": "dinner", "time_label": "晚餐"})
+            )
+
         if (
             not selected
             or sum(item.estimated_cost for item in selected) > request.effective_total_budget
@@ -1265,7 +1290,7 @@ class DatePlanningAgent:
 
         replaced_item = existing_plan.items[target_index]
         items = [_annotate_existing_item(item, request) for item in existing_plan.items]
-        items[target_index] = _make_date_item(
+        replacement_item = _make_date_item(
             candidate,
             preferences=request.preferences,
             activity_keywords=request.activity_keywords,
@@ -1273,11 +1298,16 @@ class DatePlanningAgent:
             meal_keywords=request.meal_keywords,
             schedule_hints=request.schedule_hints,
             slot_keyword=replacement_keyword,
-        ).model_copy(
+        )
+        items[target_index] = replacement_item.model_copy(
             update={
                 "order": replaced_item.order,
                 "day_index": replaced_item.day_index,
                 "scheduled_date": replaced_item.scheduled_date,
+                "meal_type": replacement_item.meal_type or replaced_item.meal_type,
+                "time_label": replacement_item.time_label or replaced_item.time_label,
+                "after_item": replacement_item.after_item or replaced_item.after_item,
+                "slot_keyword": replacement_item.slot_keyword or replaced_item.slot_keyword,
             }
         )
         if sum(item.estimated_cost for item in items) > request.effective_total_budget:
@@ -1746,6 +1776,10 @@ def _meal_type_for_keyword(
     )
 
 
+def _requires_dinner_anchor(request: DatePlanRequest) -> bool:
+    return any("晚饭后" in hint or "晚餐后" in hint for hint in request.schedule_hints)
+
+
 def _time_label_for_item(
     keyword: str | None,
     meal_type: str | None,
@@ -1871,7 +1905,7 @@ def _date_item_label(item: DatePlanItem) -> str:
         )
     elif item.time_label:
         prefix = item.time_label
-    return f"{prefix}安排“{item.place.name}”" if prefix else item.place.name
+    return f"[{prefix}] {item.place.name}" if prefix else item.place.name
 
 
 _DATE_KEYWORD_ALIASES = {

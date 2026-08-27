@@ -20,6 +20,8 @@ from loveapp.application.conversation_flow import (
     pending_cancel_message,
     pending_follow_up_prompt,
 )
+from loveapp.application.date_planning.clause_parsing import split_date_clauses
+from loveapp.application.date_planning.plan_diff import diff_date_plans
 from loveapp.application.routing import extract_date_plan_slots
 from loveapp.application.runtime_context import RuntimeContextBuilder
 from loveapp.core.timing import ExecutionTrace
@@ -373,8 +375,17 @@ class ConversationAgent:
                         "source": "deterministic_rule",
                     }
                 )
+            with state["trace"].measure("date_clause_parse") as clause_details:
+                clause_details["clauses"] = len(split_date_clauses(request.query))
             with state["trace"].measure("date_semantic_parse") as semantic_details:
-                semantic_details["candidate_count"] = route.date_operation_candidate_count
+                semantic_details.update(
+                    {
+                        "candidate_count": route.date_operation_candidate_count,
+                        "required": route.date_semantic_parse_required,
+                        "llm_used": route.date_semantic_llm_used,
+                        "error": route.date_semantic_error,
+                    }
+                )
             with state["trace"].measure("date_operation_verify") as verify_details:
                 verify_details.update(
                     {
@@ -721,9 +732,7 @@ class ConversationAgent:
             text=request.query,
             trace=state["trace"],
             active_task=(
-                state["route"].task_type
-                if state.get("route") is not None
-                else request.active_task
+                state["route"].task_type if state.get("route") is not None else request.active_task
             ),
         )
         return {"current_message": message, "memory_task": memory_task}
@@ -999,6 +1008,64 @@ def _compose_date_response(
             "我核对了你刚补充的条件，现有行程没有需要替换的节点，因此先保留当前版本。"
             "下面把完整安排再列一次，方便你确认顺序和费用。"
         )
+    plan_diff = diff_date_plans(current.current_plan, plan)
+    change_kind_count = sum(
+        bool(place_ids)
+        for place_ids in (
+            plan_diff.added_place_ids,
+            plan_diff.removed_place_ids,
+            plan_diff.moved_place_ids,
+        )
+    )
+    if change_kind_count > 1:
+        before_names = {item.place.id: item.place.name for item in current.current_plan.items}
+        after_names = {item.place.id: item.place.name for item in plan.items}
+        added = [
+            _date_item_label(item, include_day=plan.plan_mode == DatePlanMode.MULTI_DAY)
+            for item in plan.items
+            if item.place.id in plan_diff.added_place_ids
+        ]
+        removed = [
+            before_names[place_id]
+            for place_id in plan_diff.removed_place_ids
+            if place_id in before_names
+        ]
+        moved = [
+            after_names[place_id]
+            for place_id in plan_diff.moved_place_ids
+            if place_id in after_names
+        ]
+        changes: list[str] = []
+        if added and removed:
+            changes.append(f"将{'、'.join(removed)}替换为{'、'.join(added)}")
+        else:
+            if added:
+                changes.append(f"新增了{'、'.join(added)}")
+            if removed:
+                changes.append(f"移除了{'、'.join(removed)}")
+        if moved:
+            changes.append(f"调整了{'、'.join(moved)}的位置")
+        return (
+            f"新的要求已生效，行程{'；'.join(changes)}。"
+            "其他未受影响的节点保持不变，下面是更新后的完整安排。"
+        )
+    if plan_diff.added_place_ids and plan_diff.removed_place_ids:
+        before_names = {item.place.id: item.place.name for item in current.current_plan.items}
+        after_names = {item.place.id: item.place.name for item in plan.items}
+        removed = "、".join(
+            before_names[place_id]
+            for place_id in plan_diff.removed_place_ids
+            if place_id in before_names
+        )
+        added = "、".join(
+            after_names[place_id]
+            for place_id in plan_diff.added_place_ids
+            if place_id in after_names
+        )
+        return (
+            f"新的约束已生效，行程已将{removed or '原节点'}替换为{added or '新节点'}。"
+            "其他未受影响的节点保持不变，下面是更新后的完整安排。"
+        )
     if route.date_mutation == DatePlanMutation.ADD:
         previous_ids = {item.place.id for item in current.current_plan.items}
         additions = [
@@ -1016,8 +1083,18 @@ def _compose_date_response(
             "收到，我保留了没有受到影响的节点，并替换了你指定的部分。"
             "下面是重新核对路线和预算后的完整安排。"
         )
+    if plan_diff.moved_place_ids:
+        moved_names = {
+            item.place.id: item.place.name
+            for item in plan.items
+            if item.place.id in plan_diff.moved_place_ids
+        }
+        return (
+            f"收到，我已按新的时段要求调整{'、'.join(moved_names.values())}的位置。"
+            "下面是更新后的完整安排。"
+        )
     return (
-        "收到，我已经把新的日期、预算或其他约束纳入核对，并保留原有行程节点。"
+        "收到，我已经把新的日期、预算或其他约束纳入核对；现有地点节点保持不变。"
         "下面是当前版本的完整安排，方便你继续补充或调整。"
     )
 
@@ -1031,7 +1108,7 @@ def _date_item_label(item, *, include_day: bool = False) -> str:
         )
     elif item.time_label:
         prefix = item.time_label
-    label = f"{prefix}安排“{item.place.name}”" if prefix else item.place.name
+    label = f"[{prefix}] {item.place.name}" if prefix else item.place.name
     return f"第{item.day_index}天 {label}" if include_day else label
 
 

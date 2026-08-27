@@ -99,9 +99,7 @@ class RecordingOperationPlanner:
             )
         )
         if existing_plan is None:
-            return _plan(
-                _item("initial", "公园", PlaceCategory.ATTRACTION, order=1)
-            )
+            return _plan(_item("initial", "公园", PlaceCategory.ATTRACTION, order=1))
         if mutation == DatePlanMutation.UPDATE_CONSTRAINT:
             return existing_plan.model_copy(update={"summary": "constraints updated"})
         if mutation == DatePlanMutation.REPLAN:
@@ -112,17 +110,9 @@ class RecordingOperationPlanner:
         keyword = activity or dining
         if keyword is None:
             return existing_plan
-        category = (
-            PlaceCategory.ENTERTAINMENT
-            if activity is not None
-            else PlaceCategory.RESTAURANT
-        )
+        category = PlaceCategory.ENTERTAINMENT if activity is not None else PlaceCategory.RESTAURANT
         meal_type = next(
-            (
-                meal
-                for meal, keywords in request.meal_keywords.items()
-                if keyword in keywords
-            ),
+            (meal for meal, keywords in request.meal_keywords.items() if keyword in keywords),
             None,
         )
         new_item = _item(
@@ -289,6 +279,7 @@ async def test_executor_replaces_the_referenced_stop() -> None:
     result = await executor.apply(current, [replace], _request())
 
     assert [item.slot_keyword for item in result.plan.items] == ["电影院", "西餐"]
+    assert result.plan.items[1].meal_type == "dinner"
     assert planner.plan_calls[0].mutation == DatePlanMutation.REPLACE
     assert planner.plan_calls[0].request.replace_place_names == ["测试火锅"]
     assert result.effective_mutation == DatePlanMutation.REPLACE
@@ -333,9 +324,7 @@ async def test_executor_replan_is_applied_last() -> None:
     planner = RecordingOperationPlanner()
     executor = DateOperationExecutor(planner)
     replan = DatePlanOperation(type=DateOperationType.REPLAN)
-    current = _plan(
-        _item("movie", "电影院", PlaceCategory.ENTERTAINMENT, order=1)
-    )
+    current = _plan(_item("movie", "电影院", PlaceCategory.ENTERTAINMENT, order=1))
 
     result = await executor.apply(current, [replan, _update_budget()], _request())
 
@@ -359,7 +348,5 @@ async def test_initial_plan_rejects_operations_that_require_existing_state() -> 
     result = await executor.apply(None, [remove, _update_budget()], _request())
 
     assert result.plan.items[0].slot_keyword == "公园"
-    assert [operation.type for operation in result.applied] == [
-        DateOperationType.UPDATE_CONSTRAINT
-    ]
+    assert [operation.type for operation in result.applied] == [DateOperationType.UPDATE_CONSTRAINT]
     assert result.rejected[0].reason == "operation_requires_existing_plan"
