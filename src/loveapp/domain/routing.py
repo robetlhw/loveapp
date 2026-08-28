@@ -55,6 +55,10 @@ class RecentRiskState(BaseModel):
     expires_after_turns: int = Field(default=2, ge=0, le=4)
 
 
+class DateMutationPolicy(BaseModel):
+    preserve_unmentioned_items: bool = False
+
+
 class RouteInput(BaseModel):
     latest_query: str = Field(min_length=1, max_length=4000)
     recent_messages: list[StoredMessage] = Field(default_factory=list, max_length=20)
@@ -118,8 +122,10 @@ class RouteResult(BaseModel):
     date_request_mode: DateRequestMode = DateRequestMode.NONE
     date_intent: DateTaskIntent = DateTaskIntent.NONE
     date_mutation: DatePlanMutation = DatePlanMutation.NONE
+    date_mutation_policy: DateMutationPolicy = Field(default_factory=DateMutationPolicy)
     date_operations: list[DatePlanOperation] = Field(default_factory=list, max_length=12)
     date_operation_candidate_count: int = Field(default=0, ge=0)
+    date_operation_dedupe_input_count: int = Field(default=0, ge=0)
     date_operation_rejections: list[str] = Field(default_factory=list, max_length=24)
     date_clause_count: int = Field(default=0, ge=0)
     date_semantic_parse_required: bool = False
@@ -134,6 +140,9 @@ class RouteResult(BaseModel):
     date_semantic_duration_ms: float | None = Field(default=None, ge=0)
     date_semantic_fallback_reason: str | None = None
     date_semantic_error: str | None = None
+    date_semantic_validation_error_path: str | None = None
+    date_semantic_invalid_field: str | None = None
+    date_semantic_raw_operation_type: str | None = None
     date_unresolved_references: list[str] = Field(default_factory=list, max_length=12)
     date_missing_fields: list[str] = Field(default_factory=list, max_length=8)
     source: RouteSource = RouteSource.RULES

@@ -99,7 +99,9 @@ class PlaceSearchRequest(BaseModel):
     required_keywords: list[str] = Field(default_factory=list, max_length=8)
     excluded_keywords: list[str] = Field(default_factory=list, max_length=8)
     strict_area: bool = True
-    max_cost_per_person: int | None = None
+    max_cost_per_person: int | None = Field(default=None, gt=0)
+    require_verified_cost: bool = False
+    min_rating: float | None = Field(default=None, ge=0, le=5)
 
 
 class Place(BaseModel):

@@ -19,6 +19,7 @@ from loveapp.domain.enums import PlaceCategory
 class DateStopMatch:
     item: DatePlanItem
     placement_satisfied: bool
+    constraint_reason: str | None = None
 
 
 def match_desired_stop(
@@ -41,6 +42,7 @@ def match_desired_stop(
                 plan,
                 keyword_aliases=aliases,
             ),
+            constraint_reason=_constraint_failure_reason(item, desired),
         )
         for item in plan.items
         if _identity_matches(item, desired, keyword_aliases=aliases)
@@ -83,7 +85,7 @@ def requirement_satisfied(
         )
         if anchor_order is None or item.order >= anchor_order:
             return False
-    return True
+    return _constraint_failure_reason(item, desired) is None
 
 
 def has_placement_requirement(stop: DesiredDateStop) -> bool:
@@ -91,6 +93,46 @@ def has_placement_requirement(stop: DesiredDateStop) -> bool:
         value is not None
         for value in (stop.meal_type, stop.target_day, stop.time_window, stop.after, stop.before)
     )
+
+
+def _constraint_failure_reason(
+    item: DatePlanItem,
+    desired: DesiredDateStop,
+) -> str | None:
+    constraints = desired.constraints
+    if constraints is None:
+        return None
+    place = item.place
+    if constraints.max_cost_per_person is not None:
+        if place.cost_is_estimate:
+            return "constraint_unverified"
+        if place.estimated_cost_per_person > constraints.max_cost_per_person:
+            return "constraint_unsatisfied"
+    if constraints.min_rating is not None:
+        if place.rating is None:
+            return "constraint_unverified"
+        if place.rating < constraints.min_rating:
+            return "constraint_unsatisfied"
+    if constraints.preferred_area is not None:
+        area = _normalize(constraints.preferred_area.removesuffix("区").removesuffix("县"))
+        place_areas = _normalize(
+            " ".join(
+                [
+                    place.address,
+                    place.business_area or "",
+                    place.district or "",
+                ]
+            )
+        )
+        if not area or area not in place_areas:
+            return "constraint_unsatisfied"
+    if constraints.max_distance_meters is not None:
+        route = item.route_from_previous
+        if route is None:
+            return "constraint_unverified"
+        if route.distance_meters > constraints.max_distance_meters:
+            return "constraint_unsatisfied"
+    return None
 
 
 def item_matches_reference(
@@ -101,13 +143,23 @@ def item_matches_reference(
 ) -> bool:
     if reference.place_id is not None and item.place.id == reference.place_id:
         return True
-    if reference.meal_type is not None and item.meal_type == reference.meal_type.value:
+    if reference.meal_type is not None and _item_matches_meal_reference(
+        item,
+        reference.meal_type,
+    ):
         return True
     value = reference.keyword or reference.place_name
     return value is not None and item_matches_keyword(
         item,
         value,
         keyword_aliases=keyword_aliases,
+    )
+
+
+def _item_matches_meal_reference(item: DatePlanItem, meal_type: MealType) -> bool:
+    return item.meal_type == meal_type.value or (
+        item.meal_type is None
+        and item.place.category in {PlaceCategory.RESTAURANT, PlaceCategory.CAFE}
     )
 
 

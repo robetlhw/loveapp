@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     date_semantic_timeout_seconds: float = Field(default=20, ge=1, le=120)
     date_semantic_max_retries: int = Field(default=0, ge=0, le=3)
     date_semantic_thinking: Literal["enabled", "disabled"] = "disabled"
-    date_semantic_prompt_version: str = "date-semantic-v1.0"
+    date_semantic_prompt_version: str = "date-semantic-v1.1"
 
     rag_backend: Literal["memory", "qdrant"] = "qdrant"
     rag_min_score: float = 0.45

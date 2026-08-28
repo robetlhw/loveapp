@@ -2,10 +2,16 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
-from loveapp.application.date_planning.requirements import primary_desired_stops
+from loveapp.application.date_planning.requirements import (
+    DateRequirementBinding,
+    primary_desired_stops,
+    resolve_requirement_bindings_for_plan_item,
+)
 from loveapp.domain.date_operations import (
     DateOperationType,
     DatePlanOperation,
+    DateRequirementMatch,
+    DateStopConstraints,
     DateStopRequirement,
     DesiredDateStop,
     MealType,
@@ -92,10 +98,15 @@ class DateRequirementProjector:
         *,
         current_plan: DatePlan | None = None,
         source_text: str | None = None,
+        requirement_matches: list[DateRequirementMatch] | None = None,
     ) -> list[DateStopRequirement]:
         """Project the verified request batch, independent of execution success."""
 
         projected = list(requirements)
+        for operation in operations:
+            if operation.type == DateOperationType.UPDATE_REQUIREMENT:
+                projected = _apply_requirement_update(projected, operation)
+
         grouped_adds = _alternative_add_groups(operations, source_text)
         grouped_ids = {id(operation) for group in grouped_adds for operation in group}
         for group in grouped_adds:
@@ -115,21 +126,48 @@ class DateRequirementProjector:
         for operation in operations:
             if id(operation) in grouped_ids:
                 continue
+            if operation.type == DateOperationType.UPDATE_REQUIREMENT:
+                continue
             if operation.type == DateOperationType.ADD_STOP and operation.payload is not None:
                 projected = _add_or_merge_requirement(
                     projected,
                     _single_requirement(operation.payload, operation.source_span),
                 )
             elif operation.type == DateOperationType.REMOVE_STOP and operation.target is not None:
-                index = _target_requirement_index(projected, operation.target, current_plan)
-                if index is not None:
-                    projected.pop(index)
+                bindings = _target_requirement_bindings(
+                    projected,
+                    operation.target,
+                    current_plan,
+                    requirement_matches or [],
+                )
+                if len(bindings) == 1:
+                    projected = _remove_bound_requirements(projected, bindings)
             elif operation.type == DateOperationType.REPLACE_STOP and operation.payload is not None:
-                index = _target_requirement_index(projected, operation.target, current_plan)
+                bindings = _target_requirement_bindings(
+                    projected,
+                    operation.target,
+                    current_plan,
+                    requirement_matches or [],
+                )
+                if len(bindings) > 1:
+                    continue
+                binding = bindings[0] if bindings else None
+                index = (
+                    next(
+                        (
+                            offset
+                            for offset, requirement in enumerate(projected)
+                            if requirement.id == binding.requirement_id
+                        ),
+                        None,
+                    )
+                    if binding is not None
+                    else None
+                )
                 target_item = _target_item(operation.target, current_plan)
                 previous = (
-                    projected[index].alternatives[0]
-                    if index is not None
+                    projected[index].alternatives[binding.alternative_index]
+                    if index is not None and binding is not None
                     else target_item
                 )
                 inherited = (
@@ -143,36 +181,56 @@ class DateRequirementProjector:
                     and inherited.place_name is None
                     and inherited.meal_type is None
                 ):
-                    if index is not None:
-                        projected.pop(index)
+                    if binding is not None:
+                        projected = _remove_bound_requirements(projected, [binding])
                     continue
-                if index is None:
+                if index is None or binding is None:
                     projected = _add_or_merge_requirement(
                         projected,
                         _single_requirement(inherited, operation.source_span),
                     )
                 else:
                     current = projected[index]
+                    alternatives = list(current.alternatives)
+                    alternatives[binding.alternative_index] = inherited
                     projected[index] = current.model_copy(
                         update={
-                            "alternatives": [inherited],
+                            "alternatives": alternatives,
                             "source_span": operation.source_span or current.source_span,
                         }
                     )
             elif operation.type == DateOperationType.MOVE_STOP and operation.payload is not None:
-                index = _target_requirement_index(projected, operation.target, current_plan)
-                if index is not None:
+                bindings = _target_requirement_bindings(
+                    projected,
+                    operation.target,
+                    current_plan,
+                    requirement_matches or [],
+                )
+                if len(bindings) == 1:
+                    binding = bindings[0]
+                    index = next(
+                        (
+                            offset
+                            for offset, requirement in enumerate(projected)
+                            if requirement.id == binding.requirement_id
+                        ),
+                        None,
+                    )
+                    if index is None:
+                        continue
                     current = projected[index]
+                    alternatives = list(current.alternatives)
+                    alternatives[binding.alternative_index] = _apply_placement(
+                        alternatives[binding.alternative_index],
+                        operation.payload,
+                    )
                     projected[index] = current.model_copy(
                         update={
-                            "alternatives": [
-                                _apply_placement(alternative, operation.payload)
-                                for alternative in current.alternatives
-                            ],
+                            "alternatives": alternatives,
                             "source_span": operation.source_span or current.source_span,
                         }
                     )
-                else:
+                elif not bindings:
                     target_item = _target_item(operation.target, current_plan)
                     if target_item is not None:
                         projected = _add_or_merge_requirement(
@@ -316,6 +374,10 @@ def inherit_desired_stop_role(
             "time_window": replacement.time_window or previous.time_window,
             "after": replacement.after or previous.after,
             "before": replacement.before or previous.before,
+            "constraints": _merge_stop_constraints(
+                replacement.constraints,
+                previous.constraints,
+            ),
         }
     )
 
@@ -331,6 +393,35 @@ def _apply_placement(
             "time_window": placement.time_window or current.time_window,
             "after": placement.after or current.after,
             "before": placement.before or current.before,
+            "constraints": _merge_stop_constraints(
+                placement.constraints,
+                current.constraints,
+            ),
+        }
+    )
+
+
+def _merge_stop_constraints(
+    incoming: DateStopConstraints | None,
+    current: DateStopConstraints | None,
+) -> DateStopConstraints | None:
+    if incoming is None:
+        return current
+    if current is None:
+        return incoming
+    return incoming.model_copy(
+        update={
+            field: (
+                getattr(incoming, field)
+                if getattr(incoming, field) is not None
+                else getattr(current, field)
+            )
+            for field in (
+                "max_cost_per_person",
+                "min_rating",
+                "preferred_area",
+                "max_distance_meters",
+            )
         }
     )
 
@@ -411,7 +502,17 @@ def _target_item(
         item
         for item in ordered
         if (reference.place_id is not None and item.place.id == reference.place_id)
-        or (reference.meal_type is not None and item.meal_type == reference.meal_type.value)
+        or (
+            reference.meal_type is not None
+            and (
+                item.meal_type == reference.meal_type.value
+                or (
+                    item.meal_type is None
+                    and item.place.category
+                    in {PlaceCategory.RESTAURANT, PlaceCategory.CAFE}
+                )
+            )
+        )
         or any(
             _normalize(value) in _normalize(candidate) or _normalize(candidate) in _normalize(value)
             for value in (reference.keyword, reference.place_name)
@@ -539,6 +640,165 @@ def _add_or_merge_requirement(
     incoming: DateStopRequirement,
 ) -> list[DateStopRequirement]:
     return _dedupe_requirements([*current, incoming])
+
+
+def _apply_requirement_update(
+    requirements: list[DateStopRequirement],
+    operation: DatePlanOperation,
+) -> list[DateStopRequirement]:
+    update = operation.requirement_update
+    if update is None:
+        return requirements
+    target_ids: list[str] = []
+    for reference in update.targets:
+        requirement_id = reference.requirement_id
+        if requirement_id is None and reference.stop_reference is not None:
+            candidates = _requirement_indexes_for_reference(
+                requirements,
+                reference.stop_reference,
+            )
+            if len(candidates) != 1:
+                return requirements
+            requirement_id = requirements[candidates[0]].id
+        if requirement_id is None or not any(
+            requirement.id == requirement_id for requirement in requirements
+        ):
+            return requirements
+        target_ids.append(requirement_id)
+    target_ids = list(dict.fromkeys(target_ids))
+    if len(target_ids) != len(update.targets):
+        return requirements
+    targets = [
+        requirement for requirement in requirements if requirement.id in target_ids
+    ]
+    if len(targets) != len(target_ids) or any(
+        len(requirement.alternatives) != 1 for requirement in targets
+    ):
+        return requirements
+    alternatives = [requirement.alternatives[0] for requirement in targets]
+    try:
+        grouped = DateStopRequirement(
+            alternatives=alternatives,
+            min_satisfied=update.min_satisfied,
+            max_satisfied=update.max_satisfied,
+            source_span=operation.source_span,
+        )
+    except ValueError:
+        return requirements
+    remaining = [
+        requirement for requirement in requirements if requirement.id not in target_ids
+    ]
+    return _add_or_merge_requirement(remaining, grouped)
+
+
+def _target_requirement_bindings(
+    requirements: list[DateStopRequirement],
+    reference: StopReference | None,
+    current_plan: DatePlan | None,
+    requirement_matches: list[DateRequirementMatch],
+) -> list[DateRequirementBinding]:
+    if reference is None:
+        return []
+    target_item = _target_item(reference, current_plan)
+    if target_item is not None:
+        return resolve_requirement_bindings_for_plan_item(
+            place_id=target_item.place.id,
+            requirements=requirements,
+            plan=current_plan,
+            matches=requirement_matches,
+        )
+    if (
+        current_plan is None
+        and reference.ordinal is not None
+        and reference.ordinal <= len(requirements)
+    ):
+        requirement = requirements[reference.ordinal - 1]
+        if len(requirement.alternatives) == 1:
+            return [
+                DateRequirementBinding(
+                    requirement_id=requirement.id,
+                    alternative_index=0,
+                    place_id="unbound",
+                    source="ordinal_fallback",
+                )
+            ]
+    bindings: list[DateRequirementBinding] = []
+    for requirement_index in _requirement_indexes_for_reference(requirements, reference):
+        requirement = requirements[requirement_index]
+        reference_values = [
+            _normalize(value)
+            for value in (reference.keyword, reference.place_name)
+            if value is not None
+        ]
+        for alternative_index, alternative in enumerate(requirement.alternatives):
+            if _stop_matches_reference(alternative, reference, reference_values):
+                bindings.append(
+                    DateRequirementBinding(
+                        requirement_id=requirement.id,
+                        alternative_index=alternative_index,
+                        place_id=reference.place_id or "unbound",
+                        source="keyword_fallback",
+                    )
+                )
+    return bindings
+
+
+def _remove_bound_requirements(
+    requirements: list[DateStopRequirement],
+    bindings: list[DateRequirementBinding],
+) -> list[DateStopRequirement]:
+    removals: dict[str, set[int]] = {}
+    for binding in bindings:
+        removals.setdefault(binding.requirement_id, set()).add(binding.alternative_index)
+    result: list[DateStopRequirement] = []
+    for requirement in requirements:
+        indexes = removals.get(requirement.id)
+        if not indexes:
+            result.append(requirement)
+            continue
+        alternatives = [
+            alternative
+            for index, alternative in enumerate(requirement.alternatives)
+            if index not in indexes
+        ]
+        if not alternatives:
+            continue
+        result.append(
+            requirement.model_copy(
+                update={
+                    "alternatives": alternatives,
+                    "min_satisfied": min(
+                        requirement.min_satisfied,
+                        len(alternatives),
+                    ),
+                    "max_satisfied": (
+                        min(requirement.max_satisfied, len(alternatives))
+                        if requirement.max_satisfied is not None
+                        else None
+                    ),
+                }
+            )
+        )
+    return result
+
+
+def _requirement_indexes_for_reference(
+    requirements: list[DateStopRequirement],
+    reference: StopReference,
+) -> list[int]:
+    reference_values = [
+        _normalize(value)
+        for value in (reference.keyword, reference.place_name)
+        if value is not None
+    ]
+    return [
+        index
+        for index, requirement in enumerate(requirements)
+        if any(
+            _stop_matches_reference(alternative, reference, reference_values)
+            for alternative in requirement.alternatives
+        )
+    ]
 
 
 def _target_requirement_index(

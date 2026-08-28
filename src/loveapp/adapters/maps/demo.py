@@ -22,13 +22,14 @@ class DemoMapProvider:
                     if preference in template["tags"]
                 ],
                 estimated_cost_per_person=template["cost"],
-                cost_is_estimate=True,
+                cost_is_estimate=False,
                 rating=template["rating"],
                 source=self.name,
             )
             for index, template in enumerate(templates, start=1)
             if request.max_cost_per_person is None
             or template["cost"] <= request.max_cost_per_person
+            if request.min_rating is None or template["rating"] >= request.min_rating
         ]
 
         required_keywords = request.required_keywords or request.keywords
@@ -97,6 +98,7 @@ _PLACE_TEMPLATES: dict[PlaceCategory, list[dict]] = {
         {"name": "创意料理", "tags": ["氛围", "新鲜感"], "cost": 190, "rating": 4.5},
         {"name": "家常小馆", "tags": ["轻松", "性价比"], "cost": 90, "rating": 4.4},
         {"name": "炭火烧烤店", "tags": ["烧烤", "烤肉"], "cost": 100, "rating": 4.5},
+        {"name": "精品法餐厅", "tags": ["法餐", "西餐", "安静"], "cost": 450, "rating": 5.0},
     ],
     PlaceCategory.CAFE: [
         {"name": "湖畔咖啡", "tags": ["咖啡", "安静"], "cost": 55, "rating": 4.7},
@@ -118,6 +120,7 @@ _PLACE_TEMPLATES: dict[PlaceCategory, list[dict]] = {
 
 _DEMO_KEYWORD_ALIASES = {
     "西餐": ("西餐", "西餐厅"),
+    "法餐": ("法餐", "法国菜", "西餐"),
     "日料": ("日料", "日本料理"),
     "火锅": ("火锅",),
     "烧烤": ("烧烤", "烤肉"),

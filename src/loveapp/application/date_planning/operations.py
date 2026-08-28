@@ -1,6 +1,11 @@
 from dataclasses import dataclass
 from typing import Protocol
 
+from loveapp.application.date_planning.requirements import (
+    DateRequirementMatcher,
+    requirement_identity_place_ids,
+    resolve_requirement_bindings_for_plan_item,
+)
 from loveapp.application.date_planning.role_completion import complete_date_plan_roles
 from loveapp.application.date_planning.state_projection import (
     derive_legacy_slots,
@@ -110,6 +115,22 @@ class DateOperationExecutor:
         applied: list[DatePlanOperation] = []
         rejected: list[RejectedDatePlanOperation] = []
         effective_mutation = DatePlanMutation.NONE
+        for operation in ordered:
+            if operation.type != DateOperationType.UPDATE_REQUIREMENT:
+                continue
+            plan, reason, changed = await self._apply_requirement_update_to_plan(
+                plan,
+                operation,
+                request,
+                existing_requirements or [],
+                trace=trace,
+            )
+            if reason is not None:
+                rejected.append(RejectedDatePlanOperation(operation, reason))
+                continue
+            applied.append(operation)
+            if changed:
+                effective_mutation = DatePlanMutation.REMOVE
         alternative_groups = _explicit_alternative_add_groups(ordered)
         satisfied_alternative_groups = {
             group_id
@@ -137,7 +158,10 @@ class DateOperationExecutor:
             effective_mutation = DatePlanMutation.UPDATE_CONSTRAINT
 
         for operation in ordered:
-            if operation.type == DateOperationType.UPDATE_CONSTRAINT:
+            if operation.type in {
+                DateOperationType.UPDATE_CONSTRAINT,
+                DateOperationType.UPDATE_REQUIREMENT,
+            }:
                 continue
             alternative_group = (
                 operation.alternative_group
@@ -151,6 +175,16 @@ class DateOperationExecutor:
                 continue
             context = contexts[id(operation)]
             local_request = _request_for_execution_context(context)
+            binding_rejection = _ambiguous_requirement_binding_rejection(
+                plan,
+                operation,
+                existing_requirements or [],
+            )
+            if binding_rejection is not None:
+                rejected.append(
+                    RejectedDatePlanOperation(operation, binding_rejection)
+                )
+                continue
             if operation.type == DateOperationType.REPLAN:
                 plan = await self._planner.plan(
                     _request_with_add_operations(local_request, ordered),
@@ -212,6 +246,60 @@ class DateOperationExecutor:
             effective_mutation=effective_mutation,
         )
 
+    async def _apply_requirement_update_to_plan(
+        self,
+        plan: DatePlan,
+        operation: DatePlanOperation,
+        request: DatePlanRequest,
+        existing_requirements: list[DateStopRequirement],
+        *,
+        trace: ExecutionTrace | None,
+    ) -> tuple[DatePlan, str | None, bool]:
+        update = operation.requirement_update
+        if update is None:
+            return plan, "requirement_update_missing", False
+        by_id = {requirement.id: requirement for requirement in existing_requirements}
+        targets: list[DateStopRequirement] = []
+        for reference in update.targets:
+            if reference.requirement_id is None or reference.requirement_id not in by_id:
+                return plan, "requirement_target_not_found", False
+            target = by_id[reference.requirement_id]
+            if len(target.alternatives) != 1:
+                return plan, "requirement_regroup_requires_independent_targets", False
+            targets.append(target)
+
+        matches_by_target = [
+            set(requirement_identity_place_ids(plan, target.alternatives[0]))
+            for target in targets
+        ]
+        selected = next(
+            (index for index, place_ids in enumerate(matches_by_target) if place_ids),
+            None,
+        )
+        if selected is None:
+            return plan, None, False
+        keep_ids = matches_by_target[selected]
+        remove_ids = set().union(
+            *(
+                place_ids
+                for index, place_ids in enumerate(matches_by_target)
+                if index != selected
+            )
+        ) - keep_ids
+        if not remove_ids:
+            return plan, None, False
+        items = [item for item in plan.items if item.place.id not in remove_ids]
+        if not items:
+            return plan, "operation_would_empty_plan", False
+        rebuilt = await self._planner.rebuild_plan(
+            plan,
+            request,
+            _renumber_items(items),
+            summary="已将现有地点要求合并为一个可选项，并保留其中一个行程节点。",
+            trace=trace,
+        )
+        return rebuilt, None, True
+
     async def apply_batch(
         self,
         existing_plan: DatePlan | None,
@@ -257,6 +345,7 @@ class DateOperationExecutor:
             if operation.type
             in {
                 DateOperationType.UPDATE_CONSTRAINT,
+                DateOperationType.UPDATE_REQUIREMENT,
                 DateOperationType.ADD_STOP,
                 DateOperationType.REPLAN,
             }
@@ -613,6 +702,7 @@ def _same_required_stop(first: DesiredDateStop, second: DesiredDateStop) -> bool
 def _ordered_operations(operations: list[DatePlanOperation]) -> list[DatePlanOperation]:
     order = {
         DateOperationType.UPDATE_CONSTRAINT: 0,
+        DateOperationType.UPDATE_REQUIREMENT: 0,
         DateOperationType.REMOVE_STOP: 1,
         DateOperationType.REPLACE_STOP: 2,
         DateOperationType.ADD_STOP: 3,
@@ -764,6 +854,30 @@ def _unique_target(
     if len(matches) != 1:
         return None, "operation_target_ambiguous"
     return matches[0], None
+
+
+def _ambiguous_requirement_binding_rejection(
+    plan: DatePlan,
+    operation: DatePlanOperation,
+    requirements: list[DateStopRequirement],
+) -> str | None:
+    if operation.type not in {
+        DateOperationType.REMOVE_STOP,
+        DateOperationType.REPLACE_STOP,
+        DateOperationType.MOVE_STOP,
+    } or not requirements:
+        return None
+    target, reason = _unique_target(plan, operation.target)
+    if reason is not None or target is None:
+        return None
+    matches = DateRequirementMatcher().match(requirements, plan)
+    bindings = resolve_requirement_bindings_for_plan_item(
+        place_id=target.place.id,
+        requirements=requirements,
+        plan=plan,
+        matches=matches,
+    )
+    return "ambiguous_requirement_binding" if len(bindings) > 1 else None
 
 
 def _kind_for_item(item: DatePlanItem) -> StopKind:

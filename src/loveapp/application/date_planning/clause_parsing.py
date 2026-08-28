@@ -7,6 +7,7 @@ class DateClause:
     text: str
     start: int
     end: int
+    source_text: str
 
 
 def split_date_clauses(text: str) -> list[DateClause]:
@@ -18,10 +19,13 @@ def split_date_clauses(text: str) -> list[DateClause]:
         _append_clause(clauses, text, start, match.start())
         start = match.end()
     _append_clause(clauses, text, start, len(text))
-    return _fold_temporal_prefixes(clauses)
+    return _fold_temporal_prefixes(clauses, text)
 
 
-def _fold_temporal_prefixes(clauses: list[DateClause]) -> list[DateClause]:
+def _fold_temporal_prefixes(
+    clauses: list[DateClause],
+    source_text: str,
+) -> list[DateClause]:
     folded: list[DateClause] = []
     index = 0
     while index < len(clauses):
@@ -44,6 +48,7 @@ def _fold_temporal_prefixes(clauses: list[DateClause]) -> list[DateClause]:
                 text="".join([*(prefix.text for prefix in prefixes), action.text]),
                 start=prefixes[0].start,
                 end=action.end,
+                source_text=source_text[prefixes[0].start : action.end].strip(),
             )
         )
         index += 1
@@ -67,6 +72,7 @@ def _append_clause(
             text=stripped,
             start=clause_start,
             end=clause_start + len(stripped),
+            source_text=stripped,
         )
     )
 

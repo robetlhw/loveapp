@@ -178,10 +178,18 @@ def _parse_place(poi: dict, request: PlaceSearchRequest) -> Place | None:
 
     cost_value = _as_float(business.get("cost"))
     cost_is_estimate = cost_value is None
+    if request.require_verified_cost and cost_value is None:
+        return None
     estimated_cost = (
         round(cost_value) if cost_value is not None else _DEFAULT_COSTS[request.category]
     )
     if request.max_cost_per_person is not None and estimated_cost > request.max_cost_per_person:
+        return None
+
+    rating = _bounded_rating(business.get("rating"))
+    if request.min_rating is not None and (
+        rating is None or rating < request.min_rating
+    ):
         return None
 
     tags = _place_tags(type_name, business, request.category)
@@ -225,7 +233,7 @@ def _parse_place(poi: dict, request: PlaceSearchRequest) -> Place | None:
         matched_preferences=matched_preferences,
         estimated_cost_per_person=max(estimated_cost, 0),
         cost_is_estimate=cost_is_estimate,
-        rating=_bounded_rating(business.get("rating")),
+        rating=rating,
         type_name=type_name or None,
         type_code=type_code or None,
         business_area=_as_text(business.get("business_area")) or None,

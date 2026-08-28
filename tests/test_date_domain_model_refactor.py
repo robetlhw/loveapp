@@ -26,6 +26,7 @@ from loveapp.application.date_planning.state_projection import (
     requirements_for_state,
 )
 from loveapp.application.routing import extract_date_plan_slots
+from loveapp.core.timing import ExecutionTrace
 from loveapp.domain.conversation import ConversationRequest
 from loveapp.domain.date_operations import (
     DateConstraintField,
@@ -44,11 +45,14 @@ from loveapp.domain.date_plan import DatePlan, DatePlanItem, DatePlanRequest, Pl
 from loveapp.domain.date_task import DatePlanningTaskState
 from loveapp.domain.date_workflow import DatePlanningWorkflowInput
 from loveapp.domain.enums import (
+    BudgetScope,
+    DatePlanMode,
     DatePlanMutation,
     DatePlanningStatus,
     DateTaskIntent,
     PlaceCategory,
     TaskType,
+    TransportMode,
 )
 from loveapp.domain.routing import DatePlanSlots, RouteInput, RouteResult
 
@@ -237,7 +241,7 @@ async def test_legacy_sqlite_state_migrates_once_without_overwriting_canonical(
         "user_id": "u",
         "relationship_id": "r",
         "conversation_id": "c",
-        "dining_keywords": ["火锅"],
+        "dining_keywords": [],
         "meal_keywords": {"dinner": ["火锅"]},
         "updated_at": now,
     }
@@ -266,6 +270,53 @@ async def test_legacy_sqlite_state_migrates_once_without_overwriting_canonical(
     assert reloaded.requirements[0].id == first_id
     assert reloaded.requirements[0].alternatives[0].keyword == "火锅"
     assert reloaded.dining_keywords == ["火锅"]
+
+
+async def test_sqlite_round_trip_preserves_typed_last_operation_values(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "typed-date-operations.db"
+    store = SQLiteDatePlanningTaskStore(database_path)
+    expected = [
+        (DateConstraintField.BUDGET_SCOPE, BudgetScope.PER_DAY),
+        (DateConstraintField.PLAN_MODE, DatePlanMode.MULTI_DAY),
+        (DateConstraintField.TRANSPORT_MODE, TransportMode.DRIVING),
+        (DateConstraintField.DATE, date(2026, 9, 1)),
+        (DateConstraintField.START_TIME, datetime(2026, 9, 1, 18, 30, tzinfo=UTC)),
+    ]
+    state = DatePlanningTaskState(
+        user_id="typed-user",
+        relationship_id="typed-relationship",
+        conversation_id="typed-conversation",
+        last_operations=[
+            DatePlanOperation(
+                type=DateOperationType.UPDATE_CONSTRAINT,
+                constraint_field=field,
+                constraint_value=value,
+            )
+            for field, value in expected
+        ],
+    )
+
+    await store.save(state)
+    reloaded = await store.get(
+        user_id=state.user_id,
+        relationship_id=state.relationship_id,
+        conversation_id=state.conversation_id,
+    )
+
+    assert reloaded is not None
+    assert [
+        (operation.constraint_field, operation.constraint_value)
+        for operation in reloaded.last_operations
+    ] == expected
+    assert [type(operation.constraint_value) for operation in reloaded.last_operations] == [
+        BudgetScope,
+        DatePlanMode,
+        TransportMode,
+        date,
+        datetime,
+    ]
 
 
 def test_requirement_matcher_reports_fulfilled_and_unsatisfied() -> None:
@@ -594,6 +645,21 @@ class _UnusedPlanner:
         raise AssertionError("planner should not run")
 
 
+class _KeepExistingPlanPlanner:
+    async def plan(
+        self,
+        request,
+        *,
+        existing_plan=None,
+        mutation=DatePlanMutation.NONE,
+        **kwargs,
+    ):
+        del request, kwargs
+        assert existing_plan is not None
+        assert mutation == DatePlanMutation.UPDATE_CONSTRAINT
+        return existing_plan
+
+
 class _OutcomeExecutor:
     def __init__(
         self,
@@ -635,7 +701,7 @@ async def _run_failed_add(
     conversation_id: str,
     candidate: DatePlan,
     apply_operation: bool,
-) -> tuple[DatePlanningTaskState, DatePlanOperation]:
+) -> tuple[DatePlanningTaskState, DatePlanOperation, str, ExecutionTrace]:
     old_plan = _plan(
         _item("old-japanese", "日料", PlaceCategory.RESTAURANT, order=1)
     )
@@ -661,14 +727,16 @@ async def _run_failed_add(
         ),
     )
 
+    trace = ExecutionTrace()
     result = await workflow.run(
         DatePlanningWorkflowInput(
             request=request,
             route=_route(query, [operation]),
             current_task_state=current,
-        )
+        ),
+        trace=trace,
     )
-    return result.task_state, operation
+    return result.task_state, operation, result.message, trace
 
 
 async def test_rejected_operation_preserves_requested_requirement() -> None:
@@ -676,7 +744,7 @@ async def test_rejected_operation_preserves_requested_requirement() -> None:
         _item("old-japanese", "日料", PlaceCategory.RESTAURANT, order=1)
     )
 
-    state, operation = await _run_failed_add(
+    state, operation, message, trace = await _run_failed_add(
         conversation_id="rejected-operation",
         candidate=old_plan,
         apply_operation=False,
@@ -689,6 +757,14 @@ async def test_rejected_operation_preserves_requested_requirement() -> None:
     ]
     assert state.requirement_satisfaction[0].status == RequirementStatus.UNSATISFIED
     assert state.last_operations == [operation]
+    assert "已记录火锅要求" in message
+    assert "尚未找到满足条件的地点" in message
+    projection = next(
+        record for record in trace.snapshot() if record.name == "date_requirement_projection"
+    )
+    assert projection.details["date_requirements_requested"] == 1
+    assert projection.details["date_requirements_committed"] == 1
+    assert projection.details["committed"] is True
 
 
 async def test_invalid_candidate_preserves_requirement_and_last_valid_plan() -> None:
@@ -697,7 +773,7 @@ async def test_invalid_candidate_preserves_requirement_and_last_valid_plan() -> 
         total_cost=800,
     )
 
-    state, _ = await _run_failed_add(
+    state, _, _, _ = await _run_failed_add(
         conversation_id="invalid-candidate",
         candidate=over_budget_hotpot,
         apply_operation=True,
@@ -707,6 +783,61 @@ async def test_invalid_candidate_preserves_requirement_and_last_valid_plan() -> 
     assert [item.place.id for item in state.current_plan.items] == ["old-japanese"]
     assert state.requirements[0].alternatives[0].keyword == "火锅"
     assert state.requirement_satisfaction[0].status == RequirementStatus.UNSATISFIED
+
+
+async def test_historical_unsatisfied_does_not_block_budget_update() -> None:
+    plan = _plan(_item("old-japanese", "日料", PlaceCategory.RESTAURANT, order=1))
+    requirement = _requirement(
+        "req-cinema",
+        DesiredDateStop(kind=StopKind.ACTIVITY, keyword="电影院"),
+    )
+    current = _current_state("historical-unsatisfied", plan, budget=1000).model_copy(
+        update={
+            "requirements": [requirement],
+            "requirement_satisfaction": DateRequirementMatcher().match(
+                [requirement],
+                plan,
+            ),
+        }
+    )
+    query = "预算提高到1500，其他安排不动。"
+    patch = DatePlanPatch(
+        budget=1500,
+        source_by_field={"budget": SlotSource.RULE},
+    )
+    operation = DatePlanOperation(
+        type=DateOperationType.UPDATE_CONSTRAINT,
+        constraint_field=DateConstraintField.BUDGET,
+        constraint_value=1500,
+        source_span=query,
+    )
+    route = _route(query, [operation], patch=patch).model_copy(
+        update={"date_mutation": DatePlanMutation.UPDATE_CONSTRAINT}
+    )
+    workflow = DatePlanningWorkflow(
+        _KeepExistingPlanPlanner(),  # type: ignore[arg-type]
+        InMemoryDatePlanningTaskStore(),
+    )
+
+    result = await workflow.run(
+        DatePlanningWorkflowInput(
+            request=ConversationRequest(
+                user_id=current.user_id,
+                relationship_id=current.relationship_id,
+                conversation_id=current.conversation_id,
+                query=query,
+            ),
+            route=route,
+            current_task_state=current,
+        )
+    )
+
+    assert result.task_state.budget == 1500
+    assert result.plan == plan
+    assert result.plan_changed is False
+    assert result.requirement_satisfaction[0].status == RequirementStatus.UNSATISFIED
+    assert "预算已从1000元调整为1500元" in result.message
+    assert "之前未满足的电影院要求仍待补充" in result.message
 
 
 async def test_invalid_candidate_without_fallback_matches_the_committed_empty_plan() -> None:

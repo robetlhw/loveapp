@@ -162,7 +162,12 @@ class DatePlanningWorkflow:
                 source_text=request.query,
                 unresolved_references=list(route.date_unresolved_references),
             )
-            _record_operation_batch(trace, operation_batch)
+            _record_operation_batch(
+                trace,
+                operation_batch,
+                preserve_unmentioned=route.date_mutation_policy.preserve_unmentioned_items,
+                candidate_count=route.date_operation_dedupe_input_count,
+            )
             if _should_clarify_date_task(current, merged):
                 _record_requirement_projection(
                     trace,
@@ -293,6 +298,11 @@ class DatePlanningWorkflow:
                                 ensure_ascii=False,
                                 separators=(",", ":"),
                             ),
+                            "alternative_outcomes_json": _alternative_outcomes_json(
+                                route.date_operations,
+                                execution.applied,
+                                execution.rejected,
+                            ),
                         }
                     )
                 blocking_rejections = _blocking_operation_rejections(execution)
@@ -313,16 +323,26 @@ class DatePlanningWorkflow:
                         else None
                     ),
                 )
-            _record_requirement_projection(
-                trace,
-                requirements_before,
-                candidate_requirements,
-                committed=True,
-            )
             if blocking_rejections:
+                committed_requirements = self._requirements_after_rejected_batch(
+                    requirements_before,
+                    candidate_requirements,
+                    current,
+                    operation_batch,
+                )
+                _record_requirement_projection(
+                    trace,
+                    requirements_before,
+                    candidate_requirements,
+                    committed=False,
+                    committed_requirements=committed_requirements,
+                )
                 return await self._invalid_plan_result(
                     current=current,
-                    merged=merged,
+                    merged=project_requirements_to_state(
+                        merged,
+                        committed_requirements,
+                    ),
                     candidate_plan=plan,
                     mutation=mutation,
                     operation_batch=operation_batch,
@@ -331,6 +351,30 @@ class DatePlanningWorkflow:
                     ],
                     trace=trace,
                 )
+            if not _has_executable_plan(plan) and _has_executable_plan(
+                current.current_plan
+            ):
+                _record_requirement_projection(
+                    trace,
+                    requirements_before,
+                    candidate_requirements,
+                    committed=True,
+                )
+                return await self._invalid_plan_result(
+                    current=current,
+                    merged=merged,
+                    candidate_plan=plan,
+                    mutation=mutation,
+                    operation_batch=operation_batch,
+                    validation_codes=["empty_candidate_plan"],
+                    trace=trace,
+                )
+            _record_requirement_projection(
+                trace,
+                requirements_before,
+                candidate_requirements,
+                committed=True,
+            )
             with trace.measure("date_plan_role_completion") as details:
                 completion = complete_date_plan_roles(
                     plan,
@@ -373,7 +417,14 @@ class DatePlanningWorkflow:
                 candidate_requirements,
                 satisfaction,
             )
-            _record_requirement_satisfaction(trace, satisfaction)
+            historical_unsatisfied_ids = _unsatisfied_requirement_ids(
+                current.requirement_satisfaction
+            )
+            _record_requirement_satisfaction(
+                trace,
+                satisfaction,
+                historical_unsatisfied_ids=historical_unsatisfied_ids,
+            )
             with trace.measure("date_plan_validation") as details:
                 validation = _validate_candidate_plan(
                     self._validator,
@@ -384,6 +435,7 @@ class DatePlanningWorkflow:
                     satisfaction,
                 )
                 details["valid"] = validation.valid
+                details["validation_hard_valid"] = validation.valid
                 details["issue_codes"] = ",".join(issue.code for issue in validation.issues)
             if not validation.valid:
                 return await self._invalid_plan_result(
@@ -466,6 +518,7 @@ class DatePlanningWorkflow:
                     plan_diff=plan_diff,
                     task_diff=task_diff,
                     satisfaction=satisfaction,
+                    requirements=candidate_requirements,
                 ),
                 task_state=saved,
                 plan=plan,
@@ -490,6 +543,7 @@ class DatePlanningWorkflow:
                 operations,
                 current_plan=current.current_plan,
                 source_text=source_text,
+                requirement_matches=current.requirement_satisfaction,
             )
         incoming = desired_stops_from_legacy(
             dining_keywords=slots.dining_keywords,
@@ -505,6 +559,33 @@ class DatePlanningWorkflow:
             [DatePlanOperation(type=DateOperationType.ADD_STOP, payload=stop) for stop in incoming],
             current_plan=current.current_plan,
             source_text=source_text,
+            requirement_matches=current.requirement_satisfaction,
+        )
+
+    def _requirements_after_rejected_batch(
+        self,
+        requirements_before: list[DateStopRequirement],
+        candidate_requirements: list[DateStopRequirement],
+        current: DatePlanningTaskState,
+        operation_batch: DateOperationBatch,
+    ) -> list[DateStopRequirement]:
+        """Keep failed additions durable while rolling back destructive projections."""
+
+        additions = [
+            operation
+            for operation in operation_batch.operations
+            if operation.type == DateOperationType.ADD_STOP
+        ]
+        if not additions:
+            return requirements_before
+        if len(additions) == len(operation_batch.operations):
+            return candidate_requirements
+        return self._requirement_projector.apply_requirement_operations(
+            requirements_before,
+            additions,
+            current_plan=current.current_plan,
+            source_text=operation_batch.source_text,
+            requirement_matches=current.requirement_satisfaction,
         )
 
     async def _invalid_plan_result(
@@ -540,7 +621,13 @@ class DatePlanningWorkflow:
                 trace,
             )
             _record_task_diff(trace, task_diff)
-            _record_requirement_satisfaction(trace, satisfaction)
+            _record_requirement_satisfaction(
+                trace,
+                satisfaction,
+                historical_unsatisfied_ids=_unsatisfied_requirement_ids(
+                    current.requirement_satisfaction
+                ),
+            )
             _record_plan_diff(
                 trace,
                 diff_date_plans(current.current_plan, current.current_plan),
@@ -553,7 +640,15 @@ class DatePlanningWorkflow:
                 validation_codes=validation_codes,
             )
             return DatePlanningWorkflowResult(
-                message="新的条件无法满足；已保留上一版有效行程。",
+                message=(
+                    _unsatisfied_turn_message(
+                        current,
+                        requirements_for_state(merged),
+                        satisfaction,
+                        fallback_plan=True,
+                    )
+                    or "新的条件无法满足；已保留上一版有效行程。"
+                ),
                 task_state=saved,
                 plan=current.current_plan,
                 plan_changed=False,
@@ -579,7 +674,13 @@ class DatePlanningWorkflow:
             trace,
         )
         _record_task_diff(trace, task_diff)
-        _record_requirement_satisfaction(trace, satisfaction)
+        _record_requirement_satisfaction(
+            trace,
+            satisfaction,
+            historical_unsatisfied_ids=_unsatisfied_requirement_ids(
+                current.requirement_satisfaction
+            ),
+        )
         _record_plan_diff(
             trace,
             diff_date_plans(current.current_plan, current.current_plan),
@@ -855,14 +956,45 @@ def _record_requirement_projection(
     after: list[DateStopRequirement],
     *,
     committed: bool,
+    committed_requirements: list[DateStopRequirement] | None = None,
 ) -> None:
+    before_by_id = {requirement.id: requirement for requirement in before}
+    after_by_id = {requirement.id: requirement for requirement in after}
+    removed_ids = [value for value in before_by_id if value not in after_by_id]
+    created_ids = [value for value in after_by_id if value not in before_by_id]
+    updated_ids = [
+        value
+        for value in before_by_id
+        if value in after_by_id and before_by_id[value] != after_by_id[value]
+    ]
+    grouped = len(removed_ids) >= 2 and len(created_ids) == 1
+    mutation_types: list[str] = []
+    if grouped:
+        mutation_types.append("grouped")
+    elif created_ids:
+        mutation_types.append("created")
+    if updated_ids:
+        mutation_types.append("updated")
+    if removed_ids and not grouped:
+        mutation_types.append("removed")
+    actual_committed = (
+        committed_requirements
+        if committed_requirements is not None
+        else after
+        if committed
+        else before
+    )
     with trace.measure("date_requirement_projection") as details:
         details.update(
             {
                 "date_requirements_before": len(before),
                 "date_requirements_requested": len(after),
-                "date_requirements_committed": len(after) if committed else len(before),
-                "committed": committed,
+                "date_requirements_committed": len(actual_committed),
+                "committed": actual_committed == after,
+                "requirement_update_type": ",".join(mutation_types) or "unchanged",
+                "requirement_created_ids": ",".join(created_ids),
+                "requirement_updated_ids": ",".join(updated_ids),
+                "requirement_removed_ids": ",".join(removed_ids),
                 "date_requirements_json": json.dumps(
                     [requirement.model_dump(mode="json") for requirement in after],
                     ensure_ascii=False,
@@ -961,6 +1093,9 @@ def _blocking_operation_rejections(
 def _record_operation_batch(
     trace: ExecutionTrace,
     batch: DateOperationBatch,
+    *,
+    preserve_unmentioned: bool,
+    candidate_count: int,
 ) -> None:
     with trace.measure("date_operation_batch") as details:
         details.update(
@@ -968,18 +1103,56 @@ def _record_operation_batch(
                 "date_operation_batch_count": len(batch.operations),
                 "operation_types": ",".join(operation.type.value for operation in batch.operations),
                 "unresolved_reference_count": len(batch.unresolved_references),
+                "mutation_policy_preserve_unmentioned": preserve_unmentioned,
+                "operation_dedupe_input_count": candidate_count,
+                "operation_dedupe_output_count": len(batch.operations),
             }
         )
+
+
+def _alternative_outcomes_json(
+    requested: list[DatePlanOperation],
+    applied: tuple[DatePlanOperation, ...],
+    rejected: tuple[RejectedDatePlanOperation, ...],
+) -> str:
+    groups: dict[str, list[DatePlanOperation]] = {}
+    for operation in requested:
+        if operation.alternative_group is not None:
+            groups.setdefault(operation.alternative_group, []).append(operation)
+    outcomes: list[dict[str, object]] = []
+    for group_id, operations in groups.items():
+        applied_count = sum(operation in applied for operation in operations)
+        already_satisfied = any(
+            item.operation in operations and item.reason == "alternative_not_selected"
+            for item in rejected
+        )
+        matched = applied_count or int(already_satisfied)
+        outcomes.append(
+            {
+                "group": group_id,
+                "candidates": len(operations),
+                "required": 1,
+                "matched": matched,
+                "status": "fulfilled" if matched else "unsatisfied",
+            }
+        )
+    return json.dumps(outcomes, ensure_ascii=False, separators=(",", ":"))
 
 
 def _record_requirement_satisfaction(
     trace: ExecutionTrace,
     matches: list[DateRequirementMatch],
+    *,
+    historical_unsatisfied_ids: set[str] | None = None,
 ) -> None:
     unsatisfied = [
         match for match in matches if match.status != RequirementStatus.FULFILLED
     ]
     with trace.measure("date_requirement_satisfaction") as details:
+        historical_ids = historical_unsatisfied_ids or set()
+        historical_count = sum(
+            match.requirement_id in historical_ids for match in unsatisfied
+        )
         details.update(
             {
                 "date_requirement_match_count": len(matches),
@@ -989,6 +1162,8 @@ def _record_requirement_satisfaction(
                         match.reason_code or match.status.value for match in unsatisfied
                     )
                 ),
+                "historical_unsatisfied_count": historical_count,
+                "current_turn_unsatisfied_count": len(unsatisfied) - historical_count,
                 "matches_json": json.dumps(
                     [match.model_dump(mode="json") for match in matches],
                     ensure_ascii=False,
@@ -1115,9 +1290,46 @@ def _compose_response(
     plan_diff: DatePlanDiff,
     task_diff: DateTaskDiff,
     satisfaction: list[DateRequirementMatch],
+    requirements: list[DateStopRequirement],
 ) -> str:
+    historical_ids = _unsatisfied_requirement_ids(current.requirement_satisfaction)
+    current_turn_unsatisfied = any(
+        match.status != RequirementStatus.FULFILLED
+        and match.requirement_id not in historical_ids
+        for match in satisfaction
+    )
+    if current_turn_unsatisfied:
+        unsatisfied_message = _unsatisfied_turn_message(
+            current,
+            requirements,
+            satisfaction,
+            fallback_plan=False,
+        )
+        budget_change = task_diff.changes.get("budget")
+        if budget_change is not None:
+            return (
+                f"预算已从{budget_change.before or '未设置'}元调整为"
+                f"{budget_change.after}元。当前行程保持不变；{unsatisfied_message}"
+            )
+        return unsatisfied_message
+    historical_note = (
+        _unsatisfied_turn_message(
+            current,
+            requirements,
+            satisfaction,
+            fallback_plan=False,
+        )
+        if any(match.status != RequirementStatus.FULFILLED for match in satisfaction)
+        else ""
+    )
+
+    def respond(message: str) -> str:
+        if not historical_note:
+            return message
+        return f"{message.rstrip('。')}；{historical_note}"
+
     if current.current_plan is None:
-        return (
+        return respond(
             "好的，我已根据地点、预算和偏好整理出一份完整约会行程。"
             if plan.items
             else "我已先根据当前信息整理了规划草案，补充条件后可以继续完善。"
@@ -1125,16 +1337,16 @@ def _compose_response(
     if not changed:
         budget_change = task_diff.changes.get("budget")
         if budget_change is not None:
-            return (
+            return respond(
                 f"预算已从{budget_change.before or '未设置'}元调整为"
                 f"{budget_change.after}元。当前行程仍满足新预算，因此地点无需调整。"
             )
         if task_diff.changed:
-            return (
+            return respond(
                 f"已更新约会条件：{'、'.join(task_diff.changed_fields)}。"
                 "当前行程仍满足这些要求，因此地点无需调整。"
             )
-        return "我核对了刚补充的条件，现有行程没有需要替换的节点，因此先保留当前版本。"
+        return respond("我核对了刚补充的条件，现有行程没有需要替换的节点，因此先保留当前版本。")
     change_kind_count = sum(
         bool(place_ids)
         for place_ids in (
@@ -1157,23 +1369,85 @@ def _compose_response(
                 changes.append(f"移除了{'、'.join(removed)}")
         if moved:
             changes.append(f"调整了{'、'.join(moved)}的行程位置")
-        return f"新的要求已生效，行程{'；'.join(changes)}。其他未受影响的节点保持不变。"
+        return respond(
+            f"新的要求已生效，行程{'；'.join(changes)}。其他未受影响的节点保持不变。"
+        )
     if plan_diff.added_place_ids and plan_diff.removed_place_ids:
         removed = _plan_place_names(current.current_plan, plan_diff.removed_place_ids)
         added = _plan_place_names(plan, plan_diff.added_place_ids)
-        return (
+        return respond(
             "新的约束已生效。行程已将"
             f"{'、'.join(removed) or '原节点'}替换为{'、'.join(added) or '新节点'}，"
             "其他未受影响的节点保持不变。"
         )
     if mutation == DatePlanMutation.ADD:
-        return "明白了，我保留上一版行程，并补充了新的约会节点。"
+        return respond("明白了，我保留上一版行程，并补充了新的约会节点。")
     if mutation == DatePlanMutation.REPLACE:
-        return "收到，我保留了没有受到影响的节点，并替换了你指定的部分。"
+        return respond("收到，我保留了没有受到影响的节点，并替换了你指定的部分。")
     if plan_diff.moved_place_ids:
         moved = _plan_place_names(plan, plan_diff.moved_place_ids)
-        return f"收到，我已按新的时段要求调整{'、'.join(moved)}的行程位置。"
-    return "收到，我已把新的日期、预算或其他约束纳入核对；现有地点节点保持不变。"
+        return respond(f"收到，我已按新的时段要求调整{'、'.join(moved)}的行程位置。")
+    if plan_diff.removed_place_ids:
+        removed = _plan_place_names(current.current_plan, plan_diff.removed_place_ids)
+        return respond(
+            f"收到，我已移除{'、'.join(removed) or '你指定的节点'}，其他安排保持不变。"
+        )
+    return respond("收到，我已把新的日期、预算或其他约束纳入核对；现有地点节点保持不变。")
+
+
+def _unsatisfied_requirement_ids(
+    matches: list[DateRequirementMatch],
+) -> set[str]:
+    return {
+        match.requirement_id
+        for match in matches
+        if match.status != RequirementStatus.FULFILLED
+    }
+
+
+def _unsatisfied_turn_message(
+    current: DatePlanningTaskState,
+    requirements: list[DateStopRequirement],
+    matches: list[DateRequirementMatch],
+    *,
+    fallback_plan: bool,
+) -> str:
+    unsatisfied = [
+        match for match in matches if match.status != RequirementStatus.FULFILLED
+    ]
+    if not unsatisfied:
+        return ""
+    historical_ids = _unsatisfied_requirement_ids(current.requirement_satisfaction)
+    current_turn = [
+        match for match in unsatisfied if match.requirement_id not in historical_ids
+    ]
+    by_id = {requirement.id: requirement for requirement in requirements}
+    if current_turn:
+        labels = [
+            "/".join(
+                alternative.keyword
+                or alternative.place_name
+                or alternative.meal_type.value
+                for alternative in by_id[match.requirement_id].alternatives
+            )
+            for match in current_turn
+            if match.requirement_id in by_id
+        ]
+        subject = "、".join(dict.fromkeys(labels)) or "新增地点"
+        suffix = "已保留上一版有效行程。" if fallback_plan else "当前行程保持不变。"
+        return f"已记录{subject}要求，但当前条件下尚未找到满足条件的地点；{suffix}"
+    labels = [
+        "/".join(
+            alternative.keyword
+            or alternative.place_name
+            or alternative.meal_type.value
+            for alternative in by_id[match.requirement_id].alternatives
+        )
+        for match in unsatisfied
+        if match.requirement_id in by_id
+    ]
+    pending = "、".join(dict.fromkeys(labels)) or "既有要求"
+    return f"之前未满足的{pending}要求仍待补充。"
 
 
 def _apply_requirement_match_reasons(

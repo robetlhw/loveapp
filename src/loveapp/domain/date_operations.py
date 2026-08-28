@@ -11,6 +11,7 @@ from loveapp.domain.enums import BudgetScope, DatePlanMode, TransportMode
 
 class DateOperationType(StrEnum):
     UPDATE_CONSTRAINT = "update_constraint"
+    UPDATE_REQUIREMENT = "update_requirement"
     ADD_STOP = "add_stop"
     REMOVE_STOP = "remove_stop"
     REPLACE_STOP = "replace_stop"
@@ -94,7 +95,42 @@ class StopReference(BaseModel):
         return self
 
 
+class RequirementReference(BaseModel):
+    requirement_id: str | None = Field(default=None, min_length=1, max_length=64)
+    stop_reference: StopReference | None = None
+
+    @model_validator(mode="after")
+    def validate_reference(self) -> "RequirementReference":
+        if self.requirement_id is None and self.stop_reference is None:
+            raise ValueError("a requirement reference requires an identifier")
+        return self
+
+
+class DateRequirementUpdate(BaseModel):
+    targets: list[RequirementReference] = Field(min_length=2, max_length=8)
+    min_satisfied: int = Field(default=1, ge=1, le=8)
+    max_satisfied: int | None = Field(default=1, ge=1, le=8)
+
+    @model_validator(mode="after")
+    def validate_cardinality(self) -> "DateRequirementUpdate":
+        if self.min_satisfied > len(self.targets):
+            raise ValueError("minimum satisfaction cannot exceed target count")
+        if self.max_satisfied is not None:
+            if self.max_satisfied < self.min_satisfied:
+                raise ValueError("maximum satisfaction cannot be below minimum satisfaction")
+            if self.max_satisfied > len(self.targets):
+                raise ValueError("maximum satisfaction cannot exceed target count")
+        return self
+
+
 type TemporalReference = TemporalAnchor | StopReference
+
+
+class DateStopConstraints(BaseModel):
+    max_cost_per_person: int | None = Field(default=None, gt=0)
+    min_rating: float | None = Field(default=None, ge=0, le=5)
+    preferred_area: str | None = Field(default=None, min_length=1, max_length=120)
+    max_distance_meters: int | None = Field(default=None, gt=0)
 
 
 class DesiredDateStop(BaseModel):
@@ -111,6 +147,7 @@ class DesiredDateStop(BaseModel):
     time_window: TimeWindow | None = None
     after: TemporalReference | None = None
     before: TemporalReference | None = None
+    constraints: DateStopConstraints | None = None
 
     @model_validator(mode="after")
     def validate_stop(self) -> "DesiredDateStop":
@@ -171,8 +208,14 @@ class DateStopRequirement(BaseModel):
 
 
 def deterministic_requirement_id(alternatives: list[DesiredDateStop]) -> str:
+    serialized: list[dict[str, object]] = []
+    for stop in alternatives:
+        value = stop.model_dump(mode="json")
+        if value.get("constraints") is None:
+            value.pop("constraints", None)
+        serialized.append(value)
     signature = json.dumps(
-        [stop.model_dump(mode="json") for stop in alternatives],
+        serialized,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -196,6 +239,19 @@ def desired_stops_from_legacy_slots(
         if meal_type in MealType._value2member_map_
         for keyword in keywords
     }
+    dining_values = list(
+        dict.fromkeys(
+            [
+                *dining_keywords,
+                *(
+                    keyword
+                    for meal_type, keywords in meal_keywords.items()
+                    if meal_type in MealType._value2member_map_
+                    for keyword in keywords
+                ),
+            ]
+        )
+    )
     result = [
         DesiredDateStop(
             kind=StopKind.CAFE if "咖啡" in keyword else StopKind.DINING,
@@ -203,7 +259,7 @@ def desired_stops_from_legacy_slots(
             meal_type=meal_by_keyword.get(keyword),
             target_day=target_day,
         )
-        for keyword in dining_keywords
+        for keyword in dining_values
     ]
     unique_after_dinner = len(activity_keywords) == 1 and any(
         marker in schedule_hints for marker in ("晚饭后", "晚餐后")
@@ -238,6 +294,7 @@ class DatePlanOperation(BaseModel):
     payload: DesiredDateStop | None = None
     constraint_field: DateConstraintField | None = None
     constraint_value: DateConstraintValue | None = None
+    requirement_update: DateRequirementUpdate | None = None
     source_span: str | None = Field(default=None, min_length=1, max_length=1000)
     alternative_group: str | None = Field(default=None, min_length=1, max_length=64)
     confidence: float | None = Field(default=None, ge=0, le=1)
@@ -249,6 +306,13 @@ class DatePlanOperation(BaseModel):
         if self.type == DateOperationType.UPDATE_CONSTRAINT:
             if self.constraint_field is None or self.constraint_value is None:
                 raise ValueError("constraint updates require a field and value")
+            self.constraint_value = _typed_constraint_value(
+                self.constraint_field,
+                self.constraint_value,
+            )
+        elif self.type == DateOperationType.UPDATE_REQUIREMENT:
+            if self.requirement_update is None:
+                raise ValueError("requirement updates require a typed update payload")
         elif self.type == DateOperationType.ADD_STOP:
             if self.payload is None:
                 raise ValueError("add-stop operations require a payload")
@@ -265,6 +329,29 @@ class DatePlanOperation(BaseModel):
         ):
             raise ValueError("move-stop operations require a target and desired placement")
         return self
+
+
+def _typed_constraint_value(
+    field: DateConstraintField,
+    value: DateConstraintValue,
+) -> DateConstraintValue:
+    enum_types = {
+        DateConstraintField.BUDGET_SCOPE: BudgetScope,
+        DateConstraintField.PLAN_MODE: DatePlanMode,
+        DateConstraintField.TRANSPORT_MODE: TransportMode,
+    }
+    enum_type = enum_types.get(field)
+    if enum_type is not None:
+        return value if isinstance(value, enum_type) else enum_type(value)
+    if field in {DateConstraintField.BUDGET, DateConstraintField.DAY_COUNT}:
+        return value if isinstance(value, int) else int(value)
+    if field in {DateConstraintField.DATE, DateConstraintField.END_DATE}:
+        if isinstance(value, datetime):
+            return value.date()
+        return value if isinstance(value, date) else date.fromisoformat(value)
+    if field == DateConstraintField.START_TIME:
+        return value if isinstance(value, datetime) else datetime.fromisoformat(value)
+    return value
 
 
 class DateOperationBatch(BaseModel):

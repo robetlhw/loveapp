@@ -1067,6 +1067,8 @@ async def _run_chat(
                 if turn.date_task_state is not None:
                     _render_date_task_state(turn.date_task_state)
                 _render_date_operation_outcome(trace)
+                _render_date_requirement_mutations(trace)
+                _render_date_validation(trace)
                 _render_date_plan_telemetry(trace)
             if debug_memory and turn.memory_result is not None:
                 console.print()
@@ -1355,6 +1357,21 @@ def _render_date_semantic(route: RouteResult) -> None:
     table.add_row("date_semantic_fallback_reason", route.date_semantic_fallback_reason or "-")
     if route.date_semantic_error:
         table.add_row("date_semantic_error", route.date_semantic_error)
+    validation_error_path = getattr(route, "date_semantic_validation_error_path", None)
+    invalid_field = getattr(route, "date_semantic_invalid_field", None)
+    raw_operation_type = getattr(route, "date_semantic_raw_operation_type", None)
+    if validation_error_path:
+        table.add_row(
+            "semantic_validation_error_path",
+            validation_error_path,
+        )
+    if invalid_field:
+        table.add_row("semantic_invalid_field", invalid_field)
+    if raw_operation_type:
+        table.add_row(
+            "semantic_raw_operation_type",
+            raw_operation_type,
+        )
     console.print(table)
 
 
@@ -1526,6 +1543,73 @@ def _render_date_operation_outcome(trace: ExecutionTrace) -> None:
     console.print(table)
 
 
+def _render_date_requirement_mutations(trace: ExecutionTrace) -> None:
+    records = [
+        record
+        for record in trace.snapshot()
+        if record.name == "date_requirement_projection"
+        and record.details.get("requirement_update_type") != "unchanged"
+    ]
+    if not records:
+        return
+    details = records[-1].details
+    table = Table(title="Requirement Mutations")
+    table.add_column("Type")
+    table.add_column("Created")
+    table.add_column("Updated")
+    table.add_column("Removed")
+    table.add_row(
+        str(details.get("requirement_update_type") or "-"),
+        str(details.get("requirement_created_ids") or "-"),
+        str(details.get("requirement_updated_ids") or "-"),
+        str(details.get("requirement_removed_ids") or "-"),
+    )
+    console.print(table)
+
+
+def _render_date_validation(trace: ExecutionTrace) -> None:
+    records = trace.snapshot()
+    validation = next(
+        (record.details for record in reversed(records) if record.name == "date_plan_validation"),
+        None,
+    )
+    satisfaction = next(
+        (
+            record.details
+            for record in reversed(records)
+            if record.name == "date_requirement_satisfaction"
+        ),
+        {},
+    )
+    operation_batch = next(
+        (record.details for record in reversed(records) if record.name == "date_operation_batch"),
+        {},
+    )
+    if validation is None:
+        return
+    table = Table(title="Validation")
+    table.add_column("Hard Valid")
+    table.add_column("Issues")
+    table.add_column("Historical Unsatisfied", justify="right")
+    table.add_column("Current Unsatisfied", justify="right")
+    table.add_column("Dedupe")
+    table.add_column("Preserve Unmentioned")
+    table.add_row(
+        "yes" if validation.get("validation_hard_valid") else "no",
+        str(validation.get("issue_codes") or "-"),
+        str(satisfaction.get("historical_unsatisfied_count", 0)),
+        str(satisfaction.get("current_turn_unsatisfied_count", 0)),
+        (
+            f"{operation_batch.get('operation_dedupe_input_count', 0)} -> "
+            f"{operation_batch.get('operation_dedupe_output_count', 0)}"
+        ),
+        "yes"
+        if operation_batch.get("mutation_policy_preserve_unmentioned")
+        else "no",
+    )
+    console.print(table)
+
+
 def _render_date_plan_telemetry(trace: ExecutionTrace) -> None:
     records = [
         record
@@ -1565,6 +1649,9 @@ def _format_date_stop_role(stop: DesiredDateStop) -> str:
         parts.append(f"after={_format_temporal_reference(stop.after)}")
     if stop.before is not None:
         parts.append(f"before={_format_temporal_reference(stop.before)}")
+    if stop.constraints is not None:
+        constraints = stop.constraints.model_dump(exclude_none=True)
+        parts.extend(f"{name}={value}" for name, value in constraints.items())
     return ", ".join(parts)
 
 
@@ -1596,6 +1683,16 @@ def _format_date_operation_payload(operation: DatePlanOperation) -> str:
         payload = _format_desired_date_stop(operation.payload)
         role = _format_date_stop_role(operation.payload)
         return f"{payload} ({role})" if role else payload
+    if operation.requirement_update is not None:
+        targets = ",".join(
+            reference.requirement_id or _format_stop_reference(reference.stop_reference)
+            for reference in operation.requirement_update.targets
+        )
+        maximum = operation.requirement_update.max_satisfied
+        return (
+            f"targets={targets}; cardinality="
+            f"{operation.requirement_update.min_satisfied}..{maximum or '*'}"
+        )
     return "-"
 
 

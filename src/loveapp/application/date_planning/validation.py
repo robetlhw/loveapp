@@ -69,12 +69,15 @@ class DatePlanValidator:
         self,
         matches: list[DateRequirementMatch],
     ) -> list[PlanValidationIssue]:
+        """Report satisfaction without turning it into transaction acceptance."""
+
         issues: list[PlanValidationIssue] = []
         for match in matches:
             if match.status == RequirementStatus.FULFILLED:
                 continue
+            issue = _error if match.reason_code == "required_stop_role_mismatch" else _warning
             issues.append(
-                _error(
+                issue(
                     match.reason_code or "required_stop_unsatisfied",
                     "当前方案尚未满足一项明确的用户要求。",
                     match.matched_place_ids,

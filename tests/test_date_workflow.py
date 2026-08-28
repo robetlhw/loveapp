@@ -18,6 +18,7 @@ from loveapp.domain.date_operations import (
     DatePlanOperation,
     DateStopRequirement,
     DesiredDateStop,
+    RequirementStatus,
     StopKind,
     StopReference,
 )
@@ -350,6 +351,47 @@ async def test_workflow_does_not_persist_empty_plan_as_planned() -> None:
 
 
 @pytest.mark.asyncio
+async def test_empty_candidate_keeps_and_returns_last_valid_plan() -> None:
+    current = _planned_single_stop_state(
+        "empty-candidate-fallback",
+        requirement=DesiredDateStop(kind=StopKind.ACTIVITY, keyword="景点"),
+    )
+    route = _route(intent=DateTaskIntent.SUPPLEMENT).model_copy(
+        update={
+            "date_patch": DatePlanPatch(
+                budget=10,
+                source_by_field={"budget": SlotSource.RULE},
+            )
+        }
+    )
+
+    result = await DatePlanningWorkflow(
+        RecordingPlanner(empty=True),  # type: ignore[arg-type]
+        InMemoryDatePlanningTaskStore(),
+        PermissiveValidator(),  # type: ignore[arg-type]
+    ).run(
+        DatePlanningWorkflowInput(
+            request=ConversationRequest(
+                user_id=current.user_id,
+                relationship_id=current.relationship_id,
+                conversation_id=current.conversation_id,
+                query="把预算改为10元",
+            ),
+            route=route,
+            current_task_state=current,
+        )
+    )
+
+    assert result.plan_committed is False
+    assert result.plan == current.current_plan
+    assert result.task_state.current_plan == current.current_plan
+    assert result.task_state.plan_version == current.plan_version
+    assert result.task_state.budget == 10
+    assert result.requirement_satisfaction[0].status == RequirementStatus.FULFILLED
+    assert result.task_state.requirement_satisfaction == result.requirement_satisfaction
+
+
+@pytest.mark.asyncio
 async def test_city_remains_blocking_after_an_earlier_clarification() -> None:
     store = InMemoryDatePlanningTaskStore()
     workflow = DatePlanningWorkflow(UnusedPlanner(), store)  # type: ignore[arg-type]
@@ -487,7 +529,7 @@ async def test_rejected_remove_fails_candidate_commit() -> None:
     )
 
     assert result.plan_committed is False
-    assert result.task_state.requirements == []
+    assert result.task_state.requirements == current.requirements
     assert result.task_state.current_plan == current.current_plan
     assert result.task_state.plan_version == 1
     assert result.task_state.last_operations == [operation]
@@ -532,7 +574,7 @@ async def test_rejected_generic_replace_fails_candidate_commit() -> None:
     )
 
     assert result.plan_committed is False
-    assert result.task_state.requirements == []
+    assert result.task_state.requirements == current.requirements
     assert result.task_state.current_plan == current.current_plan
     assert result.task_state.plan_version == 1
 

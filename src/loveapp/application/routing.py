@@ -42,7 +42,13 @@ from loveapp.domain.enums import (
     TaskType,
 )
 from loveapp.domain.memory import MessageRole
-from loveapp.domain.routing import DatePlanSlots, RouteCorrection, RouteInput, RouteResult
+from loveapp.domain.routing import (
+    DateMutationPolicy,
+    DatePlanSlots,
+    RouteCorrection,
+    RouteInput,
+    RouteResult,
+)
 from loveapp.ports.date_semantics import DateSemanticParser
 from loveapp.ports.routing import RouteCorrector
 from loveapp.safety import SafetyPolicy
@@ -230,6 +236,32 @@ class HybridRouter:
             route_input.runtime_context,
             deterministic,
         )
+        semantic_base_patch = _remove_unverified_stop_local_area(
+            result.date_patch,
+            route_input.latest_query,
+            parse_reasons=parse_reasons,
+        )
+        if semantic_base_patch != result.date_patch:
+            deterministic = _DATE_OPERATION_RESOLVER.resolve(
+                route_input.latest_query,
+                route_input.runtime_context,
+                semantic_base_patch,
+            )
+            required = requires_date_semantic_parse(
+                route_input.latest_query,
+                route_input.runtime_context,
+                deterministic,
+            )
+            parse_reasons = date_semantic_parse_reasons(
+                route_input.latest_query,
+                route_input.runtime_context,
+                deterministic,
+            )
+            deterministic_complete = deterministic_date_parse_is_complete(
+                route_input.latest_query,
+                route_input.runtime_context,
+                deterministic,
+            )
         profile = getattr(self._date_semantic_parser, "semantic_profile", {})
         base_update = {
             "date_clause_count": len(clauses),
@@ -240,6 +272,10 @@ class HybridRouter:
                 profile if isinstance(profile, Mapping) else {}
             ),
             "date_unresolved_references": list(deterministic.unresolved_references),
+            "date_patch": semantic_base_patch,
+            "date_operations": list(deterministic.operations),
+            "date_operation_candidate_count": len(deterministic.candidates),
+            "date_operation_dedupe_input_count": deterministic.input_count,
         }
         if not required:
             return result.model_copy(
@@ -265,8 +301,8 @@ class HybridRouter:
             resolution = _DATE_OPERATION_RESOLVER.resolve(
                 route_input.latest_query,
                 route_input.runtime_context,
-                result.date_patch,
-                proposed_operations=[*result.date_operations, *parsed.operations],
+                semantic_base_patch,
+                proposed_operations=[*deterministic.operations, *parsed.operations],
                 proposed_unresolved_references=parsed.unresolved_references,
                 preferred_constraint_operations=parsed.operations,
                 allow_semantic_constraint_corrections=True,
@@ -312,12 +348,13 @@ class HybridRouter:
                 "date_semantic_llm_used": True,
                 **_date_semantic_route_telemetry(telemetry),
                 "date_patch": _apply_verified_semantic_constraints(
-                    result.date_patch,
+                    semantic_base_patch,
                     parsed.operations,
                     resolution.operations,
                 ),
                 "date_operations": list(resolution.operations),
                 "date_operation_candidate_count": len(resolution.candidates),
+                "date_operation_dedupe_input_count": resolution.input_count,
                 "date_operation_rejections": [
                     f"{item.operation.type.value}:{item.reason}" for item in resolution.rejected
                 ],
@@ -393,6 +430,9 @@ class HybridRouter:
                 "date_operations": date_operations,
                 "date_operation_candidate_count": (
                     result.date_operation_candidate_count if date_authorized else 0
+                ),
+                "date_operation_dedupe_input_count": (
+                    result.date_operation_dedupe_input_count if date_authorized else 0
                 ),
                 "date_operation_rejections": date_operation_rejections,
                 "date_unresolved_references": (
@@ -617,6 +657,9 @@ def _date_semantic_route_telemetry(telemetry: Mapping[str, object]) -> dict[str,
         "date_semantic_input_tokens": telemetry.get("input_tokens"),
         "date_semantic_output_tokens": telemetry.get("output_tokens"),
         "date_semantic_duration_ms": telemetry.get("duration_ms"),
+        "date_semantic_validation_error_path": telemetry.get("validation_error_path"),
+        "date_semantic_invalid_field": telemetry.get("invalid_field"),
+        "date_semantic_raw_operation_type": telemetry.get("raw_operation_type"),
     }
 
 
@@ -650,7 +693,12 @@ def _apply_verified_semantic_constraints(
     accepted = list(accepted_operations)
     updates: dict[str, object] = {}
     sources = dict(patch.source_by_field)
+    local_areas: list[str] = []
     for operation in semantic_operations:
+        if operation in accepted and operation.payload is not None:
+            constraints = operation.payload.constraints
+            if constraints is not None and constraints.preferred_area is not None:
+                local_areas.append(constraints.preferred_area)
         if (
             operation not in accepted
             or operation.type != DateOperationType.UPDATE_CONSTRAINT
@@ -660,15 +708,55 @@ def _apply_verified_semantic_constraints(
         field = operation.constraint_field.value
         updates[field] = operation.constraint_value
         sources[field] = SlotSource.LLM_VERIFIED
-    if not updates:
+    patch_values = patch.model_dump(exclude={"source_by_field"})
+    removes_local_area = (
+        "area" not in updates
+        and patch.area is not None
+        and any(_same_area_value(patch.area, area) for area in local_areas)
+    )
+    if removes_local_area:
+        patch_values["area"] = None
+        sources.pop("area", None)
+    if not updates and not removes_local_area:
         return patch
     return DatePlanPatch.model_validate(
         {
-            **patch.model_dump(exclude={"source_by_field"}),
+            **patch_values,
             **updates,
             "source_by_field": sources,
         }
     )
+
+
+def _remove_unverified_stop_local_area(
+    patch: DatePlanPatch,
+    text: str,
+    *,
+    parse_reasons: tuple[str, ...],
+) -> DatePlanPatch:
+    area = patch.area
+    if area is None or "stop_local_constraints" not in parse_reasons:
+        return patch
+    if re.search(
+        rf"(?:(?:整个|全程|所有|全部).{{0,12}}(?:约会|行程|安排).{{0,12}}"
+        rf"{re.escape(area)}|{re.escape(area)}.{{0,12}}(?:安排|覆盖).{{0,8}}"
+        r"(?:整个|全程|所有|全部).{0,8}(?:约会|行程))",
+        text,
+    ) is not None:
+        return patch
+    if re.search(rf"{re.escape(area)}\s*(?:附近|周边|一带|商圈)", text) is None:
+        return patch
+    values = patch.model_dump(exclude={"source_by_field"})
+    values["area"] = None
+    sources = dict(patch.source_by_field)
+    sources.pop("area", None)
+    return DatePlanPatch.model_validate({**values, "source_by_field": sources})
+
+
+def _same_area_value(first: str, second: str) -> bool:
+    left = re.sub(r"\s+", "", first).removesuffix("区")
+    right = re.sub(r"\s+", "", second).removesuffix("区")
+    return left == right or left in right or right in left
 
 
 def route_by_rules(route_input: RouteInput, normalized_query: str | None = None) -> RouteResult:
@@ -956,11 +1044,15 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
         date_request_mode=date_request_mode,
         date_intent=date_intent,
         date_mutation=date_mutation,
+        date_mutation_policy=_date_mutation_policy(route_input.latest_query),
         date_operations=(
             list(operation_resolution.operations) if operation_resolution is not None else []
         ),
         date_operation_candidate_count=(
             len(operation_resolution.candidates) if operation_resolution is not None else 0
+        ),
+        date_operation_dedupe_input_count=(
+            operation_resolution.input_count if operation_resolution is not None else 0
         ),
         date_operation_rejections=(
             [f"{item.operation.type.value}:{item.reason}" for item in operation_resolution.rejected]
@@ -1212,6 +1304,9 @@ def merge_route_correction(
             ),
             "date_operation_candidate_count": (
                 len(operation_resolution.candidates) if operation_resolution is not None else 0
+            ),
+            "date_operation_dedupe_input_count": (
+                operation_resolution.input_count if operation_resolution is not None else 0
             ),
             "date_operation_rejections": (
                 [
@@ -2825,6 +2920,7 @@ def _extract_place_keywords(text: str) -> tuple[list[str], list[str], list[str]]
     activities: list[str] = []
     excluded: list[str] = []
     groups = (
+        (dining, ("法餐", "法国菜", "法国料理")),
         (dining, ("西餐", "西餐厅")),
         (dining, ("日料", "日本料理")),
         (dining, ("火锅",)),
@@ -2893,6 +2989,7 @@ def _extract_schedule_slots(text: str) -> tuple[dict[str, list[str]], list[str]]
         "breakfast": ("早餐", "早饭", "早上"),
     }
     cuisine_aliases = {
+        "法餐": ("法餐", "法国菜", "法国料理"),
         "西餐": ("西餐", "西餐厅"),
         "日料": ("日料", "日本料理"),
         "火锅": ("火锅",),
@@ -2911,12 +3008,20 @@ def _extract_schedule_slots(text: str) -> tuple[dict[str, list[str]], list[str]]
             for marker in markers
             for position in _all_positions(clause, marker)
         ]
+        clause_meal_types = {meal_type for meal_type, _, _ in marker_positions}
+        scoped_meal_type = (
+            next(iter(clause_meal_types)) if len(clause_meal_types) == 1 else None
+        )
         clock_meal_type = _meal_type_from_clock(clause)
         for keyword, aliases in cuisine_aliases.items():
             for alias in aliases:
                 for position in _all_positions(clause, alias):
                     nearest = _nearest_meal_marker(clause, position, marker_positions)
-                    meal_type = nearest[0] if nearest is not None else clock_meal_type
+                    meal_type = (
+                        nearest[0]
+                        if nearest is not None
+                        else scoped_meal_type or clock_meal_type
+                    )
                     if meal_type is None:
                         continue
                     meal_keywords.setdefault(meal_type, []).append(keyword)
@@ -3038,6 +3143,8 @@ def _extract_date_notes(text: str) -> tuple[list[str], list[str]]:
 
 def _is_operation_only_constraint(text: str, candidate: str) -> bool:
     clause = _containing_clause(text, candidate)
+    if _is_turn_control_scope(clause):
+        return True
     has_edit = re.search(
         r"(?:换(?:一个|个|成|为)?|替换|更换|删掉|删除|移除)",
         clause,
@@ -3053,6 +3160,32 @@ def _is_operation_only_constraint(text: str, candidate: str) -> bool:
         and (
             has_plan_reference
             or re.search(r"(?:换(?:一个|个)?|替换|更换)", text) is not None
+        )
+    )
+
+
+def _is_turn_control_scope(clause: str) -> bool:
+    preserve_scope = re.search(
+        r"(?:其他|其它|其余|剩下|未提及|没提到).{0,8}"
+        r"(?:安排|行程|地点|节点)?.{0,4}(?:不变|不动|保留)",
+        clause,
+    )
+    protected_edit = re.search(
+        r"(?:不要|别|不用).{0,4}(?:换|删|动|改|调整|移除|替换)",
+        clause,
+    ) and re.search(
+        r"(?:安排|行程|地点|节点|电影|景点|餐厅|午餐|晚餐|其他|其余)",
+        clause,
+    )
+    exclusive_edit = re.search(r"(?:只|仅).{0,8}(?:调整|移动|改|换|删)", clause)
+    return bool(preserve_scope or protected_edit or exclusive_edit)
+
+
+def _date_mutation_policy(text: str) -> DateMutationPolicy:
+    return DateMutationPolicy(
+        preserve_unmentioned_items=any(
+            _is_turn_control_scope(clause.text)
+            for clause in split_date_clauses(text)
         )
     )
 
@@ -3796,6 +3929,7 @@ _DATE_KEYWORD_ALIASES = {
     "美术馆": ("美术馆", "博物馆"),
     "公园": ("公园",),
     "剧场": ("剧场", "演出"),
+    "法餐": ("法餐", "法国菜", "法国料理"),
     "西餐": ("西餐", "西餐厅"),
     "日料": ("日料", "日本料理"),
     "火锅": ("火锅",),

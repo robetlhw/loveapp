@@ -3,6 +3,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+from loveapp.domain.date_operations import DateRequirementMatch, DateStopRequirement
 from loveapp.domain.date_plan import DatePlan
 from loveapp.domain.enums import (
     BudgetScope,
@@ -27,6 +28,11 @@ class DatePlanRuntimeContext(BaseModel):
     budget: int | None = None
     budget_scope: BudgetScope | None = None
     transport_mode: TransportMode | None = None
+    requirements: list[DateStopRequirement] = Field(default_factory=list, max_length=16)
+    requirement_satisfaction: list[DateRequirementMatch] = Field(
+        default_factory=list,
+        max_length=16,
+    )
     current_plan: DatePlan | None = None
     plan_version: int = Field(default=0, ge=0)
     missing_fields: list[str] = Field(default_factory=list)

@@ -76,6 +76,8 @@ def _date_plan_context(state: DatePlanningTaskState) -> DatePlanRuntimeContext:
         budget=state.budget,
         budget_scope=state.budget_scope,
         transport_mode=state.transport_mode,
+        requirements=list(state.requirements),
+        requirement_satisfaction=list(state.requirement_satisfaction),
         current_plan=state.current_plan,
         plan_version=state.plan_version,
         missing_fields=list(state.missing_fields),

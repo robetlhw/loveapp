@@ -14,15 +14,20 @@ from loveapp.application.date_planning.operation_validation import (
 )
 from loveapp.application.date_planning.structured_stops import (
     has_placement_requirement,
+    item_matches_reference,
     match_desired_stop,
 )
 from loveapp.domain.date_operations import (
     DateConstraintField,
     DateOperationType,
     DatePlanOperation,
+    DateRequirementUpdate,
     DateSemanticParseResult,
+    DateStopConstraints,
+    DateStopRequirement,
     DesiredDateStop,
     MealType,
+    RequirementReference,
     StopKind,
     StopReference,
     TemporalAnchor,
@@ -40,6 +45,7 @@ class DateOperationResolution:
     operations: tuple[DatePlanOperation, ...]
     rejected: tuple[RejectedDateOperation, ...]
     unresolved_references: tuple[str, ...] = ()
+    input_count: int = 0
 
 
 class DateOperationResolver:
@@ -87,8 +93,11 @@ class DateOperationResolver:
                 or operation.constraint_field not in preferred_constraints
                 or operation == preferred_constraints[operation.constraint_field]
             ]
+        current_plan = _current_plan(runtime_context)
         candidates = _dedupe_operations(
-            tuple(candidate_operations)
+            tuple(candidate_operations),
+            current_plan=current_plan,
+            source_text=text,
         )
         verification = self._verifier.verify(
             candidates,
@@ -127,7 +136,9 @@ class DateOperationResolver:
                         deterministic,
                         text,
                     )
-                )
+                ),
+                current_plan=current_plan,
+                source_text=text,
             )
         )
         return DateOperationResolution(
@@ -135,6 +146,7 @@ class DateOperationResolver:
             operations=operations,
             rejected=tuple(rejected),
             unresolved_references=unresolved,
+            input_count=len(candidate_operations),
         )
 
 
@@ -185,12 +197,30 @@ def date_semantic_parse_reasons(
         reasons.append("relative_scalar_update")
     if _stop_alternative_expressions(text):
         reasons.append("alternative_choice")
+    if _has_stop_local_constraint_semantics(text):
+        reasons.append("stop_local_constraints")
+    if not stop_operations and _UNPARSED_NAMED_STOP_CUE.search(text) is not None:
+        reasons.append("unparsed_named_stop")
     reasons.extend(detection.reasons)
     if detection.is_candidate and not stop_operations:
         reasons.append("deterministic_parse_incomplete")
     if not deterministic_date_parse_is_complete(text, runtime_context, deterministic_result):
         reasons.append("partial_parse")
     return tuple(dict.fromkeys(reasons))
+
+
+def _has_stop_local_constraint_semantics(text: str) -> bool:
+    """Detect typed constraints whose scope is one requested or edited stop."""
+
+    return any(
+        pattern.search(text) is not None
+        for pattern in (
+            _STOP_LOCAL_PRICE_CUE,
+            _STOP_LOCAL_RATING_CUE,
+            _STOP_LOCAL_AREA_CUE,
+            _STOP_LOCAL_DISTANCE_CUE,
+        )
+    )
 
 
 def _is_single_budget_constraint_bundle(
@@ -258,6 +288,8 @@ def _deterministic_operations(
     patch: DatePlanPatch,
 ) -> list[DatePlanOperation]:
     operations = _constraint_operations(text, patch)
+    requirement_updates = _existing_requirement_update_operations(text, runtime_context)
+    operations.extend(requirement_updates)
     normalized = _normalize(text)
     if _REPLAN_CUE.search(normalized):
         operations.append(
@@ -288,8 +320,13 @@ def _deterministic_operations(
         *replacement_keywords,
         *removal_keywords,
         *patch.excluded_keywords,
+        *_regrouped_stop_values(requirement_updates),
     }
-    desired_stops = [*_desired_stops(text), *_patch_desired_stops(text, patch)]
+    desired_stops = [
+        *_desired_stops(text),
+        *_named_desired_stops(text),
+        *_patch_desired_stops(text, patch),
+    ]
     for desired, source_span in desired_stops:
         if desired.keyword in excluded:
             continue
@@ -323,6 +360,122 @@ def _deterministic_operations(
     return operations
 
 
+def _existing_requirement_update_operations(
+    text: str,
+    runtime_context: RuntimeContext | None,
+) -> list[DatePlanOperation]:
+    active = runtime_context.active_date_plan if runtime_context is not None else None
+    if active is None:
+        return []
+    operations: list[DatePlanOperation] = []
+    for clause in split_date_clauses(text):
+        if (
+            _REQUIREMENT_REGROUP_CUE.search(clause.text) is None
+            or _NEGATED_REQUIREMENT_REGROUP_CUE.search(clause.text) is not None
+        ):
+            continue
+        referenced: list[RequirementReference] = []
+        kind_families: set[str] = set()
+        mentioned_requirement_ids = _mentioned_requirement_ids(
+            clause.text,
+            active.requirements,
+        )
+        for requirement in active.requirements:
+            if len(requirement.alternatives) != 1:
+                continue
+            alternative = requirement.alternatives[0]
+            value = alternative.keyword or alternative.place_name
+            if value is None or requirement.id not in mentioned_requirement_ids:
+                continue
+            referenced.append(
+                RequirementReference(
+                    requirement_id=requirement.id,
+                    stop_reference=StopReference(
+                        keyword=alternative.keyword,
+                        place_name=alternative.place_name,
+                        meal_type=alternative.meal_type,
+                    ),
+                )
+            )
+            kind_families.add(
+                "dining"
+                if alternative.kind in {StopKind.DINING, StopKind.CAFE}
+                else alternative.kind.value
+            )
+        if len(referenced) < 2 or len(kind_families) != 1:
+            continue
+        operations.append(
+            DatePlanOperation(
+                type=DateOperationType.UPDATE_REQUIREMENT,
+                requirement_update=DateRequirementUpdate(
+                    targets=referenced,
+                    min_satisfied=1,
+                    max_satisfied=1,
+                ),
+                source_span=clause.source_text,
+                confidence=1,
+            )
+        )
+    return operations
+
+
+def _regrouped_stop_values(operations: list[DatePlanOperation]) -> set[str]:
+    return {
+        value
+        for operation in operations
+        if operation.requirement_update is not None
+        for reference in operation.requirement_update.targets
+        if reference.stop_reference is not None
+        for value in (
+            reference.stop_reference.keyword,
+            reference.stop_reference.place_name,
+        )
+        if value is not None
+    }
+
+
+def _mentioned_requirement_ids(
+    text: str,
+    requirements: list[DateStopRequirement],
+) -> set[str]:
+    normalized = _normalize(text)
+    matches: list[tuple[int, int, bool, str]] = []
+    for requirement in requirements:
+        if len(requirement.alternatives) != 1:
+            continue
+        alternative = requirement.alternatives[0]
+        value = alternative.keyword or alternative.place_name
+        if value is None:
+            continue
+        normalized_value = _normalize(value)
+        for alias in dict.fromkeys(_ALIASES.get(value, (value,))):
+            normalized_alias = _normalize(alias)
+            for match in re.finditer(re.escape(normalized_alias), normalized):
+                matches.append(
+                    (
+                        match.start(),
+                        match.end(),
+                        normalized_alias == normalized_value,
+                        requirement.id,
+                    )
+                )
+
+    claimed_spans: list[tuple[int, int]] = []
+    mentioned: set[str] = set()
+    for start, end, _exact, requirement_id in sorted(
+        matches,
+        key=lambda item: (-(item[1] - item[0]), -int(item[2]), item[0], item[3]),
+    ):
+        if any(
+            start >= claimed_start and end <= claimed_end
+            for claimed_start, claimed_end in claimed_spans
+        ):
+            continue
+        claimed_spans.append((start, end))
+        mentioned.add(requirement_id)
+    return mentioned
+
+
 def _constraint_operations(text: str, patch: DatePlanPatch) -> list[DatePlanOperation]:
     operations: list[DatePlanOperation] = []
     for field in DateConstraintField:
@@ -351,6 +504,7 @@ def _replacement_operations(text: str) -> tuple[list[DatePlanOperation], set[str
             continue
         target_keyword, _ = target
         replacement_keyword, replacement_kind = replacement
+        replacement_text = match.group("replacement")
         used_keywords.update((target_keyword, replacement_keyword))
         operations.append(
             DatePlanOperation(
@@ -359,6 +513,10 @@ def _replacement_operations(text: str) -> tuple[list[DatePlanOperation], set[str
                 payload=DesiredDateStop(
                     kind=replacement_kind,
                     keyword=replacement_keyword,
+                    generic_replacement=(
+                        _GENERIC_REPLACEMENT_VALUE_CUE.search(replacement_text)
+                        is not None
+                    ),
                     meal_type=(
                         _meal_type_for_stop(match.group(0), replacement_keyword)
                         if replacement_kind in {StopKind.DINING, StopKind.CAFE}
@@ -396,7 +554,14 @@ def _patch_replacement_operations(
     }
     target = _replacement_target(runtime_context, patch, payloads)
     if target is None:
-        return [], payload_keywords
+        # During collection there is no old node to replace. Preserve the
+        # requested stop as an ADD; once a plan exists, unresolved replacement
+        # targets remain fail-closed instead of silently appending a stop.
+        return (
+            ([], payload_keywords)
+            if _current_plan(runtime_context) is not None
+            else ([], set())
+        )
     target_reference, target_kind, target_keywords = target
     compatible_payloads = [
         (desired, source_span)
@@ -524,7 +689,48 @@ def _desired_stops(text: str) -> list[tuple[DesiredDateStop, str]]:
                         after=_after_anchor(clause, keyword),
                         before=_before_anchor(clause, keyword),
                     ),
-                    clause,
+                    parsed_clause.source_text,
+                )
+            )
+    return desired
+
+
+def _named_desired_stops(text: str) -> list[tuple[DesiredDateStop, str]]:
+    desired: list[tuple[DesiredDateStop, str]] = []
+    for parsed_clause in split_date_clauses(text):
+        clause = parsed_clause.text
+        for match in _NAMED_STOP_PATTERN.finditer(clause):
+            name = match.group("name").strip()
+            if _first_stop(name) is not None:
+                continue
+            kind = (
+                StopKind.CAFE
+                if "咖啡" in name
+                else StopKind.DINING
+                if re.search(r"餐厅|饭店|餐馆|菜馆$", name)
+                else StopKind.ACTIVITY
+            )
+            time_window = _time_window(clause)
+            desired.append(
+                (
+                    DesiredDateStop(
+                        kind=kind,
+                        place_name=name,
+                        meal_type=(
+                            _meal_type_for_stop(
+                                clause,
+                                name,
+                                time_window=time_window,
+                            )
+                            if kind in {StopKind.DINING, StopKind.CAFE}
+                            else None
+                        ),
+                        target_day=_target_day(clause),
+                        time_window=time_window,
+                        after=_after_anchor(clause, name),
+                        before=_before_anchor(clause, name),
+                    ),
+                    parsed_clause.source_text,
                 )
             )
     return desired
@@ -540,13 +746,17 @@ def _patch_desired_stops(
         (StopKind.DINING, patch.dining_keywords),
     ):
         for keyword in keywords:
-            clause = next(
+            parsed_clause = next(
                 (
-                    candidate.text
+                    candidate
                     for candidate in split_date_clauses(text)
                     if keyword in candidate.text
                 ),
-                text,
+                None,
+            )
+            clause = parsed_clause.text if parsed_clause is not None else text
+            source_span = (
+                parsed_clause.source_text if parsed_clause is not None else text
             )
             time_window = _time_window(clause)
             meal_type = _patch_meal_type(keyword, patch) or (
@@ -571,7 +781,7 @@ def _patch_desired_stops(
                         after=_after_anchor(clause, keyword),
                         before=_before_anchor(clause, keyword),
                     ),
-                    clause,
+                    source_span,
                 )
             )
     return desired
@@ -779,7 +989,12 @@ def _clauses(text: str) -> list[str]:
     return [clause.text for clause in split_date_clauses(text)]
 
 
-def _dedupe_operations(operations: tuple[DatePlanOperation, ...]) -> list[DatePlanOperation]:
+def _dedupe_operations(
+    operations: tuple[DatePlanOperation, ...],
+    *,
+    current_plan: DatePlan | None = None,
+    source_text: str | None = None,
+) -> list[DatePlanOperation]:
     seen: set[str] = set()
     result: list[DatePlanOperation] = []
     for operation in operations:
@@ -788,10 +1003,306 @@ def _dedupe_operations(operations: tuple[DatePlanOperation, ...]) -> list[DatePl
             ensure_ascii=False,
             sort_keys=True,
         )
-        if identity not in seen:
-            seen.add(identity)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        equivalent = next(
+            (
+                index
+                for index, existing in enumerate(result)
+                if _operations_are_semantically_equivalent(
+                    existing,
+                    operation,
+                    current_plan=current_plan,
+                    source_text=source_text,
+                )
+            ),
+            None,
+        )
+        if equivalent is None:
             result.append(operation)
+        else:
+            result[equivalent] = _merge_equivalent_operations(
+                result[equivalent],
+                operation,
+            )
     return result
+
+
+def _operations_are_semantically_equivalent(
+    first: DatePlanOperation,
+    second: DatePlanOperation,
+    *,
+    current_plan: DatePlan | None,
+    source_text: str | None,
+) -> bool:
+    if first.type != second.type:
+        return False
+    if not _operation_source_spans_overlap(first, second, source_text):
+        return False
+    if first.type == DateOperationType.ADD_STOP:
+        if first.alternative_group != second.alternative_group:
+            return False
+        if first.payload is None or second.payload is None:
+            return False
+        return _add_payloads_are_equivalent(first.payload, second.payload)
+    if first.type not in _REFERENCE_TARGETED_MUTATIONS:
+        return False
+    first_target = _resolved_target_place_id(current_plan, first.target)
+    second_target = _resolved_target_place_id(current_plan, second.target)
+    if first_target is None or first_target != second_target:
+        return False
+    if first.type == DateOperationType.REMOVE_STOP:
+        return True
+    if first.payload is None or second.payload is None:
+        return False
+    return _desired_payloads_are_equivalent(first.payload, second.payload)
+
+
+def _operation_source_spans_overlap(
+    first: DatePlanOperation,
+    second: DatePlanOperation,
+    source_text: str | None,
+) -> bool:
+    if first.source_span == second.source_span and first.source_span is not None:
+        return True
+    return bool(
+        source_text
+        and first.source_span
+        and second.source_span
+        and _source_spans_overlap(source_text, first.source_span, second.source_span)
+    )
+
+
+def _resolved_target_place_id(
+    plan: DatePlan | None,
+    reference: StopReference | None,
+) -> str | None:
+    if plan is None or reference is None:
+        return None
+    ordered = sorted(plan.items, key=lambda item: (item.day_index, item.order))
+    if reference.ordinal is not None:
+        if reference.ordinal > len(ordered):
+            return None
+        candidate = ordered[reference.ordinal - 1]
+        has_other_identity = any(
+            value is not None
+            for value in (
+                reference.place_id,
+                reference.place_name,
+                reference.keyword,
+                reference.meal_type,
+            )
+        )
+        matches = (
+            [candidate]
+            if not has_other_identity or item_matches_reference(candidate, reference)
+            else []
+        )
+    else:
+        matches = [
+            item for item in ordered if item_matches_reference(item, reference)
+        ]
+    return matches[0].place.id if len(matches) == 1 else None
+
+
+def _desired_payloads_are_equivalent(
+    first: DesiredDateStop,
+    second: DesiredDateStop,
+) -> bool:
+    first_family = "dining" if first.kind in {StopKind.DINING, StopKind.CAFE} else first.kind
+    second_family = (
+        "dining" if second.kind in {StopKind.DINING, StopKind.CAFE} else second.kind
+    )
+    if first_family != second_family:
+        return False
+    first_value = first.keyword or first.place_name
+    second_value = second.keyword or second.place_name
+    if first_value is not None and second_value is not None:
+        if _normalize(first_value) != _normalize(second_value):
+            return False
+    elif not (first.generic_replacement or second.generic_replacement):
+        return False
+    for field in ("meal_type", "target_day", "time_window", "after", "before"):
+        first_value = getattr(first, field)
+        second_value = getattr(second, field)
+        if first_value is not None and second_value is not None and first_value != second_value:
+            return False
+    return _stop_constraints_are_compatible(first.constraints, second.constraints)
+
+
+def _add_payloads_are_equivalent(
+    first: DesiredDateStop,
+    second: DesiredDateStop,
+) -> bool:
+    first_family = "dining" if first.kind in {StopKind.DINING, StopKind.CAFE} else first.kind
+    second_family = (
+        "dining" if second.kind in {StopKind.DINING, StopKind.CAFE} else second.kind
+    )
+    if first_family != second_family:
+        return False
+    first_value = first.keyword or first.place_name
+    second_value = second.keyword or second.place_name
+    if (
+        first_value is not None
+        and second_value is not None
+        and _normalize(first_value) != _normalize(second_value)
+    ):
+        return False
+    for field in ("meal_type", "target_day", "time_window", "after", "before"):
+        first_modifier = getattr(first, field)
+        second_modifier = getattr(second, field)
+        if (
+            first_modifier is not None
+            and second_modifier is not None
+            and first_modifier != second_modifier
+        ):
+            return False
+    return _stop_constraints_are_compatible(first.constraints, second.constraints)
+
+
+def _stop_constraints_are_compatible(
+    first: DateStopConstraints | None,
+    second: DateStopConstraints | None,
+) -> bool:
+    if first is None or second is None:
+        return True
+    return all(
+        left is None or right is None or left == right
+        for left, right in (
+            (first.max_cost_per_person, second.max_cost_per_person),
+            (first.min_rating, second.min_rating),
+            (first.preferred_area, second.preferred_area),
+            (first.max_distance_meters, second.max_distance_meters),
+        )
+    )
+
+
+def _merge_equivalent_operations(
+    first: DatePlanOperation,
+    second: DatePlanOperation,
+) -> DatePlanOperation:
+    target = max(
+        (candidate for candidate in (first.target, second.target) if candidate is not None),
+        key=_target_specificity,
+        default=None,
+    )
+    payload = None
+    if first.payload is not None and second.payload is not None:
+        payload = _merge_equivalent_payloads(first.payload, second.payload)
+    else:
+        payload = first.payload or second.payload
+    preferred = max((first, second), key=_operation_specificity)
+    return preferred.model_copy(
+        update={
+            "target": target,
+            "payload": payload,
+            "confidence": max(
+                value
+                for value in (first.confidence, second.confidence, 0.0)
+                if value is not None
+            ),
+        }
+    )
+
+
+def _merge_equivalent_payloads(
+    first: DesiredDateStop,
+    second: DesiredDateStop,
+) -> DesiredDateStop:
+    preferred, fallback = sorted(
+        (first, second),
+        key=_payload_specificity,
+        reverse=True,
+    )
+    updates = {
+        field: getattr(preferred, field) or getattr(fallback, field)
+        for field in (
+            "keyword",
+            "place_name",
+            "meal_type",
+            "target_day",
+            "time_window",
+            "after",
+            "before",
+        )
+    }
+    updates["constraints"] = _merge_stop_constraints(
+        preferred.constraints,
+        fallback.constraints,
+    )
+    updates["generic_replacement"] = (
+        first.generic_replacement and second.generic_replacement
+    )
+    updates["replacement_preferences"] = list(
+        dict.fromkeys(
+            [*first.replacement_preferences, *second.replacement_preferences]
+        )
+    )
+    return preferred.model_copy(update=updates)
+
+
+def _merge_stop_constraints(
+    preferred: DateStopConstraints | None,
+    fallback: DateStopConstraints | None,
+) -> DateStopConstraints | None:
+    if preferred is None:
+        return fallback
+    if fallback is None:
+        return preferred
+    return preferred.model_copy(
+        update={
+            field: (
+                getattr(preferred, field)
+                if getattr(preferred, field) is not None
+                else getattr(fallback, field)
+            )
+            for field in (
+                "max_cost_per_person",
+                "min_rating",
+                "preferred_area",
+                "max_distance_meters",
+            )
+        }
+    )
+
+
+def _operation_specificity(operation: DatePlanOperation) -> int:
+    return _target_specificity(operation.target) + _payload_specificity(operation.payload)
+
+
+def _target_specificity(reference: StopReference | None) -> int:
+    if reference is None:
+        return 0
+    return sum(
+        score
+        for value, score in (
+            (reference.place_id, 8),
+            (reference.ordinal, 6),
+            (reference.place_name, 4),
+            (reference.keyword, 2),
+            (reference.meal_type, 1),
+        )
+        if value is not None
+    )
+
+
+def _payload_specificity(payload: DesiredDateStop | None) -> int:
+    if payload is None:
+        return 0
+    values = (
+        payload.keyword,
+        payload.place_name,
+        payload.meal_type,
+        payload.target_day,
+        payload.time_window,
+        payload.after,
+        payload.before,
+        payload.constraints,
+    )
+    return sum(value is not None for value in values) + 3 * payload.generic_replacement + len(
+        payload.replacement_preferences
+    )
 
 
 def _prefer_grouped_additions(
@@ -851,6 +1362,7 @@ def _grouped_addition_refines(
         (current.time_window, incoming.time_window),
         (current.after, incoming.after),
         (current.before, incoming.before),
+        (current.constraints, incoming.constraints),
     ):
         if current_field is not None and current_field != incoming_field:
             return False
@@ -968,6 +1480,14 @@ _STOP_CHOICE_VALUE_CUE = re.compile(
     r"火锅|烧烤|烤肉|日料|西餐|咖啡|电影|影院|剧场|景点|公园|展览|活动|"
     r"[\u4e00-\u9fff]{1,12}(?:馆|店|餐厅|饭店|乐园)"
 )
+_NAMED_STOP_PATTERN = re.compile(
+    r"(?:想去|再去|准备去|打算去|想逛|去|逛)\s*"
+    r"(?P<name>(?!哪|哪里|什么|一家|一个|这个|那个|活动|吃饭|用餐)"
+    r"[\u4e00-\u9fffA-Za-z0-9·]{2,24}?"
+    r"(?:明珠|外滩|塔|楼|馆|院|园|店|中心|广场|乐园|寺|街|山|湖|滩))"
+    r"(?=$|[，,。；;！？!?])"
+)
+_UNPARSED_NAMED_STOP_CUE = _NAMED_STOP_PATTERN
 _REPLACE_CUE = re.compile(r"替换|更换|换成|换为|换一个|换一家|换个|改成|改为")
 _RELATIVE_BUDGET_UPDATE = re.compile(
     r"(?:总预算|预算)\s*从\s*\d{2,6}\s*(?:元|块)?\s*"
@@ -979,12 +1499,54 @@ _EXPLICIT_MOVE_CUE = re.compile(
     r".{0,8}(?:放(?:到)?|移到|挪到|提前|推后).{0,8}"
     r"(?:前|后|上午|下午|晚上|早饭|午饭|晚饭)"
 )
+_STOP_LOCAL_ROLE = (
+    r"(?:早餐|午餐|晚餐|餐厅|饭店|咖啡|电影|影院|景点|场馆|活动|"
+    r"法餐|西餐|日料|火锅|烧烤)"
+)
+_STOP_LOCAL_PRICE_VALUE = (
+    r"(?:人均|每人|每位|客单)\s*(?:(?:不超过|最多|至多|上限)\s*"
+    r"\d{1,6}(?:\.\d+)?\s*(?:元|块)?|\d{1,6}(?:\.\d+)?\s*"
+    r"(?:元|块)?\s*(?:以内|以下|不超过|最多|至多))"
+)
+_STOP_LOCAL_RATING_VALUE = (
+    r"(?:评分|星级)\s*(?:(?:不低于|至少|最低)\s*\d(?:\.\d+)?\s*(?:分)?|"
+    r"\d(?:\.\d+)?\s*(?:分)?\s*(?:以上|不低于|至少))"
+)
+_STOP_LOCAL_DISTANCE_VALUE = (
+    r"(?:距离|相距|路程).{0,12}(?:(?:不超过|最多|至多)\s*"
+    r"\d{1,6}(?:\.\d+)?\s*(?:米|公里|km|m)|\d{1,6}(?:\.\d+)?\s*"
+    r"(?:米|公里|km|m)\s*(?:以内|以下|不超过|最多|至多))"
+)
+_STOP_LOCAL_PRICE_CUE = re.compile(
+    rf"(?:{_STOP_LOCAL_ROLE}.{{0,30}}{_STOP_LOCAL_PRICE_VALUE}|"
+    rf"{_STOP_LOCAL_PRICE_VALUE}.{{0,30}}{_STOP_LOCAL_ROLE})"
+)
+_STOP_LOCAL_RATING_CUE = re.compile(
+    rf"(?:{_STOP_LOCAL_ROLE}.{{0,30}}{_STOP_LOCAL_RATING_VALUE}|"
+    rf"{_STOP_LOCAL_RATING_VALUE}.{{0,30}}{_STOP_LOCAL_ROLE})"
+)
+_STOP_LOCAL_AREA_CUE = re.compile(
+    rf"(?:{_STOP_LOCAL_ROLE}.{{0,30}}(?:附近|周边|一带)|"
+    rf"(?:附近|周边|一带).{{0,30}}{_STOP_LOCAL_ROLE})"
+)
+_STOP_LOCAL_DISTANCE_CUE = re.compile(
+    rf"(?:{_STOP_LOCAL_ROLE}.{{0,30}}{_STOP_LOCAL_DISTANCE_VALUE}|"
+    rf"{_STOP_LOCAL_DISTANCE_VALUE}.{{0,30}}{_STOP_LOCAL_ROLE})"
+)
 _STOP_OPERATIONS = {
+    DateOperationType.UPDATE_REQUIREMENT,
     DateOperationType.ADD_STOP,
     DateOperationType.REMOVE_STOP,
     DateOperationType.REPLACE_STOP,
     DateOperationType.MOVE_STOP,
 }
+_REQUIREMENT_REGROUP_CUE = re.compile(
+    r"(?:二选一|任选(?:其一|一个)?|选一个就行|任意一个|(?:或者|或是|要么|还是).{0,24}(?:都行|均可|即可))"
+)
+_NEGATED_REQUIREMENT_REGROUP_CUE = re.compile(
+    r"(?:不要|别|不用|无需|不再|取消|撤销)(?:再)?(?:搞|做|按|改成|设成|设置成)?\s*"
+    r"(?:二选一|任选(?:其一|一个)?|选一个)"
+)
 _REFERENCE_TARGETED_MUTATIONS = {
     DateOperationType.REMOVE_STOP,
     DateOperationType.REPLACE_STOP,
@@ -995,7 +1557,11 @@ _REPLACEMENT_PATTERN = re.compile(
     r"(?:替换为|更换为|换成|换为|改成|改为)\s*"
     r"(?P<replacement>[^，,。；;]{1,24})"
 )
+_GENERIC_REPLACEMENT_VALUE_CUE = re.compile(
+    r"(?:另(?:一|外)?(?:个|家)?|别的|其他)(?:\S{0,12})"
+)
 _STOP_SPECS = (
+    ("法餐", StopKind.DINING, ("法餐", "法国菜", "法国料理")),
     ("西餐", StopKind.DINING, ("西餐", "西式料理")),
     ("日料", StopKind.DINING, ("日料", "日本料理")),
     ("火锅", StopKind.DINING, ("火锅",)),

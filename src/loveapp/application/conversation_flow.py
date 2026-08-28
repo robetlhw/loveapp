@@ -93,6 +93,14 @@ def advance_conversation_flow(
 
 
 def clarification_message(route: RouteResult, *, repeated: bool) -> str:
+    if (
+        route.clarification_reason == "unresolved_date_plan_reference"
+        and route.clarification_options
+    ):
+        options = [f'“{option}”' for option in route.clarification_options]
+        if len(options) == 1:
+            return f"你指的是{options[0]}吗？"
+        return f"你指的是{'、'.join(options[:-1])}，还是{options[-1]}？"
     if repeated:
         return (
             "我还不能可靠判断你想继续哪件事。当前版本主要支持关系咨询和约会规划，"

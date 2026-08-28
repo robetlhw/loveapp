@@ -51,6 +51,9 @@ class DatePlanningState(TypedDict, total=False):
     trace: ExecutionTrace
 
 
+type _StopSearchSpec = tuple[str | None, DesiredDateStop | None]
+
+
 class DatePlanningAgent:
     def __init__(
         self,
@@ -220,22 +223,18 @@ class DatePlanningAgent:
             excluded_keywords = state.get("effective_excluded_keywords", request.excluded_keywords)
             focus_dining = state.get("focus_dining_keywords")
             focus_activity = state.get("focus_activity_keywords")
-            dining_keywords = (
-                _requirement_search_keywords(request, dining=True)
-                if focus_dining is None and request.requirements
-                else request.dining_keywords
-                if focus_dining is None
-                else focus_dining
+            dining_specs = _stop_search_specs(
+                request,
+                dining=True,
+                focus_keywords=focus_dining,
             )
-            activity_keywords = (
-                _requirement_search_keywords(request, dining=False)
-                if focus_activity is None and request.requirements
-                else request.activity_keywords
-                if focus_activity is None
-                else focus_activity
+            activity_specs = _stop_search_specs(
+                request,
+                dining=False,
+                focus_keywords=focus_activity,
             )
-            had_activity_keywords = bool(activity_keywords)
-            had_dining_keywords = bool(dining_keywords)
+            had_activity_specs = bool(activity_specs)
+            had_dining_specs = bool(dining_specs)
             existing_plan = state.get("existing_plan")
             if existing_plan is not None and state.get("mutation") == DatePlanMutation.ADD:
                 comparison_items = [
@@ -243,53 +242,77 @@ class DatePlanningAgent:
                     for item in existing_plan.items
                     if request.target_day is None or item.day_index == request.target_day
                 ]
-                dining_keywords = [
-                    keyword
-                    for keyword in dining_keywords
-                    if not any(
-                        _plan_item_matches_keyword(item, keyword) for item in comparison_items
+                dining_specs = [
+                    spec
+                    for spec in dining_specs
+                    if spec[0] is None
+                    or not any(
+                        _plan_item_matches_keyword(item, spec[0]) for item in comparison_items
                     )
                 ]
-                activity_keywords = [
-                    keyword
-                    for keyword in activity_keywords
-                    if not any(
-                        _plan_item_matches_keyword(item, keyword) for item in comparison_items
+                activity_specs = [
+                    spec
+                    for spec in activity_specs
+                    if spec[0] is None
+                    or not any(
+                        _plan_item_matches_keyword(item, spec[0]) for item in comparison_items
                     )
                 ]
+            dining_keywords = _search_spec_keywords(dining_specs)
+            activity_keywords = _search_spec_keywords(activity_specs)
             details["dining_keywords"] = ",".join(dining_keywords) or None
             details["activity_keywords"] = ",".join(activity_keywords) or None
             details["excluded_keywords"] = ",".join(excluded_keywords) or None
             per_person_budget = max(request.effective_daily_budget // 2, 1)
+            details["stop_local_constraint_count"] = sum(
+                desired.constraints is not None
+                for requirement in request.requirements
+                for desired in requirement.alternatives
+            )
 
             async def search(
                 category: PlaceCategory,
-                keywords: list[str | None],
+                specs: list[_StopSearchSpec],
             ) -> list[Place]:
                 # Each explicit term describes one possible stop.  Sending
                 # all terms as required_keywords would ask the map provider
                 # for one place that is simultaneously a cinema, attraction,
                 # Japanese restaurant, and hot-pot venue.
-                query_keywords = list(dict.fromkeys(keywords)) or [None]
+                query_specs = specs or [(None, None)]
                 batches = await asyncio.gather(
                     *(
                         self._map_provider.search_places(
                             PlaceSearchRequest(
                                 city=request.city,
-                                area=request.area,
+                                area=(
+                                    desired.constraints.preferred_area
+                                    if desired is not None
+                                    and desired.constraints is not None
+                                    and desired.constraints.preferred_area is not None
+                                    else request.area
+                                ),
                                 category=category,
                                 preferences=preferences,
                                 keywords=[keyword] if keyword else [],
                                 required_keywords=[keyword] if keyword else [],
                                 excluded_keywords=excluded_keywords,
-                                max_cost_per_person=per_person_budget,
+                                max_cost_per_person=_effective_stop_cost_limit(
+                                    per_person_budget,
+                                    desired,
+                                ),
+                                require_verified_cost=_requires_verified_stop_cost(desired),
+                                min_rating=(
+                                    desired.constraints.min_rating
+                                    if desired is not None and desired.constraints is not None
+                                    else None
+                                ),
                             )
                         )
-                        for keyword in query_keywords
+                        for keyword, desired in query_specs
                     )
                 )
                 by_id: dict[str, Place] = {}
-                for keyword, places in zip(query_keywords, batches, strict=False):
+                for (keyword, _), places in zip(query_specs, batches, strict=False):
                     for place in places:
                         previous = by_id.get(place.id)
                         search_keywords = list(
@@ -305,57 +328,60 @@ class DatePlanningAgent:
                         )
                 return list(by_id.values())
 
-            explicit_activity = bool(activity_keywords)
-            explicit_dining = bool(dining_keywords)
-            attraction_keywords = [
-                keyword
-                for keyword in activity_keywords
-                if keyword not in _ENTERTAINMENT_ONLY_KEYWORDS
+            explicit_activity = bool(activity_specs)
+            explicit_dining = bool(dining_specs)
+            attraction_specs = [
+                spec
+                for spec in activity_specs
+                if spec[0] not in _ENTERTAINMENT_ONLY_KEYWORDS
             ]
-            entertainment_keywords = [
-                keyword for keyword in activity_keywords if keyword not in _ATTRACTION_ONLY_KEYWORDS
+            entertainment_specs = [
+                spec for spec in activity_specs if spec[0] not in _ATTRACTION_ONLY_KEYWORDS
             ]
 
             async def search_or_empty(
                 category: PlaceCategory,
-                keywords: list[str],
+                specs: list[_StopSearchSpec],
                 *,
                 enabled: bool,
             ) -> list[Place]:
-                return await search(category, keywords) if enabled else []
+                return await search(category, specs) if enabled else []
 
-            restaurant_search_keywords: list[str | None] = list(dining_keywords)
-            if _requires_dinner_anchor(request) and None not in restaurant_search_keywords:
-                restaurant_search_keywords.append(None)
+            restaurant_search_specs = list(dining_specs)
+            if _requires_dinner_anchor(request) and not any(
+                keyword is None and desired is None
+                for keyword, desired in restaurant_search_specs
+            ):
+                restaurant_search_specs.append((None, None))
             attractions, entertainment, restaurants, cafes = await asyncio.gather(
                 search_or_empty(
                     PlaceCategory.ATTRACTION,
-                    attraction_keywords,
+                    attraction_specs,
                     enabled=(
-                        bool(attraction_keywords)
+                        bool(attraction_specs)
                         if explicit_activity
-                        else focus_activity is None and not had_activity_keywords
+                        else focus_activity is None and not had_activity_specs
                     ),
                 ),
                 search_or_empty(
                     PlaceCategory.ENTERTAINMENT,
-                    entertainment_keywords,
+                    entertainment_specs,
                     enabled=(
-                        bool(entertainment_keywords)
+                        bool(entertainment_specs)
                         if explicit_activity
-                        else focus_activity is None and not had_activity_keywords
+                        else focus_activity is None and not had_activity_specs
                     ),
                 ),
                 search_or_empty(
                     PlaceCategory.RESTAURANT,
-                    restaurant_search_keywords,
-                    enabled=(explicit_dining or (focus_dining is None and not had_dining_keywords)),
+                    restaurant_search_specs,
+                    enabled=(explicit_dining or (focus_dining is None and not had_dining_specs)),
                 ),
                 search_or_empty(
                     PlaceCategory.CAFE,
-                    dining_keywords,
+                    dining_specs,
                     enabled=(
-                        not explicit_dining and focus_dining is None and not had_dining_keywords
+                        not explicit_dining and focus_dining is None and not had_dining_specs
                     ),
                 ),
             )
@@ -511,7 +537,7 @@ class DatePlanningAgent:
                 )
             }
 
-        if request.activity_keywords or request.dining_keywords:
+        if request.activity_keywords or request.dining_keywords or request.requirements:
             keyword_plan = await self._build_keyword_plan(
                 state,
                 activities,
@@ -1934,6 +1960,65 @@ def _requirement_search_keywords(
     )
 
 
+def _stop_search_specs(
+    request: DatePlanRequest,
+    *,
+    dining: bool,
+    focus_keywords: list[str] | None,
+) -> list[_StopSearchSpec]:
+    desired_stops = [
+        alternative
+        for requirement in _requirements_for_kind(request, dining=dining)
+        for alternative in requirement.alternatives
+    ]
+    if focus_keywords is None and request.requirements:
+        return [
+            (desired.keyword or desired.place_name, desired)
+            for desired in desired_stops
+        ]
+
+    keywords = (
+        request.dining_keywords if dining else request.activity_keywords
+    ) if focus_keywords is None else focus_keywords
+    specs: list[_StopSearchSpec] = []
+    for keyword in dict.fromkeys(keywords):
+        matching = [
+            desired
+            for desired in desired_stops
+            if desired.keyword == keyword or desired.place_name == keyword
+        ]
+        specs.extend((keyword, desired) for desired in matching)
+        if not matching:
+            specs.append((keyword, None))
+    return specs
+
+
+def _search_spec_keywords(specs: list[_StopSearchSpec]) -> list[str]:
+    return list(
+        dict.fromkeys(keyword for keyword, _ in specs if keyword is not None)
+    )
+
+
+def _effective_stop_cost_limit(
+    global_limit: int,
+    desired: DesiredDateStop | None,
+) -> int:
+    local_limit = (
+        desired.constraints.max_cost_per_person
+        if desired is not None and desired.constraints is not None
+        else None
+    )
+    return min(global_limit, local_limit) if local_limit is not None else global_limit
+
+
+def _requires_verified_stop_cost(desired: DesiredDateStop | None) -> bool:
+    return bool(
+        desired is not None
+        and desired.constraints is not None
+        and desired.constraints.max_cost_per_person is not None
+    )
+
+
 def _first_matching_alternative(
     places: list[Place],
     alternatives: list[DesiredDateStop] | list[None],
@@ -1941,7 +2026,16 @@ def _first_matching_alternative(
 ) -> tuple[Place | None, DesiredDateStop | None]:
     for desired in alternatives:
         keyword = desired.keyword or desired.place_name if desired is not None else None
-        candidate = _first_matching_place(places, keyword, excluded_ids)
+        candidate = next(
+            (
+                place
+                for place in places
+                if place.id not in excluded_ids
+                and (keyword is None or _place_matches_keyword(place, keyword))
+                and _place_satisfies_stop_constraints(place, desired)
+            ),
+            None,
+        )
         if candidate is not None:
             return candidate, desired
     return None, None
@@ -1973,7 +2067,7 @@ def _select_requirement_group_places(
             for place in places:
                 if place.id in used_ids or (
                     keyword is not None and not _place_matches_keyword(place, keyword)
-                ):
+                ) or not _place_satisfies_stop_constraints(place, desired):
                     continue
                 estimated_cost = place.estimated_cost_per_person * 2
                 if max_total_cost is not None and total_cost + estimated_cost > max_total_cost:
@@ -1988,6 +2082,43 @@ def _select_requirement_group_places(
         return None
 
     return select(0, set(), 0)
+
+
+def _place_satisfies_stop_constraints(
+    place: Place,
+    desired: DesiredDateStop | None,
+) -> bool:
+    constraints = desired.constraints if desired is not None else None
+    if constraints is None:
+        return True
+    if constraints.max_cost_per_person is not None and (
+        place.cost_is_estimate
+        or place.estimated_cost_per_person > constraints.max_cost_per_person
+    ):
+        return False
+    if constraints.min_rating is not None and (
+        place.rating is None or place.rating < constraints.min_rating
+    ):
+        return False
+    if constraints.preferred_area is not None:
+        expected = _normalized_area(constraints.preferred_area)
+        actual = _normalized_area(
+            " ".join(
+                [
+                    place.address,
+                    place.business_area or "",
+                    place.district or "",
+                ]
+            )
+        )
+        if not expected or expected not in actual:
+            return False
+    # Distance is route-derived and is validated after routes are attached.
+    return True
+
+
+def _normalized_area(value: str) -> str:
+    return "".join(value.casefold().split()).removesuffix("区").removesuffix("县")
 
 
 def _apply_requirement_role(

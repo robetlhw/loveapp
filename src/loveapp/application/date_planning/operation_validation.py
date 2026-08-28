@@ -5,10 +5,12 @@ from itertools import pairwise
 
 from pydantic import ValidationError
 
+from loveapp.application.date_planning.clause_parsing import split_date_clauses
 from loveapp.domain.date_operations import (
     DateOperationType,
     DatePlanOperation,
     DateReplacementPreference,
+    DateStopConstraints,
     StopReference,
     TemporalAnchor,
 )
@@ -104,6 +106,12 @@ class DateOperationVerifier:
                 text,
                 allow_semantic_constraint_corrections=allow_semantic_constraint_corrections,
             )
+        if operation.type == DateOperationType.UPDATE_REQUIREMENT:
+            return _requirement_update_rejection(
+                operation,
+                operation.source_span or text,
+                runtime_context,
+            )
         if operation.type == DateOperationType.REPLAN:
             return None if _REPLAN_CUE.search(normalized) else "replan_without_explicit_cue"
         if operation.type == DateOperationType.REMOVE_STOP and not _REMOVE_CUE.search(normalized):
@@ -137,6 +145,86 @@ class DateOperationVerifier:
             ):
                 return "payload_modifier_without_source_evidence"
         return None
+
+
+def _requirement_update_rejection(
+    operation: DatePlanOperation,
+    evidence: str,
+    runtime_context: RuntimeContext | None,
+) -> str | None:
+    update = operation.requirement_update
+    active = runtime_context.active_date_plan if runtime_context is not None else None
+    if update is None:
+        return "requirement_update_missing"
+    if active is None or not active.requirements:
+        return "requirement_targets_unavailable"
+    by_id = {requirement.id: requirement for requirement in active.requirements}
+    target_ids: list[str] = []
+    target_values: list[str] = []
+    kind_families: set[str] = set()
+    normalized_evidence = _normalize(evidence)
+    for reference in update.targets:
+        requirement_id = reference.requirement_id
+        if requirement_id is None or requirement_id not in by_id:
+            return "requirement_target_not_found"
+        requirement = by_id[requirement_id]
+        if len(requirement.alternatives) != 1:
+            return "requirement_regroup_requires_independent_targets"
+        stop_reference = reference.stop_reference
+        if stop_reference is None:
+            return "requirement_target_without_source_evidence"
+        alternative = requirement.alternatives[0]
+        expected = alternative.keyword or alternative.place_name
+        observed = stop_reference.keyword or stop_reference.place_name
+        if (
+            expected is None
+            or observed is None
+            or not _text_supports_value(observed, normalized_evidence)
+            or not _text_supports_value(expected, _normalize(observed))
+        ):
+            return "requirement_target_without_source_evidence"
+        target_ids.append(requirement_id)
+        target_values.append(observed)
+        kind_families.add(
+            "dining"
+            if alternative.kind.value in {"dining", "cafe"}
+            else alternative.kind.value
+        )
+    if len(set(target_ids)) != len(target_ids):
+        return "requirement_targets_not_distinct"
+    if len(kind_families) != 1:
+        return "requirement_targets_incompatible"
+    clause_rejection = _requirement_update_clause_rejection(evidence, target_values)
+    if clause_rejection is not None:
+        return clause_rejection
+    if update.min_satisfied != 1 or update.max_satisfied != 1:
+        return "requirement_cardinality_without_source_evidence"
+    return None
+
+
+def _requirement_update_clause_rejection(
+    evidence: str,
+    target_values: list[str],
+) -> str | None:
+    cue_clauses: list[str] = []
+    positive_cue_clauses: list[str] = []
+    for clause in split_date_clauses(evidence):
+        normalized = _normalize(clause.text)
+        if _REQUIREMENT_REGROUP_CUE.search(normalized) is None:
+            continue
+        cue_clauses.append(normalized)
+        if _NEGATED_REQUIREMENT_REGROUP_CUE.search(normalized) is None:
+            positive_cue_clauses.append(normalized)
+    if not cue_clauses:
+        return "requirement_update_without_explicit_cue"
+    if not positive_cue_clauses:
+        return "requirement_update_negated"
+    if not any(
+        all(_text_supports_value(value, clause) for value in target_values)
+        for clause in positive_cue_clauses
+    ):
+        return "requirement_targets_outside_regroup_clause"
+    return None
 
 
 def _alternative_group_evidence(
@@ -376,7 +464,18 @@ def _semantic_reference_filters(text: str, items: list) -> list[list]:
         if pattern.search(text) is not None
     }
     if meal_types:
-        filters.append([item for item in items if item.meal_type in meal_types])
+        filters.append(
+            [
+                item
+                for item in items
+                if item.meal_type in meal_types
+                or (
+                    item.meal_type is None
+                    and item.place.category
+                    in {PlaceCategory.RESTAURANT, PlaceCategory.CAFE}
+                )
+            ]
+        )
     target_day = _target_day_from_text(text)
     if target_day is not None:
         filters.append([item for item in items if item.day_index == target_day])
@@ -423,7 +522,14 @@ def _reference_matches_item(reference: StopReference, item) -> bool:
         )
         or (
             reference.meal_type is not None
-            and item.meal_type == reference.meal_type.value
+            and (
+                item.meal_type == reference.meal_type.value
+                or (
+                    item.meal_type is None
+                    and item.place.category
+                    in {PlaceCategory.RESTAURANT, PlaceCategory.CAFE}
+                )
+            )
         )
     )
 
@@ -485,6 +591,8 @@ def _payload_modifiers_have_direct_evidence(
         evidence,
     ):
         return False
+    if not _payload_constraints_have_evidence(payload.constraints, evidence):
+        return False
     if payload.after is not None and not _temporal_reference_has_evidence(
         payload.after,
         evidence,
@@ -496,6 +604,51 @@ def _payload_modifiers_have_direct_evidence(
         evidence,
         relation="before",
     )
+
+
+def _payload_constraints_have_evidence(
+    constraints: DateStopConstraints | None,
+    evidence: str,
+) -> bool:
+    if constraints is None:
+        return True
+    if constraints.max_cost_per_person is not None and (
+        _STOP_LOCAL_COST_CUE.search(evidence) is None
+        or not _number_has_evidence(constraints.max_cost_per_person, evidence)
+    ):
+        return False
+    if constraints.min_rating is not None and (
+        _STOP_LOCAL_RATING_CUE.search(evidence) is None
+        or not _number_has_evidence(constraints.min_rating, evidence)
+    ):
+        return False
+    if constraints.preferred_area is not None and (
+        not _text_supports_value(constraints.preferred_area, evidence)
+        or _STOP_LOCAL_AREA_CUE.search(evidence) is None
+    ):
+        return False
+    return constraints.max_distance_meters is None or (
+        _STOP_LOCAL_DISTANCE_CUE.search(evidence) is not None
+        and _distance_has_evidence(constraints.max_distance_meters, evidence)
+    )
+
+
+def _number_has_evidence(value: int | float, evidence: str) -> bool:
+    rendered = f"{value:g}" if isinstance(value, float) else str(value)
+    return re.search(rf"(?<!\d){re.escape(rendered)}(?!\d)", evidence) is not None
+
+
+def _distance_has_evidence(meters: int, evidence: str) -> bool:
+    if re.search(rf"(?<!\d){meters}(?!\d)\s*(?:米|m)", evidence, re.IGNORECASE):
+        return True
+    for match in re.finditer(
+        r"(?<!\d)(?P<value>\d+(?:\.\d+)?)(?!\d)\s*(?:公里|km)",
+        evidence,
+        re.IGNORECASE,
+    ):
+        if round(float(match.group("value")) * 1000) == meters:
+            return True
+    return False
 
 
 def _payload_modifier_conflicts_with_local(
@@ -717,6 +870,13 @@ _NEGATED_ADD_CUE = re.compile(
 )
 _INFIX_ALTERNATIVE_CUE = re.compile(r"或者|或是|要么|还是")
 _POSTFIX_ALTERNATIVE_CUE = re.compile(r"也行|也可以|都可以|均可|任选|二选一")
+_REQUIREMENT_REGROUP_CUE = re.compile(
+    r"二选一|任选(?:其一|一个)?|选一个就行|任意一个|或者|或是|要么|还是"
+)
+_NEGATED_REQUIREMENT_REGROUP_CUE = re.compile(
+    r"(?:不要|别|不用|无需|不再|取消|撤销)(?:再)?(?:搞|做|按|改成|设成|设置成)?\s*"
+    r"(?:二选一|任选(?:其一|一个)?|选一个)"
+)
 _STRONG_BOUNDARY_CUE = re.compile(r"[。；;！？!?\n]")
 _SIMPLE_CHOICE_GAP = re.compile(r"(?:[，,、/]|或者|或是|要么|还是|和|与|以及)*")
 _REPLACE_CUE = re.compile(
@@ -758,6 +918,18 @@ _BEFORE_CUE = re.compile(r"前|之前|以前")
 _AFTER_DINNER_CUE = re.compile(r"(?:晚餐|晚饭)(?:后|之后|以后)")
 _CLOCK_CUE = re.compile(r"(?<!\d)(?P<hour>\d{1,2})(?:点|时|:)(?:\d{1,2})?(?!\d)")
 _NEARBY_CUE = re.compile(r"近一点|近一些|附近|就近|更近")
+_STOP_LOCAL_COST_CUE = re.compile(
+    r"(?:人均|每人|每位|客单).{0,16}(?:以内|以下|不超过|最多|至多|上限)"
+)
+_STOP_LOCAL_RATING_CUE = re.compile(
+    r"(?:评分|星级).{0,12}(?:以上|不低于|至少|最低)"
+)
+_STOP_LOCAL_AREA_CUE = re.compile(r"附近|周边|一带|商圈")
+_STOP_LOCAL_DISTANCE_CUE = re.compile(
+    r"(?:距离|相距|路程)(?=.{0,24}(?:米|公里|km|m))"
+    r"(?=.{0,24}(?:以内|以下|不超过|最多|至多)).{0,30}",
+    re.IGNORECASE,
+)
 _GENERIC_CATEGORY_CUE = re.compile(r"餐厅|饭店|用餐|咖啡馆|咖啡店|景点|活动")
 _PERIOD_TEXT = {
     "上午": re.compile(r"上午|早上"),

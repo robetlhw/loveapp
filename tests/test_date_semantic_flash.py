@@ -32,6 +32,7 @@ from loveapp.domain.date_operations import (
     DatePlanOperation,
     DateReplacementPreference,
     DateSemanticParseResult,
+    DateStopConstraints,
     DesiredDateStop,
     MealType,
     StopKind,
@@ -119,7 +120,7 @@ class _StaticSemanticParser:
         self.semantic_profile = {
             "model": "deepseek-v4-flash",
             "thinking": "disabled",
-            "prompt_version": "date-semantic-v1.0",
+            "prompt_version": "date-semantic-v1.1",
         }
         self.last_telemetry: dict[str, object] = {}
 
@@ -971,7 +972,7 @@ def test_date_semantic_settings_are_independent_from_main_and_router_models() ->
     assert settings.router_model == "router-flash"
     assert settings.date_semantic_model == "date-flash"
     assert settings.date_semantic_thinking == "disabled"
-    assert settings.date_semantic_prompt_version == "date-semantic-v1.0"
+    assert settings.date_semantic_prompt_version == "date-semantic-v1.1"
 
 
 def test_date_semantic_settings_load_from_environment(
@@ -1086,7 +1087,7 @@ async def test_openai_date_semantic_adapter_uses_flash_structured_non_thinking_r
         max_retries=0,
         max_tokens=2048,
         thinking="disabled",
-        prompt_version="date-semantic-v1.0",
+        prompt_version="date-semantic-v1.1",
     )
     runtime = _compound_runtime()
 
@@ -1112,7 +1113,7 @@ async def test_openai_date_semantic_adapter_uses_flash_structured_non_thinking_r
     assert parser.last_telemetry == {
         "model": "deepseek-v4-flash",
         "thinking": "disabled",
-        "prompt_version": "date-semantic-v1.0",
+        "prompt_version": "date-semantic-v1.1",
         "input_tokens": 61,
         "output_tokens": 17,
         "duration_ms": parser.last_telemetry["duration_ms"],
@@ -1259,6 +1260,103 @@ async def test_compound_partial_parse_is_completed_by_date_semantic_flash() -> N
 
 
 @pytest.mark.asyncio
+async def test_stop_local_area_does_not_overwrite_global_area() -> None:
+    query = "晚餐改成一家人均500元以内、评分4.9以上、陆家嘴附近的法餐。"
+    operation = DatePlanOperation(
+        type=DateOperationType.REPLACE_STOP,
+        target=StopReference(meal_type=MealType.DINNER),
+        payload=DesiredDateStop(
+            kind=StopKind.DINING,
+            keyword="法餐",
+            meal_type=MealType.DINNER,
+            constraints=DateStopConstraints(
+                max_cost_per_person=500,
+                min_rating=4.9,
+                preferred_area="陆家嘴",
+            ),
+        ),
+        source_span=query,
+    )
+    parser = _StaticSemanticParser(DateSemanticParseResult(operations=[operation]))
+
+    result = await HybridRouter(
+        SafetyPolicy(),
+        date_semantic_parser=parser,
+    ).route(
+        RouteInput(
+            latest_query=query,
+            active_task=TaskType.DATE_PLANNING,
+            forced_task=TaskType.DATE_PLANNING,
+            runtime_context=_runtime(
+                _item(
+                    "restaurant",
+                    "现有晚餐",
+                    PlaceCategory.RESTAURANT,
+                    "西餐",
+                    order=1,
+                    meal_type="dinner",
+                    time_label="晚餐",
+                )
+            ),
+        )
+    )
+
+    assert parser.calls == 1
+    assert "stop_local_constraints" in result.date_semantic_trigger_reasons
+    assert result.date_patch is not None
+    assert result.date_patch.area is None
+    replacement = next(
+        candidate
+        for candidate in result.date_operations
+        if candidate.type == DateOperationType.REPLACE_STOP
+    )
+    assert replacement.payload is not None
+    assert replacement.payload.constraints == operation.payload.constraints
+
+
+@pytest.mark.asyncio
+async def test_explicit_global_area_survives_stop_local_price_constraint() -> None:
+    query = "整个约会都安排在陆家嘴附近，晚餐改成人均500以内的法餐。"
+    operation = DatePlanOperation(
+        type=DateOperationType.REPLACE_STOP,
+        target=StopReference(meal_type=MealType.DINNER),
+        payload=DesiredDateStop(
+            kind=StopKind.DINING,
+            keyword="法餐",
+            meal_type=MealType.DINNER,
+            constraints=DateStopConstraints(max_cost_per_person=500),
+        ),
+        source_span=query,
+    )
+    parser = _StaticSemanticParser(DateSemanticParseResult(operations=[operation]))
+
+    result = await HybridRouter(
+        SafetyPolicy(),
+        date_semantic_parser=parser,
+    ).route(
+        RouteInput(
+            latest_query=query,
+            active_task=TaskType.DATE_PLANNING,
+            forced_task=TaskType.DATE_PLANNING,
+            runtime_context=_runtime(
+                _item(
+                    "restaurant",
+                    "现有晚餐",
+                    PlaceCategory.RESTAURANT,
+                    "西餐",
+                    order=1,
+                    meal_type="dinner",
+                    time_label="晚餐",
+                )
+            ),
+        )
+    )
+
+    assert result.date_patch is not None
+    assert result.date_patch.area == "陆家嘴"
+
+
+@pytest.mark.asyncio
 async def test_deterministic_turn_does_not_reuse_previous_semantic_usage() -> None:
     parser = _StaticSemanticParser(_compound_semantic_result())
     router = HybridRouter(SafetyPolicy(), date_semantic_parser=parser)
@@ -1377,6 +1475,34 @@ async def test_semantic_timeout_fails_closed_when_deterministic_parse_is_partial
 
 
 @pytest.mark.asyncio
+async def test_semantic_failure_keeps_complete_folded_temporal_add() -> None:
+    query = "晚饭后再加一个电影院。"
+    parser = _FailingSemanticParser(DateSemanticParseResult())
+
+    result = await HybridRouter(
+        SafetyPolicy(),
+        date_semantic_parser=parser,
+    ).route(
+        RouteInput(
+            latest_query=query,
+            active_task=TaskType.DATE_PLANNING,
+            forced_task=TaskType.DATE_PLANNING,
+        )
+    )
+
+    assert parser.calls == 1
+    assert result.date_semantic_fallback_reason == "semantic_parse_failed"
+    assert len(result.date_operations) == 1
+    addition = result.date_operations[0]
+    assert addition.type == DateOperationType.ADD_STOP
+    assert addition.source_span == "晚饭后再加一个电影院"
+    assert addition.payload is not None
+    assert addition.payload.keyword == "电影院"
+    assert result.date_unresolved_references == []
+    assert result.needs_clarification is False
+
+
+@pytest.mark.asyncio
 async def test_valid_but_incomplete_semantic_result_also_fails_closed() -> None:
     query = "预算从600提高到800，第二个地方换个近一点的，电影放晚饭后。"
     parser = _StaticSemanticParser(DateSemanticParseResult())
@@ -1469,7 +1595,7 @@ def test_cli_date_semantic_debug_block_exposes_flash_telemetry(
         date_semantic_llm_used=True,
         date_semantic_model="deepseek-v4-flash",
         date_semantic_thinking="disabled",
-        date_semantic_prompt_version="date-semantic-v1.0",
+        date_semantic_prompt_version="date-semantic-v1.1",
         date_semantic_input_tokens=642,
         date_semantic_output_tokens=187,
         date_semantic_duration_ms=532.0,

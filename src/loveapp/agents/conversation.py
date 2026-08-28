@@ -383,6 +383,8 @@ class ConversationAgent:
                 semantic_details.update(
                     {
                         "candidate_count": route.date_operation_candidate_count,
+                        "dedupe_input_count": route.date_operation_dedupe_input_count,
+                        "dedupe_output_count": len(route.date_operations),
                         "required": route.date_semantic_parse_required,
                         "reason": route.date_semantic_parse_reason,
                         "trigger_reasons": ",".join(
