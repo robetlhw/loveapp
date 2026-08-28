@@ -11,6 +11,7 @@ from loveapp.domain.date_operations import (
     DatePlanOperation,
     DateReplacementPreference,
     DateStopConstraints,
+    StopKind,
     StopReference,
     TemporalAnchor,
 )
@@ -114,14 +115,29 @@ class DateOperationVerifier:
             )
         if operation.type == DateOperationType.REPLAN:
             return None if _REPLAN_CUE.search(normalized) else "replan_without_explicit_cue"
-        if operation.type == DateOperationType.REMOVE_STOP and not _REMOVE_CUE.search(normalized):
-            return "remove_without_explicit_cue"
-        if operation.type == DateOperationType.REPLACE_STOP and not _REPLACE_CUE.search(normalized):
-            return "replace_without_explicit_cue"
-        if operation.type == DateOperationType.MOVE_STOP and not _MOVE_CUE.search(normalized):
-            return "move_without_temporal_cue"
+        if operation.type == DateOperationType.REMOVE_STOP:
+            if _NEGATED_REMOVE_CUE.search(evidence):
+                return "remove_negated_in_source"
+            if not _remove_has_positive_evidence(operation, evidence):
+                return "remove_without_explicit_cue"
+        if operation.type == DateOperationType.REPLACE_STOP:
+            if _NEGATED_REPLACE_CUE.search(evidence):
+                return "replace_negated_in_source"
+            if not _REPLACE_CUE.search(evidence):
+                return "replace_without_explicit_cue"
+        if operation.type == DateOperationType.MOVE_STOP:
+            if _NEGATED_MOVE_CUE.search(evidence):
+                return "move_negated_in_source"
+            if not _MOVE_CUE.search(evidence):
+                return "move_without_temporal_cue"
         if operation.type == DateOperationType.ADD_STOP and _NEGATED_ADD_CUE.search(evidence):
             return "add_negated_in_source"
+        constraint_source_rejection = _stop_local_constraint_source_rejection(
+            operation,
+            text,
+        )
+        if constraint_source_rejection is not None:
+            return constraint_source_rejection
         if (
             operation.alternative_group is not None
             and alternative_evidence is None
@@ -633,6 +649,250 @@ def _payload_constraints_have_evidence(
     )
 
 
+def _stop_local_constraint_source_rejection(
+    operation: DatePlanOperation,
+    text: str,
+) -> str | None:
+    payload = operation.payload
+    if (
+        payload is None
+        or payload.constraints is None
+        or not any(
+            value is not None
+            for value in payload.constraints.model_dump().values()
+        )
+    ):
+        return None
+    if operation.source_span is None:
+        return "stop_local_constraint_source_not_clause_local"
+    source = _normalize_source_evidence(operation.source_span)
+    if not source:
+        return "stop_local_constraint_source_not_clause_local"
+    matching_clauses = [
+        clause
+        for clause in split_date_clauses(text)
+        if source in _normalize_source_evidence(clause.source_text)
+    ]
+    if len(matching_clauses) != 1:
+        return "stop_local_constraint_source_not_clause_local"
+    for field, pattern in _STOP_LOCAL_CONSTRAINT_PATTERNS.items():
+        if getattr(payload.constraints, field) is not None and len(
+            list(pattern.finditer(operation.source_span))
+        ) != 1:
+            return "stop_local_constraint_source_ambiguous"
+    if (
+        not _stop_local_source_only_mentions_payload_target(operation)
+        or not _stop_local_constraint_gaps_are_payload_local(operation)
+        or not _stop_local_constraints_bind_to_payload_target(operation)
+    ):
+        return "stop_local_constraint_source_ambiguous"
+    return None
+
+
+def _stop_local_source_only_mentions_payload_target(
+    operation: DatePlanOperation,
+) -> bool:
+    payload = operation.payload
+    source = operation.source_span
+    if payload is None or source is None:
+        return False
+    mentions = [
+        match.group(0) for match in _STOP_LOCAL_TARGET_PATTERN.finditer(source)
+    ]
+    if (
+        payload.kind == StopKind.DINING
+        and payload.keyword is None
+        and payload.place_name is None
+    ):
+        specific_dining_mentions = {
+            _normalize(mention)
+            for mention in mentions
+            if _DINING_STOP_ROLE_CUE.fullmatch(mention) is None
+        }
+        return (
+            all(_DINING_STOP_CUE.fullmatch(mention) is not None for mention in mentions)
+            and len(specific_dining_mentions) <= 1
+        )
+    return all(
+        _stop_local_mention_matches_payload(mention, operation)
+        for mention in mentions
+    )
+
+
+def _stop_local_mention_matches_payload(
+    mention: str,
+    operation: DatePlanOperation,
+) -> bool:
+    payload = operation.payload
+    if payload is None:
+        return False
+    normalized_mention = _normalize(mention)
+    for value in (payload.keyword, payload.place_name):
+        if value is None:
+            continue
+        for alias in _VALUE_ALIASES.get(value, (value,)):
+            normalized_alias = _normalize(alias)
+            if (
+                normalized_mention in normalized_alias
+                or normalized_alias in normalized_mention
+            ):
+                return True
+    if (
+        payload.meal_type is not None
+        and _MEAL_TEXT[payload.meal_type.value].fullmatch(mention) is not None
+    ):
+        return True
+    return payload.kind == StopKind.DINING and (
+        _DINING_STOP_ROLE_CUE.fullmatch(mention) is not None
+    )
+
+
+def _stop_local_constraint_gaps_are_payload_local(
+    operation: DatePlanOperation,
+) -> bool:
+    payload = operation.payload
+    source = operation.source_span
+    if payload is None or payload.constraints is None or source is None:
+        return False
+    spans = sorted(
+        match.span()
+        for pattern in _STOP_LOCAL_CONSTRAINT_PATTERNS.values()
+        for match in pattern.finditer(source)
+    )
+    if len(spans) < 2:
+        return True
+    allowed_values = [payload.keyword, payload.place_name]
+    if payload.constraints.preferred_area is not None:
+        allowed_values.append(payload.constraints.preferred_area)
+    allowed_fragments = {
+        _normalize(alias)
+        for value in allowed_values
+        if value is not None
+        for alias in _VALUE_ALIASES.get(value, (value,))
+    }
+    if payload.meal_type is not None:
+        allowed_fragments.update(_MEAL_VALUE_ALIASES[payload.meal_type.value])
+    for (_, previous_end), (next_start, _) in pairwise(spans):
+        gap = _normalize(source[previous_end:next_start])
+        for fragment in sorted(allowed_fragments, key=len, reverse=True):
+            gap = gap.replace(fragment, "")
+        if _STOP_LOCAL_CONSTRAINT_GAP_FILLER.sub("", gap):
+            return False
+    return True
+
+
+def _stop_local_constraints_bind_to_payload_target(
+    operation: DatePlanOperation,
+) -> bool:
+    payload = operation.payload
+    source = operation.source_span
+    if payload is None or payload.constraints is None or source is None:
+        return False
+    aliases = {
+        _normalize(alias)
+        for value in (payload.keyword, payload.place_name)
+        if value is not None
+        for alias in _VALUE_ALIASES.get(value, (value,))
+    }
+    if not aliases:
+        return True
+    normalized_source = _normalize(source)
+    constraint_spans = [
+        match.span()
+        for field, pattern in _STOP_LOCAL_CONSTRAINT_PATTERNS.items()
+        if getattr(payload.constraints, field) is not None
+        for match in pattern.finditer(normalized_source)
+    ]
+    if not constraint_spans:
+        return False
+    bundle_start = min(start for start, _ in constraint_spans)
+    bundle_end = max(end for _, end in constraint_spans)
+    target_spans = {
+        match.span()
+        for alias in aliases
+        for match in re.finditer(re.escape(alias), normalized_source)
+    }
+    for target_start, target_end in target_spans:
+        if target_end <= bundle_start:
+            gap = normalized_source[target_end:bundle_start]
+        elif bundle_end <= target_start:
+            gap = normalized_source[bundle_end:target_start]
+        else:
+            return True
+        if not _STOP_LOCAL_TARGET_BINDING_FILLER.sub("", gap):
+            return True
+    return False
+
+
+def _remove_has_positive_evidence(
+    operation: DatePlanOperation,
+    evidence: str,
+) -> bool:
+    if operation.target is None:
+        return False
+    values = [
+        value
+        for value in (operation.target.keyword, operation.target.place_name)
+        if value is not None
+    ]
+    for value in values:
+        for alias in _VALUE_ALIASES.get(value, (value,)):
+            normalized_alias = _normalize(alias)
+            escaped = re.escape(normalized_alias)
+            if _postfix_remove_cue_targets_alias(evidence, normalized_alias):
+                return True
+            if re.search(rf"不要\s*保留\s*{escaped}", evidence):
+                return True
+            if re.search(
+                rf"不要\s*{escaped}(?:了)?(?=$|[，,。；;！？!?\n])",
+                evidence,
+            ):
+                return True
+            if re.search(
+                rf"(?:不去|不要(?:再)?(?:去|吃|看|逛))"
+                rf"[^，,。；;！？!?\n]{{0,8}}{escaped}",
+                evidence,
+            ):
+                return True
+            if _direct_remove_cue_targets_alias(evidence, normalized_alias):
+                return True
+    return False
+
+
+def _direct_remove_cue_targets_alias(evidence: str, alias: str) -> bool:
+    for alias_match in re.finditer(re.escape(alias), evidence):
+        for cue in _DIRECT_REMOVE_CUE.finditer(evidence):
+            if cue.end() <= alias_match.start():
+                between = evidence[cue.end() : alias_match.start()]
+                if _remove_cue_can_cross_to_target(between):
+                    return True
+            elif alias_match.end() <= cue.start():
+                between = evidence[alias_match.end() : cue.start()]
+                if _remove_cue_can_cross_to_target(between):
+                    return True
+    return False
+
+
+def _postfix_remove_cue_targets_alias(evidence: str, alias: str) -> bool:
+    for alias_match in re.finditer(re.escape(alias), evidence):
+        for cue in _POSTFIX_REMOVE_CUE.finditer(evidence):
+            if alias_match.end() > cue.start():
+                continue
+            between = evidence[alias_match.end() : cue.start()]
+            if len(between) <= 8 and _remove_cue_can_cross_to_target(between):
+                return True
+    return False
+
+
+def _remove_cue_can_cross_to_target(text: str) -> bool:
+    if _REMOVE_SCOPE_CONFLICT_CUE.search(text) is not None:
+        return False
+    if _REMOVE_SCOPE_STOP_CUE.search(text) is None:
+        return True
+    remainder = _REMOVE_SCOPE_STOP_CUE.sub("", text)
+    return not _REMOVE_MULTI_TARGET_LIST_FILLER.sub("", remainder)
+
+
 def _number_has_evidence(value: int | float, evidence: str) -> bool:
     rendered = f"{value:g}" if isinstance(value, float) else str(value)
     return re.search(rf"(?<!\d){re.escape(rendered)}(?!\d)", evidence) is not None
@@ -864,7 +1124,20 @@ def _normalize_source_evidence(value: str) -> str:
 
 
 _REPLAN_CUE = re.compile(r"重新.{0,4}(?:规划|安排)|换一套|全部重排|从头安排|重新来")
-_REMOVE_CUE = re.compile(r"删除|删掉|去掉|移除|取消|不去|不要")
+_DIRECT_REMOVE_CUE = re.compile(r"删除|删掉|去掉|移除|取消")
+_POSTFIX_REMOVE_CUE = re.compile(r"不要(?:了|保留)")
+_REMOVE_SCOPE_CONFLICT_CUE = re.compile(
+    r"保留|留下|但|不过|然而|(?:调|移|挪|放|换|改)(?:到|成|为)?"
+)
+_REMOVE_MULTI_TARGET_LIST_FILLER = re.compile(
+    r"(?:和|与|跟|及|以及|还有|同时|并且|加上|、|/|都|[，,])+"
+)
+_NEGATED_REMOVE_CUE = re.compile(
+    r"(?:不要|别|不用|无需|不必|不能|不准|不)(?:再)?\s*(?:把\s*)?"
+    r"[^，,。；;！？!?\n]{0,16}?"
+    r"(?:删(?:除|掉)?|去掉|移除|取消|替换|更换|换掉|换成|换为|换个|换|"
+    r"动|改|调整|调到|调|移动|移到|挪到|挪|放到|放|提前|推后)"
+)
 _NEGATED_ADD_CUE = re.compile(
     r"(?:不|别)(?:要|想|打算)?(?:去|吃|喝|看|逛|安排|加|添加)|取消(?:去|安排|添加)?"
 )
@@ -883,8 +1156,18 @@ _REPLACE_CUE = re.compile(
     r"替换|更换|换掉|换一下|换一换|换成|换为|换一个|换一家|换个|改成|改为|"
     r"有没有.{0,8}(?:近一点|近一些|附近|其他|别的)"
 )
+_NEGATED_REPLACE_CUE = re.compile(
+    r"(?:不要|别|不用|无需|不必|不能|不准|不)(?:再)?\s*(?:把\s*)?"
+    r"[^，,。；;！？!?\n]{0,16}?"
+    r"(?:替换|更换|换掉|换一下|换一换|换成|换为|换一个|换一家|换个|换|改成|改为)"
+)
 _MOVE_CUE = re.compile(
     r"之前|之后|前|后|上午|中午|下午|晚上|早餐|午饭|午餐|晚饭|晚餐|调整顺序|放到"
+)
+_NEGATED_MOVE_CUE = re.compile(
+    r"(?:不要|别|不用|无需|不必|不能|不准|不)(?:再)?\s*(?:把\s*)?"
+    r"[^，,。；;！？!?\n]{0,16}?"
+    r"(?:移动|移到|挪到|调整(?:顺序|到)?|调到|改到|换到|放(?:到|在)?|提前|推后)"
 )
 _CHINESE_ORDINALS = {1: "一", 2: "二", 3: "三", 4: "四", 5: "五"}
 _CHINESE_NUMERALS = {
@@ -905,6 +1188,11 @@ _MEAL_TEXT = {
     "breakfast": re.compile(r"早餐|早饭|早上"),
     "lunch": re.compile(r"午餐|午饭|中饭|中午"),
     "dinner": re.compile(r"晚餐|晚饭|晚上"),
+}
+_MEAL_VALUE_ALIASES = {
+    "breakfast": {"早餐", "早饭", "早上"},
+    "lunch": {"午餐", "午饭", "中饭", "中午"},
+    "dinner": {"晚餐", "晚饭", "晚上"},
 }
 _TEMPORAL_ANCHOR_TEXT = {
     TemporalAnchor.BREAKFAST: _MEAL_TEXT["breakfast"],
@@ -930,6 +1218,26 @@ _STOP_LOCAL_DISTANCE_CUE = re.compile(
     r"(?=.{0,24}(?:以内|以下|不超过|最多|至多)).{0,30}",
     re.IGNORECASE,
 )
+_STOP_LOCAL_CONSTRAINT_PATTERNS = {
+    "max_cost_per_person": _STOP_LOCAL_COST_CUE,
+    "min_rating": _STOP_LOCAL_RATING_CUE,
+    "preferred_area": _STOP_LOCAL_AREA_CUE,
+    "max_distance_meters": _STOP_LOCAL_DISTANCE_CUE,
+}
+_STOP_LOCAL_CONSTRAINT_GAP_FILLER = re.compile(
+    r"(?:[，,。；;！？!?、/]|以及|还有|同时|并且|加上|另一家|另一个|一家|一个|和|与|跟|的|且|并)+"
+)
+_STOP_LOCAL_TARGET_BINDING_FILLER = re.compile(
+    r"(?:的|另一家|另一个|一家|一个|这家|这个|新的|新)+"
+)
+_STOP_LOCAL_TARGET_CUE = (
+    r"(?:早餐|午餐|晚餐|餐厅|饭店|咖啡馆|咖啡店|咖啡|电影院|电影|影院|"
+    r"景点|场馆|活动|法餐|西餐|日料|火锅|烧烤|博物馆|美术馆|公园|剧场)"
+)
+_STOP_LOCAL_TARGET_PATTERN = re.compile(_STOP_LOCAL_TARGET_CUE)
+_REMOVE_SCOPE_STOP_CUE = _STOP_LOCAL_TARGET_PATTERN
+_DINING_STOP_ROLE_CUE = re.compile(r"早餐|午餐|晚餐|餐厅|饭店")
+_DINING_STOP_CUE = re.compile(r"早餐|午餐|晚餐|餐厅|饭店|法餐|西餐|日料|火锅|烧烤")
 _GENERIC_CATEGORY_CUE = re.compile(r"餐厅|饭店|用餐|咖啡馆|咖啡店|景点|活动")
 _PERIOD_TEXT = {
     "上午": re.compile(r"上午|早上"),

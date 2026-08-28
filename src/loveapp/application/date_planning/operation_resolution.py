@@ -98,6 +98,7 @@ class DateOperationResolver:
             tuple(candidate_operations),
             current_plan=current_plan,
             source_text=text,
+            merge_semantic_equivalents=False,
         )
         verification = self._verifier.verify(
             candidates,
@@ -212,14 +213,76 @@ def date_semantic_parse_reasons(
 def _has_stop_local_constraint_semantics(text: str) -> bool:
     """Detect typed constraints whose scope is one requested or edited stop."""
 
-    return any(
-        pattern.search(text) is not None
-        for pattern in (
-            _STOP_LOCAL_PRICE_CUE,
-            _STOP_LOCAL_RATING_CUE,
-            _STOP_LOCAL_AREA_CUE,
-            _STOP_LOCAL_DISTANCE_CUE,
+    return bool(_stop_local_constraint_fields(text))
+
+
+def _stop_local_constraint_fields(text: str) -> set[str]:
+    return {
+        field
+        for _, field, _ in _stop_local_constraint_obligations(text)
+    }
+
+
+def _stop_local_constraint_obligations(text: str) -> list[tuple[str, str, str]]:
+    return [
+        (clause.source_text, field, marker.group(0))
+        for clause in split_date_clauses(text)
+        for marker_pattern, field in _STOP_LOCAL_CONSTRAINT_MARKERS
+        for marker in marker_pattern.finditer(clause.text)
+        if _stop_role_is_near_marker(clause.text, marker.start(), marker.end())
+    ]
+
+
+def _stop_role_is_near_marker(text: str, start: int, end: int) -> bool:
+    window = text[max(0, start - 30) : min(len(text), end + 30)]
+    return _STOP_LOCAL_ROLE_CUE.search(window) is not None
+
+
+def _stop_local_constraint_obligations_are_covered(
+    obligations: list[tuple[str, str, str]],
+    operations: tuple[DatePlanOperation, ...],
+) -> bool:
+    used_operation_fields: set[tuple[int, str]] = set()
+    for clause, field, marker in obligations:
+        match = next(
+            (
+                index
+                for index, operation in enumerate(operations)
+                if (index, field) not in used_operation_fields
+                and _operation_covers_stop_local_constraint(
+                    operation,
+                    clause,
+                    field,
+                    marker,
+                )
+            ),
+            None,
         )
+        if match is None:
+            return False
+        used_operation_fields.add((match, field))
+    return True
+
+
+def _operation_covers_stop_local_constraint(
+    operation: DatePlanOperation,
+    clause: str,
+    field: str,
+    marker: str,
+) -> bool:
+    if (
+        operation.type not in _STOP_OPERATIONS
+        or operation.payload is None
+        or operation.payload.constraints is None
+        or getattr(operation.payload.constraints, field) is None
+        or operation.source_span is None
+    ):
+        return False
+    source = _normalized(operation.source_span)
+    return bool(
+        source
+        and source in _normalized(clause)
+        and _normalized(marker) in source
     )
 
 
@@ -249,6 +312,12 @@ def deterministic_date_parse_is_complete(
         operation for operation in operations if operation.type in _STOP_OPERATIONS
     ]
     if detection.is_candidate and not stop_operations:
+        return False
+    expected_stop_constraints = _stop_local_constraint_obligations(text)
+    if not _stop_local_constraint_obligations_are_covered(
+        expected_stop_constraints,
+        operations,
+    ):
         return False
     relative_match = _RELATIVE_BUDGET_UPDATE.search(text)
     if relative_match is not None:
@@ -647,10 +716,13 @@ def _removal_operations(
     used_keywords: set[str] = set()
     excluded = excluded_keywords or set()
     for clause in _clauses(text):
-        if _REMOVE_CUE.search(clause) is None:
+        if _NEGATED_MUTATION_CUE.search(clause) is not None:
             continue
         for keyword, _kind in _stops_in_text(clause):
-            if keyword in excluded:
+            if keyword in excluded or not _has_explicit_removal_for_stop(
+                clause,
+                keyword,
+            ):
                 continue
             used_keywords.add(keyword)
             operations.append(
@@ -662,6 +734,66 @@ def _removal_operations(
                 )
             )
     return operations, used_keywords
+
+
+def _has_explicit_removal_for_stop(text: str, keyword: str) -> bool:
+    for alias in _aliases_for_stop(keyword):
+        escaped = re.escape(alias)
+        if _postfix_remove_cue_targets_alias(text, alias):
+            return True
+        if re.search(rf"不要\s*保留\s*{escaped}", text):
+            return True
+        if re.search(
+            rf"不要\s*{escaped}(?:了)?(?=$|[，,。；;！？!?\n])",
+            text,
+        ):
+            return True
+        if re.search(
+            rf"(?:不去|不要(?:再)?(?:去|吃|看|逛))[^，,。；;！？!?\n]{{0,8}}{escaped}",
+            text,
+        ):
+            return True
+        if _direct_remove_cue_targets_alias(text, alias):
+            return True
+    return False
+
+
+def _direct_remove_cue_targets_alias(text: str, alias: str) -> bool:
+    for alias_match in re.finditer(re.escape(alias), text):
+        for cue in _DIRECT_REMOVE_CUE.finditer(text):
+            if cue.end() <= alias_match.start():
+                between = text[cue.end() : alias_match.start()]
+                if _remove_cue_can_cross_to_target(between):
+                    return True
+            elif alias_match.end() <= cue.start():
+                between = text[alias_match.end() : cue.start()]
+                if _remove_cue_can_cross_to_target(between):
+                    return True
+    return False
+
+
+def _postfix_remove_cue_targets_alias(text: str, alias: str) -> bool:
+    for alias_match in re.finditer(re.escape(alias), text):
+        for cue in _POSTFIX_REMOVE_CUE.finditer(text):
+            if alias_match.end() > cue.start():
+                continue
+            between = text[alias_match.end() : cue.start()]
+            if len(between) <= 8 and _remove_cue_can_cross_to_target(between):
+                return True
+    return False
+
+
+def _remove_cue_can_cross_to_target(text: str) -> bool:
+    if _REMOVE_SCOPE_CONFLICT_CUE.search(text) is not None:
+        return False
+    intervening_stops = _stops_in_text(text)
+    if not intervening_stops:
+        return True
+    remainder = text
+    for keyword, _kind in intervening_stops:
+        for alias in _aliases_for_stop(keyword):
+            remainder = re.sub(re.escape(alias), "", remainder)
+    return not _REMOVE_MULTI_TARGET_LIST_FILLER.sub("", _normalized(remainder))
 
 
 def _desired_stops(text: str) -> list[tuple[DesiredDateStop, str]]:
@@ -994,18 +1126,29 @@ def _dedupe_operations(
     *,
     current_plan: DatePlan | None = None,
     source_text: str | None = None,
+    merge_semantic_equivalents: bool = True,
 ) -> list[DatePlanOperation]:
     seen: set[str] = set()
     result: list[DatePlanOperation] = []
     for operation in operations:
         identity = json.dumps(
-            operation.model_dump(mode="json", exclude={"source_span", "confidence"}),
+            operation.model_dump(
+                mode="json",
+                exclude=(
+                    {"source_span", "confidence"}
+                    if merge_semantic_equivalents
+                    else {"confidence"}
+                ),
+            ),
             ensure_ascii=False,
             sort_keys=True,
         )
         if identity in seen:
             continue
         seen.add(identity)
+        if not merge_semantic_equivalents:
+            result.append(operation)
+            continue
         equivalent = next(
             (
                 index
@@ -1464,7 +1607,20 @@ def _normalized(value: str) -> str:
 
 
 _REPLAN_CUE = re.compile(r"重新.{0,4}(?:规划|安排)|换一套|全部重排|从头安排|重新来")
-_REMOVE_CUE = re.compile(r"删除|删掉|去掉|移除|取消|不去|不要")
+_DIRECT_REMOVE_CUE = re.compile(r"删除|删掉|去掉|移除|取消")
+_POSTFIX_REMOVE_CUE = re.compile(r"不要(?:了|保留)")
+_REMOVE_SCOPE_CONFLICT_CUE = re.compile(
+    r"保留|留下|但|不过|然而|(?:调|移|挪|放|换|改)(?:到|成|为)?"
+)
+_REMOVE_MULTI_TARGET_LIST_FILLER = re.compile(
+    r"(?:和|与|跟|及|以及|还有|同时|并且|加上|、|/|都|[，,])+"
+)
+_NEGATED_MUTATION_CUE = re.compile(
+    r"(?:不要|别|不用|无需|不必|不能|不准|不)(?:再)?\s*(?:把\s*)?"
+    r"[^，,。；;！？!?\n]{0,16}?"
+    r"(?:删(?:除|掉)?|去掉|移除|取消|替换|更换|换掉|换成|换为|换个|换|"
+    r"动|改|调整|调到|调|移动|移到|挪到|挪|放到|放|提前|推后)"
+)
 _STOP_CHOICE_LEFT_FRAGMENT = r"[^，,。；;！？!?\n]{1,30}?"
 _STOP_CHOICE_RIGHT_FRAGMENT = r"[^，,。；;！？!?\n]{1,30}"
 _INFIX_STOP_ALTERNATIVE = re.compile(
@@ -1532,6 +1688,13 @@ _STOP_LOCAL_AREA_CUE = re.compile(
 _STOP_LOCAL_DISTANCE_CUE = re.compile(
     rf"(?:{_STOP_LOCAL_ROLE}.{{0,30}}{_STOP_LOCAL_DISTANCE_VALUE}|"
     rf"{_STOP_LOCAL_DISTANCE_VALUE}.{{0,30}}{_STOP_LOCAL_ROLE})"
+)
+_STOP_LOCAL_ROLE_CUE = re.compile(_STOP_LOCAL_ROLE)
+_STOP_LOCAL_CONSTRAINT_MARKERS = (
+    (re.compile(_STOP_LOCAL_PRICE_VALUE), "max_cost_per_person"),
+    (re.compile(_STOP_LOCAL_RATING_VALUE), "min_rating"),
+    (re.compile(r"附近|周边|一带"), "preferred_area"),
+    (re.compile(_STOP_LOCAL_DISTANCE_VALUE), "max_distance_meters"),
 )
 _STOP_OPERATIONS = {
     DateOperationType.UPDATE_REQUIREMENT,

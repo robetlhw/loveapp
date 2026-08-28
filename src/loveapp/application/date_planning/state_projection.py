@@ -34,6 +34,42 @@ class LegacyDateRequirementSlots:
     schedule_hints: list[str]
 
 
+@dataclass(frozen=True)
+class DateRequirementProjectionResult:
+    requirements: list[DateStopRequirement]
+    rejected_batch_requirements: list[DateStopRequirement]
+
+
+_DATE_OPERATION_ORDER = {
+    DateOperationType.UPDATE_CONSTRAINT: 0,
+    DateOperationType.UPDATE_REQUIREMENT: 0,
+    DateOperationType.REMOVE_STOP: 1,
+    DateOperationType.REPLACE_STOP: 2,
+    DateOperationType.ADD_STOP: 3,
+    DateOperationType.MOVE_STOP: 4,
+    DateOperationType.REPLAN: 5,
+}
+
+
+def order_date_plan_operations(
+    operations: list[DatePlanOperation] | tuple[DatePlanOperation, ...],
+) -> list[DatePlanOperation]:
+    return [
+        operation
+        for _, operation in sorted(
+            enumerate(operations),
+            key=lambda item: (
+                _DATE_OPERATION_ORDER[item[1].type],
+                0
+                if item[1].type == DateOperationType.ADD_STOP
+                and item[1].alternative_group is not None
+                else 1,
+                item[0],
+            ),
+        )
+    ]
+
+
 class DateRequirementProjector:
     """Project verified operations onto canonical date-stop requirements."""
 
@@ -45,7 +81,7 @@ class DateRequirementProjector:
         current_plan: DatePlan | None = None,
     ) -> list[DesiredDateStop]:
         projected = list(desired_stops)
-        for operation in operations:
+        for operation in order_date_plan_operations(operations):
             if operation.type == DateOperationType.ADD_STOP and operation.payload is not None:
                 projected = _add_or_merge(projected, operation.payload)
             elif operation.type == DateOperationType.REMOVE_STOP and operation.target is not None:
@@ -100,38 +136,75 @@ class DateRequirementProjector:
         source_text: str | None = None,
         requirement_matches: list[DateRequirementMatch] | None = None,
     ) -> list[DateStopRequirement]:
-        """Project the verified request batch, independent of execution success."""
+        return self.project_requirement_operations(
+            requirements,
+            operations,
+            current_plan=current_plan,
+            source_text=source_text,
+            requirement_matches=requirement_matches,
+        ).requirements
+
+    def project_requirement_operations(
+        self,
+        requirements: list[DateStopRequirement],
+        operations: list[DatePlanOperation] | tuple[DatePlanOperation, ...],
+        *,
+        current_plan: DatePlan | None = None,
+        source_text: str | None = None,
+        requirement_matches: list[DateRequirementMatch] | None = None,
+    ) -> DateRequirementProjectionResult:
+        """Project the batch and its addition-only failure fallback together."""
 
         projected = list(requirements)
-        for operation in operations:
+        rejected_batch_requirements = list(requirements)
+        existing_requirement_ids = {requirement.id for requirement in requirements}
+        ordered = order_date_plan_operations(operations)
+        grouped_adds = _alternative_add_groups(ordered, source_text)
+        grouped_by_operation = {
+            id(operation): (index, group)
+            for index, group in enumerate(grouped_adds)
+            for operation in group
+        }
+        applied_groups: set[int] = set()
+
+        for operation in ordered:
+            grouped = grouped_by_operation.get(id(operation))
+            if grouped is not None:
+                group_index, group = grouped
+                if group_index not in applied_groups:
+                    alternatives = [
+                        member.payload
+                        for member in group
+                        if member.payload is not None
+                    ]
+                    incoming = DateStopRequirement(
+                        alternatives=alternatives,
+                        min_satisfied=1,
+                        max_satisfied=1,
+                        source_span=_shared_source_span(group, source_text),
+                    )
+                    projected = _add_or_merge_requirement(
+                        projected,
+                        incoming,
+                    )
+                    rejected_batch_requirements = _add_or_merge_requirement(
+                        rejected_batch_requirements,
+                        incoming,
+                    )
+                    applied_groups.add(group_index)
+                continue
             if operation.type == DateOperationType.UPDATE_REQUIREMENT:
                 projected = _apply_requirement_update(projected, operation)
-
-        grouped_adds = _alternative_add_groups(operations, source_text)
-        grouped_ids = {id(operation) for group in grouped_adds for operation in group}
-        for group in grouped_adds:
-            alternatives = [
-                operation.payload for operation in group if operation.payload is not None
-            ]
-            projected = _add_or_merge_requirement(
-                projected,
-                DateStopRequirement(
-                    alternatives=alternatives,
-                    min_satisfied=1,
-                    max_satisfied=1,
-                    source_span=_shared_source_span(group, source_text),
-                ),
-            )
-
-        for operation in operations:
-            if id(operation) in grouped_ids:
-                continue
-            if operation.type == DateOperationType.UPDATE_REQUIREMENT:
                 continue
             if operation.type == DateOperationType.ADD_STOP and operation.payload is not None:
+                incoming = _single_requirement(operation.payload, operation.source_span)
                 projected = _add_or_merge_requirement(
                     projected,
-                    _single_requirement(operation.payload, operation.source_span),
+                    incoming,
+                )
+                rejected_batch_requirements = _add_or_merge_requirement(
+                    rejected_batch_requirements,
+                    incoming,
                 )
             elif operation.type == DateOperationType.REMOVE_STOP and operation.target is not None:
                 bindings = _target_requirement_bindings(
@@ -200,50 +273,29 @@ class DateRequirementProjector:
                         }
                     )
             elif operation.type == DateOperationType.MOVE_STOP and operation.payload is not None:
-                bindings = _target_requirement_bindings(
+                projected = _apply_requirement_move(
                     projected,
-                    operation.target,
+                    operation,
                     current_plan,
                     requirement_matches or [],
                 )
-                if len(bindings) == 1:
-                    binding = bindings[0]
-                    index = next(
-                        (
-                            offset
-                            for offset, requirement in enumerate(projected)
-                            if requirement.id == binding.requirement_id
-                        ),
-                        None,
-                    )
-                    if index is None:
-                        continue
-                    current = projected[index]
-                    alternatives = list(current.alternatives)
-                    alternatives[binding.alternative_index] = _apply_placement(
-                        alternatives[binding.alternative_index],
-                        operation.payload,
-                    )
-                    projected[index] = current.model_copy(
-                        update={
-                            "alternatives": alternatives,
-                            "source_span": operation.source_span or current.source_span,
-                        }
-                    )
-                elif not bindings:
-                    target_item = _target_item(operation.target, current_plan)
-                    if target_item is not None:
-                        projected = _add_or_merge_requirement(
-                            projected,
-                            _single_requirement(
-                                _apply_placement(
-                                    _desired_stop_for_item(target_item),
-                                    operation.payload,
-                                ),
-                                operation.source_span,
-                            ),
-                        )
-        return _dedupe_requirements(projected)
+                rejected_batch_requirements = _apply_requirement_move(
+                    rejected_batch_requirements,
+                    operation,
+                    None,
+                    [],
+                    allowed_requirement_ids={
+                        requirement.id
+                        for requirement in rejected_batch_requirements
+                        if requirement.id not in existing_requirement_ids
+                    },
+                )
+        return DateRequirementProjectionResult(
+            requirements=_dedupe_requirements(projected),
+            rejected_batch_requirements=_dedupe_requirements(
+                rejected_batch_requirements
+            ),
+        )
 
 
 def desired_stops_for_state(state: DatePlanningTaskState) -> list[DesiredDateStop]:
@@ -689,6 +741,69 @@ def _apply_requirement_update(
         requirement for requirement in requirements if requirement.id not in target_ids
     ]
     return _add_or_merge_requirement(remaining, grouped)
+
+
+def _apply_requirement_move(
+    requirements: list[DateStopRequirement],
+    operation: DatePlanOperation,
+    current_plan: DatePlan | None,
+    requirement_matches: list[DateRequirementMatch],
+    *,
+    allowed_requirement_ids: set[str] | None = None,
+) -> list[DateStopRequirement]:
+    if operation.payload is None:
+        return requirements
+    bindings = _target_requirement_bindings(
+        requirements,
+        operation.target,
+        current_plan,
+        requirement_matches,
+    )
+    if len(bindings) == 1:
+        binding = bindings[0]
+        if (
+            allowed_requirement_ids is not None
+            and binding.requirement_id not in allowed_requirement_ids
+        ):
+            return requirements
+        index = next(
+            (
+                offset
+                for offset, requirement in enumerate(requirements)
+                if requirement.id == binding.requirement_id
+            ),
+            None,
+        )
+        if index is None:
+            return requirements
+        current = requirements[index]
+        alternatives = list(current.alternatives)
+        alternatives[binding.alternative_index] = _apply_placement(
+            alternatives[binding.alternative_index],
+            operation.payload,
+        )
+        projected = list(requirements)
+        projected[index] = current.model_copy(
+            update={
+                "alternatives": alternatives,
+                "source_span": operation.source_span or current.source_span,
+            }
+        )
+        return projected
+    if not bindings and allowed_requirement_ids is None:
+        target_item = _target_item(operation.target, current_plan)
+        if target_item is not None:
+            return _add_or_merge_requirement(
+                requirements,
+                _single_requirement(
+                    _apply_placement(
+                        _desired_stop_for_item(target_item),
+                        operation.payload,
+                    ),
+                    operation.source_span,
+                ),
+            )
+    return requirements
 
 
 def _target_requirement_bindings(

@@ -142,7 +142,10 @@ class DatePlanningWorkflow:
             else:
                 merged = _merge_date_task_state(current, route.date_plan, route.date_mutation)
             requirements_before = requirements_for_state(current)
-            candidate_requirements = self._project_turn_requirements(
+            (
+                candidate_requirements,
+                rejected_batch_requirements,
+            ) = self._project_turn_requirements(
                 requirements_before,
                 current,
                 current_turn_slots,
@@ -196,7 +199,16 @@ class DatePlanningWorkflow:
                     draft = _fallback_date_draft(clarified)
                 task_diff = diff_date_tasks(current, clarified)
                 clarified = clarified.model_copy(update={"last_task_diff": task_diff})
-                _record_requirement_satisfaction(trace, satisfaction)
+                _record_requirement_satisfaction(
+                    trace,
+                    satisfaction,
+                    historical_unsatisfied_ids=(
+                        _historical_unsatisfied_requirement_ids(
+                            current,
+                            candidate_requirements,
+                        )
+                    ),
+                )
                 _record_task_diff(trace, task_diff)
                 _record_plan_diff(
                     trace,
@@ -234,7 +246,16 @@ class DatePlanningWorkflow:
                 candidate_state = candidate_state.model_copy(
                     update={"last_task_diff": task_diff}
                 )
-                _record_requirement_satisfaction(trace, satisfaction)
+                _record_requirement_satisfaction(
+                    trace,
+                    satisfaction,
+                    historical_unsatisfied_ids=(
+                        _historical_unsatisfied_requirement_ids(
+                            current,
+                            candidate_requirements,
+                        )
+                    ),
+                )
                 _record_task_diff(trace, task_diff)
                 _record_plan_diff(
                     trace,
@@ -326,8 +347,7 @@ class DatePlanningWorkflow:
             if blocking_rejections:
                 committed_requirements = self._requirements_after_rejected_batch(
                     requirements_before,
-                    candidate_requirements,
-                    current,
+                    rejected_batch_requirements,
                     operation_batch,
                 )
                 _record_requirement_projection(
@@ -417,8 +437,9 @@ class DatePlanningWorkflow:
                 candidate_requirements,
                 satisfaction,
             )
-            historical_unsatisfied_ids = _unsatisfied_requirement_ids(
-                current.requirement_satisfaction
+            historical_unsatisfied_ids = _historical_unsatisfied_requirement_ids(
+                current,
+                candidate_requirements,
             )
             _record_requirement_satisfaction(
                 trace,
@@ -536,14 +557,18 @@ class DatePlanningWorkflow:
         operations: list[DatePlanOperation],
         *,
         source_text: str,
-    ) -> list[DateStopRequirement]:
+    ) -> tuple[list[DateStopRequirement], list[DateStopRequirement]]:
         if operations:
-            return self._requirement_projector.apply_requirement_operations(
+            projection = self._requirement_projector.project_requirement_operations(
                 requirements_before,
                 operations,
                 current_plan=current.current_plan,
                 source_text=source_text,
                 requirement_matches=current.requirement_satisfaction,
+            )
+            return (
+                projection.requirements,
+                projection.rejected_batch_requirements,
             )
         incoming = desired_stops_from_legacy(
             dining_keywords=slots.dining_keywords,
@@ -553,20 +578,20 @@ class DatePlanningWorkflow:
             target_day=slots.target_day,
         )
         if not incoming:
-            return requirements_before
-        return self._requirement_projector.apply_requirement_operations(
+            return requirements_before, requirements_before
+        projected = self._requirement_projector.apply_requirement_operations(
             requirements_before,
             [DatePlanOperation(type=DateOperationType.ADD_STOP, payload=stop) for stop in incoming],
             current_plan=current.current_plan,
             source_text=source_text,
             requirement_matches=current.requirement_satisfaction,
         )
+        return projected, projected
 
     def _requirements_after_rejected_batch(
         self,
         requirements_before: list[DateStopRequirement],
-        candidate_requirements: list[DateStopRequirement],
-        current: DatePlanningTaskState,
+        rejected_batch_requirements: list[DateStopRequirement],
         operation_batch: DateOperationBatch,
     ) -> list[DateStopRequirement]:
         """Keep failed additions durable while rolling back destructive projections."""
@@ -578,15 +603,7 @@ class DatePlanningWorkflow:
         ]
         if not additions:
             return requirements_before
-        if len(additions) == len(operation_batch.operations):
-            return candidate_requirements
-        return self._requirement_projector.apply_requirement_operations(
-            requirements_before,
-            additions,
-            current_plan=current.current_plan,
-            source_text=operation_batch.source_text,
-            requirement_matches=current.requirement_satisfaction,
-        )
+        return rejected_batch_requirements
 
     async def _invalid_plan_result(
         self,
@@ -624,8 +641,9 @@ class DatePlanningWorkflow:
             _record_requirement_satisfaction(
                 trace,
                 satisfaction,
-                historical_unsatisfied_ids=_unsatisfied_requirement_ids(
-                    current.requirement_satisfaction
+                historical_unsatisfied_ids=_historical_unsatisfied_requirement_ids(
+                    current,
+                    requirements_for_state(merged),
                 ),
             )
             _record_plan_diff(
@@ -677,8 +695,9 @@ class DatePlanningWorkflow:
         _record_requirement_satisfaction(
             trace,
             satisfaction,
-            historical_unsatisfied_ids=_unsatisfied_requirement_ids(
-                current.requirement_satisfaction
+            historical_unsatisfied_ids=_historical_unsatisfied_requirement_ids(
+                current,
+                requirements_for_state(merged),
             ),
         )
         _record_plan_diff(
@@ -1292,7 +1311,7 @@ def _compose_response(
     satisfaction: list[DateRequirementMatch],
     requirements: list[DateStopRequirement],
 ) -> str:
-    historical_ids = _unsatisfied_requirement_ids(current.requirement_satisfaction)
+    historical_ids = _historical_unsatisfied_requirement_ids(current, requirements)
     current_turn_unsatisfied = any(
         match.status != RequirementStatus.FULFILLED
         and match.requirement_id not in historical_ids
@@ -1405,6 +1424,31 @@ def _unsatisfied_requirement_ids(
     }
 
 
+def _historical_unsatisfied_requirement_ids(
+    current: DatePlanningTaskState,
+    requirements: list[DateStopRequirement],
+) -> set[str]:
+    previous_by_id = {requirement.id: requirement for requirement in current.requirements}
+    current_by_id = {requirement.id: requirement for requirement in requirements}
+    return {
+        requirement_id
+        for requirement_id in _unsatisfied_requirement_ids(
+            current.requirement_satisfaction
+        )
+        if requirement_id in previous_by_id
+        and requirement_id in current_by_id
+        and _requirement_semantics(previous_by_id[requirement_id])
+        == _requirement_semantics(current_by_id[requirement_id])
+    }
+
+
+def _requirement_semantics(requirement: DateStopRequirement) -> dict[str, object]:
+    return requirement.model_dump(
+        mode="json",
+        exclude={"id", "source_span"},
+    )
+
+
 def _unsatisfied_turn_message(
     current: DatePlanningTaskState,
     requirements: list[DateStopRequirement],
@@ -1417,7 +1461,7 @@ def _unsatisfied_turn_message(
     ]
     if not unsatisfied:
         return ""
-    historical_ids = _unsatisfied_requirement_ids(current.requirement_satisfaction)
+    historical_ids = _historical_unsatisfied_requirement_ids(current, requirements)
     current_turn = [
         match for match in unsatisfied if match.requirement_id not in historical_ids
     ]

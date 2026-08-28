@@ -218,7 +218,7 @@ def test_move_preserves_requirement_identity_when_current_day_differs() -> None:
     assert projected[0].alternatives[0].target_day == 3
 
 
-async def test_regroup_prunes_by_stop_identity_when_placement_is_unsatisfied() -> None:
+async def test_regroup_keeps_fulfilled_target_when_other_placement_is_unsatisfied() -> None:
     cinema = _requirement("cinema", _stop("cinema", target_day=2))
     pearl = _requirement("pearl", _stop("pearl"))
     plan = _plan(
@@ -257,5 +257,5 @@ async def test_regroup_prunes_by_stop_identity_when_placement_is_unsatisfied() -
         existing_requirements=[cinema, pearl],
     )
 
-    assert [item.place.id for item in execution.plan.items] == ["cinema-place"]
+    assert [item.place.id for item in execution.plan.items] == ["pearl-place"]
     assert execution.applied == (operation,)

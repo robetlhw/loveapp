@@ -10,6 +10,7 @@ from loveapp.application.date_planning.role_completion import complete_date_plan
 from loveapp.application.date_planning.state_projection import (
     derive_legacy_slots,
     inherit_desired_stop_role,
+    order_date_plan_operations,
 )
 from loveapp.application.date_planning.structured_stops import (
     has_placement_requirement,
@@ -24,6 +25,7 @@ from loveapp.domain.date_operations import (
     DateStopRequirement,
     DesiredDateStop,
     MealType,
+    RequirementStatus,
     StopKind,
     StopReference,
     TemporalAnchor,
@@ -94,7 +96,7 @@ class DateOperationExecutor:
         requirements: list[DateStopRequirement] | None = None,
         existing_requirements: list[DateStopRequirement] | None = None,
     ) -> DatePlanOperationExecution:
-        ordered = _ordered_operations(operations)
+        ordered = order_date_plan_operations(operations)
         contexts = _operation_execution_contexts(
             request,
             ordered,
@@ -132,15 +134,7 @@ class DateOperationExecutor:
             if changed:
                 effective_mutation = DatePlanMutation.REMOVE
         alternative_groups = _explicit_alternative_add_groups(ordered)
-        satisfied_alternative_groups = {
-            group_id
-            for group_id, alternatives in alternative_groups.items()
-            if any(
-                operation.payload is not None
-                and _desired_stop_is_satisfied(plan, operation.payload)
-                for operation in alternatives
-            )
-        }
+        satisfied_alternative_groups: set[str] = set()
 
         constraint_operations = [
             operation
@@ -168,6 +162,16 @@ class DateOperationExecutor:
                 if operation.alternative_group in alternative_groups
                 else None
             )
+            if (
+                alternative_group is not None
+                and alternative_group not in satisfied_alternative_groups
+                and any(
+                    alternative.payload is not None
+                    and _desired_stop_is_satisfied(plan, alternative.payload)
+                    for alternative in alternative_groups[alternative_group]
+                )
+            ):
+                satisfied_alternative_groups.add(alternative_group)
             if alternative_group in satisfied_alternative_groups:
                 rejected.append(
                     RejectedDatePlanOperation(operation, "alternative_not_selected")
@@ -272,29 +276,65 @@ class DateOperationExecutor:
             set(requirement_identity_place_ids(plan, target.alternatives[0]))
             for target in targets
         ]
-        selected = next(
-            (index for index, place_ids in enumerate(matches_by_target) if place_ids),
-            None,
+        target_ids = {target.id for target in targets}
+        matcher = DateRequirementMatcher()
+        fulfilled_ids = {
+            match.requirement_id
+            for match in matcher.match(existing_requirements, plan)
+            if match.status == RequirementStatus.FULFILLED
+        }
+        selectable = [
+            index
+            for index, place_ids in enumerate(matches_by_target)
+            if place_ids and targets[index].id in fulfilled_ids
+        ]
+        if not selectable:
+            return plan, None, False
+        protected_requirements = [
+            requirement
+            for requirement in existing_requirements
+            if requirement.id not in target_ids and requirement.id in fulfilled_ids
+        ]
+        grouped_requirement = DateStopRequirement(
+            alternatives=[target.alternatives[0] for target in targets],
+            min_satisfied=update.min_satisfied,
+            max_satisfied=update.max_satisfied,
+            source_span=operation.source_span,
         )
-        if selected is None:
+        requirements_to_preserve = [
+            *protected_requirements,
+            grouped_requirement,
+        ]
+        selected_items: list[DatePlanItem] | None = None
+        for selected in selectable:
+            keep_ids = matches_by_target[selected]
+            candidate_remove_ids = set().union(
+                *(
+                    place_ids
+                    for index, place_ids in enumerate(matches_by_target)
+                    if index != selected
+                )
+            ) - keep_ids
+            items = [
+                item for item in plan.items if item.place.id not in candidate_remove_ids
+            ]
+            if not items:
+                continue
+            candidate = plan.model_copy(update={"items": _renumber_items(items)})
+            if all(
+                match.status == RequirementStatus.FULFILLED
+                for match in matcher.match(requirements_to_preserve, candidate)
+            ):
+                selected_items = items
+                break
+        if selected_items is None:
+            return plan, "requirement_update_conflicts_with_active_requirement", False
+        if len(selected_items) == len(plan.items):
             return plan, None, False
-        keep_ids = matches_by_target[selected]
-        remove_ids = set().union(
-            *(
-                place_ids
-                for index, place_ids in enumerate(matches_by_target)
-                if index != selected
-            )
-        ) - keep_ids
-        if not remove_ids:
-            return plan, None, False
-        items = [item for item in plan.items if item.place.id not in remove_ids]
-        if not items:
-            return plan, "operation_would_empty_plan", False
         rebuilt = await self._planner.rebuild_plan(
             plan,
             request,
-            _renumber_items(items),
+            _renumber_items(selected_items),
             summary="已将现有地点要求合并为一个可选项，并保留其中一个行程节点。",
             trace=trace,
         )
@@ -697,25 +737,6 @@ def _same_required_stop(first: DesiredDateStop, second: DesiredDateStop) -> bool
         and first.meal_type == second.meal_type
         and first.target_day == second.target_day
     )
-
-
-def _ordered_operations(operations: list[DatePlanOperation]) -> list[DatePlanOperation]:
-    order = {
-        DateOperationType.UPDATE_CONSTRAINT: 0,
-        DateOperationType.UPDATE_REQUIREMENT: 0,
-        DateOperationType.REMOVE_STOP: 1,
-        DateOperationType.REPLACE_STOP: 2,
-        DateOperationType.ADD_STOP: 3,
-        DateOperationType.MOVE_STOP: 4,
-        DateOperationType.REPLAN: 5,
-    }
-    return [
-        operation
-        for _, operation in sorted(
-            enumerate(operations),
-            key=lambda item: (order[item[1].type], item[0]),
-        )
-    ]
 
 
 def _request_with_add_operations(

@@ -295,7 +295,7 @@ def test_rule_route_exposes_patch_and_typed_compound_operations() -> None:
     assert [
         operation.constraint_field for operation in result.date_operations[:2]
     ] == [DateConstraintField.BUDGET, DateConstraintField.BUDGET_SCOPE]
-    assert result.date_operation_candidate_count == 4
+    assert result.date_operation_candidate_count == 5
     assert result.date_operation_rejections == []
 
 

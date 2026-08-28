@@ -1503,6 +1503,29 @@ async def test_semantic_failure_keeps_complete_folded_temporal_add() -> None:
 
 
 @pytest.mark.asyncio
+async def test_semantic_failure_drops_untyped_stop_local_fallback() -> None:
+    query = "晚餐改成一家人均500元以内、评分4.9以上、陆家嘴附近的法餐。"
+    parser = _FailingSemanticParser(DateSemanticParseResult())
+
+    result = await HybridRouter(
+        SafetyPolicy(),
+        date_semantic_parser=parser,
+    ).route(
+        RouteInput(
+            latest_query=query,
+            active_task=TaskType.DATE_PLANNING,
+            forced_task=TaskType.DATE_PLANNING,
+        )
+    )
+
+    assert parser.calls == 1
+    assert result.date_semantic_fallback_reason == "semantic_parse_failed"
+    assert result.date_operations == []
+    assert result.date_unresolved_references
+    assert result.needs_clarification is True
+
+
+@pytest.mark.asyncio
 async def test_valid_but_incomplete_semantic_result_also_fails_closed() -> None:
     query = "预算从600提高到800，第二个地方换个近一点的，电影放晚饭后。"
     parser = _StaticSemanticParser(DateSemanticParseResult())
