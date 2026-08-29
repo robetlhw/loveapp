@@ -214,6 +214,156 @@ def test_single_clear_evidence_dimension_repairs_mislabeled_interaction_metric()
     assert "interaction_metric_from_evidence" in parsed.repair_steps
 
 
+@pytest.mark.parametrize(
+    "current,expected_value",
+    [
+        ("no_response_3_days", "no_response_3_days"),
+        ("none_for_3_days", "no_response_3_days"),
+        ("no_response_three_days", "no_response_3_days"),
+    ],
+)
+def test_missing_reply_evidence_repairs_frequency_to_response_engagement(
+    current: str,
+    expected_value: str,
+) -> None:
+    text = "她已经三天没有回我消息了，我也联系不上她。"
+    payload = {
+        "claims": [
+            {
+                "claim_id": "missing-replies",
+                "kind": "interaction_pattern",
+                "subject": "relationship",
+                "predicate": "contact_frequency",
+                "summary": "对方连续三天没有回复用户",
+                "evidence_spans": ["她已经三天没有回我消息了"],
+                "payload": {
+                    "metric": "contact_frequency",
+                    "current": current,
+                },
+            }
+        ],
+        "discarded_spans": [],
+    }
+
+    parsed = parse_memory_response(json.dumps(payload, ensure_ascii=False), source_text=text)
+    claim = parsed.extraction.claims[0]
+    candidate = normalize_memory_candidate(
+        claim.to_candidate(),
+        datetime(2099, 7, 31, 12, tzinfo=UTC),
+    )
+
+    assert claim.payload["metric"] == "response_engagement"
+    assert candidate.canonical_predicate == "interaction.response_engagement"
+    assert candidate.state_value == expected_value
+    assert "interaction_metric_from_evidence" in parsed.repair_steps
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"metric": "response_engagement"},
+        {"metric": "contact_frequency", "current": "resumed"},
+    ],
+)
+def test_explicit_resumed_chatting_normalizes_to_responsive_state(
+    payload: dict[str, str],
+) -> None:
+    text = "她今天终于回复我了，我们又开始正常聊天了。"
+    response = {
+        "claims": [
+            {
+                "claim_id": "chat-restored",
+                "kind": "interaction_event",
+                "subject": "relationship",
+                "predicate": "resumed_chatting",
+                "summary": "双方恢复正常聊天",
+                "evidence_spans": ["她今天终于回复我了，我们又开始正常聊天了"],
+                "payload": payload,
+            }
+        ],
+        "discarded_spans": [],
+    }
+
+    parsed = parse_memory_response(
+        json.dumps(response, ensure_ascii=False),
+        source_text=text,
+    )
+    candidate = normalize_memory_candidate(
+        parsed.extraction.claims[0].to_candidate(),
+        datetime(2099, 7, 31, 12, tzinfo=UTC),
+    )
+
+    assert candidate.canonical_predicate == "interaction.response_engagement"
+    assert candidate.state_value == "responsive"
+
+
+def test_explicit_response_restoration_repairs_unknown_event_predicate() -> None:
+    text = "她今天终于回复我了，我们又开始正常聊天了。"
+    response = {
+        "claims": [
+            {
+                "claim_id": "response-after-silence",
+                "kind": "interaction_event",
+                "subject": "relationship",
+                "predicate": "responded_after_silence",
+                "predicate_type": "custom",
+                "custom_predicate": "responded_after_silence",
+                "summary": "对方沉默后回复，双方恢复聊天",
+                "evidence_spans": ["她今天终于回复我了，我们又开始正常聊天了"],
+                "payload": {"event_status": "completed"},
+            }
+        ],
+        "discarded_spans": [],
+    }
+
+    parsed = parse_memory_response(
+        json.dumps(response, ensure_ascii=False),
+        source_text=text,
+    )
+    candidate = normalize_memory_candidate(
+        parsed.extraction.claims[0].to_candidate(),
+        datetime(2099, 7, 31, 12, tzinfo=UTC),
+    )
+
+    assert candidate.canonical_predicate == "interaction.response_engagement"
+    assert candidate.state_value == "responsive"
+    assert "response_restoration_from_evidence" in parsed.repair_steps
+
+
+def test_single_reply_event_does_not_imply_restored_response_state() -> None:
+    text = "她今天回复了我一条消息。"
+    response = {
+        "claims": [
+            {
+                "claim_id": "single-response",
+                "kind": "interaction_event",
+                "subject": "partner",
+                "predicate": "responded_once",
+                "predicate_type": "custom",
+                "custom_predicate": "responded_once",
+                "summary": "对方今天回复了一条消息",
+                "evidence_spans": ["她今天回复了我一条消息"],
+                "payload": {"event_status": "completed"},
+            }
+        ],
+        "discarded_spans": [],
+    }
+
+    parsed = parse_memory_response(
+        json.dumps(response, ensure_ascii=False),
+        source_text=text,
+    )
+    candidate = normalize_memory_candidate(
+        parsed.extraction.claims[0].to_candidate(),
+        datetime(2099, 7, 31, 12, tzinfo=UTC),
+    )
+
+    assert candidate.canonical_predicate is None
+    assert candidate.custom_predicate == "responded_once"
+    assert "response_restoration_from_evidence" not in parsed.repair_steps
+
+
 def test_contact_initiative_alias_supports_channel_qualified_pattern() -> None:
     text = "微信上通常是我主动找她聊天。"
     payload = {

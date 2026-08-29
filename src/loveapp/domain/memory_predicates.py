@@ -440,13 +440,21 @@ def normalize_predicate(
     if metric:
         metric_predicate = _INTERACTION_METRIC_PREDICATES.get(_normalize_identifier(metric))
         if metric_predicate:
+            state_value = interaction_pattern_state(metric, payload)
+            raw_alias = PREDICATE_ALIASES.get(_normalize_identifier(raw)) if raw else None
+            if (
+                state_value is None
+                and raw_alias is not None
+                and raw_alias.canonical_predicate == metric_predicate
+            ):
+                state_value = raw_alias.state_value
             return PredicateNormalization(
                 raw_predicate=raw or metric,
                 predicate_type="canonical",
                 canonical_predicate=metric_predicate,
                 custom_predicate=None,
                 state_dimension=CANONICAL_PREDICATES[metric_predicate].state_dimension,
-                state_value=interaction_pattern_state(metric, payload),
+                state_value=state_value,
                 alias_hit=_normalize_identifier(metric) != metric_predicate,
             )
 

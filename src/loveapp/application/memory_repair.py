@@ -134,13 +134,14 @@ def parse_memory_response(
             repair_steps=",".join(steps),
         )
 
+    raw_claims_snapshot = payload.get("claims")
     normalized = dict(payload)
     defaults_applied = _add_safe_container_defaults(normalized)
     if defaults_applied:
         steps.append("default_fields")
     if _normalize_enum_aliases(normalized):
         steps.append("enum_aliases")
-    steps.extend(_normalize_claim_semantics(normalized))
+    steps.extend(_normalize_claim_semantics(normalized, source_text=source_text))
 
     _validate_root_shape(normalized)
     valid_claims: list[AtomicClaim] = []
@@ -204,6 +205,10 @@ def parse_memory_response(
             {
                 "invalid_claim_count": len(invalid_claim_reasons),
                 "invalid_claim_reasons": " | ".join(invalid_claim_reasons[:5]),
+                "invalid_claim_snapshot": _safe_json_snapshot(raw_claims_snapshot),
+                "validation_error": detail[:1000],
+                "repair_attempt": _repair_attempt_name(steps),
+                "repair_result": "unresolved",
                 "repair_status": failure.repair_status,
                 "repair_steps": failure.repair_steps,
             }
@@ -551,7 +556,70 @@ def _claim_failure_category(reasons: list[str]) -> str:
     return "schema_validation"
 
 
-def _normalize_claim_semantics(payload: dict[str, object]) -> list[str]:
+_RELATIONSHIP_STAGE_DATING_PATTERN = re.compile(
+    r"确认(?:了)?(?:恋爱)?关系|正式(?:地)?在一起|(?:开始|正在|已经)(?:正式)?交往|"
+    r"成为(?:了)?(?:男女朋友|情侣)|谈恋爱|恋爱关系|"
+    r"(?:我们|双方|我和(?:她|他))(?:现在|已经)?在一起了"
+)
+_RELATIONSHIP_STAGE_ACQUAINTANCE_PATTERN = re.compile(
+    r"普通朋友|只是朋友|刚认识|尚未(?:正式)?(?:交往|在一起)|"
+    r"还(?:没|没有)(?:正式)?(?:交往|在一起)"
+)
+_RELATIONSHIP_STAGE_COMMITTED_PATTERN = re.compile(
+    r"长期(?:稳定|承诺|共同规划|规划|共同生活)|明确.{0,8}长期(?:承诺|规划)|"
+    r"稳定(?:的)?伴侣(?:关系)?|准备共同生活|共同生活规划|"
+    r"已经(?:订婚|结婚)|稳定交往(?:了)?(?:很多年|多年|\d+年)"
+)
+_RELATIONSHIP_STAGE_NEGATED_DATING_PATTERN = re.compile(
+    r"(?:尚未|还没|还没有|并没|并没有|没有|没|拒绝|不愿意|不同意).{0,8}(?:"
+    r"确认(?:了)?(?:恋爱)?关系|正式(?:地)?在一起|开始(?:正式)?交往|"
+    r"成为(?:了)?(?:男女朋友|情侣))"
+)
+_RELATIONSHIP_STAGE_SPECULATIVE_PATTERN = re.compile(
+    r"(?:如果|假如|要是|可能|也许|希望|但愿|想要?|打算|准备|计划|将来|以后).{0,16}(?:"
+    r"确认(?:了)?(?:恋爱)?关系|正式(?:地)?在一起|在一起|开始(?:正式)?交往|"
+    r"成为(?:了)?(?:男女朋友|情侣)|长期(?:稳定|承诺|规划|共同生活)|"
+    r"共同生活|分手|离婚|复合|重新(?:在一起|交往)|订婚|结婚)"
+)
+_RELATIONSHIP_STAGE_VAGUE_STABILITY_PATTERN = re.compile(
+    r"关系.{0,6}(?:更|比较|挺|很|越来越)?稳定|关系稳定(?:多了|一些|了)"
+)
+_RELATIONSHIP_STAGE_BREAKUP_PATTERN = re.compile(
+    r"分手|离婚|结束(?:了)?(?:恋爱|关系)|(?:已经|现在|后来)?分开了|不在一起了"
+)
+_RELATIONSHIP_STAGE_REUNION_PATTERN = re.compile(
+    r"复合|重新(?:正式)?(?:在一起|交往)"
+)
+_RELATIONSHIP_STAGE_NEGATED_TRANSITION_PATTERN = re.compile(
+    r"(?:尚未|还没|还没有|并未|并没|并没有|没有|没|拒绝|不愿意|不同意).{0,10}(?:"
+    r"分手|离婚|复合|重新(?:在一起|交往)|订婚|结婚)"
+)
+_RELATIONSHIP_STAGE_CONFLICT_RESOLUTION_PATTERN = re.compile(
+    r"和好|说开|矛盾.{0,8}(?:解决|结束)|冷战.{0,8}(?:解决|结束)"
+)
+_RELATIONSHIP_STAGE_HISTORICAL_PATTERN = re.compile(
+    r"曾经|以前|之前|去年|上个月|当时"
+)
+_RELATIONSHIP_STAGE_CURRENT_PATTERN = re.compile(r"现在|今天|昨天|刚刚|刚才")
+_RELATIONSHIP_STAGE_GENERIC_CUE_PATTERN = re.compile(
+    r"在一起|交往|恋爱关系|普通朋友|情侣|男女朋友|长期承诺|共同生活|"
+    r"分手|离婚|复合|订婚|结婚"
+)
+_EXPLICIT_RESPONSE_RESTORATION_PATTERN = re.compile(
+    r"(?:终于|重新|又开始|恢复).{0,10}(?:回复|回应|回.{0,3}消息|聊天|联系)|"
+    r"(?:回复|回应|回.{0,3}消息|聊天|联系).{0,10}(?:恢复正常|恢复|正常)"
+)
+_EXPLICIT_NO_RESPONSE_PATTERN = re.compile(
+    r"(?:没(?:有)?|未|不).{0,3}回(?:复|应)?(?:了)?(?:我|用户)?(?:的)?消息|"
+    r"(?:联系不上|无法联系|失去联系)"
+)
+
+
+def _normalize_claim_semantics(
+    payload: dict[str, object],
+    *,
+    source_text: str | None,
+) -> list[str]:
     claims = payload.get("claims")
     if not isinstance(claims, list):
         return []
@@ -574,6 +642,8 @@ def _normalize_claim_semantics(payload: dict[str, object]) -> list[str]:
             claim["kind"] = MemoryKind.PREFERENCE.value
             steps.append("preference_kind")
             kind = MemoryKind.PREFERENCE.value
+        if _align_exact_canonical_predicate(claim, claim_payload, kind):
+            steps.append("exact_canonical_predicate_alignment")
         uncertainty_dimension = normalize_state_dimension(
             claim_payload.get("uncertainty_type")
         )
@@ -612,6 +682,22 @@ def _normalize_claim_semantics(payload: dict[str, object]) -> list[str]:
             claim["payload"] = claim_payload
             steps.append("unscheduled_plan_to_action_intent")
         if kind == MemoryKind.RELATIONSHIP_STATE.value:
+            steps.extend(
+                _normalize_relationship_stage_claim(
+                    claim,
+                    claim_payload,
+                    source_text=source_text,
+                )
+            )
+            raw_payload = claim.get("payload")
+            claim_payload = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+            state_dimension = normalize_state_dimension(
+                claim_payload.get("state_dimension")
+            )
+            state_value = normalize_state_value(
+                state_dimension,
+                claim_payload.get("state_value"),
+            )
             predicate_normalization = normalize_predicate(
                 kind=kind,
                 raw_predicate=claim.get("predicate"),
@@ -645,7 +731,10 @@ def _normalize_claim_semantics(payload: dict[str, object]) -> list[str]:
                 if value == "unknown":
                     claim_payload.setdefault("attention_status", "unresolved")
                 claim["payload"] = claim_payload
-        if kind == MemoryKind.INTERACTION_PATTERN.value:
+        if kind in {
+            MemoryKind.INTERACTION_PATTERN.value,
+            MemoryKind.INTERACTION_EVENT.value,
+        }:
             raw_metric = claim_payload.get("metric")
             original_metric = normalize_interaction_metric(raw_metric)
             evidence = claim.get("evidence_spans")
@@ -659,6 +748,30 @@ def _normalize_claim_semantics(payload: dict[str, object]) -> list[str]:
                 evidence_text,
                 claim.get("predicate"),
             )
+            if (
+                normalize_interaction_metric(
+                    normalized_interaction_payload.get("metric")
+                )
+                == "contact_frequency"
+                and _EXPLICIT_NO_RESPONSE_PATTERN.search(evidence_text)
+            ):
+                normalized_interaction_payload["metric"] = "response_engagement"
+                steps.append("response_engagement_from_evidence")
+            detected_dimensions = (
+                detect_evidence_dimensions(evidence_text)
+                & INTERACTION_PATTERN_DIMENSIONS
+            )
+            if (
+                normalized_interaction_payload.get("metric") is None
+                and detected_dimensions == {"response_engagement"}
+                and _EXPLICIT_RESPONSE_RESTORATION_PATTERN.search(evidence_text)
+            ):
+                normalized_interaction_payload["metric"] = "response_engagement"
+                normalized_interaction_payload["current"] = "responsive"
+                claim["predicate_type"] = PredicateType.CANONICAL.value
+                claim["canonical_predicate"] = "interaction.response_engagement"
+                claim.pop("custom_predicate", None)
+                steps.append("response_restoration_from_evidence")
             metric = normalize_interaction_metric(
                 normalized_interaction_payload.get("metric")
             )
@@ -680,6 +793,312 @@ def _normalize_claim_semantics(payload: dict[str, object]) -> list[str]:
         normalized_claims.append(claim)
     payload["claims"] = normalized_claims
     return list(dict.fromkeys(steps))
+
+
+def _normalize_relationship_stage_claim(
+    claim: dict[str, object],
+    claim_payload: dict[str, object],
+    *,
+    source_text: str | None,
+) -> list[str]:
+    """Repair only relationship stages uniquely supported by exact evidence."""
+
+    evidence = claim.get("evidence_spans")
+    evidence_text = (
+        " ".join(str(value) for value in evidence)
+        if isinstance(evidence, list)
+        else ""
+    )
+    authorization_text = source_text if source_text is not None else evidence_text
+    evidence_value, _evidence_reason = _relationship_stage_from_evidence(
+        authorization_text
+    )
+    if not _has_relationship_stage_clue(claim, claim_payload, evidence_value):
+        return []
+
+    raw_value = claim_payload.get("state_value", claim.get("state_value"))
+    declared_value = _canonical_relationship_stage_value(raw_value)
+    if evidence_value is None:
+        if declared_value not in {None, "unknown"}:
+            claim_payload.pop("state_value", None)
+            claim.pop("state_value", None)
+            claim["payload"] = claim_payload
+            return ["relationship_stage_fail_closed"]
+        return []
+
+    raw_dimension = claim_payload.get("state_dimension", claim.get("state_dimension"))
+    raw_dimension_key = _stage_identifier(raw_dimension)
+    missing_shape = raw_dimension_key not in {
+        "relationship.stage",
+        "relationship_stage",
+    } or declared_value is None
+    semantic_change = declared_value is not None and declared_value != evidence_value
+
+    claim_payload["state_dimension"] = "relationship.stage"
+    claim_payload["state_value"] = evidence_value
+    claim["payload"] = claim_payload
+    claim["predicate_type"] = PredicateType.CANONICAL.value
+    claim["canonical_predicate"] = "relationship.stage"
+    claim.pop("custom_predicate", None)
+    claim["state_dimension"] = "relationship.stage"
+    claim["state_value"] = evidence_value
+
+    if missing_shape:
+        return ["relationship_stage_shape_repair"]
+    if semantic_change:
+        return ["relationship_stage_semantic_normalization"]
+    return []
+
+
+def _relationship_stage_from_evidence(text: str) -> tuple[str | None, str]:
+    compact = re.sub(r"\s+", "", text)
+    if not compact:
+        return None, "missing_evidence"
+    clauses = [
+        value
+        for value in re.split(
+            r"[，,。；;！？!?]+|(?=(?:但|不过|后来|昨天|今天|现在))",
+            compact,
+        )
+        if value
+    ]
+    decisions: list[tuple[str | None, str]] = []
+    historical_stage_seen = False
+    for clause in clauses:
+        value, reason = _relationship_stage_clause(clause)
+        if reason == "historical_only":
+            historical_stage_seen = True
+            continue
+        if value is not None or reason in {
+            "conflict_resolution",
+            "historical_ended",
+            "negative_or_conflicting",
+            "speculative",
+        }:
+            decisions.append((value, reason))
+    if decisions:
+        return decisions[-1]
+    if _RELATIONSHIP_STAGE_VAGUE_STABILITY_PATTERN.search(compact):
+        return None, "vague_stability"
+    if historical_stage_seen:
+        return None, "historical_only"
+    return None, "no_stage_evidence"
+
+
+def _relationship_stage_clause(clause: str) -> tuple[str | None, str]:
+    if _RELATIONSHIP_STAGE_SPECULATIVE_PATTERN.search(clause):
+        return None, "speculative"
+    if _RELATIONSHIP_STAGE_NEGATED_TRANSITION_PATTERN.search(clause):
+        return None, "negative_or_conflicting"
+    if (
+        _RELATIONSHIP_STAGE_HISTORICAL_PATTERN.search(clause)
+        and not _RELATIONSHIP_STAGE_CURRENT_PATTERN.search(clause)
+        and _RELATIONSHIP_STAGE_GENERIC_CUE_PATTERN.search(clause)
+    ):
+        return None, "historical_only"
+    if _RELATIONSHIP_STAGE_BREAKUP_PATTERN.search(clause):
+        return "separated", "explicit"
+    if _RELATIONSHIP_STAGE_REUNION_PATTERN.search(clause):
+        return "reconciled", "explicit"
+
+    negated_dating = _RELATIONSHIP_STAGE_NEGATED_DATING_PATTERN.search(clause) is not None
+    signals: set[str] = set()
+    if _RELATIONSHIP_STAGE_ACQUAINTANCE_PATTERN.search(clause):
+        signals.add("acquaintance")
+    if _RELATIONSHIP_STAGE_DATING_PATTERN.search(clause) and not negated_dating:
+        signals.add("dating")
+    if _RELATIONSHIP_STAGE_COMMITTED_PATTERN.search(clause):
+        signals.add("committed")
+    if "committed" in signals and "acquaintance" not in signals:
+        return "committed", "explicit"
+    if len(signals) == 1:
+        return next(iter(signals)), "explicit"
+    if len(signals) > 1 or negated_dating:
+        if signals == {"acquaintance"}:
+            return "acquaintance", "explicit"
+        return None, "negative_or_conflicting"
+    if _RELATIONSHIP_STAGE_CONFLICT_RESOLUTION_PATTERN.search(clause):
+        return None, "conflict_resolution"
+    return None, "no_stage_evidence"
+
+
+def _has_relationship_stage_clue(
+    claim: dict[str, object],
+    claim_payload: dict[str, object],
+    evidence_value: str | None,
+) -> bool:
+    values = (
+        claim.get("predicate"),
+        claim.get("raw_predicate"),
+        claim.get("canonical_predicate"),
+        claim.get("custom_predicate"),
+        claim.get("state_dimension"),
+        claim_payload.get("state_dimension"),
+    )
+    if any(
+        _stage_identifier(value) in {"relationship.stage", "relationship_stage"}
+        for value in values
+    ):
+        return True
+
+    normalized = normalize_predicate(
+        kind=MemoryKind.RELATIONSHIP_STATE.value,
+        raw_predicate=claim.get("raw_predicate") or claim.get("predicate"),
+        canonical_predicate=claim.get("canonical_predicate"),
+        custom_predicate=claim.get("custom_predicate"),
+        predicate_type=claim.get("predicate_type"),
+        payload=claim_payload,
+    )
+    if normalized.canonical_predicate == "relationship.stage":
+        return True
+    if normalized.canonical_predicate is not None or normalized.state_dimension is not None:
+        return False
+
+    generic_identifiers = {
+        "",
+        "has_state",
+        "relationship_state",
+        "relationship_status",
+        "relationship_stage_status",
+    }
+    declared_identifiers = {
+        _stage_identifier(value)
+        for value in (
+            claim.get("predicate"),
+            claim.get("raw_predicate"),
+            claim.get("canonical_predicate"),
+            claim.get("custom_predicate"),
+        )
+        if value is not None
+    }
+    return evidence_value is not None and (
+        not declared_identifiers or declared_identifiers <= generic_identifiers
+    )
+
+
+def _canonical_relationship_stage_value(value: object) -> str | None:
+    if value is None:
+        return None
+    normalized = normalize_predicate(
+        kind=MemoryKind.RELATIONSHIP_STATE.value,
+        canonical_predicate="relationship.stage",
+        predicate_type=PredicateType.CANONICAL.value,
+        payload={"state_value": value},
+    )
+    if normalized.canonical_predicate != "relationship.stage":
+        return None
+    return normalized.state_value
+
+
+def _align_exact_canonical_predicate(
+    claim: dict[str, object],
+    claim_payload: dict[str, object],
+    kind: str,
+) -> bool:
+    if _enum_key(claim.get("predicate_type")) != PredicateType.CANONICAL.value:
+        return False
+    if claim.get("canonical_predicate"):
+        return False
+    predicate = claim.get("predicate")
+    if not isinstance(predicate, str) or predicate not in CANONICAL_PREDICATES:
+        return False
+    if kind == MemoryKind.PREFERENCE.value:
+        if not predicate.startswith("preference.") or not claim_payload.get("preference"):
+            return False
+    elif kind == MemoryKind.RELATIONSHIP_STATE.value:
+        spec = CANONICAL_PREDICATES[predicate]
+        if spec.state_dimension is None:
+            return False
+    else:
+        return False
+    normalized = normalize_predicate(
+        kind=kind,
+        raw_predicate=predicate,
+        predicate_type=PredicateType.CANONICAL.value,
+        payload=claim_payload,
+    )
+    if normalized.canonical_predicate != predicate:
+        return False
+    claim["canonical_predicate"] = predicate
+    claim.pop("custom_predicate", None)
+    if normalized.state_dimension is not None:
+        claim["state_dimension"] = normalized.state_dimension
+        claim_payload["state_dimension"] = normalized.state_dimension
+    if normalized.state_value is not None:
+        claim["state_value"] = normalized.state_value
+        claim_payload["state_value"] = normalized.state_value
+    if claim_payload:
+        claim["payload"] = claim_payload
+    return True
+
+
+def _stage_identifier(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.casefold().strip().replace("-", "_").replace(" ", "_")
+
+
+def _repair_attempt_name(steps: list[str]) -> str:
+    if "relationship_stage_shape_repair" in steps:
+        return "relationship_stage_bounded_repair"
+    if "relationship_stage_semantic_normalization" in steps:
+        return "relationship_stage_semantic_normalization"
+    if "relationship_stage_fail_closed" in steps:
+        return "relationship_stage_semantic_guard"
+    return "none"
+
+
+def _safe_json_snapshot(value: object, *, limit: int = 2000) -> str:
+    sensitive_keys = {
+        "apikey",
+        "authorization",
+        "password",
+        "secret",
+        "token",
+        "accesstoken",
+        "refreshtoken",
+        "clientsecret",
+        "privatekey",
+    }
+
+    def is_sensitive_key(value: object) -> bool:
+        normalized = re.sub(r"[-_\s]+", "", str(value).casefold())
+        return normalized in sensitive_keys or normalized.endswith(
+            ("apikey", "password", "secret", "token", "privatekey")
+        )
+
+    def sanitize(item: object) -> object:
+        if isinstance(item, dict):
+            return {
+                str(key): "[REDACTED]" if is_sensitive_key(key) else sanitize(child)
+                for key, child in item.items()
+            }
+        if isinstance(item, list):
+            return [sanitize(child) for child in item[:5]]
+        return item
+
+    try:
+        sanitized = sanitize(value)
+        snapshot = json.dumps(
+            sanitized,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+    except (TypeError, ValueError):
+        snapshot = str(value)
+    if len(snapshot) <= limit:
+        return snapshot
+    return json.dumps(
+        [
+            {
+                "snapshot_truncated": True,
+                "preview": snapshot[: max(200, limit // 3)],
+            }
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def _registered_relationship_state(

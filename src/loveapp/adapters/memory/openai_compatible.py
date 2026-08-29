@@ -1,4 +1,5 @@
 import json
+import re
 from contextlib import nullcontext
 from dataclasses import replace
 from datetime import datetime
@@ -28,7 +29,7 @@ from loveapp.domain.memory_verification import ClaimVerification
 from loveapp.ports.memory import MemoryAttemptCallback
 from loveapp.ports.observability import TraceRecorder
 
-_MEMORY_PROMPT_VERSION = "memory-v2.1"
+_MEMORY_PROMPT_VERSION = "memory-v2.2"
 
 
 class OpenAICompatibleMemoryExtractor:
@@ -146,6 +147,16 @@ class OpenAICompatibleMemoryExtractor:
                         details.setdefault("repair_status", exc.repair_status)
                     if exc.repair_steps:
                         details.setdefault("repair_steps", exc.repair_steps)
+                    details.setdefault(
+                        "raw_model_response",
+                        _safe_model_response_snapshot(content),
+                    )
+                    details.setdefault("validation_error", str(exc)[:1000])
+                    details.setdefault(
+                        "repair_attempt",
+                        _repair_attempt_from_steps(exc.repair_steps),
+                    )
+                    details.setdefault("repair_result", "unresolved")
                     raise
                 parsed = replace(
                     parsed,
@@ -197,6 +208,12 @@ class OpenAICompatibleMemoryExtractor:
                 )
                 if parsed.repair_steps:
                     details["repair_steps"] = parsed.repair_steps
+                    repair_attempt = _repair_attempt_from_steps(parsed.repair_steps)
+                    if repair_attempt != "none":
+                        details["repair_attempt"] = repair_attempt
+                        details["repair_result"] = _relationship_stage_repair_result(
+                            parsed.extraction
+                        )
                 if parsed.invalid_claim_count:
                     details["invalid_claim_count"] = parsed.invalid_claim_count
                     details["invalid_claim_reasons"] = " | ".join(
@@ -690,6 +707,31 @@ def _build_attempt(
             if details.get("repair_steps")
             else None
         ),
+        raw_model_response=(
+            str(details.get("raw_model_response"))[:2000]
+            if details.get("raw_model_response")
+            else None
+        ),
+        invalid_claim_snapshot=(
+            str(details.get("invalid_claim_snapshot"))[:2000]
+            if details.get("invalid_claim_snapshot")
+            else None
+        ),
+        validation_error=(
+            str(details.get("validation_error"))[:1000]
+            if details.get("validation_error")
+            else None
+        ),
+        repair_attempt=(
+            str(details.get("repair_attempt"))[:160]
+            if details.get("repair_attempt")
+            else None
+        ),
+        repair_result=(
+            str(details.get("repair_result"))[:500]
+            if details.get("repair_result")
+            else None
+        ),
         upgrade_reason=(
             str(details.get("upgrade_reason"))
             if details.get("upgrade_reason")
@@ -704,6 +746,86 @@ def _build_attempt(
             str(details.get("retry_reason")) if details.get("retry_reason") else None
         ),
         error=error[:500] if error else None,
+    )
+
+
+def _repair_attempt_from_steps(steps: str) -> str:
+    values = {value.strip() for value in steps.split(",") if value.strip()}
+    if "relationship_stage_shape_repair" in values:
+        return "relationship_stage_bounded_repair"
+    if "relationship_stage_semantic_normalization" in values:
+        return "relationship_stage_semantic_normalization"
+    if "relationship_stage_fail_closed" in values:
+        return "relationship_stage_semantic_guard"
+    return "none"
+
+
+def _relationship_stage_repair_result(extraction: AtomicExtraction) -> str:
+    values = [
+        claim.payload.get("state_value")
+        for claim in extraction.claims
+        if claim.canonical_predicate == "relationship.stage"
+    ]
+    normalized = [str(value) for value in values if value]
+    return (
+        f"relationship.stage={','.join(normalized)}"
+        if normalized
+        else "unresolved"
+    )
+
+
+def _safe_model_response_snapshot(content: object, *, limit: int = 2000) -> str:
+    snapshot = str(content or "")
+    try:
+        parsed = json.loads(snapshot)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        parsed = None
+    if parsed is not None:
+        snapshot = json.dumps(
+            _redact_snapshot_value(parsed),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+    sensitive_field = re.compile(
+        r'(?i)(["\']?(?:api[ _-]?key|authorization|password|secret|token|'
+        r'access[ _-]?token|refresh[ _-]?token|client[ _-]?secret|private[ _-]?key)'
+        r'["\']?\s*:\s*)'
+        r'(?:(?:"(?:\\.|[^"\\])*")|(?:\'(?:\\.|[^\'\\])*\')|[^\r\n,}\]]+)'
+    )
+    snapshot = sensitive_field.sub(r'\1"[REDACTED]"', snapshot)
+    return snapshot[:limit]
+
+
+def _redact_snapshot_value(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            str(key): (
+                "[REDACTED]"
+                if _is_sensitive_snapshot_key(key)
+                else _redact_snapshot_value(child)
+            )
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_snapshot_value(child) for child in value[:5]]
+    return value
+
+
+def _is_sensitive_snapshot_key(value: object) -> bool:
+    normalized = re.sub(r"[-_\s]+", "", str(value).casefold())
+    return normalized in {
+        "apikey",
+        "authorization",
+        "password",
+        "secret",
+        "token",
+        "accesstoken",
+        "refreshtoken",
+        "clientsecret",
+        "privatekey",
+    } or normalized.endswith(
+        ("apikey", "password", "secret", "token", "privatekey")
     )
 
 
@@ -915,4 +1037,14 @@ _SYSTEM_PROMPT = """
      {"dimension":"trust","direction":"support","strength":0.8,
       "confidence":0.85,"rationale":"private_access_accepted"}]。
     无直接关系证据时省略该字段，不得为了填满结构而猜测。
+34. relationship.stage 只表示用户明确陈述的当前正式关系阶段：“普通朋友/尚未正式交往”为
+    acquaintance；“确认恋爱关系/正式在一起/我们在一起了/开始交往/成为情侣”为 dating；只有
+    明确长期承诺、长期共同规划或共同生活安排才是 committed。否定、假设、希望、可能性或笼统的
+    “关系更稳定”不能推出 dating/committed。“和好/矛盾解决”应使用 conflict_status=resolved，
+    不能仅凭和好写 relationship.stage=reconciled；愿意见朋友、参加社交活动、见父母等开放世界事实
+    使用 custom predicate，不能推成 relationship.stage 或 relationship_familiarity。若表白被接受且
+    原文明说“我们在一起了”，应另存当前 relationship.stage=dating，不能只保存表白事件。
+35. “没有回消息/不回应”属于 interaction.response_engagement，不是 contact_frequency；“终于回复、
+    恢复正常聊天”应输出 response_engagement=responsive 或 contact.status=restored。contact_frequency
+    不承载单次回复恢复事件，也不要用 resumed、available 等游离值代替现有 responsive/restored。
 """.strip()

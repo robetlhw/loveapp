@@ -222,6 +222,11 @@ class MemoryExtractionAttempt(BaseModel):
     failure_category: str | None = None
     repair_status: str | None = None
     repair_steps: str | None = None
+    raw_model_response: str | None = None
+    invalid_claim_snapshot: str | None = None
+    validation_error: str | None = None
+    repair_attempt: str | None = None
+    repair_result: str | None = None
     upgrade_reason: str | None = None
     discard_reason: str | None = None
     retry_reason: str | None = None
@@ -655,6 +660,13 @@ def normalize_candidate_predicate(candidate: MemoryCandidate) -> MemoryCandidate
         "state_dimension": normalized.state_dimension,
         "state_value": normalized.state_value,
     }
+    payload = dict(candidate.payload)
+    if normalized.state_dimension is not None:
+        payload.setdefault("state_dimension", normalized.state_dimension)
+    if normalized.state_value is not None:
+        payload["state_value"] = normalized.state_value
+    if payload != candidate.payload:
+        updates["payload"] = payload
     if normalized.predicate_type == PredicateType.CUSTOM.value:
         updates["lifecycle_review_required"] = True
     return candidate.model_copy(update=updates)

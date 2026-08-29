@@ -26,6 +26,23 @@ from loveapp.domain.memory import (
 from loveapp.evaluation.baseline import _memory_trace_summary
 
 
+def _stage_claim(*, claim_id: str, evidence: str, value: str) -> dict[str, object]:
+    return {
+        "claim_id": claim_id,
+        "kind": "relationship_state",
+        "subject": "relationship",
+        "predicate": "relationship.stage",
+        "predicate_type": "canonical",
+        "canonical_predicate": "relationship.stage",
+        "summary": "双方关系阶段发生变化",
+        "evidence_spans": [evidence],
+        "payload": {
+            "state_dimension": "relationship.stage",
+            "state_value": value,
+        },
+    }
+
+
 def test_atomic_claim_keeps_normalized_summary_and_exact_evidence() -> None:
     text = "起初我们只在群里互动，最近连续四天都会单独交流。"
     claim = AtomicClaim(
@@ -138,6 +155,415 @@ def test_parser_accepts_registered_canonical_states_before_candidate_normalizati
     assert claim.payload["state_dimension"] == dimension
     assert claim.payload["state_value"] == value
     assert "canonical_state_alignment" in parsed.repair_steps
+
+
+@pytest.mark.parametrize(
+    "raw_claim",
+    [
+        {
+            "claim_id": "missing-dimension",
+            "kind": "relationship_state",
+            "subject": "relationship",
+            "predicate": "relationship_stage",
+            "summary": "双方已经确认恋爱关系",
+            "evidence_spans": ["昨天我们确认关系了，现在正式在一起了"],
+            "payload": {"state_value": "dating"},
+        },
+        {
+            "claim_id": "missing-value",
+            "kind": "relationship_state",
+            "subject": "relationship",
+            "predicate": "relationship.stage",
+            "predicate_type": "canonical",
+            "canonical_predicate": "relationship.stage",
+            "summary": "双方已经确认恋爱关系",
+            "evidence_spans": ["昨天我们确认关系了，现在正式在一起了"],
+            "payload": {"state_dimension": "relationship.stage"},
+        },
+        {
+            "claim_id": "missing-canonical-shape",
+            "kind": "relationship_state",
+            "subject": "relationship",
+            "predicate": "relationship_stage",
+            "summary": "双方已经确认恋爱关系",
+            "evidence_spans": ["昨天我们确认关系了，现在正式在一起了"],
+            "payload": {},
+        },
+    ],
+)
+def test_relationship_stage_bounded_repair_recovers_explicit_dating_shape(
+    raw_claim: dict,
+) -> None:
+    text = "昨天我们确认关系了，现在正式在一起了。"
+
+    parsed = parse_memory_response(
+        json.dumps({"claims": [raw_claim], "discarded_spans": []}, ensure_ascii=False),
+        source_text=text,
+    )
+
+    claim = parsed.extraction.claims[0]
+    assert claim.canonical_predicate == "relationship.stage"
+    assert claim.state_dimension == "relationship.stage"
+    assert claim.state_value == "dating"
+    assert claim.payload["state_dimension"] == "relationship.stage"
+    assert claim.payload["state_value"] == "dating"
+    assert "relationship_stage_shape_repair" in parsed.repair_steps
+
+
+def test_parser_restores_missing_canonical_field_from_exact_registered_predicate() -> None:
+    text = "她喜欢日料。"
+    raw_claim = {
+        "claim_id": "exact-canonical-predicate",
+        "kind": "preference",
+        "subject": "partner",
+        "predicate": "preference.food.cuisine",
+        "predicate_type": "canonical",
+        "summary": "对方喜欢日料",
+        "evidence_spans": ["她喜欢日料"],
+        "payload": {"preference": "日料", "preference_type": "like"},
+    }
+
+    parsed = parse_memory_response(
+        json.dumps({"claims": [raw_claim], "discarded_spans": []}, ensure_ascii=False),
+        source_text=text,
+    )
+
+    assert parsed.extraction.claims[0].canonical_predicate == "preference.food.cuisine"
+    assert "exact_canonical_predicate_alignment" in parsed.repair_steps
+
+
+def test_exact_canonical_alignment_rejects_incompatible_kind_and_evidence() -> None:
+    text = "她喜欢日料。"
+    raw_claim = {
+        "claim_id": "wrong-kind-stage",
+        "kind": "stable_fact",
+        "subject": "relationship",
+        "predicate": "relationship.stage",
+        "predicate_type": "canonical",
+        "summary": "双方处于恋爱关系",
+        "evidence_spans": ["她喜欢日料"],
+        "payload": {"state_value": "dating"},
+    }
+
+    with pytest.raises(MemoryResponseError):
+        parse_memory_response(
+            json.dumps(
+                {"claims": [raw_claim], "discarded_spans": []},
+                ensure_ascii=False,
+            ),
+            source_text=text,
+        )
+
+
+def test_relationship_stage_repair_accepts_explicit_current_together_statement() -> None:
+    text = "她答应我了，我们在一起了。"
+    raw_claim = {
+        "claim_id": "accepted-and-dating",
+        "kind": "relationship_state",
+        "subject": "relationship",
+        "predicate": "relationship_status",
+        "summary": "双方已经开始交往",
+        "evidence_spans": ["她答应我了，我们在一起了"],
+        "payload": {},
+    }
+
+    parsed = parse_memory_response(
+        json.dumps({"claims": [raw_claim], "discarded_spans": []}, ensure_ascii=False),
+        source_text=text,
+    )
+
+    claim = parsed.extraction.claims[0]
+    assert claim.canonical_predicate == "relationship.stage"
+    assert claim.state_value == "dating"
+    assert "relationship_stage_shape_repair" in parsed.repair_steps
+
+
+def test_relationship_stage_semantics_downgrade_new_relationship_from_committed() -> None:
+    text = "昨天我们确认关系了，现在正式在一起了。"
+    raw_claim = _stage_claim(
+        claim_id="overstated-stage",
+        evidence="昨天我们确认关系了，现在正式在一起了",
+        value="committed",
+    )
+
+    parsed = parse_memory_response(
+        json.dumps({"claims": [raw_claim], "discarded_spans": []}, ensure_ascii=False),
+        source_text=text,
+    )
+
+    claim = parsed.extraction.claims[0]
+    assert claim.state_value == "dating"
+    assert claim.payload["state_value"] == "dating"
+    assert "relationship_stage_semantic_normalization" in parsed.repair_steps
+
+
+def test_relationship_stage_semantics_preserve_explicit_long_term_commitment() -> None:
+    text = "我们已经交往多年，也明确做了长期共同规划。"
+    raw_claim = _stage_claim(
+        claim_id="committed-stage",
+        evidence="我们已经交往多年，也明确做了长期共同规划",
+        value="committed",
+    )
+
+    parsed = parse_memory_response(
+        json.dumps({"claims": [raw_claim], "discarded_spans": []}, ensure_ascii=False),
+        source_text=text,
+    )
+
+    assert parsed.extraction.claims[0].state_value == "committed"
+    assert "relationship_stage_semantic_normalization" not in parsed.repair_steps
+
+
+def test_relationship_stage_semantics_do_not_upgrade_vague_stability() -> None:
+    text = "感觉我们的关系最近更稳定了。"
+    raw_claim = _stage_claim(
+        claim_id="vague-stage",
+        evidence="感觉我们的关系最近更稳定了",
+        value="committed",
+    )
+
+    with pytest.raises(MemoryResponseError) as exc_info:
+        parse_memory_response(
+            json.dumps(
+                {"claims": [raw_claim], "discarded_spans": []},
+                ensure_ascii=False,
+            ),
+            source_text=text,
+        )
+
+    assert exc_info.value.category == "schema_validation"
+    assert "relationship_stage_fail_closed" in exc_info.value.repair_steps
+    assert exc_info.value.details["repair_result"] == "unresolved"
+
+
+@pytest.mark.parametrize(
+    "text,evidence",
+    [
+        ("如果以后我们正式在一起就好了。", "如果以后我们正式在一起就好了"),
+        ("我们可能会在一起。", "我们可能会在一起"),
+        ("我希望能和她正式在一起。", "我希望能和她正式在一起"),
+        ("我们并没有确认关系。", "我们并没有确认关系"),
+    ],
+)
+def test_relationship_stage_semantics_fail_closed_for_non_factual_dating_cues(
+    text: str,
+    evidence: str,
+) -> None:
+    raw_claim = _stage_claim(
+        claim_id="unsupported-dating-stage",
+        evidence=evidence,
+        value="dating",
+    )
+
+    with pytest.raises(MemoryResponseError) as exc_info:
+        parse_memory_response(
+            json.dumps(
+                {"claims": [raw_claim], "discarded_spans": []},
+                ensure_ascii=False,
+            ),
+            source_text=text,
+        )
+
+    assert "relationship_stage_fail_closed" in exc_info.value.repair_steps
+
+
+@pytest.mark.parametrize(
+    "text,evidence",
+    [
+        ("她拒绝和我正式在一起。", "正式在一起"),
+        ("我想和她正式在一起。", "正式在一起"),
+    ],
+)
+def test_relationship_stage_authorization_uses_full_source_not_trimmed_evidence(
+    text: str,
+    evidence: str,
+) -> None:
+    raw_claim = _stage_claim(
+        claim_id="misleading-trimmed-evidence",
+        evidence=evidence,
+        value="dating",
+    )
+
+    with pytest.raises(MemoryResponseError) as exc_info:
+        parse_memory_response(
+            json.dumps(
+                {"claims": [raw_claim], "discarded_spans": []},
+                ensure_ascii=False,
+            ),
+            source_text=text,
+        )
+
+    assert "relationship_stage_fail_closed" in exc_info.value.repair_steps
+
+
+def test_full_source_negation_overrides_trimmed_positive_evidence() -> None:
+    text = "我和她现在还只是普通朋友，还没有正式在一起。"
+    raw_claim = _stage_claim(
+        claim_id="trimmed-negative-stage",
+        evidence="正式在一起",
+        value="dating",
+    )
+
+    parsed = parse_memory_response(
+        json.dumps({"claims": [raw_claim], "discarded_spans": []}, ensure_ascii=False),
+        source_text=text,
+    )
+
+    assert parsed.extraction.claims[0].state_value == "acquaintance"
+
+
+def test_current_dating_clause_wins_over_prior_negated_stage() -> None:
+    text = "之前我们还没有正式在一起，昨天已经确认关系了。"
+    raw_claim = _stage_claim(
+        claim_id="current-stage-after-history",
+        evidence="昨天已经确认关系了",
+        value="dating",
+    )
+
+    parsed = parse_memory_response(
+        json.dumps({"claims": [raw_claim], "discarded_spans": []}, ensure_ascii=False),
+        source_text=text,
+    )
+
+    assert parsed.extraction.claims[0].state_value == "dating"
+
+
+def test_reordered_historical_dating_does_not_override_current_breakup() -> None:
+    text = "我们已经分手了，以前正式在一起过。"
+    raw_claim = _stage_claim(
+        claim_id="historical-stage-after-breakup",
+        evidence="正式在一起",
+        value="dating",
+    )
+
+    parsed = parse_memory_response(
+        json.dumps({"claims": [raw_claim], "discarded_spans": []}, ensure_ascii=False),
+        source_text=text,
+    )
+
+    assert parsed.extraction.claims[0].state_value == "separated"
+    assert "relationship_stage_semantic_normalization" in parsed.repair_steps
+
+
+def test_conflict_repair_cannot_be_stored_as_relationship_stage_reconciled() -> None:
+    text = "我们现在和好了。"
+    raw_claim = _stage_claim(
+        claim_id="conflict-repair-as-stage",
+        evidence="现在和好了",
+        value="reconciled",
+    )
+
+    with pytest.raises(MemoryResponseError) as exc_info:
+        parse_memory_response(
+            json.dumps(
+                {"claims": [raw_claim], "discarded_spans": []},
+                ensure_ascii=False,
+            ),
+            source_text=text,
+        )
+
+    assert "relationship_stage_fail_closed" in exc_info.value.repair_steps
+
+
+@pytest.mark.parametrize(
+    "text,declared_value",
+    [
+        ("我们没有分手。", "separated"),
+        ("如果以后我们分手了。", "separated"),
+        ("我们以前分手过。", "separated"),
+        ("我希望以后我们能复合。", "reconciled"),
+        ("我们没有复合。", "reconciled"),
+        ("我们以前复合过。", "reconciled"),
+        ("如果以后我们已经结婚了。", "committed"),
+    ],
+)
+def test_relationship_stage_rejects_non_current_or_unrelated_evidence(
+    text: str,
+    declared_value: str,
+) -> None:
+    raw_claim = _stage_claim(
+        claim_id="unsupported-current-stage",
+        evidence=text.rstrip("。"),
+        value=declared_value,
+    )
+
+    with pytest.raises(MemoryResponseError) as exc_info:
+        parse_memory_response(
+            json.dumps({"claims": [raw_claim], "discarded_spans": []}, ensure_ascii=False),
+            source_text=text,
+        )
+
+    assert "relationship_stage_fail_closed" in exc_info.value.repair_steps
+
+
+@pytest.mark.parametrize(
+    "text,declared_value,expected_value",
+    [
+        ("我们现在已经分手了。", "separated", "separated"),
+        ("我们昨天复合了。", "reconciled", "reconciled"),
+        ("我们已经结婚了。", "committed", "committed"),
+        ("我们曾经已经结婚，后来离婚了。", "committed", "separated"),
+    ],
+)
+def test_relationship_stage_accepts_only_explicit_current_transition_evidence(
+    text: str,
+    declared_value: str,
+    expected_value: str,
+) -> None:
+    raw_claim = _stage_claim(
+        claim_id="explicit-current-stage",
+        evidence=text.rstrip("。"),
+        value=declared_value,
+    )
+
+    parsed = parse_memory_response(
+        json.dumps({"claims": [raw_claim], "discarded_spans": []}, ensure_ascii=False),
+        source_text=text,
+    )
+
+    assert parsed.extraction.claims[0].state_value == expected_value
+
+
+@pytest.mark.parametrize(
+    "declared_value",
+    ["acquaintance", "dating", "separated", "reconciled"],
+)
+def test_social_integration_evidence_cannot_authorize_relationship_stage(
+    declared_value: str,
+) -> None:
+    text = "她愿意带我认识她的朋友。"
+    raw_claim = _stage_claim(
+        claim_id="overcanonicalized-social-stage",
+        evidence="她愿意带我认识她的朋友",
+        value=declared_value,
+    )
+
+    parsed = parse_memory_response(
+        json.dumps({"claims": [raw_claim], "discarded_spans": []}, ensure_ascii=False),
+        source_text=text,
+    )
+
+    claim = parsed.extraction.claims[0]
+    assert claim.state_value is None
+    assert claim.payload.get("state_value") is None
+    assert "relationship_stage_fail_closed" in parsed.repair_steps
+
+
+def test_negated_formal_relationship_normalizes_to_acquaintance() -> None:
+    text = "我和她现在还只是普通朋友，还没有正式在一起。"
+    raw_claim = _stage_claim(
+        claim_id="negated-dating-stage",
+        evidence="现在还只是普通朋友，还没有正式在一起",
+        value="dating",
+    )
+
+    parsed = parse_memory_response(
+        json.dumps({"claims": [raw_claim], "discarded_spans": []}, ensure_ascii=False),
+        source_text=text,
+    )
+
+    assert parsed.extraction.claims[0].state_value == "acquaintance"
+    assert "relationship_stage_semantic_normalization" in parsed.repair_steps
 
 
 def test_parser_case_normalizes_canonical_user_belief_enums() -> None:
@@ -590,6 +1016,37 @@ async def test_memory_extractor_uses_one_flash_call_for_invalid_json() -> None:
     await extractor.aclose()
 
 
+@pytest.mark.parametrize(
+    "response,secret",
+    [
+        ("Authorization: Bearer top-secret", "top-secret"),
+        ('{ "client_secret": bare-secret }', "bare-secret"),
+        ("access_token: exposed-token\nnot-json", "exposed-token"),
+    ],
+)
+async def test_invalid_model_response_snapshot_redacts_bare_secrets(
+    response: str,
+    secret: str,
+) -> None:
+    attempts = []
+    extractor = _build_tiered_extractor(_FakeCompletions([response]), None)
+
+    result = await extractor.extract(
+        "我喜欢粤菜。",
+        reference_time=datetime(2026, 7, 18, tzinfo=UTC),
+        existing_memories=[],
+        conversation_history=[],
+        attempt_callback=attempts.append,
+    )
+
+    assert result.claims == []
+    assert len(attempts) == 1
+    assert attempts[0].failure_category == "json_syntax"
+    assert secret not in str(attempts[0].raw_model_response)
+    assert "[REDACTED]" in str(attempts[0].raw_model_response)
+    await extractor.aclose()
+
+
 async def test_failed_extraction_attempt_keeps_validation_and_repair_details() -> None:
     response = json.dumps(
         {
@@ -601,6 +1058,12 @@ async def test_failed_extraction_attempt_keeps_validation_and_repair_details() -
                     "predicate": "has_fact",
                     "summary": "用户陈述了一条事实",
                     "evidence_spans": ["我有一条事实"],
+                    "api_key": "must-not-be-logged",
+                    "access_token": "access-token-must-not-be-logged",
+                    "client-secret": "client-secret-must-not-be-logged",
+                    "nested": {
+                        "private_key": "private-key-must-not-be-logged",
+                    },
                 }
             ],
             "discarded_spans": [],
@@ -624,6 +1087,68 @@ async def test_failed_extraction_attempt_keeps_validation_and_repair_details() -
     assert attempts[0].invalid_claim_count == 1
     assert "unsupported_kind" in str(attempts[0].invalid_claim_reasons)
     assert attempts[0].repair_status in {"none", "local_repair"}
+    assert "unsupported_kind" in str(attempts[0].invalid_claim_snapshot)
+    assert "must-not-be-logged" not in str(attempts[0].invalid_claim_snapshot)
+    assert "must-not-be-logged" not in str(attempts[0].raw_model_response)
+    assert "access-token-must-not-be-logged" not in str(
+        attempts[0].invalid_claim_snapshot
+    )
+    assert "access-token-must-not-be-logged" not in str(
+        attempts[0].raw_model_response
+    )
+    assert "client-secret-must-not-be-logged" not in str(
+        attempts[0].invalid_claim_snapshot
+    )
+    assert "client-secret-must-not-be-logged" not in str(
+        attempts[0].raw_model_response
+    )
+    assert "private-key-must-not-be-logged" not in str(
+        attempts[0].invalid_claim_snapshot
+    )
+    assert "private-key-must-not-be-logged" not in str(
+        attempts[0].raw_model_response
+    )
+    assert "[REDACTED]" in str(attempts[0].invalid_claim_snapshot)
+    assert "[REDACTED]" in str(attempts[0].raw_model_response)
+    assert attempts[0].validation_error
+    assert attempts[0].repair_attempt == "none"
+    assert attempts[0].repair_result == "unresolved"
+    await extractor.aclose()
+
+
+async def test_successful_relationship_stage_repair_is_visible_in_attempt() -> None:
+    text = "昨天我们确认关系了，现在正式在一起了。"
+    response = json.dumps(
+        {
+            "claims": [
+                {
+                    "claim_id": "repaired-stage",
+                    "kind": "relationship_state",
+                    "subject": "relationship",
+                    "predicate": "relationship_stage",
+                    "summary": "双方已经确认恋爱关系",
+                    "evidence_spans": ["昨天我们确认关系了，现在正式在一起了"],
+                    "payload": {},
+                }
+            ],
+            "discarded_spans": [],
+        },
+        ensure_ascii=False,
+    )
+    attempts = []
+    extractor = _build_tiered_extractor(_FakeCompletions([response]), None)
+
+    result = await extractor.extract(
+        text,
+        reference_time=datetime(2026, 7, 18, tzinfo=UTC),
+        existing_memories=[],
+        conversation_history=[],
+        attempt_callback=attempts.append,
+    )
+
+    assert result.claims[0].state_value == "dating"
+    assert attempts[0].repair_attempt == "relationship_stage_bounded_repair"
+    assert attempts[0].repair_result == "relationship.stage=dating"
     await extractor.aclose()
 
 
@@ -676,7 +1201,7 @@ async def test_flash_trace_keeps_raw_predicate_before_canonicalization() -> None
     assert claims[0]["evidence_spans"] == [source_text]
     assert claims[0]["payload"] == {"metric": "contact_frequency"}
     assert claims[0]["extractor_model"] == "flash-model"
-    assert claims[0]["prompt_version"] == "memory-v2.1"
+    assert claims[0]["prompt_version"] == "memory-v2.2"
     await extractor.aclose()
 
 

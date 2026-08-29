@@ -362,6 +362,16 @@ def _render_model_outputs(console: Console, outputs: list[dict[str, Any]]) -> No
             for claim in claims
             if isinstance(claim, dict)
         )
+        failure_repair = "\n".join(
+            str(value)
+            for value in (
+                output.get("failure_category") or output.get("repair_status"),
+                output.get("repair_attempt"),
+                output.get("repair_result"),
+                output.get("validation_error"),
+            )
+            if value
+        )
         table.add_row(
             str(output.get("tier") or "-"),
             str(output.get("model") or "-"),
@@ -369,7 +379,7 @@ def _render_model_outputs(console: Console, outputs: list[dict[str, Any]]) -> No
             str(len(claims)),
             claim_text or "-",
             f"{float(output.get('duration_ms') or 0):.2f} ms",
-            str(output.get("failure_category") or output.get("repair_status") or "-"),
+            failure_repair or "-",
         )
     if not outputs:
         table.add_row("-", "-", "-", "0", "-", "-", "No model attempt recorded")

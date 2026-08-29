@@ -541,6 +541,36 @@ def normalize_interaction_state_value(
     if value is None:
         return None
     normalized = _normalize_identifier(str(value))
+    if canonical_metric == "response_engagement":
+        normalized = {
+            "resumed": "responsive",
+            "recovered": "responsive",
+            "back_to_normal": "responsive",
+            "normal_chatting": "responsive",
+        }.get(normalized, normalized)
+        if normalized.startswith("none_for_"):
+            normalized = f"no_response_{normalized.removeprefix('none_for_')}"
+        duration_match = re.fullmatch(
+            r"(no_(?:response|reply))_(one|two|three|four|five|six|seven)_days",
+            normalized,
+        )
+        if duration_match is not None:
+            count = {
+                "one": "1",
+                "two": "2",
+                "three": "3",
+                "four": "4",
+                "five": "5",
+                "six": "6",
+                "seven": "7",
+            }[duration_match.group(2)]
+            normalized = f"{duration_match.group(1)}_{count}_days"
+    elif canonical_metric == "contact_frequency":
+        normalized = {
+            "resumed": "restored",
+            "recovered": "restored",
+            "back_to_normal": "restored",
+        }.get(normalized, normalized)
     if canonical_metric != "initiation_balance":
         return normalized or None
     normalized = _INITIATION_BALANCE_VALUE_ALIASES.get(normalized, normalized)

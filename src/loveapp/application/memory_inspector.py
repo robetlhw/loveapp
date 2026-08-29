@@ -304,10 +304,22 @@ def _model_outputs(records: list[Any]) -> list[dict[str, Any]]:
                 "status": record.status.value,
                 "duration_ms": round(record.duration_ms, 2),
                 "repair_status": details.get("repair_status"),
+                "repair_steps": details.get("repair_steps"),
+                "repair_attempt": details.get("repair_attempt"),
+                "repair_result": details.get("repair_result"),
                 "failure_category": details.get("failure_category"),
+                "validation_error": details.get("validation_error"),
+                "raw_model_response": details.get("raw_model_response"),
+                "invalid_claim_snapshot": _load_json(
+                    details.get("invalid_claim_snapshot"),
+                    [],
+                ),
                 "raw_claims": _load_json(
                     details.get("claims_json"),
-                    _load_json(details.get("claim_predicates_json"), []),
+                    _load_json(
+                        details.get("invalid_claim_snapshot"),
+                        _load_json(details.get("claim_predicates_json"), []),
+                    ),
                 ),
             }
         )

@@ -3,7 +3,8 @@ from datetime import UTC, datetime
 
 from loveapp.adapters.memory.in_memory import InMemoryMemoryStore
 from loveapp.application.memory import MemoryService
-from loveapp.application.memory_inspector import MemoryInspector
+from loveapp.application.memory_inspector import MemoryInspector, _model_outputs
+from loveapp.core.timing import ExecutionTrace
 from loveapp.domain.memory import (
     AtomicClaim,
     AtomicExtraction,
@@ -133,6 +134,39 @@ async def test_inspector_exposes_skip_failure_history_context_runs_and_reset() -
     assert await failure.get_history() == []
     assert await failure.list_memories(include_all=True) == []
     assert await failure.list_runs() == []
+
+
+def test_inspector_exposes_schema_failure_snapshot_and_repair_result() -> None:
+    trace = ExecutionTrace()
+    invalid_claim = {
+        "claim_id": "invalid-stage",
+        "kind": "relationship_state",
+        "predicate": "relationship_stage",
+        "payload": {},
+    }
+    with trace.measure("memory_model_attempt_1") as details:
+        details.update(
+            {
+                "tier": "flash",
+                "model": "flash-model",
+                "failure_category": "schema_validation",
+                "invalid_claim_snapshot": json.dumps(
+                    [invalid_claim],
+                    ensure_ascii=False,
+                ),
+                "validation_error": "missing state_value",
+                "repair_attempt": "relationship_stage_bounded_repair",
+                "repair_result": "unresolved",
+            }
+        )
+
+    output = _model_outputs(trace.snapshot())[0]
+
+    assert output["raw_claims"] == [invalid_claim]
+    assert output["invalid_claim_snapshot"] == [invalid_claim]
+    assert output["validation_error"] == "missing state_value"
+    assert output["repair_attempt"] == "relationship_stage_bounded_repair"
+    assert output["repair_result"] == "unresolved"
 
 
 def _sushi_claim(claim_id: str, evidence: str) -> AtomicClaim:
