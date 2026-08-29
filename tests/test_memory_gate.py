@@ -90,6 +90,68 @@ def test_memory_gate_keeps_durable_claims_in_mixed_questions() -> None:
     assert "advice_outcome" in outcome.signals
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "她最近开始经常带我参加她朋友的聚会。",
+        "她现在愿意带我认识她的朋友。",
+        "但她暂时还不愿意让我去见她父母。",
+        "最近一个月她几乎不再让我参加她朋友的活动。",
+        "昨天有一个聚会她没有叫我。",
+    ],
+)
+def test_memory_gate_accepts_durable_social_integration_signals(text: str) -> None:
+    decision = MemoryGate().evaluate(text)
+
+    assert decision.should_extract is True
+    assert decision.reason.value == "durable_signal"
+    assert "social_integration" in decision.signals
+    assert decision.matched_rule is not None
+    assert decision.matched_rule.startswith("social_integration_")
+    assert decision.matched_span
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "我现在应该怎么跟她道歉？",
+        "怎么跟她道歉？",
+        "我该不该跟她道歉？",
+        "我要不要向她道歉？",
+        "如何跟她道歉？",
+        "我要怎么跟她道歉？",
+        "我现在要怎么跟她道歉？",
+        "我想知道怎么跟她道歉？",
+    ],
+)
+def test_memory_gate_rejects_pure_relationship_action_consultations(text: str) -> None:
+    decision = MemoryGate().evaluate(text)
+
+    assert decision.should_extract is False
+    assert decision.reason.value == "consultation_only"
+    assert decision.matched_rule is not None
+    assert decision.matched_rule.startswith("relationship_action_consultation_")
+
+
+def test_relationship_action_consultation_guard_preserves_observed_fact() -> None:
+    decision = MemoryGate().evaluate(
+        "她最近主动找我聊天，我该怎么跟她道歉？"
+    )
+
+    assert decision.should_extract is True
+    assert "temporal_interaction" in decision.signals
+
+
+def test_social_integration_hypothesis_still_fails_closed() -> None:
+    decision = MemoryGate().evaluate(
+        "如果她以后突然不理我了，我应该怎么办？"
+    )
+
+    assert decision.should_extract is False
+    assert decision.reason.value == "hypothetical"
+    assert decision.matched_rule == "hypothetical_1"
+
+
 def test_memory_gate_marks_future_events_without_dropping_shared_context() -> None:
     decision = MemoryGate().evaluate(
         "我俩最近被分到了同一个课程作业小组，下周有机会一起小组讨论，"

@@ -155,6 +155,57 @@ INTERACTION_PATTERN_DIMENSIONS = frozenset(
     }
 )
 
+_INITIATION_BALANCE_VALUES = frozenset(
+    {"partner_to_user", "balanced", "user_to_partner", "mixed"}
+)
+_INITIATION_BALANCE_VALUE_ALIASES = {
+    "partner_initiated": "partner_to_user",
+    "partner_initiates": "partner_to_user",
+    "partner_led": "partner_to_user",
+    "user_initiated": "user_to_partner",
+    "user_initiates": "user_to_partner",
+    "user_led": "user_to_partner",
+    "mutual": "balanced",
+    "reciprocal": "balanced",
+    "both": "balanced",
+    "alternating": "mixed",
+}
+_CADENCE_VALUES = frozenset(
+    {
+        "daily",
+        "weekly",
+        "monthly",
+        "frequent",
+        "frequently",
+        "often",
+        "occasionally",
+        "rare",
+        "rarely",
+    }
+)
+_RELATIONSHIP_INTERACTION_SUBJECTS = frozenset(
+    {
+        "relationship",
+        "partner",
+        "user",
+        "both",
+        "couple",
+        "dyad",
+        "partner_and_user",
+        "user_and_partner",
+        "双方",
+        "关系",
+        "对方",
+        "用户",
+        "我",
+        "她",
+        "他",
+        "我们",
+        "我和她",
+        "我和他",
+    }
+)
+
 
 # Model predicates are intentionally normalized through a registry rather than
 # interpreted with one-off branches in the extraction pipeline.  Metrics and
@@ -436,6 +487,137 @@ def normalize_interaction_metric(value: object) -> str | None:
         return None
     normalized = _normalize_identifier(value)
     return INTERACTION_METRIC_ALIASES.get(normalized, normalized)
+
+
+def normalize_interaction_pattern_payload(
+    payload: Mapping[str, object],
+    evidence_text: str,
+    predicate: object = None,
+) -> dict[str, object]:
+    """Normalize one interaction metric without mixing cadence and direction."""
+
+    normalized = dict(payload)
+    metric = normalize_interaction_metric(normalized.get("metric"))
+    metric = reconcile_interaction_metric(metric, evidence_text, predicate)
+    if metric is None:
+        return normalized
+    normalized["metric"] = metric
+    if metric != "initiation_balance":
+        return normalized
+
+    raw_state = normalized.get("current")
+    state = next(
+        (
+            candidate
+            for field in ("current", "direction")
+            if (
+                candidate := normalize_interaction_state_value(
+                    metric,
+                    normalized.get(field),
+                )
+            )
+            is not None
+        ),
+        None,
+    )
+    if state is None:
+        state = infer_initiation_balance(evidence_text)
+    if state is not None:
+        normalized["current"] = state
+    elif raw_state is not None:
+        normalized.pop("current", None)
+
+    raw_key = _normalize_identifier(str(raw_state or ""))
+    if raw_key in _CADENCE_VALUES:
+        normalized.setdefault("frequency", raw_key)
+    return normalized
+
+
+def normalize_interaction_state_value(
+    metric: object,
+    value: object,
+) -> str | None:
+    canonical_metric = normalize_interaction_metric(metric)
+    if value is None:
+        return None
+    normalized = _normalize_identifier(str(value))
+    if canonical_metric != "initiation_balance":
+        return normalized or None
+    normalized = _INITIATION_BALANCE_VALUE_ALIASES.get(normalized, normalized)
+    return normalized if normalized in _INITIATION_BALANCE_VALUES else None
+
+
+def is_relationship_interaction_subject(value: object) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    return _normalize_identifier(value) in _RELATIONSHIP_INTERACTION_SUBJECTS
+
+
+def interaction_pattern_state(
+    metric: object,
+    payload: Mapping[str, object],
+) -> str | None:
+    canonical_metric = normalize_interaction_metric(metric)
+    if canonical_metric == "initiation_balance":
+        for key in ("current", "direction"):
+            value = normalize_interaction_state_value(
+                canonical_metric,
+                payload.get(key),
+            )
+            if value is not None:
+                return value
+        return None
+    for key in ("current", "direction", "frequency"):
+        value = normalize_interaction_state_value(canonical_metric, payload.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def infer_initiation_balance(text: str) -> str | None:
+    if re.search(r"双方|两人|彼此|互相", text) and re.search(
+        r"轮流|都会|各自|互相|有来有回", text
+    ):
+        return "balanced"
+    partner = _has_positive_initiation_clause(
+        text,
+        r"(?:她|他|对方)",
+        r"(?:我|用户)",
+    )
+    user = _has_positive_initiation_clause(
+        text,
+        r"(?:我|用户)",
+        r"(?:她|他|对方)",
+    )
+    if partner and user:
+        return "mixed"
+    if partner:
+        return "partner_to_user"
+    if user:
+        return "user_to_partner"
+    return None
+
+
+def _has_positive_initiation_clause(
+    text: str,
+    actor: str,
+    recipient: str,
+) -> bool:
+    for clause in re.split(r"[，,。；;！？!?]", text):
+        if not re.search(
+            rf"{actor}.{{0,14}}(?:主动|先).{{0,10}}"
+            rf"(?:找|联系|发消息|聊|问候|开口).{{0,8}}{recipient}",
+            clause,
+        ):
+            continue
+        if re.search(
+            rf"{actor}.{{0,8}}(?:很少|几乎不|不再|从来不|从来没有|"
+            rf"从不|从未|未曾|没有|并不|不(?:太|怎么)?).{{0,5}}主动",
+            clause,
+        ):
+            continue
+        return True
+    return False
 
 
 def detect_evidence_dimensions(text: str) -> frozenset[str]:

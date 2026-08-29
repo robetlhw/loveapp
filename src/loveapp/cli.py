@@ -60,6 +60,7 @@ from loveapp.domain.relationship_plan import PlanStatus, RelationshipPlan
 from loveapp.domain.routing import RouteResult
 from loveapp.evaluation import (
     evaluate_live_routing_conversations,
+    evaluate_memory_foundation,
     evaluate_memory_lifecycle,
     evaluate_routing_conversations,
     run_baseline,
@@ -240,6 +241,43 @@ def memory_lifecycle_eval(
         raise typer.Exit(code=1) from exc
     console.print(f"[green]记忆生命周期评测已保存：[/green]{output}")
     table = Table(title="Memory Lifecycle 指标")
+    table.add_column("指标")
+    table.add_column("值", justify="right")
+    table.add_row("case_count", str(report["case_count"]))
+    table.add_row("passed_case_count", str(report["passed_case_count"]))
+    for key, value in report["metrics"].items():
+        table.add_row(key, str(value))
+    console.print(table)
+
+
+@eval_app.command("memory-foundation")
+def memory_foundation_eval(
+    dataset: Annotated[
+        Path,
+        typer.Option("--dataset", help="Memory Foundation 确定性评测集路径。"),
+    ] = Path("evals/memory/cases_v1.jsonl"),
+    output: Annotated[
+        Path,
+        typer.Option("--output", help="Memory Foundation 评测报告保存路径。"),
+    ] = Path("evals/baselines/memory_foundation_v1.json"),
+    case: Annotated[
+        str | None,
+        typer.Option("--case", help="只运行指定 Case，例如 MEM-001。"),
+    ] = None,
+) -> None:
+    """运行固定 extractor 输出的 Memory Foundation 端到端评测。"""
+    try:
+        report = asyncio.run(evaluate_memory_foundation(dataset, case_id=case))
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        console.print(f"[red]Memory Foundation 评测失败：[/red]{exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Memory Foundation 评测已保存：[/green]{output}")
+    table = Table(title="Memory Foundation 指标")
     table.add_column("指标")
     table.add_column("值", justify="right")
     table.add_row("case_count", str(report["case_count"]))

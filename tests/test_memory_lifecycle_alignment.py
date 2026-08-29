@@ -264,6 +264,66 @@ async def test_contact_status_reduction_closes_when_metric_is_restored() -> None
     assert audits[0].rule_name == "restore_contact_frequency"
 
 
+@pytest.mark.parametrize(
+    ("stale_kind", "expected_rule"),
+    [
+        ("no_contact", "restore_contact_frequency"),
+        ("unresponsive", "restore_contact"),
+    ],
+)
+async def test_explicit_contact_recovery_closes_cross_dimension_stale_state(
+    stale_kind: str,
+    expected_rule: str,
+) -> None:
+    stale_claim = (
+        _contact_frequency_claim("no_contact", "对方已经彻底不联系用户")
+        if stale_kind == "no_contact"
+        else AtomicClaim(
+            claim_id="response-unresponsive",
+            kind=MemoryKind.INTERACTION_PATTERN,
+            subject="partner",
+            predicate="responds_to_conversation",
+            summary="对方目前不回复用户",
+            evidence_spans=["她已经三天没有回我消息了"],
+            confidence=0.95,
+            explicitness=EvidenceExplicitness.EXPLICIT,
+            payload={"metric": "response_engagement", "current": "unresponsive"},
+        )
+    )
+    first_text = stale_claim.evidence_spans[0]
+    second_text = "她今天终于回复我了，我们又开始正常聊天了。"
+    store = InMemoryMemoryStore(clock=lambda: NOW)
+    service = MemoryService(
+        store,
+        SequenceExtractor(
+            AtomicExtraction(claims=[stale_claim]),
+            AtomicExtraction(claims=[_contact_status_claim("restored", second_text)]),
+        ),
+        clock=lambda: NOW,
+    )
+
+    first = await service.remember_text(
+        text=f"记一下：{first_text}",
+        status=MemoryStatus.CONFIRMED,
+        **SCOPE,
+    )
+    second = await service.remember_text(
+        text=f"记一下：{second_text}",
+        status=MemoryStatus.CONFIRMED,
+        **SCOPE,
+    )
+
+    old = await store.get_memory(first.saved[0].item.id, SCOPE["user_id"])
+    audits = await store.list_transition_audits(
+        user_id=SCOPE["user_id"],
+        relationship_id=SCOPE["relationship_id"],
+        source_message_id=second.message.id,
+    )
+    assert old is not None and old.status == MemoryStatus.SUPERSEDED
+    assert second.saved[0].item.supersedes_id == old.id
+    assert audits[0].rule_name == expected_rule
+
+
 async def test_conflict_repair_does_not_close_reduced_contact_frequency() -> None:
     store = InMemoryMemoryStore(clock=lambda: NOW)
     reduced = await store.save_memory(
@@ -286,6 +346,155 @@ async def test_conflict_repair_does_not_close_reduced_contact_frequency() -> Non
 
     unchanged = await store.get_memory(reduced.item.id, SCOPE["user_id"])
     assert unchanged is not None and unchanged.status == MemoryStatus.CONFIRMED
+
+
+async def test_conflict_resolution_alone_does_not_restore_contact_availability() -> None:
+    store = InMemoryMemoryStore(clock=lambda: NOW)
+    unavailable = await store.save_memory(
+        user_id=SCOPE["user_id"],
+        relationship_id=SCOPE["relationship_id"],
+        status=MemoryStatus.CONFIRMED,
+        candidate=_contact_status_candidate("unavailable", "当前无法联系对方"),
+    )
+    service = MemoryService(
+        store,
+        SequenceExtractor(
+            AtomicExtraction(claims=[_conflict_claim("resolved", "我们已经和好了")])
+        ),
+        clock=lambda: NOW,
+    )
+
+    await service.remember_text(
+        text="记一下：我们已经和好了",
+        status=MemoryStatus.CONFIRMED,
+        **SCOPE,
+    )
+
+    unchanged = await store.get_memory(unavailable.item.id, SCOPE["user_id"])
+    assert unchanged is not None and unchanged.status == MemoryStatus.CONFIRMED
+
+
+async def test_apology_alone_does_not_restore_contact_availability() -> None:
+    store = InMemoryMemoryStore(clock=lambda: NOW)
+    unavailable = await store.save_memory(
+        user_id=SCOPE["user_id"],
+        relationship_id=SCOPE["relationship_id"],
+        status=MemoryStatus.CONFIRMED,
+        candidate=_contact_status_candidate("unavailable", "当前无法联系对方"),
+    )
+    apology = AtomicClaim(
+        claim_id="partner-apology",
+        kind=MemoryKind.INTERACTION_EVENT,
+        subject="partner",
+        predicate="partner_apologized",
+        summary="对方已经向用户道歉",
+        evidence_spans=["她已经向我道歉了"],
+        confidence=0.95,
+        explicitness=EvidenceExplicitness.EXPLICIT,
+    )
+    service = MemoryService(
+        store,
+        SequenceExtractor(AtomicExtraction(claims=[apology])),
+        clock=lambda: NOW,
+    )
+
+    await service.remember_text(
+        text="记一下：她已经向我道歉了",
+        status=MemoryStatus.CONFIRMED,
+        **SCOPE,
+    )
+
+    unchanged = await store.get_memory(unavailable.item.id, SCOPE["user_id"])
+    assert unchanged is not None and unchanged.status == MemoryStatus.CONFIRMED
+
+
+async def test_normal_response_engagement_does_not_imply_frequency_restoration() -> None:
+    store = InMemoryMemoryStore(clock=lambda: NOW)
+    reduced = await store.save_memory(
+        user_id=SCOPE["user_id"],
+        relationship_id=SCOPE["relationship_id"],
+        status=MemoryStatus.CONFIRMED,
+        candidate=_contact_frequency_candidate("low", "双方联系频率较低"),
+    )
+    response_text = "对方回复时的交流已经恢复正常"
+    response_claim = AtomicClaim(
+        claim_id="response-normal",
+        kind=MemoryKind.INTERACTION_PATTERN,
+        subject="relationship",
+        predicate="responds_to_conversation",
+        summary=response_text,
+        evidence_spans=[response_text],
+        confidence=0.95,
+        explicitness=EvidenceExplicitness.EXPLICIT,
+        payload={"metric": "response_engagement", "current": "normal"},
+    )
+    service = MemoryService(
+        store,
+        SequenceExtractor(AtomicExtraction(claims=[response_claim])),
+        clock=lambda: NOW,
+    )
+
+    await service.remember_text(
+        text=f"记一下：{response_text}",
+        status=MemoryStatus.CONFIRMED,
+        **SCOPE,
+    )
+
+    unchanged = await store.get_memory(reduced.item.id, SCOPE["user_id"])
+    assert unchanged is not None and unchanged.status == MemoryStatus.CONFIRMED
+
+
+async def test_response_restoration_event_closes_unresponsive_pattern() -> None:
+    old_text = "她已经三天没有回我消息了"
+    restored_text = "她今天终于回复我了，我们又开始正常聊天了"
+    old_claim = AtomicClaim(
+        claim_id="response-unresponsive",
+        kind=MemoryKind.INTERACTION_PATTERN,
+        subject="partner",
+        predicate="not_responding",
+        summary="对方已经三天没有回复用户",
+        evidence_spans=[old_text],
+        confidence=0.95,
+        explicitness=EvidenceExplicitness.EXPLICIT,
+        payload={"metric": "response_engagement", "current": "unresponsive"},
+    )
+    restored_claim = AtomicClaim(
+        claim_id="response-restored-event",
+        kind=MemoryKind.INTERACTION_EVENT,
+        subject="relationship",
+        predicate="resumed_chatting",
+        summary="双方已经恢复正常聊天",
+        evidence_spans=[restored_text],
+        confidence=0.95,
+        explicitness=EvidenceExplicitness.EXPLICIT,
+        payload={"metric": "response_engagement", "current": "responsive"},
+    )
+    store = InMemoryMemoryStore(clock=lambda: NOW)
+    service = MemoryService(
+        store,
+        SequenceExtractor(
+            AtomicExtraction(claims=[old_claim]),
+            AtomicExtraction(claims=[restored_claim]),
+        ),
+        clock=lambda: NOW,
+    )
+
+    first = await service.remember_text(
+        text=old_text,
+        status=MemoryStatus.CONFIRMED,
+        **SCOPE,
+    )
+    second = await service.remember_text(
+        text=restored_text,
+        status=MemoryStatus.CONFIRMED,
+        **SCOPE,
+    )
+
+    old = await store.get_memory(first.saved[0].item.id, SCOPE["user_id"])
+    assert old is not None and old.status == MemoryStatus.SUPERSEDED
+    assert second.saved[0].item.kind == MemoryKind.INTERACTION_EVENT
+    assert second.saved[0].item.state_dimension == "interaction.response_engagement"
+    assert second.saved[0].item.state_value == "responsive"
 
 
 async def test_proposed_cross_representation_restoration_keeps_confirmed_reduction() -> None:

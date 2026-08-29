@@ -3,6 +3,8 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
+from loveapp.domain.memory_dimensions import interaction_pattern_state
+
 
 @dataclass(frozen=True)
 class CanonicalPredicateSpec:
@@ -179,8 +181,15 @@ _register_aliases(
     "partner_resumed_contact",
     "received_reply",
     "resumed_contact",
+    "resumed_communication",
     "started_talking_again",
     "communication_recovered",
+)
+_register_aliases(
+    "interaction.response_engagement",
+    "responsive",
+    "response_restored",
+    "resumed_chatting",
 )
 _register_aliases(
     "contact.status",
@@ -217,6 +226,8 @@ _register_aliases(
     "conflict_resolved",
     "made_up",
     "reconciled",
+    "interaction.reconciliation",
+    "reconciliation_occurred",
     "relationship_reconciled",
     "relationship_repaired",
     "resolved_conflict",
@@ -233,6 +244,8 @@ _register_aliases(
     "confession.status",
     "intended",
     "intend_to_confess",
+    "plan_to_confess",
+    "confession_planned",
     "plans_to_confess",
     "will_confess",
 )
@@ -240,6 +253,7 @@ _register_aliases(
     "confession.status",
     "executed",
     "confessed",
+    "confessed_to_partner",
     "confession_executed",
 )
 _register_aliases(
@@ -289,8 +303,11 @@ _STATE_DIMENSION_PREDICATES = {
     "romantic_availability": "partner.relationship_status",
     "relationship.contact_status": "contact.status",
     "relationship.stage": "relationship.stage",
+    "relationship_stage": "relationship.stage",
     "relationship.repair_status": "relationship.repair_status",
     "relationship.confession_status": "confession.status",
+    "relationship_confession_status": "confession.status",
+    "confession_status": "confession.status",
 }
 
 _INTERACTION_METRIC_PREDICATES = {
@@ -344,9 +361,19 @@ _STATE_VALUE_ALIASES = {
         "repaired": "resolved",
     },
     "relationship.stage": {
+        "friend": "acquaintance",
+        "friends": "acquaintance",
+        "friendship": "acquaintance",
+        "ordinary_friends": "acquaintance",
+        "partnered": "dating",
         "stable_relationship": "committed",
         "long_distance": "committed",
         "breakup": "separated",
+    },
+    "confession.status": {
+        "confessed": "executed",
+        "confessed_pending_response": "executed",
+        "pending_response": "executed",
     },
 }
 
@@ -410,7 +437,7 @@ def normalize_predicate(
                 )
 
     metric = _clean_string(payload.get("metric"))
-    if kind_value == "interaction_pattern" and metric:
+    if metric:
         metric_predicate = _INTERACTION_METRIC_PREDICATES.get(_normalize_identifier(metric))
         if metric_predicate:
             return PredicateNormalization(
@@ -419,7 +446,7 @@ def normalize_predicate(
                 canonical_predicate=metric_predicate,
                 custom_predicate=None,
                 state_dimension=CANONICAL_PREDICATES[metric_predicate].state_dimension,
-                state_value=_pattern_state(payload),
+                state_value=interaction_pattern_state(metric, payload),
                 alias_hit=_normalize_identifier(metric) != metric_predicate,
             )
 
@@ -506,14 +533,6 @@ def _normalize_state_value(canonical_predicate: str, value: object) -> str | Non
         return None
     normalized = _normalize_identifier(str(value))
     return _STATE_VALUE_ALIASES.get(canonical_predicate, {}).get(normalized, normalized)
-
-
-def _pattern_state(payload: dict[str, Any]) -> str | None:
-    for key in ("current", "direction", "frequency"):
-        value = payload.get(key)
-        if value is not None and str(value).strip():
-            return _normalize_identifier(str(value))
-    return None
 
 
 def _clean_string(value: object) -> str | None:

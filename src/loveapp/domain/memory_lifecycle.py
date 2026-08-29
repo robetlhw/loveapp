@@ -15,6 +15,9 @@ from loveapp.domain.memory import (
     normalize_candidate_predicate,
 )
 from loveapp.domain.memory_dimensions import (
+    INTERACTION_PATTERN_DIMENSIONS,
+    is_relationship_interaction_subject,
+    normalize_interaction_pattern_payload,
     normalize_state_dimension,
     normalize_state_value,
     relationship_state_ttl,
@@ -57,6 +60,12 @@ class PlannedMemoryTransition:
     trigger_index: int
     target_ids: tuple[str, ...]
     target_status: MemoryStatus
+
+
+_EXPLICIT_CONTACT_RESTORATION_PATTERN = re.compile(
+    r"(?:回(?:复)?(?:了|过)?我(?:的)?(?:消息)?|重新(?:联系|聊天)|"
+    r"恢复(?:正常)?(?:联系|聊天)|又开始正常聊天)"
+)
 
 
 _PREDICATE_FAMILIES: tuple[PredicateFamily, ...] = (
@@ -175,15 +184,20 @@ _PREDICATE_FAMILIES: tuple[PredicateFamily, ...] = (
 STATE_TRANSITION_RULES: tuple[StateTransitionRule, ...] = (
     StateTransitionRule(
         name="restore_contact",
-        trigger_concepts=frozenset(
-            {"contact_restored", "repair_started", "relationship_repaired"}
+        trigger_concepts=frozenset({"contact_restored"}),
+        closes_concepts=frozenset(
+            {"contact_unavailable", "response_unresponsive"}
         ),
-        closes_concepts=frozenset({"contact_unavailable"}),
     ),
     StateTransitionRule(
         name="restore_contact_frequency",
         trigger_concepts=frozenset({"contact_restored"}),
         closes_concepts=frozenset({"contact_reduced"}),
+    ),
+    StateTransitionRule(
+        name="restore_response_engagement",
+        trigger_concepts=frozenset({"response_restored"}),
+        closes_concepts=frozenset({"response_unresponsive"}),
     ),
     StateTransitionRule(
         name="resolve_active_conflict",
@@ -192,7 +206,9 @@ STATE_TRANSITION_RULES: tuple[StateTransitionRule, ...] = (
     ),
     StateTransitionRule(
         name="complete_confession_intent",
-        trigger_concepts=frozenset({"relationship_started"}),
+        trigger_concepts=frozenset(
+            {"confession_executed", "relationship_started"}
+        ),
         closes_concepts=frozenset({"confession_intent"}),
     ),
 )
@@ -239,6 +255,10 @@ def memory_concept(memory: MemoryCandidate) -> str:
             return "contact_reduced"
         return f"contact_{state_value}"
     if canonical == "relationship.repair_status" and state_value:
+        if state_value == "in_progress" and _has_explicit_contact_restoration(
+            memory
+        ):
+            return "contact_restored"
         return {
             "in_progress": "repair_started",
             "completed": "relationship_repaired",
@@ -256,10 +276,15 @@ def memory_concept(memory: MemoryCandidate) -> str:
     if canonical == "relationship.stage" and state_value in {"dating", "committed"}:
         return "relationship_started"
     if canonical == "interaction.contact_frequency" and state_value:
-        if state_value in {"low", "decreasing", "reduced"}:
+        if state_value in {"low", "decreasing", "reduced", "no_contact"}:
             return "contact_reduced"
         if state_value in {"normal", "restored"}:
             return "contact_restored"
+    if canonical == "interaction.response_engagement" and state_value:
+        if state_value in {"unresponsive", "no_response", "unavailable"}:
+            return "response_unresponsive"
+        if state_value in {"normal", "responsive", "restored", "engaged"}:
+            return "response_restored"
     state_identity = governed_state_identity(memory)
     state_value = governed_state_value(memory)
     if state_identity is not None and state_value is not None:
@@ -274,8 +299,19 @@ def memory_concept(memory: MemoryCandidate) -> str:
     predicate = memory_predicate(memory)
     for family in _FAMILIES_BY_PREDICATE.get(predicate, ()):
         if _family_matches(family, memory):
+            if family.concept == "repair_started" and _has_explicit_contact_restoration(
+                memory
+            ):
+                return "contact_restored"
             return family.concept
     return predicate
+
+
+def _has_explicit_contact_restoration(memory: MemoryCandidate) -> bool:
+    evidence = " ".join(
+        [memory.original_text, *memory.evidence_spans]
+    )
+    return bool(_EXPLICIT_CONTACT_RESTORATION_PATTERN.search(evidence))
 
 
 def memory_role(memory: MemoryCandidate) -> MemoryRole:
@@ -363,6 +399,19 @@ def normalize_memory_candidate(
             ttl = relationship_state_ttl(dimension)
             if candidate.expires_at is None and ttl is not None:
                 updates["expires_at"] = reference_time + ttl
+    elif effective_kind == MemoryKind.INTERACTION_PATTERN:
+        normalized_interaction_payload = normalize_interaction_pattern_payload(
+            payload,
+            " ".join(candidate.evidence_spans) or candidate.original_text,
+            candidate.raw_predicate or payload.get("predicate"),
+        )
+        metric = normalized_interaction_payload.get("metric")
+        if normalized_interaction_payload != payload:
+            payload = normalized_interaction_payload
+        if metric in INTERACTION_PATTERN_DIMENSIONS and is_relationship_interaction_subject(
+            candidate.subject
+        ):
+            updates["subject"] = "relationship"
     elif effective_kind == MemoryKind.ACTION_INTENT:
         payload.setdefault("event_status", "intended")
         payload.setdefault("memory_role", MemoryRole.ACTION_INTENT.value)
@@ -537,12 +586,25 @@ def relationship_state_value(memory: MemoryCandidate) -> str | None:
     return normalize_state_value(identity[1], raw_value)
 
 
-_GOVERNED_INTERACTION_STATE_DIMENSIONS = frozenset(
-    {"interaction.contact_frequency"}
-)
-_GOVERNED_INTERACTION_STATE_VALUES = frozenset(
-    {"low", "decreasing", "reduced", "normal", "restored"}
-)
+_GOVERNED_INTERACTION_STATE_VALUES = {
+    "interaction.contact_frequency": frozenset(
+        {"low", "decreasing", "reduced", "no_contact", "normal", "restored"}
+    ),
+    "interaction.initiation_balance": frozenset(
+        {"partner_to_user", "balanced", "user_to_partner", "mixed"}
+    ),
+    "interaction.response_engagement": frozenset(
+        {
+            "unresponsive",
+            "no_response",
+            "unavailable",
+            "normal",
+            "responsive",
+            "restored",
+            "engaged",
+        }
+    ),
+}
 
 
 def governed_state_identity(memory: MemoryCandidate) -> tuple[str, str] | None:
@@ -551,8 +613,9 @@ def governed_state_identity(memory: MemoryCandidate) -> tuple[str, str] | None:
         return relationship_identity
     if (
         memory.kind == MemoryKind.INTERACTION_PATTERN
-        and memory.state_dimension in _GOVERNED_INTERACTION_STATE_DIMENSIONS
-        and memory.state_value in _GOVERNED_INTERACTION_STATE_VALUES
+        and memory.state_dimension in _GOVERNED_INTERACTION_STATE_VALUES
+        and memory.state_value
+        in _GOVERNED_INTERACTION_STATE_VALUES[memory.state_dimension]
     ):
         return "interaction", memory.state_dimension
     return None

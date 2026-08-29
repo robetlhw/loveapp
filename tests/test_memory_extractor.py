@@ -18,6 +18,8 @@ from loveapp.domain.memory import (
     AtomicClaim,
     AtomicExtraction,
     MemoryKind,
+    MemoryPerspective,
+    PredicateType,
     TemporalPrecision,
     TimeKind,
 )
@@ -53,6 +55,144 @@ def test_atomic_claim_keeps_normalized_summary_and_exact_evidence() -> None:
     ]
     assert candidate.payload["predicate"] == "conversation_engagement_changed"
     assert candidate.payload["object"] == "partner"
+
+
+@pytest.mark.parametrize(
+    ("text", "raw_claim", "predicate", "dimension", "value"),
+    [
+        (
+            "我和她现在还只是普通朋友，还没有正式在一起。",
+            {
+                "claim_id": "relationship-stage",
+                "kind": "RELATIONSHIP_STATE",
+                "subject": "relationship",
+                "predicate": "relationship_stage",
+                "predicate_type": "CANONICAL",
+                "canonical_predicate": "relationship.stage",
+                "summary": "双方目前还是普通朋友",
+                "evidence_spans": ["现在还只是普通朋友"],
+                "payload": {
+                    "state_dimension": "relationship_stage",
+                    "state_value": "friends",
+                },
+            },
+            "relationship.stage",
+            "relationship.stage",
+            "acquaintance",
+        ),
+        (
+            "昨天我们确认关系了，现在正式在一起了。",
+            {
+                "claim_id": "relationship-confirmed",
+                "kind": "relationship_state",
+                "subject": "relationship",
+                "predicate": "relationship.stage",
+                "predicate_type": "canonical",
+                "canonical_predicate": "relationship.stage",
+                "summary": "双方已经确认恋爱关系",
+                "evidence_spans": ["我们确认关系了，现在正式在一起了"],
+                "payload": {
+                    "state_dimension": "relationship_stage",
+                    "state_value": "partnered",
+                },
+            },
+            "relationship.stage",
+            "relationship.stage",
+            "dating",
+        ),
+        (
+            "我昨天已经跟她表白了。",
+            {
+                "claim_id": "confession-executed",
+                "kind": "RELATIONSHIP_STATE",
+                "subject": "relationship",
+                "predicate": "confession_executed",
+                "summary": "用户已经向对方表白",
+                "evidence_spans": ["昨天已经跟她表白了"],
+                "payload": {
+                    "state_dimension": "confession_status",
+                    "state_value": "confessed_pending_response",
+                },
+            },
+            "confession.status",
+            "relationship.confession_status",
+            "executed",
+        ),
+    ],
+)
+def test_parser_accepts_registered_canonical_states_before_candidate_normalization(
+    text: str,
+    raw_claim: dict,
+    predicate: str,
+    dimension: str,
+    value: str,
+) -> None:
+    parsed = parse_memory_response(
+        json.dumps({"claims": [raw_claim], "discarded_spans": []}, ensure_ascii=False),
+        source_text=text,
+    )
+
+    claim = parsed.extraction.claims[0]
+    assert claim.predicate_type == PredicateType.CANONICAL
+    assert claim.canonical_predicate == predicate
+    assert claim.payload["state_dimension"] == dimension
+    assert claim.payload["state_value"] == value
+    assert "canonical_state_alignment" in parsed.repair_steps
+
+
+def test_parser_case_normalizes_canonical_user_belief_enums() -> None:
+    text = "我感觉她可能已经不喜欢我了。"
+    raw = {
+        "claims": [
+            {
+                "claim_id": "belief",
+                "kind": "USER_BELIEF",
+                "subject": "partner",
+                "predicate": "may_no_longer_like_user",
+                "summary": "用户认为对方可能已经不喜欢自己",
+                "evidence_spans": ["我感觉她可能已经不喜欢我了"],
+                "perspective": "USER_BELIEF",
+                "predicate_type": "CUSTOM",
+                "explicitness": "SPECULATIVE",
+            }
+        ],
+        "discarded_spans": [],
+    }
+
+    parsed = parse_memory_response(json.dumps(raw, ensure_ascii=False), source_text=text)
+
+    claim = parsed.extraction.claims[0]
+    assert claim.kind == MemoryKind.STABLE_FACT
+    assert claim.perspective == MemoryPerspective.USER_BELIEF
+    assert claim.predicate_type == PredicateType.CUSTOM
+    assert claim.explicitness.value == "speculative"
+    assert "enum_aliases" in parsed.repair_steps
+
+
+def test_user_belief_kind_overrides_conflicting_reported_perspective() -> None:
+    text = "我感觉她可能已经不喜欢我了。"
+    raw = {
+        "claims": [
+            {
+                "claim_id": "belief-with-conflicting-perspective",
+                "kind": "USER_BELIEF",
+                "subject": "partner",
+                "predicate": "may_no_longer_like_user",
+                "summary": "用户认为对方可能已经不喜欢自己",
+                "evidence_spans": ["我感觉她可能已经不喜欢我了"],
+                "perspective": "USER_REPORTED",
+                "predicate_type": "CUSTOM",
+                "explicitness": "SPECULATIVE",
+            }
+        ],
+        "discarded_spans": [],
+    }
+
+    parsed = parse_memory_response(json.dumps(raw, ensure_ascii=False), source_text=text)
+
+    claim = parsed.extraction.claims[0]
+    assert claim.kind == MemoryKind.STABLE_FACT
+    assert claim.perspective == MemoryPerspective.USER_BELIEF
 
 
 def test_atomic_extraction_rejects_evidence_not_present_in_source() -> None:
@@ -330,6 +470,10 @@ def test_unknown_enum_is_reported_with_safe_input_detail() -> None:
 
     assert captured.value.category == "unsupported_enum"
     assert "unsupported_kind" in str(captured.value)
+    assert captured.value.details["invalid_claim_count"] == 1
+    assert "unsupported_kind" in str(
+        captured.value.details["invalid_claim_reasons"]
+    )
 
 
 def test_partial_claim_validation_keeps_valid_atomic_claims() -> None:
@@ -443,6 +587,43 @@ async def test_memory_extractor_uses_one_flash_call_for_invalid_json() -> None:
     model_records = [record for record in trace.records if record.name.startswith("memory_model")]
     assert len(model_records) == 1
     assert model_records[0].details["failure_category"] == "json_syntax"
+    await extractor.aclose()
+
+
+async def test_failed_extraction_attempt_keeps_validation_and_repair_details() -> None:
+    response = json.dumps(
+        {
+            "claims": [
+                {
+                    "claim_id": "unknown-kind",
+                    "kind": "unsupported_kind",
+                    "subject": "user",
+                    "predicate": "has_fact",
+                    "summary": "用户陈述了一条事实",
+                    "evidence_spans": ["我有一条事实"],
+                }
+            ],
+            "discarded_spans": [],
+        },
+        ensure_ascii=False,
+    )
+    attempts = []
+    extractor = _build_tiered_extractor(_FakeCompletions([response]), None)
+
+    result = await extractor.extract(
+        "我有一条事实",
+        reference_time=datetime(2026, 7, 18, tzinfo=UTC),
+        existing_memories=[],
+        conversation_history=[],
+        attempt_callback=attempts.append,
+    )
+
+    assert result.claims == []
+    assert len(attempts) == 1
+    assert attempts[0].failure_category == "unsupported_enum"
+    assert attempts[0].invalid_claim_count == 1
+    assert "unsupported_kind" in str(attempts[0].invalid_claim_reasons)
+    assert attempts[0].repair_status in {"none", "local_repair"}
     await extractor.aclose()
 
 

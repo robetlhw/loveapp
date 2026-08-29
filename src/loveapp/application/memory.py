@@ -461,13 +461,37 @@ class MemoryService:
                 extracted = remaining_extracted.pop(match_index)
                 payload = dict(extracted.payload)
                 payload.update(deterministic.payload)
+                if extracted.payload.get("temporal_expression"):
+                    payload["temporal_expression"] = extracted.payload[
+                        "temporal_expression"
+                    ]
+                extracted_predicate = _candidate_predicate(extracted)
+                deterministic_predicate = _candidate_predicate(deterministic)
+                if (
+                    extracted_predicate
+                    and extracted_predicate != deterministic_predicate
+                ):
+                    payload.setdefault(
+                        "merged_extractor_predicate",
+                        extracted_predicate,
+                    )
                 merged_deterministic.append(
                     deterministic.model_copy(
                         update={
                             "payload": payload,
+                            "evidence_spans": list(
+                                dict.fromkeys(
+                                    [
+                                        *deterministic.evidence_spans,
+                                        *extracted.evidence_spans,
+                                    ]
+                                )
+                            )[:8],
                             "occurred_at": deterministic.occurred_at or extracted.occurred_at,
                             "period_start": deterministic.period_start or extracted.period_start,
                             "period_end": deterministic.period_end or extracted.period_end,
+                            "extractor_model": extracted.extractor_model,
+                            "prompt_version": extracted.prompt_version,
                         }
                     )
                 )

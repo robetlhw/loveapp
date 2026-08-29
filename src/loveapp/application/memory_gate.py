@@ -155,6 +155,19 @@ class MemoryGate:
                 matched_span=pure_partner_hypothesis.span,
             )
 
+        relationship_action_consultation = _first_match(
+            normalized,
+            _RELATIONSHIP_ACTION_CONSULTATION_PATTERNS,
+            "relationship_action_consultation",
+        )
+        if relationship_action_consultation is not None:
+            return _skip(
+                MemoryGateReason.CONSULTATION_ONLY,
+                "relationship action consultation without observable claim",
+                matched_rule=relationship_action_consultation.rule,
+                matched_span=relationship_action_consultation.span,
+            )
+
         signals = [
             name
             for name, patterns in _DURABLE_SIGNAL_PATTERNS.items()
@@ -397,6 +410,20 @@ _PURE_PARTNER_HYPOTHESIS_PATTERNS = (
     re.compile(r"^你觉得.{0,20}(?:兴趣下降|不喜欢).*[?？]?$"),
 )
 
+_RELATIONSHIP_ACTION = (
+    r"(?:道歉|表白|告白|解释|沟通|联系|回复|回应|追求|邀请|约会|挽回)"
+)
+_RELATIONSHIP_ACTION_CONSULTATION_PATTERNS = (
+    re.compile(
+        rf"^(?:我)?(?:现在)?(?:想知道)?(?:应该|应当|该|要)?(?:怎么|如何|怎样)"
+        rf".{{0,16}}{_RELATIONSHIP_ACTION}(?:呢|啊)?[?？。！!]*$"
+    ),
+    re.compile(
+        rf"^(?:我)?(?:现在)?(?:该不该|应不应该|要不要|能不能|可不可以)"
+        rf".{{0,16}}{_RELATIONSHIP_ACTION}(?:呢|啊)?[?？。！!]*$"
+    ),
+)
+
 _EXPLICIT_REMEMBER_PATTERNS = (
     re.compile(r"(?:请)?记住[：:]?"),
     re.compile(r"记一下[：:]?"),
@@ -487,6 +514,23 @@ _INTERACTION_QUALIFIER_RULES = (
     (
         "initiation_balance_qualifier",
         re.compile(r"(?:基本|大多|通常).{0,8}(?:都是|由).{0,6}我主动(?:联系|聊天|找她)?"),
+    ),
+)
+
+_RELATIONSHIP_PARTNER = r"(?:她|他|对方|对象|伴侣)"
+_SOCIAL_RELATION_TARGET = r"(?:朋友|朋友圈|社交圈|聚会|活动|家人|父母|亲友)"
+_SOCIAL_INTEGRATION_PATTERNS = (
+    re.compile(
+        rf"{_RELATIONSHIP_PARTNER}.{{0,20}}(?:带|邀请|叫|让).{{0,4}}我"
+        rf".{{0,12}}(?:参加|加入|认识|见|融入).{{0,12}}{_SOCIAL_RELATION_TARGET}"
+    ),
+    re.compile(
+        rf"{_RELATIONSHIP_PARTNER}.{{0,24}}(?:把)?我.{{0,8}}介绍给"
+        rf".{{0,8}}(?:朋友|家人|父母|亲友|别人)"
+    ),
+    re.compile(
+        rf"(?:聚会|活动).{{0,12}}{_RELATIONSHIP_PARTNER}.{{0,10}}"
+        r"(?:没(?:有)?|不再|很少)?(?:叫|邀请|带).{0,4}我"
     ),
 )
 
@@ -615,6 +659,7 @@ _DURABLE_SIGNAL_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
             r"(?:又出现|再次出现|重新出现)(?:矛盾|冲突|问题)"
         ),
     ),
+    "social_integration": _SOCIAL_INTEGRATION_PATTERNS,
     "planned_event": (
         re.compile(
             r"(?:明天|后天|大后天|下周|下个月|本周末|这周末|周末|过几天|几天后|月底|"

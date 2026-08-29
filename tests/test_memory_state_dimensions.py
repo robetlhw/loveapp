@@ -19,7 +19,13 @@ from loveapp.domain.memory import (
 )
 from loveapp.domain.memory_dimensions import (
     detect_evidence_dimensions,
+    infer_initiation_balance,
     normalize_interaction_metric,
+)
+from loveapp.domain.memory_lifecycle import (
+    governed_state_identity,
+    governed_state_value,
+    normalize_memory_candidate,
 )
 
 
@@ -260,6 +266,153 @@ def test_initiation_predicate_wins_over_frequency_qualifier() -> None:
 
     assert parsed.extraction.claims[0].payload["metric"] == "initiation_balance"
     assert "interaction_metric_from_evidence" in parsed.repair_steps
+
+
+def test_initiation_balance_keeps_cadence_as_qualifier_not_state_value() -> None:
+    text = "最近一个月她几乎每天都会主动找我。"
+    payload = {
+        "claims": [
+            {
+                "claim_id": "partner-initiative",
+                "kind": "interaction_pattern",
+                "subject": "partner",
+                "predicate": "initiates_contact",
+                "summary": "最近一个月对方几乎每天主动联系用户",
+                "evidence_spans": ["最近一个月她几乎每天都会主动找我"],
+                "payload": {
+                    "metric": "initiation_balance",
+                    "current": "daily",
+                },
+            }
+        ],
+        "discarded_spans": [],
+    }
+
+    parsed = parse_memory_response(json.dumps(payload, ensure_ascii=False), source_text=text)
+    claim = parsed.extraction.claims[0]
+    normalized = normalize_memory_candidate(
+        claim.to_candidate(),
+        datetime(2099, 7, 31, 12, tzinfo=UTC),
+    )
+
+    assert claim.subject == "relationship"
+    assert claim.payload["metric"] == "initiation_balance"
+    assert claim.payload["current"] == "partner_to_user"
+    assert claim.payload["frequency"] == "daily"
+    assert normalized.state_dimension == "interaction.initiation_balance"
+    assert normalized.state_value == "partner_to_user"
+    assert governed_state_identity(normalized) == (
+        "interaction",
+        "interaction.initiation_balance",
+    )
+    assert governed_state_value(normalized) == "partner_to_user"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "她不主动找我",
+        "她并不主动联系我",
+        "她从来不主动找我",
+        "她每天主动联系她妈妈",
+        "她主动找了朋友",
+    ],
+)
+def test_initiation_balance_inference_fails_closed_for_negated_or_third_party_actions(
+    text: str,
+) -> None:
+    assert infer_initiation_balance(text) is None
+
+
+def test_third_party_interaction_subject_is_not_rewritten_as_relationship() -> None:
+    text = "小王每天联系小李。"
+    claim = AtomicClaim(
+        claim_id="third-party-frequency",
+        kind=MemoryKind.INTERACTION_PATTERN,
+        subject="other_person",
+        predicate="contact_frequency",
+        summary="小王每天联系小李",
+        evidence_spans=[text.rstrip("。")],
+        confidence=0.95,
+        payload={"metric": "contact_frequency", "frequency": "daily"},
+    )
+
+    normalized = normalize_memory_candidate(
+        claim.to_candidate(),
+        datetime(2099, 7, 31, 12, tzinfo=UTC),
+    )
+
+    assert normalized.subject == "other_person"
+    assert normalized.state_dimension == "interaction.contact_frequency"
+    assert normalized.state_value == "daily"
+
+
+async def test_initiation_balance_subject_drift_still_updates_same_dimension() -> None:
+    first_text = "最近一个月她几乎每天都会主动找我。"
+    second_text = "但最近两周基本都是我主动找她，她很少主动联系我了。"
+    extractor = SequenceExtractor(
+        [
+            AtomicExtraction(
+                claims=[
+                    AtomicClaim(
+                        claim_id="partner-led",
+                        kind=MemoryKind.INTERACTION_PATTERN,
+                        subject="partner",
+                        predicate="initiates_contact",
+                        summary="对方几乎每天主动联系用户",
+                        evidence_spans=[first_text.rstrip("。")],
+                        confidence=0.95,
+                        payload={
+                            "metric": "initiation_balance",
+                            "current": "daily",
+                        },
+                    )
+                ]
+            ),
+            AtomicExtraction(
+                claims=[
+                    AtomicClaim(
+                        claim_id="user-led",
+                        kind=MemoryKind.INTERACTION_PATTERN,
+                        subject="relationship",
+                        predicate="initiates_contact",
+                        summary="最近两周基本由用户主动联系对方",
+                        evidence_spans=[second_text.rstrip("。")],
+                        confidence=0.95,
+                        payload={
+                            "metric": "initiation_balance",
+                            "current": "user_to_partner",
+                        },
+                    )
+                ]
+            ),
+        ]
+    )
+    store = InMemoryMemoryStore()
+    service = MemoryService(
+        store,
+        extractor,
+        clock=lambda: datetime(2099, 7, 31, 12, tzinfo=UTC),
+    )
+    scope = {
+        "user_id": "interaction-contract-user",
+        "relationship_id": "partner",
+        "conversation_id": "interaction-contract-conversation",
+        "status": MemoryStatus.CONFIRMED,
+    }
+
+    first = await service.remember_text(text=first_text, **scope)
+    second = await service.remember_text(text=second_text, **scope)
+
+    old = await store.get_memory(
+        first.saved[0].item.id,
+        "interaction-contract-user",
+    )
+    assert old is not None and old.status == MemoryStatus.SUPERSEDED
+    current = second.saved[0].item
+    assert current.subject == "relationship"
+    assert current.state_value == "user_to_partner"
+    assert current.supersedes_id == old.id
 
 
 @pytest.mark.parametrize(

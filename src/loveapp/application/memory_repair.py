@@ -15,8 +15,14 @@ from loveapp.domain.memory import (
     AtomicClaim,
     AtomicExtraction,
     DiscardedSpan,
+    EvidenceExplicitness,
     MemoryKind,
+    MemoryPerspective,
+    MemoryValence,
     PredicateType,
+    RelationshipImpact,
+    TemporalPrecision,
+    TimeKind,
 )
 from loveapp.domain.memory_dimensions import (
     INTERACTION_PATTERN_DIMENSIONS,
@@ -24,12 +30,13 @@ from loveapp.domain.memory_dimensions import (
     declared_claim_dimension,
     detect_evidence_dimensions,
     dimension_for_predicate,
+    is_relationship_interaction_subject,
     normalize_interaction_metric,
+    normalize_interaction_pattern_payload,
     normalize_state_dimension,
     normalize_state_value,
-    reconcile_interaction_metric,
 )
-from loveapp.domain.memory_predicates import CANONICAL_PREDICATES
+from loveapp.domain.memory_predicates import CANONICAL_PREDICATES, normalize_predicate
 
 
 @dataclass(frozen=True)
@@ -186,12 +193,21 @@ def parse_memory_response(
     if normalized["claims"] and not valid_claims:
         category = _claim_failure_category(invalid_claim_reasons)
         detail = "; ".join(invalid_claim_reasons[:5])
-        raise MemoryResponseError(
+        failure = MemoryResponseError(
             f"记忆抽取结果不是约定的 JSON 结构：{detail}",
             category=category,
             repair_status="local_repair" if steps else "none",
             repair_steps=",".join(steps),
         )
+        failure.details.update(
+            {
+                "invalid_claim_count": len(invalid_claim_reasons),
+                "invalid_claim_reasons": " | ".join(invalid_claim_reasons[:5]),
+                "repair_status": failure.repair_status,
+                "repair_steps": failure.repair_steps,
+            }
+        )
+        raise failure
 
     if invalid_claim_reasons:
         steps.append("partial_claims")
@@ -266,8 +282,7 @@ def validate_memory_claim(
         if metric is None:
             raise ValueError(f"互动模式 {claim.claim_id} 缺少单一 payload.metric")
     if claim.kind == MemoryKind.RELATIONSHIP_STATE:
-        dimension = normalize_state_dimension(claim.payload.get("state_dimension"))
-        value = normalize_state_value(dimension, claim.payload.get("state_value"))
+        dimension, value = _registered_relationship_state(claim)
         if dimension is None or value is None:
             raise ValueError(
                 f"关系状态 {claim.claim_id} 缺少已注册的 state_dimension/state_value"
@@ -461,12 +476,15 @@ def _normalize_enum_aliases(payload: dict[str, object]) -> bool:
             "fact": "stable_fact",
             "outcome": "advice_outcome",
         }
-        if kind_key in {"belief", "user_belief"} and not claim.get("perspective"):
+        if kind_key in {"belief", "user_belief"}:
             claim["kind"] = "stable_fact"
             claim["perspective"] = "user_belief"
             changed = True
         elif kind_key in kind_aliases:
             claim["kind"] = kind_aliases[kind_key]
+            changed = True
+        elif kind_key in {item.value for item in MemoryKind} and claim.get("kind") != kind_key:
+            claim["kind"] = kind_key
             changed = True
 
         perspective_aliases = {
@@ -481,6 +499,24 @@ def _normalize_enum_aliases(payload: dict[str, object]) -> bool:
         if perspective_key in perspective_aliases:
             claim["perspective"] = perspective_aliases[perspective_key]
             changed = True
+        elif (
+            perspective_key in {item.value for item in MemoryPerspective}
+            and claim.get("perspective") != perspective_key
+        ):
+            claim["perspective"] = perspective_key
+            changed = True
+        for field, enum_type in (
+            ("time_kind", TimeKind),
+            ("temporal_precision", TemporalPrecision),
+            ("valence", MemoryValence),
+            ("relationship_impact", RelationshipImpact),
+            ("predicate_type", PredicateType),
+            ("explicitness", EvidenceExplicitness),
+        ):
+            enum_key = _enum_key(claim.get(field))
+            if enum_key in {item.value for item in enum_type} and claim.get(field) != enum_key:
+                claim[field] = enum_key
+                changed = True
         normalized_claims.append(claim)
     if changed:
         payload["claims"] = normalized_claims
@@ -573,8 +609,16 @@ def _normalize_claim_semantics(payload: dict[str, object]) -> list[str]:
             claim["payload"] = claim_payload
             steps.append("unscheduled_plan_to_action_intent")
         if kind == MemoryKind.RELATIONSHIP_STATE.value:
-            dimension = state_dimension
-            value = state_value
+            predicate_normalization = normalize_predicate(
+                kind=kind,
+                raw_predicate=claim.get("predicate"),
+                canonical_predicate=claim.get("canonical_predicate"),
+                custom_predicate=claim.get("custom_predicate"),
+                predicate_type=claim.get("predicate_type"),
+                payload=claim_payload,
+            )
+            dimension = state_dimension or predicate_normalization.state_dimension
+            value = state_value or predicate_normalization.state_value
             if dimension is not None and value is not None:
                 if (
                     claim_payload.get("state_dimension") != dimension
@@ -583,34 +627,76 @@ def _normalize_claim_semantics(payload: dict[str, object]) -> list[str]:
                     steps.append("relationship_state_aliases")
                 claim_payload["state_dimension"] = dimension
                 claim_payload["state_value"] = value
+                if (
+                    state_dimension is None
+                    and predicate_normalization.canonical_predicate is not None
+                ):
+                    claim["predicate_type"] = PredicateType.CANONICAL.value
+                    claim["canonical_predicate"] = (
+                        predicate_normalization.canonical_predicate
+                    )
+                    claim.pop("custom_predicate", None)
+                    claim["state_dimension"] = dimension
+                    claim["state_value"] = value
+                    steps.append("canonical_state_alignment")
                 if value == "unknown":
                     claim_payload.setdefault("attention_status", "unresolved")
                 claim["payload"] = claim_payload
         if kind == MemoryKind.INTERACTION_PATTERN.value:
-            metric = normalize_interaction_metric(claim_payload.get("metric"))
+            raw_metric = claim_payload.get("metric")
+            original_metric = normalize_interaction_metric(raw_metric)
             evidence = claim.get("evidence_spans")
             evidence_text = (
                 " ".join(str(value) for value in evidence)
                 if isinstance(evidence, list)
                 else ""
             )
-            reconciled_metric = reconcile_interaction_metric(
-                metric,
+            normalized_interaction_payload = normalize_interaction_pattern_payload(
+                claim_payload,
                 evidence_text,
                 claim.get("predicate"),
             )
-            if reconciled_metric != metric:
-                if dimension_for_predicate(claim.get("predicate")) == metric:
-                    claim["predicate"] = reconciled_metric
-                metric = reconciled_metric
+            metric = normalize_interaction_metric(
+                normalized_interaction_payload.get("metric")
+            )
+            if metric != original_metric:
+                if dimension_for_predicate(claim.get("predicate")) == original_metric:
+                    claim["predicate"] = metric
                 steps.append("interaction_metric_from_evidence")
-            if metric is not None and claim_payload.get("metric") != metric:
-                claim_payload["metric"] = metric
+            if normalized_interaction_payload != claim_payload:
+                if metric == original_metric:
+                    steps.append("interaction_value_contract")
+                claim_payload = normalized_interaction_payload
                 claim["payload"] = claim_payload
+            if metric is not None and raw_metric != metric:
                 steps.append("interaction_metric_aliases")
+            if metric in INTERACTION_PATTERN_DIMENSIONS and is_relationship_interaction_subject(
+                claim.get("subject")
+            ):
+                claim["subject"] = "relationship"
         normalized_claims.append(claim)
     payload["claims"] = normalized_claims
     return list(dict.fromkeys(steps))
+
+
+def _registered_relationship_state(
+    claim: AtomicClaim,
+) -> tuple[str | None, str | None]:
+    normalized = normalize_predicate(
+        kind=claim.kind,
+        raw_predicate=claim.raw_predicate or claim.predicate,
+        canonical_predicate=claim.canonical_predicate,
+        custom_predicate=claim.custom_predicate,
+        predicate_type=claim.predicate_type,
+        payload=claim.payload,
+    )
+    if normalized.state_dimension is not None and normalized.state_value is not None:
+        return normalized.state_dimension, normalized.state_value
+    dimension = normalize_state_dimension(claim.payload.get("state_dimension"))
+    return dimension, normalize_state_value(
+        dimension,
+        claim.payload.get("state_value"),
+    )
 
 
 def _claim_has_temporal_anchor(claim: dict[str, object]) -> bool:

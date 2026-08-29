@@ -310,6 +310,38 @@ def test_predicate_normalizer_recognizes_raw_canonical_without_duplicate_field()
 
 
 @pytest.mark.parametrize(
+    ("raw_predicate", "canonical_predicate", "state_value"),
+    [
+        ("resumed_communication", "contact.status", "restored"),
+        ("confessed_to_partner", "confession.status", "executed"),
+        (
+            "interaction.reconciliation",
+            "relationship.repair_status",
+            "completed",
+        ),
+        (
+            "resumed_chatting",
+            "interaction.response_engagement",
+            "responsive",
+        ),
+    ],
+)
+def test_predicate_normalizer_maps_recorded_live_aliases(
+    raw_predicate: str,
+    canonical_predicate: str,
+    state_value: str,
+) -> None:
+    normalized = normalize_predicate(
+        kind=MemoryKind.INTERACTION_EVENT,
+        raw_predicate=raw_predicate,
+    )
+
+    assert normalized.canonical_predicate == canonical_predicate
+    assert normalized.state_value == state_value
+    assert normalized.alias_hit is True
+
+
+@pytest.mark.parametrize(
     "raw_predicate",
     [
         "collects_ticket_stubs",

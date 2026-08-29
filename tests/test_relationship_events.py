@@ -3,6 +3,8 @@ from loveapp.application.memory import MemoryService, NoOpMemoryExtractor
 from loveapp.application.memory_gate import MemoryGate
 from loveapp.domain.enums import RelationshipStage
 from loveapp.domain.memory import (
+    AtomicClaim,
+    AtomicExtraction,
     MemoryCandidate,
     MemoryKind,
     MemoryPerspective,
@@ -11,6 +13,15 @@ from loveapp.domain.memory import (
     StoredMessage,
     TimeKind,
 )
+
+
+class SequenceExtractor:
+    def __init__(self, *extractions: AtomicExtraction) -> None:
+        self._extractions = iter(extractions)
+
+    async def extract(self, text: str, **kwargs) -> AtomicExtraction:
+        del text, kwargs
+        return next(self._extractions)
 
 
 def _user_message(content: str, *, message_id: str = "m1") -> StoredMessage:
@@ -217,6 +228,114 @@ async def test_confession_intent_is_saved_as_short_lived_plan_without_an_extra_m
     assert planned[0].payload["predicate"] == "will_confess"
     assert planned[0].expires_at is not None
     assert planned[0].expires_at > planned[0].created_at
+
+
+async def test_same_turn_custom_confession_intent_merges_into_canonical_plan() -> None:
+    text = "我准备下周向她表白。"
+    extracted = AtomicClaim(
+        claim_id="model-confession-plan",
+        kind=MemoryKind.PLANNED_EVENT,
+        subject="user",
+        predicate="plan_to_confess",
+        summary="用户计划下周向对方表白",
+        evidence_spans=[text.rstrip("。")],
+        confidence=0.93,
+        payload={
+            "object": "partner",
+            "event_status": "planned",
+            "temporal_expression": "下周",
+        },
+        extractor_model="fixture-flash",
+        prompt_version="fixture-v1",
+    )
+    store = InMemoryMemoryStore()
+    service = MemoryService(
+        store,
+        SequenceExtractor(
+            AtomicExtraction(claims=[extracted]),
+            AtomicExtraction(),
+        ),
+    )
+    scope = {
+        "user_id": "dedupe-confession-user",
+        "relationship_id": "dedupe-confession-relationship",
+        "conversation_id": "dedupe-confession-conversation",
+        "status": MemoryStatus.CONFIRMED,
+    }
+
+    planned_result = await service.remember_text(text=text, **scope)
+
+    assert len(planned_result.saved) == 1
+    planned = planned_result.saved[0].item
+    assert planned.canonical_predicate == "confession.status"
+    assert planned.state_value == "intended"
+    assert planned.payload["predicate"] == "will_confess"
+    assert planned.payload["merged_extractor_predicate"] == "plan_to_confess"
+    assert planned.payload["temporal_expression"] == "下周"
+    assert planned.extractor_model == "fixture-flash"
+
+    completed = await service.remember_text(
+        text="她答应我了，我们在一起了。",
+        **scope,
+    )
+    old = await store.get_memory(planned.id, scope["user_id"])
+    active_plans = await store.list_memories(
+        user_id=scope["user_id"],
+        relationship_id=scope["relationship_id"],
+        kind=MemoryKind.PLANNED_EVENT,
+        status=MemoryStatus.CONFIRMED,
+    )
+
+    assert completed.saved
+    assert old is not None and old.status == MemoryStatus.SUPERSEDED
+    assert active_plans == []
+
+
+async def test_executed_confession_closes_active_confession_intent() -> None:
+    plan_text = "我准备下周向她表白。"
+    executed_text = "我昨天已经跟她表白了。"
+    planned = AtomicClaim(
+        claim_id="model-confession-plan",
+        kind=MemoryKind.PLANNED_EVENT,
+        subject="user",
+        predicate="plan_to_confess",
+        summary="用户计划下周向对方表白",
+        evidence_spans=[plan_text.rstrip("。")],
+        confidence=0.95,
+        payload={"temporal_expression": "下周"},
+    )
+    executed = AtomicClaim(
+        claim_id="model-confession-executed",
+        kind=MemoryKind.INTERACTION_EVENT,
+        subject="user",
+        predicate="confessed_to_partner",
+        summary="用户昨天已经向对方表白",
+        evidence_spans=[executed_text.rstrip("。")],
+        confidence=0.95,
+    )
+    store = InMemoryMemoryStore()
+    service = MemoryService(
+        store,
+        SequenceExtractor(
+            AtomicExtraction(claims=[planned]),
+            AtomicExtraction(claims=[executed]),
+        ),
+    )
+    scope = {
+        "user_id": "executed-confession-user",
+        "relationship_id": "executed-confession-relationship",
+        "conversation_id": "executed-confession-conversation",
+        "status": MemoryStatus.CONFIRMED,
+    }
+
+    first = await service.remember_text(text=plan_text, **scope)
+    second = await service.remember_text(text=executed_text, **scope)
+
+    old = await store.get_memory(first.saved[0].item.id, scope["user_id"])
+    assert old is not None and old.status == MemoryStatus.SUPERSEDED
+    assert second.saved[0].item.canonical_predicate == "confession.status"
+    assert second.saved[0].item.state_value == "executed"
+    assert second.saved[0].item.supersedes_id == old.id
 
 
 async def test_real_conversation_does_not_promote_bare_acceptance_but_accepts_explicit_confession(

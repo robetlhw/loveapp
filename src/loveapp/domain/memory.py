@@ -219,7 +219,9 @@ class MemoryExtractionAttempt(BaseModel):
     claim_confidences: str | None = None
     invalid_claim_count: int | None = Field(default=None, ge=0)
     invalid_claim_reasons: str | None = None
+    failure_category: str | None = None
     repair_status: str | None = None
+    repair_steps: str | None = None
     upgrade_reason: str | None = None
     discard_reason: str | None = None
     retry_reason: str | None = None

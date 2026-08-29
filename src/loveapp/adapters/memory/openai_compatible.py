@@ -141,6 +141,11 @@ class OpenAICompatibleMemoryExtractor:
                     # The trace context stores its details when it exits, so
                     # record the parse category before re-raising.
                     details["failure_category"] = exc.category
+                    details.update(exc.details)
+                    if exc.repair_status != "none":
+                        details.setdefault("repair_status", exc.repair_status)
+                    if exc.repair_steps:
+                        details.setdefault("repair_steps", exc.repair_steps)
                     raise
                 parsed = replace(
                     parsed,
@@ -670,9 +675,19 @@ def _build_attempt(
             if details.get("invalid_claim_reasons")
             else None
         ),
+        failure_category=(
+            str(details.get("failure_category"))
+            if details.get("failure_category")
+            else None
+        ),
         repair_status=(
             str(details.get("repair_status"))
             if details.get("repair_status")
+            else None
+        ),
+        repair_steps=(
+            str(details.get("repair_steps"))[:1000]
+            if details.get("repair_steps")
             else None
         ),
         upgrade_reason=(
