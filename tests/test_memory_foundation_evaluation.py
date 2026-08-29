@@ -67,6 +67,8 @@ async def test_foundation_evaluator_runs_all_cases_through_memory_service() -> N
     )
     history_case = next(row for row in report["cases"] if row["id"] == "MEM-018")
     assert "historical_conflict_active" in history_case["final_history_context_refs"]
+    stage_case = next(row for row in report["cases"] if row["id"] == "MEM-004")
+    assert stage_case["final_relationship_stage"] == "dating"
 
 
 async def test_foundation_evaluator_requires_explicit_verifier_fixtures(

@@ -141,6 +141,10 @@ def test_live_fixture_encodes_documented_relaxed_expectations() -> None:
     mem008_relation = cases["MEM-008"]["turns"][1]["relations"][0]
     assert set(mem008_relation["allowed"]) == {"complementary", "unrelated"}
 
+    assert cases["MEM-004"]["final"]["context"]["fields"] == [
+        {"path": "relationship_stage", "expected": "dating"}
+    ]
+
     atomization = cases["MEM-014"]["final"]["active_counts"]
     assert atomization[0]["min"] == 2
     assert atomization[0].get("severity", "failure") == "failure"

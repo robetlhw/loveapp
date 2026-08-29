@@ -29,6 +29,14 @@ Schema failures retained counts and reasons but not a safe invalid-claim
 snapshot or repair outcome. Inspector therefore displayed zero claims at the
 point where structural drift most needed diagnosis.
 
+### RelationshipContext projection false green
+
+The first freeze report verified that the active context contained the
+`relationship.stage=dating` Memory, but it did not assert the scalar
+`RelationshipContext.relationship_stage`. The projection helper recognized
+legacy relationship-event predicates only, so a canonical confirmed dating
+Memory could be stored correctly while the scalar context remained `unknown`.
+
 ### Contact restoration freeze regression
 
 The final live suite showed a separate normalizer stability issue. A raw alias
@@ -54,6 +62,11 @@ contact-frequency shapes for explicit no-reply/restoration statements.
 - Added prompt contracts for relationship-stage and contact-restoration output.
 - Added redacted, bounded schema-failure snapshots plus validation and repair
   fields to extraction attempts and Memory Inspector output.
+- Projected a confirmed, high-confidence canonical
+  `relationship.stage=dating` Memory to `RelationshipStage.DATING` while
+  preserving the existing event projection and refusing proposed stages.
+- Added deterministic and live scalar context-stage assertions so a context
+  Memory match cannot manufacture a successful freeze result.
 - Redaction covers structured and malformed values for API keys, authorization,
   passwords, tokens, client secrets, refresh tokens, and private keys.
 
@@ -63,14 +76,21 @@ No Memory ontology, schema, relation rule, lifecycle rule, or Store API changed.
 
 - `src/loveapp/adapters/memory/openai_compatible.py`
 - `src/loveapp/application/memory_inspector.py`
+- `src/loveapp/application/memory.py`
+- `src/loveapp/evaluation/memory_foundation.py`
 - `src/loveapp/application/memory_repair.py`
 - `src/loveapp/cli_memory_inspector.py`
 - `src/loveapp/domain/memory.py`
 - `src/loveapp/domain/memory_dimensions.py`
 - `src/loveapp/domain/memory_predicates.py`
 - `tests/test_memory_extractor.py`
+- `tests/test_memory_foundation_evaluation.py`
+- `tests/test_memory_foundation_live_script.py`
 - `tests/test_memory_inspector.py`
+- `tests/test_relationship_events.py`
 - `tests/test_memory_state_dimensions.py`
+- `evals/memory/cases_v1.jsonl`
+- `evals/memory/cases_v1_live_expectations.json`
 
 ## Freeze Results
 
@@ -85,7 +105,8 @@ No Memory ontology, schema, relation rule, lifecycle rule, or Store API changed.
 - Duplicate active memories: 0
 - Confirmed overwrite violations: 0
 
-Report: `.data/evals/memory_foundation_deterministic_freeze_final.json`
+Corrective report:
+`.data/evals/memory_foundation_mem004_projection_freeze.json`
 
 ### MEM-004 live repeat
 
@@ -95,7 +116,10 @@ Report: `.data/evals/memory_foundation_deterministic_freeze_final.json`
 - Canonical, relation, lifecycle, and context match: 1.0
 - Committed drift: 0
 
-Report: `.data/evals/memory_foundation_mem004_repeat10_freeze_final.json`
+All 10 final scalar context stages were `dating`.
+
+Corrective report:
+`.data/evals/memory_foundation_mem004_repeat10_projection_freeze.json`
 
 ### Contact restoration stability check
 
@@ -115,7 +139,8 @@ Report: `.data/evals/memory_foundation_mem003_repeat5_final.json`
 
 The only warning is the accepted MEM-014 atomization warning.
 
-Report: `.data/evals/memory_foundation_full_live_freeze_final.json`
+Corrective report:
+`.data/evals/memory_foundation_full_live_projection_freeze_retry.json`
 
 ## Automated Tests
 

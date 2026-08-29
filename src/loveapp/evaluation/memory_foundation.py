@@ -10,6 +10,7 @@ from loveapp.adapters.memory import InMemoryMemoryStore
 from loveapp.application.memory import MemoryService
 from loveapp.application.memory_repair import parse_memory_response
 from loveapp.application.memory_retrieval import MemoryRetrievalMode
+from loveapp.domain.enums import RelationshipStage
 from loveapp.domain.memory import (
     AtomicExtraction,
     ClaimRelation,
@@ -333,6 +334,7 @@ async def _evaluate_case(
         memories,
         context.current_state,
         history_context.remembered_items,
+        relationship_stage=context.relationship_stage,
     )
     counts.update(final_counts)
     failures.extend({"final": True, **failure} for failure in final_failures)
@@ -362,6 +364,7 @@ async def _evaluate_case(
         "turns": turns,
         "final_memories": [_memory_record(item) for item in memories],
         "final_current_context_refs": sorted(_refs(context.current_state)),
+        "final_relationship_stage": context.relationship_stage.value,
         "final_history_context_refs": sorted(
             _refs(history_context.remembered_items)
         ),
@@ -473,6 +476,8 @@ def _check_final(
     memories: list[MemoryItem],
     context_items: list[MemoryItem],
     history_items: list[MemoryItem],
+    *,
+    relationship_stage: RelationshipStage,
 ) -> tuple[list[dict[str, Any]], Counter]:
     failures: list[dict[str, Any]] = []
     counts = Counter()
@@ -562,6 +567,18 @@ def _check_final(
                 "context_active_refs",
                 expected["context_active_refs"],
                 sorted(context_refs),
+            )
+        )
+    expected_relationship_stage = expected.get("relationship_stage")
+    if (
+        expected_relationship_stage is not None
+        and relationship_stage.value != expected_relationship_stage
+    ):
+        failures.append(
+            _failure(
+                "relationship_stage",
+                expected_relationship_stage,
+                relationship_stage.value,
             )
         )
     for ref in expected.get("forbidden_context_refs", []):

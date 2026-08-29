@@ -175,6 +175,46 @@ async def test_contextual_acceptance_saves_event_updates_stage_and_supersedes_pl
     )
 
 
+async def test_canonical_dating_memory_projects_relationship_context_stage() -> None:
+    text = "昨天我们确认关系了，现在正式在一起了。"
+    extraction = AtomicExtraction(
+        claims=[
+            AtomicClaim(
+                claim_id="canonical-dating-stage",
+                kind=MemoryKind.RELATIONSHIP_STATE,
+                subject="relationship",
+                predicate="relationship.stage",
+                summary="双方已经确认恋爱关系",
+                evidence_spans=[text.rstrip("。")],
+                confidence=0.99,
+                importance=5,
+                payload={
+                    "state_dimension": "relationship.stage",
+                    "state_value": "dating",
+                },
+            )
+        ]
+    )
+    store = InMemoryMemoryStore()
+    service = MemoryService(store, SequenceExtractor(extraction))
+
+    result = await service.remember_text(
+        user_id="canonical-stage-user",
+        relationship_id="canonical-stage-relationship",
+        conversation_id="canonical-stage-conversation",
+        text=text,
+        status=MemoryStatus.CONFIRMED,
+    )
+
+    assert result.saved[0].item.canonical_predicate == "relationship.stage"
+    assert result.saved[0].item.state_value == "dating"
+    context = await service.get_context(
+        "canonical-stage-user",
+        "canonical-stage-relationship",
+    )
+    assert context.relationship_stage == RelationshipStage.DATING
+
+
 class FailingExtractor:
     async def extract(self, text, **kwargs):
         del text, kwargs

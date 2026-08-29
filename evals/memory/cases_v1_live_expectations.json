@@ -1,6 +1,6 @@
 {
   "version": "memory-foundation-live-semantic-v1",
-  "dataset_sha256": "8de714aeb4e7ffd5deec6d78a5ab37eeb4c4af23d32ca30956b4561c612b1f1e",
+  "dataset_sha256": "3bd09ce85b00b866a88dcc7706d082c8437c185c630eacc115f1b0391e2c3c6d",
   "cases": {
     "MEM-001": {
       "turns": [
@@ -217,7 +217,10 @@
         "superseded": [{"selector": {"canonical_predicate": "relationship.stage", "state_value": "acquaintance"}}],
         "forbidden_active": [{"selector": {"canonical_predicate": "relationship.stage", "state_value": "acquaintance"}}],
         "duplicate_active_max": [{"selector": {"state_dimension": "relationship.stage"}, "max": 1}],
-        "context": {"expected_current": [{"selector": {"canonical_predicate": "relationship.stage", "state_value": "dating"}}]}
+        "context": {
+          "expected_current": [{"selector": {"canonical_predicate": "relationship.stage", "state_value": "dating"}}],
+          "fields": [{"path": "relationship_stage", "expected": "dating"}]
+        }
       }
     },
     "MEM-005": {

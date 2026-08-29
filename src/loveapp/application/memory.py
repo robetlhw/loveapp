@@ -2127,9 +2127,18 @@ def _relationship_stage_from_memories(
     memories: list[MemoryItem],
 ) -> RelationshipStage | None:
     if any(
-        _candidate_predicate(memory) in _RELATIONSHIP_STAGE_EVENT_PREDICATES
+        (
+            (
+                _candidate_predicate(memory) in _RELATIONSHIP_STAGE_EVENT_PREDICATES
+                and memory.importance >= 4
+            )
+            or (
+                memory.canonical_predicate == "relationship.stage"
+                and memory.state_value == "dating"
+                and memory.status == MemoryStatus.CONFIRMED
+            )
+        )
         and memory.confidence >= 0.8
-        and memory.importance >= 4
         for memory in memories
     ):
         return RelationshipStage.DATING
