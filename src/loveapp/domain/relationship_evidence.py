@@ -62,6 +62,7 @@ class RelationshipEvidenceSignal(BaseModel):
     provenance: EvidenceProvenance
     rationale: str
     summary: str
+    authoritative_state: str | None = None
 
 
 class RelationshipDimensionProjection(BaseModel):
@@ -255,11 +256,14 @@ def standardize_relationship_evidence(
 ) -> list[RelationshipEvidenceSignal]:
     now = _as_aware(reference_time or utc_now())
     signals: list[RelationshipEvidenceSignal] = []
-    for memory in memories:
-        if memory.status not in {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}:
-            continue
-        if memory.expires_at is not None and _as_aware(memory.expires_at) <= now:
-            continue
+    eligible = [
+        memory
+        for memory in memories
+        if memory.status in {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}
+        and (memory.expires_at is None or _as_aware(memory.expires_at) > now)
+    ]
+    signals.extend(_authoritative_state_signals(eligible))
+    for memory in eligible:
 
         declarations = _declarations_from_memory(memory)
         explicit_dimensions = {item.dimension for item in declarations}
@@ -267,19 +271,6 @@ def standardize_relationship_evidence(
             _signal_from_declaration(memory, item, EvidenceProvenance.EXTRACTED)
             for item in declarations
         )
-
-        state_declarations = _state_declarations(memory)
-        for declaration in state_declarations:
-            if declaration.dimension in explicit_dimensions:
-                continue
-            explicit_dimensions.add(declaration.dimension)
-            signals.append(
-                _signal_from_declaration(
-                    memory,
-                    declaration,
-                    EvidenceProvenance.EXPLICIT_STATE,
-                )
-            )
 
         for template in _legacy_templates(memory):
             if template.dimension in explicit_dimensions:
@@ -351,8 +342,15 @@ def _declarations_from_memory(
 def _state_declarations(memory: MemoryItem) -> list[RelationshipEvidenceDeclaration]:
     if memory.kind != MemoryKind.RELATIONSHIP_STATE:
         return []
-    dimension = str(memory.payload.get("state_dimension") or "").casefold()
-    value = str(memory.payload.get("state_value") or "").casefold()
+    dimension = str(
+        memory.state_dimension or memory.payload.get("state_dimension") or ""
+    ).casefold()
+    dimension = {
+        "relationship.conflict_status": "conflict_status",
+        "relationship.familiarity": "relationship_familiarity",
+        "relationship.interaction_reciprocity": "interaction_reciprocity",
+    }.get(dimension, dimension)
+    value = str(memory.state_value or memory.payload.get("state_value") or "").casefold()
     mapping: dict[
         tuple[str, str],
         tuple[RelationshipEvidenceDimension, EvidenceDirection, float],
@@ -428,6 +426,44 @@ def _state_declarations(memory: MemoryItem) -> list[RelationshipEvidenceDeclarat
     ]
 
 
+def _authoritative_state_signals(
+    memories: list[MemoryItem],
+) -> list[RelationshipEvidenceSignal]:
+    authoritative: dict[
+        RelationshipEvidenceDimension,
+        tuple[MemoryItem, RelationshipEvidenceDeclaration],
+    ] = {}
+    for memory in memories:
+        for declaration in _state_declarations(memory):
+            existing = authoritative.get(declaration.dimension)
+            if existing is None or _authoritative_state_rank(memory) > (
+                _authoritative_state_rank(existing[0])
+            ):
+                authoritative[declaration.dimension] = (memory, declaration)
+    return [
+        _signal_from_declaration(
+            memory,
+            declaration,
+            EvidenceProvenance.EXPLICIT_STATE,
+            authoritative_state=_state_projection_value(memory),
+        )
+        for memory, declaration in authoritative.values()
+    ]
+
+
+def _authoritative_state_rank(memory: MemoryItem) -> tuple[int, float, float]:
+    return (
+        int(memory.status == MemoryStatus.CONFIRMED),
+        _as_aware(memory.updated_at).timestamp(),
+        memory.confidence,
+    )
+
+
+def _state_projection_value(memory: MemoryItem) -> str | None:
+    value = memory.state_value or memory.payload.get("state_value")
+    return str(value).casefold() if value is not None else None
+
+
 def _legacy_templates(memory: MemoryItem) -> tuple[_EvidenceTemplate, ...]:
     payload = memory.payload
     activity_type = str(
@@ -499,6 +535,8 @@ def _signal_from_declaration(
     memory: MemoryItem,
     declaration: RelationshipEvidenceDeclaration,
     provenance: EvidenceProvenance,
+    *,
+    authoritative_state: str | None = None,
 ) -> RelationshipEvidenceSignal:
     return _make_signal(
         memory,
@@ -513,6 +551,7 @@ def _signal_from_declaration(
         ),
         provenance=provenance,
         rationale=declaration.rationale,
+        authoritative_state=authoritative_state,
     )
 
 
@@ -540,6 +579,7 @@ def _make_signal(
     confidence: float,
     provenance: EvidenceProvenance,
     rationale: str,
+    authoritative_state: str | None = None,
 ) -> RelationshipEvidenceSignal:
     identity = "|".join(
         (memory.id, dimension.value, direction.value, provenance.value, rationale)
@@ -559,6 +599,7 @@ def _make_signal(
         provenance=provenance,
         rationale=rationale,
         summary=memory.summary,
+        authoritative_state=authoritative_state,
     )
 
 
@@ -572,9 +613,7 @@ def _deduplicate_exact_signals(
     for signal in signals:
         key = (signal.source_memory_id, signal.dimension, signal.direction)
         existing = keepers.get(key)
-        if existing is None or signal.strength * signal.confidence > (
-            existing.strength * existing.confidence
-        ):
+        if existing is None or _signal_wins_same_direction(signal, existing):
             keepers[key] = signal
     return list(keepers.values())
 
@@ -591,12 +630,41 @@ def _deduplicate_correlated_signals(
         source = signal.source_message_id or signal.source_memory_id
         key = (source, signal.dimension, signal.direction)
         existing = keepers.get(key)
-        if existing is None or _signal_rank(signal, reference_time) > _signal_rank(
+        if existing is None or _signal_wins_correlated(
+            signal,
             existing,
             reference_time,
         ):
             keepers[key] = signal
     return list(keepers.values())
+
+
+def _signal_wins_same_direction(
+    candidate: RelationshipEvidenceSignal,
+    existing: RelationshipEvidenceSignal,
+) -> bool:
+    if candidate.provenance == EvidenceProvenance.EXPLICIT_STATE:
+        return existing.provenance != EvidenceProvenance.EXPLICIT_STATE
+    if existing.provenance == EvidenceProvenance.EXPLICIT_STATE:
+        return False
+    return candidate.strength * candidate.confidence > (
+        existing.strength * existing.confidence
+    )
+
+
+def _signal_wins_correlated(
+    candidate: RelationshipEvidenceSignal,
+    existing: RelationshipEvidenceSignal,
+    reference_time: datetime,
+) -> bool:
+    if candidate.provenance == EvidenceProvenance.EXPLICIT_STATE:
+        return existing.provenance != EvidenceProvenance.EXPLICIT_STATE
+    if existing.provenance == EvidenceProvenance.EXPLICIT_STATE:
+        return False
+    return _signal_rank(candidate, reference_time) > _signal_rank(
+        existing,
+        reference_time,
+    )
 
 
 def _project_dimension(
@@ -605,6 +673,13 @@ def _project_dimension(
     reference_time: datetime,
 ) -> RelationshipDimensionProjection:
     relevant = [signal for signal in signals if signal.dimension == dimension]
+    explicit_state = [
+        signal
+        for signal in relevant
+        if signal.provenance == EvidenceProvenance.EXPLICIT_STATE
+    ]
+    if explicit_state:
+        relevant = explicit_state
     support = [signal for signal in relevant if signal.direction == EvidenceDirection.SUPPORT]
     oppose = [signal for signal in relevant if signal.direction == EvidenceDirection.OPPOSE]
     support_score = 1 - prod(
@@ -615,14 +690,25 @@ def _project_dimension(
     )
     score = max(-1.0, min(1.0, support_score - oppose_score))
     confidence = _projection_confidence(relevant, support_score, oppose_score, reference_time)
+    authoritative_state = next(
+        (
+            signal.authoritative_state
+            for signal in explicit_state
+            if signal.authoritative_state is not None
+        ),
+        None,
+    )
     return RelationshipDimensionProjection(
         dimension=dimension,
-        state=_projection_state(
-            dimension,
-            score,
-            support_score,
-            oppose_score,
-            confidence,
+        state=(
+            authoritative_state
+            or _projection_state(
+                dimension,
+                score,
+                support_score,
+                oppose_score,
+                confidence,
+            )
         ),
         score=round(score, 4),
         confidence=round(confidence, 4),

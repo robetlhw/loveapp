@@ -105,10 +105,27 @@ async def test_history_context_does_not_project_superseded_state_as_current_fact
         "history-context-user",
         MemoryStatus.SUPERSEDED,
     )
-    await store.save_memory(
+    current_candidate = _state("后来冲突已经解决", "resolved")
+    current_candidate = current_candidate.model_copy(
+        update={
+            "payload": {
+                **current_candidate.payload,
+                "relationship_evidence": [
+                    {
+                        "dimension": "conflict",
+                        "direction": "support",
+                        "strength": 0.9,
+                        "confidence": 0.95,
+                        "rationale": "explicit_reconciliation",
+                    }
+                ],
+            }
+        }
+    )
+    current = await store.save_memory(
         user_id="history-context-user",
         relationship_id="relationship",
-        candidate=_state("后来冲突已经解决", "resolved"),
+        candidate=current_candidate,
         status=MemoryStatus.CONFIRMED,
     )
 
@@ -121,3 +138,5 @@ async def test_history_context_does_not_project_superseded_state_as_current_fact
     assert old.item.id in {item.id for item in context.remembered_items}
     assert old.item.id not in {item.id for item in context.current_state}
     assert old.item.id not in {item.id for item in context.confirmed_current_state}
+    assert {item.id for item in context.current_state} == {current.item.id}
+    assert context.relationship_evidence.conflict_status == "resolved"

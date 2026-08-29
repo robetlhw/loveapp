@@ -7,10 +7,12 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 
 from loveapp.domain.memory import (
+    EvidenceExplicitness,
     MemoryCandidate,
     MemoryItem,
     MemoryKind,
     MemoryStatus,
+    PredicateType,
     TimeKind,
     normalize_candidate_predicate,
 )
@@ -65,6 +67,41 @@ class PlannedMemoryTransition:
 _EXPLICIT_CONTACT_RESTORATION_PATTERN = re.compile(
     r"(?:回(?:复)?(?:了|过)?我(?:的)?(?:消息)?|重新(?:联系|聊天)|"
     r"恢复(?:正常)?(?:联系|聊天)|又开始正常聊天)"
+)
+
+_CONTACT_OUTAGE_STATE_PATTERN = re.compile(
+    r"^(?:none|no_(?:response|reply|contact)(?:_.+)?|"
+    r"(?:very_)?low_(?:response|reply|contact)(?:_.+)?|"
+    r"(?:unresponsive|unreachable|unavailable)(?:_.+)?)$"
+)
+_EXPLICIT_CONTACT_OUTAGE_PATTERN = re.compile(
+    r"(?:联系不上|无法联系|失去联系|未(?:回(?:复)?|回应)|"
+    r"没(?:有)?回(?:复)?.{0,6}(?:消息|我)|不(?:回(?:复)?|回应)|"
+    r"无人接听|无法接通)"
+)
+
+_OPEN_WORLD_SOCIAL_INTEGRATION_PATTERN = re.compile(
+    r"(?:带|让|邀请|介绍|参加|融入|接纳).{0,18}"
+    r"(?:朋友|朋友圈|社交圈|聚会|父母|家人|家庭)|"
+    r"(?:朋友|朋友圈|社交圈|聚会|父母|家人|家庭).{0,18}"
+    r"(?:带|让|邀请|介绍|参加|融入|接纳|见)"
+)
+_EXPLICIT_FAMILIARITY_PATTERN = re.compile(
+    r"(?:不.{0,2}熟|不熟悉|很熟|比较熟|熟悉|熟络|生疏|陌生|"
+    r"刚认识|认识不久|了解不多)"
+)
+_FAMILY_INTEGRATION_PATTERN = re.compile(r"父母|家人|家庭|亲属|亲戚")
+_SOCIAL_INTEGRATION_RESTRICTION_PATTERN = re.compile(
+    r"(?:不再|不愿意|不愿|不肯|拒绝|不让|不带|不邀请|不介绍|"
+    r"限制|阻止|排斥|很少再|几乎不|从不)"
+)
+_SOCIAL_INTEGRATION_INTRODUCTION_PATTERN = re.compile(r"(?:介绍|认识)")
+_SOCIAL_INTEGRATION_PARTICIPATION_PATTERN = re.compile(
+    r"(?:邀请|参加|聚会|活动)"
+)
+_NONASSERTIVE_SOCIAL_INTEGRATION_PATTERN = re.compile(
+    r"(?:可能|也许|或许|大概|说不定|似乎|好像|未必|不确定|"
+    r"如果|假如|要是|是否|会不会|愿不愿意|吗(?:[？?]|$)|[？?])"
 )
 
 
@@ -197,7 +234,9 @@ STATE_TRANSITION_RULES: tuple[StateTransitionRule, ...] = (
     StateTransitionRule(
         name="restore_response_engagement",
         trigger_concepts=frozenset({"response_restored"}),
-        closes_concepts=frozenset({"response_unresponsive"}),
+        closes_concepts=frozenset(
+            {"contact_unavailable", "response_unresponsive"}
+        ),
     ),
     StateTransitionRule(
         name="resolve_active_conflict",
@@ -276,15 +315,23 @@ def memory_concept(memory: MemoryCandidate) -> str:
     if canonical == "relationship.stage" and state_value in {"dating", "committed"}:
         return "relationship_started"
     if canonical == "interaction.contact_frequency" and state_value:
+        if _CONTACT_OUTAGE_STATE_PATTERN.fullmatch(state_value):
+            return "contact_unavailable"
         if state_value in {"low", "decreasing", "reduced", "no_contact"}:
             return "contact_reduced"
         if state_value in {"normal", "restored"}:
             return "contact_restored"
     if canonical == "interaction.response_engagement" and state_value:
-        if state_value in {"unresponsive", "no_response", "unavailable"}:
+        if _CONTACT_OUTAGE_STATE_PATTERN.fullmatch(state_value):
             return "response_unresponsive"
         if state_value in {"normal", "responsive", "restored", "engaged"}:
             return "response_restored"
+    if (
+        canonical == "relationship.contact_opportunity"
+        and state_value == "low"
+        and _has_explicit_contact_outage(memory)
+    ):
+        return "contact_unavailable"
     state_identity = governed_state_identity(memory)
     state_value = governed_state_value(memory)
     if state_identity is not None and state_value is not None:
@@ -308,10 +355,18 @@ def memory_concept(memory: MemoryCandidate) -> str:
 
 
 def _has_explicit_contact_restoration(memory: MemoryCandidate) -> bool:
-    evidence = " ".join(
-        [memory.original_text, *memory.evidence_spans]
-    )
+    evidence = _claim_evidence_text(memory)
     return bool(_EXPLICIT_CONTACT_RESTORATION_PATTERN.search(evidence))
+
+
+def _has_explicit_contact_outage(memory: MemoryCandidate) -> bool:
+    evidence = _claim_evidence_text(memory)
+    return bool(_EXPLICIT_CONTACT_OUTAGE_PATTERN.search(evidence))
+
+
+def _claim_evidence_text(memory: MemoryCandidate) -> str:
+    evidence = [span for span in memory.evidence_spans if span.strip()]
+    return " ".join(evidence) if evidence else memory.original_text
 
 
 def memory_role(memory: MemoryCandidate) -> MemoryRole:
@@ -339,6 +394,7 @@ def normalize_memory_candidate(
     reference_time: datetime,
 ) -> MemoryCandidate:
     candidate = normalize_candidate_predicate(candidate)
+    candidate = _guard_open_world_social_integration(candidate)
     updates: dict = {}
     payload = dict(candidate.payload)
     if "relationship_evidence" in payload:
@@ -429,7 +485,95 @@ def normalize_memory_candidate(
     if payload != candidate.payload:
         updates["payload"] = payload
     normalized_candidate = candidate.model_copy(update=updates) if updates else candidate
-    return normalize_candidate_predicate(normalized_candidate)
+    normalized_candidate = normalize_candidate_predicate(normalized_candidate)
+    return _guard_open_world_social_integration(normalized_candidate)
+
+
+def _guard_open_world_social_integration(
+    candidate: MemoryCandidate,
+) -> MemoryCandidate:
+    if (
+        candidate.canonical_predicate
+        not in {
+            "relationship.familiarity",
+            "interaction.contact_frequency",
+            "interaction.initiation_balance",
+        }
+        and candidate.predicate_type != PredicateType.CUSTOM
+    ):
+        return candidate
+    evidence = " ".join([candidate.original_text, *candidate.evidence_spans])
+    custom_predicate = open_world_social_integration_predicate(evidence)
+    if custom_predicate is None:
+        return candidate
+    payload = dict(candidate.payload)
+    for field in (
+        "state_dimension",
+        "state_value",
+        "state_scope",
+        "metric",
+        "direction",
+        "baseline",
+        "current",
+    ):
+        payload.pop(field, None)
+    payload["predicate"] = custom_predicate
+    payload["object"] = _social_integration_object(evidence)
+    updates: dict[str, object] = {
+        "payload": payload,
+        "raw_predicate": custom_predicate,
+        "predicate_type": PredicateType.CUSTOM,
+        "canonical_predicate": None,
+        "custom_predicate": custom_predicate,
+        "state_dimension": None,
+        "state_value": None,
+        "expires_at": None,
+    }
+    if _is_direct_social_integration_assertion(candidate, evidence):
+        updates["explicitness"] = EvidenceExplicitness.EXPLICIT
+        updates["requires_inference"] = False
+    return candidate.model_copy(
+        update=updates
+    )
+
+
+def _social_integration_object(text: str) -> str:
+    stance = (
+        "restricted"
+        if _SOCIAL_INTEGRATION_RESTRICTION_PATTERN.search(text)
+        else "included"
+    )
+    aspects = [
+        name
+        for name, pattern in (
+            ("introduction", _SOCIAL_INTEGRATION_INTRODUCTION_PATTERN),
+            ("participation", _SOCIAL_INTEGRATION_PARTICIPATION_PATTERN),
+        )
+        if pattern.search(text)
+    ]
+    if len(aspects) == 1:
+        return f"{aspects[0]}_{stance}"
+    return stance
+
+
+def _is_direct_social_integration_assertion(
+    candidate: MemoryCandidate,
+    evidence: str,
+) -> bool:
+    return (
+        candidate.explicitness != EvidenceExplicitness.SPECULATIVE
+        and not _NONASSERTIVE_SOCIAL_INTEGRATION_PATTERN.search(evidence)
+    )
+
+
+def open_world_social_integration_predicate(text: str) -> str | None:
+    if not _OPEN_WORLD_SOCIAL_INTEGRATION_PATTERN.search(text):
+        return None
+    if _EXPLICIT_FAMILIARITY_PATTERN.search(text):
+        return None
+    if _FAMILY_INTEGRATION_PATTERN.search(text):
+        return "family_integration"
+    return "social_circle_integration"
 
 
 def plan_memory_transitions(

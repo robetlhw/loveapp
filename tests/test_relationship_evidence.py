@@ -13,6 +13,7 @@ from loveapp.domain.memory import (
     MemoryItem,
     MemoryKind,
     MemoryPerspective,
+    MemoryStatus,
     MemoryValence,
     RelationshipImpact,
     TimeKind,
@@ -274,6 +275,86 @@ def test_explicit_resolution_can_close_recent_conflict_evidence() -> None:
     assert profile.requires_deescalation is False
 
 
+def test_canonical_conflict_state_overrides_conflicting_extracted_evidence() -> None:
+    resolved = _memory_item(
+        "resolved-with-conflicting-evidence",
+        MemoryKind.RELATIONSHIP_STATE,
+        "双方已经和好",
+        {
+            "state_dimension": "conflict_status",
+            "state_value": "resolved",
+            "relationship_evidence": [
+                {
+                    "dimension": "conflict",
+                    "direction": "support",
+                    "strength": 0.95,
+                    "confidence": 0.95,
+                    "rationale": "explicit_reconciliation",
+                }
+            ],
+        },
+    ).model_copy(
+        update={
+            "canonical_predicate": "relationship.conflict_status",
+            "state_dimension": "relationship.conflict_status",
+            "state_value": "resolved",
+        }
+    )
+
+    profile = project_relationship_evidence([resolved], reference_time=NOW)
+    projection = profile.projection_for(RelationshipEvidenceDimension.CONFLICT)
+
+    assert profile.conflict_status == "resolved"
+    assert profile.requires_deescalation is False
+    assert projection is not None
+    assert projection.supporting_evidence_ids == []
+    assert len(projection.opposing_evidence_ids) == 1
+    assert {item.provenance for item in profile.evidence} == {
+        EvidenceProvenance.EXPLICIT_STATE,
+        EvidenceProvenance.EXTRACTED,
+    }
+
+
+def test_authoritative_conflict_projection_preserves_each_canonical_value() -> None:
+    for state in ("active", "cooling", "repairing", "resolved"):
+        memory = _memory_item(
+            f"conflict-{state}",
+            MemoryKind.RELATIONSHIP_STATE,
+            f"当前冲突状态为 {state}",
+            {"state_dimension": "conflict_status", "state_value": state},
+        )
+
+        profile = project_relationship_evidence([memory], reference_time=NOW)
+        projection = profile.projection_for(RelationshipEvidenceDimension.CONFLICT)
+
+        assert profile.conflict_status == state
+        assert projection is not None
+        assert projection.state == state
+
+
+def test_confirmed_canonical_state_precedes_newer_proposed_state() -> None:
+    confirmed = _memory_item(
+        "confirmed-resolved",
+        MemoryKind.RELATIONSHIP_STATE,
+        "双方冲突已经解决",
+        {"state_dimension": "conflict_status", "state_value": "resolved"},
+        status=MemoryStatus.CONFIRMED,
+        updated_at=NOW - timedelta(minutes=1),
+    )
+    proposed = _memory_item(
+        "proposed-active",
+        MemoryKind.RELATIONSHIP_STATE,
+        "模型推测双方仍有冲突",
+        {"state_dimension": "conflict_status", "state_value": "active"},
+        status=MemoryStatus.PROPOSED,
+        updated_at=NOW,
+    )
+
+    profile = project_relationship_evidence([confirmed, proposed], reference_time=NOW)
+
+    assert profile.conflict_status == "resolved"
+
+
 def test_normalization_discards_invalid_evidence_and_caps_confidence() -> None:
     normalized = normalize_evidence_declarations(
         [
@@ -442,6 +523,7 @@ def _memory_item(
     *,
     impact: RelationshipImpact = RelationshipImpact.UNCLEAR,
     source_message_id: str | None = None,
+    status: MemoryStatus = MemoryStatus.CONFIRMED,
     updated_at: datetime = NOW,
 ) -> MemoryItem:
     return MemoryItem(
@@ -460,6 +542,7 @@ def _memory_item(
         relationship_impact=impact,
         perspective=MemoryPerspective.USER_REPORTED,
         confidence=0.9,
+        status=status,
         payload=payload,
         created_at=updated_at,
         updated_at=updated_at,

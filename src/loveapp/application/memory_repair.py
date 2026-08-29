@@ -36,6 +36,7 @@ from loveapp.domain.memory_dimensions import (
     normalize_state_dimension,
     normalize_state_value,
 )
+from loveapp.domain.memory_lifecycle import open_world_social_integration_predicate
 from loveapp.domain.memory_predicates import CANONICAL_PREDICATES, normalize_predicate
 
 
@@ -283,7 +284,9 @@ def validate_memory_claim(
             raise ValueError(f"互动模式 {claim.claim_id} 缺少单一 payload.metric")
     if claim.kind == MemoryKind.RELATIONSHIP_STATE:
         dimension, value = _registered_relationship_state(claim)
-        if dimension is None or value is None:
+        if (dimension is None or value is None) and not (
+            _is_open_world_social_integration_claim(claim)
+        ):
             raise ValueError(
                 f"关系状态 {claim.claim_id} 缺少已注册的 state_dimension/state_value"
             )
@@ -697,6 +700,21 @@ def _registered_relationship_state(
         dimension,
         claim.payload.get("state_value"),
     )
+
+
+def _is_open_world_social_integration_claim(claim: AtomicClaim) -> bool:
+    normalized = normalize_predicate(
+        kind=claim.kind,
+        raw_predicate=claim.raw_predicate or claim.predicate,
+        canonical_predicate=claim.canonical_predicate,
+        custom_predicate=claim.custom_predicate,
+        predicate_type=claim.predicate_type,
+        payload=claim.payload,
+    )
+    if normalized.canonical_predicate not in {None, "relationship.familiarity"}:
+        return False
+    evidence = " ".join(claim.evidence_spans)
+    return open_world_social_integration_predicate(evidence) is not None
 
 
 def _claim_has_temporal_anchor(claim: dict[str, object]) -> bool:

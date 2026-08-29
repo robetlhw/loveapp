@@ -1,0 +1,435 @@
+{
+  "version": "memory-foundation-live-semantic-v1",
+  "dataset_sha256": "8de714aeb4e7ffd5deec6d78a5ab37eeb4c4af23d32ca30956b4561c612b1f1e",
+  "cases": {
+    "MEM-001": {
+      "turns": [
+        {
+          "gate": {"should_extract": true},
+          "claims": [
+            {"selector": {"canonical_predicate": "relationship.conflict_status", "state_dimension": "relationship.conflict_status", "state_value": "active", "perspective": "user_reported"}}
+          ]
+        },
+        {
+          "gate": {"should_extract": true},
+          "claims": [
+            {"selector": {"canonical_predicate": "relationship.conflict_status", "state_dimension": "relationship.conflict_status", "state_value": "resolved", "perspective": "user_reported"}}
+          ],
+          "relations": [
+            {"selector": {"canonical_predicate": "relationship.conflict_status", "state_value": "resolved"}, "allowed": ["update"]}
+          ]
+        }
+      ],
+      "final": {
+        "expected_active": [
+          {"selector": {"canonical_predicate": "relationship.conflict_status", "state_value": "resolved", "status": "confirmed"}}
+        ],
+        "superseded": [
+          {"selector": {"canonical_predicate": "relationship.conflict_status", "state_value": "active"}}
+        ],
+        "forbidden_active": [
+          {"selector": {"canonical_predicate": "relationship.conflict_status", "state_value": "active"}}
+        ],
+        "duplicate_active_max": [
+          {"selector": {"state_dimension": "relationship.conflict_status"}, "max": 1}
+        ],
+        "context": {
+          "expected_current": [
+            {"selector": {"canonical_predicate": "relationship.conflict_status", "state_value": "resolved"}}
+          ],
+          "forbidden_current": [
+            {"selector": {"canonical_predicate": "relationship.conflict_status", "state_value": "active"}}
+          ],
+          "fields": [
+            {"path": "relationship_evidence.conflict_status", "expected": "resolved"}
+          ]
+        }
+      }
+    },
+    "MEM-002": {
+      "turns": [
+        {
+          "gate": {"should_extract": true},
+          "claims": [
+            {"selector": {"canonical_predicate": "relationship.conflict_status", "state_value": "resolved", "perspective": "user_reported"}}
+          ]
+        },
+        {
+          "gate": {"should_extract": true},
+          "claims": [
+            {"selector": {"canonical_predicate": "relationship.conflict_status", "state_value": "active", "perspective": "user_reported"}}
+          ],
+          "relations": [
+            {"selector": {"canonical_predicate": "relationship.conflict_status", "state_value": "active"}, "allowed": ["update"]}
+          ]
+        }
+      ],
+      "final": {
+        "expected_active": [
+          {"selector": {"canonical_predicate": "relationship.conflict_status", "state_value": "active", "status": "confirmed"}}
+        ],
+        "superseded": [
+          {"selector": {"canonical_predicate": "relationship.conflict_status", "state_value": "resolved"}}
+        ],
+        "forbidden_active": [
+          {"selector": {"canonical_predicate": "relationship.conflict_status", "state_value": "resolved"}}
+        ],
+        "duplicate_active_max": [
+          {"selector": {"state_dimension": "relationship.conflict_status"}, "max": 1}
+        ],
+        "context": {
+          "expected_current": [
+            {"selector": {"canonical_predicate": "relationship.conflict_status", "state_value": "active"}}
+          ],
+          "fields": [
+            {"path": "relationship_evidence.conflict_status", "expected": "active"}
+          ]
+        }
+      }
+    },
+    "MEM-003": {
+      "turns": [
+        {
+          "gate": {"should_extract": true},
+          "claims": [
+            {
+              "selector": {
+                "perspective": "user_reported",
+                "$any": [
+                  {"payload.canonical_concept": "contact_unavailable"},
+                  {"canonical_predicate": "interaction.response_engagement", "state_value": ["no_response", "no_response_3_days", "no_reply_for_3_days", "unresponsive"]},
+                  {"canonical_predicate": "contact.status", "state_value": ["unreachable", "unavailable"]},
+                  {"canonical_predicate": "interaction.contact_frequency", "state_value": ["no_contact", "none"]}
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "gate": {"should_extract": true},
+          "claims": [
+            {
+              "selector": {
+                "perspective": "user_reported",
+                "$any": [
+                  {"payload.canonical_concept": "contact_restored"},
+                  {"canonical_predicate": "interaction.response_engagement", "state_value": ["normal", "responsive"]},
+                  {"canonical_predicate": "contact.status", "state_value": "restored"},
+                  {"canonical_predicate": "interaction.contact_frequency", "state_value": ["restored", "normal", "engaged"]}
+                ]
+              }
+            }
+          ],
+          "relations": [
+            {
+              "selector": {
+                "$any": [
+                  {"payload.canonical_concept": "contact_restored"},
+                  {"canonical_predicate": "interaction.response_engagement", "state_value": ["normal", "responsive"]},
+                  {"canonical_predicate": "contact.status", "state_value": "restored"},
+                  {"canonical_predicate": "interaction.contact_frequency", "state_value": ["restored", "normal", "engaged"]}
+                ]
+              },
+              "allowed": ["update", "unrelated"]
+            }
+          ]
+        }
+      ],
+      "final": {
+        "expected_active": [
+          {
+            "selector": {
+              "status": "confirmed",
+              "$any": [
+                {"payload.canonical_concept": "contact_restored"},
+                {"canonical_predicate": "interaction.response_engagement", "state_value": ["normal", "responsive"]},
+                {"canonical_predicate": "contact.status", "state_value": "restored"},
+                {"canonical_predicate": "interaction.contact_frequency", "state_value": ["restored", "normal", "engaged"]}
+              ]
+            }
+          }
+        ],
+        "superseded": [
+          {
+            "selector": {
+              "$any": [
+                {"payload.canonical_concept": "contact_unavailable"},
+                {"canonical_predicate": "interaction.response_engagement", "state_value": ["no_response", "no_response_3_days", "no_reply_for_3_days", "unresponsive"]},
+                {"canonical_predicate": "contact.status", "state_value": ["unreachable", "unavailable"]},
+                {"canonical_predicate": "interaction.contact_frequency", "state_value": ["no_contact", "none"]}
+              ]
+            }
+          }
+        ],
+        "forbidden_active": [
+          {
+            "selector": {
+              "$any": [
+                {"payload.canonical_concept": "contact_unavailable"},
+                {"canonical_predicate": "interaction.response_engagement", "state_value": ["no_response", "no_response_3_days", "no_reply_for_3_days", "unresponsive"]},
+                {"canonical_predicate": "contact.status", "state_value": ["unreachable", "unavailable"]},
+                {"canonical_predicate": "interaction.contact_frequency", "state_value": ["no_contact", "none"]}
+              ]
+            }
+          },
+          {"selector": {"canonical_predicate": "relationship.contact_opportunity", "state_value": "low"}}
+        ],
+        "context": {
+          "expected_current": [
+            {
+              "selector": {
+                "$any": [
+                  {"payload.canonical_concept": "contact_restored"},
+                  {"canonical_predicate": "interaction.response_engagement", "state_value": ["normal", "responsive"]},
+                  {"canonical_predicate": "contact.status", "state_value": "restored"},
+                  {"canonical_predicate": "interaction.contact_frequency", "state_value": ["restored", "normal", "engaged"]}
+                ]
+              }
+            }
+          ],
+          "forbidden_current": [
+            {
+              "selector": {
+                "$any": [
+                  {"payload.canonical_concept": "contact_unavailable"},
+                  {"canonical_predicate": "interaction.response_engagement", "state_value": ["no_response", "no_response_3_days", "no_reply_for_3_days", "unresponsive"]},
+                  {"canonical_predicate": "contact.status", "state_value": ["unreachable", "unavailable"]},
+                  {"canonical_predicate": "interaction.contact_frequency", "state_value": ["no_contact", "none"]}
+                ]
+              }
+            },
+            {"selector": {"canonical_predicate": "relationship.contact_opportunity", "state_value": "low"}}
+          ]
+        }
+      }
+    },
+    "MEM-004": {
+      "turns": [
+        {"gate": {"should_extract": true}, "claims": [{"selector": {"canonical_predicate": "relationship.stage", "state_value": "acquaintance", "perspective": "user_reported"}}]},
+        {
+          "gate": {"should_extract": true},
+          "claims": [{"selector": {"canonical_predicate": "relationship.stage", "state_value": "dating", "perspective": "user_reported"}}],
+          "relations": [{"selector": {"canonical_predicate": "relationship.stage", "state_value": "dating"}, "allowed": ["update"]}]
+        }
+      ],
+      "final": {
+        "expected_active": [{"selector": {"canonical_predicate": "relationship.stage", "state_value": "dating", "status": "confirmed"}}],
+        "superseded": [{"selector": {"canonical_predicate": "relationship.stage", "state_value": "acquaintance"}}],
+        "forbidden_active": [{"selector": {"canonical_predicate": "relationship.stage", "state_value": "acquaintance"}}],
+        "duplicate_active_max": [{"selector": {"state_dimension": "relationship.stage"}, "max": 1}],
+        "context": {"expected_current": [{"selector": {"canonical_predicate": "relationship.stage", "state_value": "dating"}}]}
+      }
+    },
+    "MEM-005": {
+      "turns": [
+        {"gate": {"should_extract": true}, "claims": [{"selector": {"canonical_predicate": "confession.status", "state_value": "intended", "perspective": "user_reported"}}]},
+        {
+          "gate": {"should_extract": true},
+          "claims": [
+            {"selector": {"memory_kind": "interaction_event", "perspective": "user_reported"}}
+          ]
+        },
+        {"gate": {"should_extract": true}, "claims": [{"selector": {"canonical_predicate": "relationship.stage", "state_value": "dating", "perspective": "user_reported"}}]}
+      ],
+      "final": {
+        "expected_active": [{"selector": {"canonical_predicate": "relationship.stage", "state_value": "dating", "status": "confirmed"}}],
+        "superseded": [{"selector": {"canonical_predicate": "confession.status", "state_value": "intended"}}],
+        "forbidden_active": [{"selector": {"canonical_predicate": "confession.status", "state_value": "intended"}}],
+        "context": {"expected_current": [{"selector": {"canonical_predicate": "relationship.stage", "state_value": "dating"}}]}
+      }
+    },
+    "MEM-006": {
+      "turns": [
+        {"gate": {"should_extract": true}, "claims": [{"selector": {"canonical_predicate": "preference.food.spiciness", "perspective": "user_reported"}}]},
+        {"gate": {"should_extract": true}}
+      ],
+      "final": {
+        "expected_active": [{"selector": {"canonical_predicate": "preference.food.spiciness", "subject": "partner", "status": "confirmed"}}],
+        "active_counts": [{"selector": {"canonical_predicate": "preference.food.spiciness", "subject": "partner"}, "min": 1, "max": 1}],
+        "protected_confirmed": [{"selector": {"canonical_predicate": "preference.food.spiciness", "subject": "partner"}}]
+      }
+    },
+    "MEM-007": {
+      "turns": [
+        {"gate": {"should_extract": true}, "claims": [{"selector": {"canonical_predicate": "preference.food.spiciness", "perspective": "user_reported"}}]},
+        {
+          "gate": {"should_extract": true},
+          "claims": [{"selector": {"canonical_predicate": "preference.food.spiciness", "perspective": "user_reported"}}],
+          "relations": [{"selector": {"canonical_predicate": "preference.food.spiciness"}, "allowed": ["update"]}]
+        }
+      ],
+      "final": {
+        "expected_active": [{"selector": {"canonical_predicate": "preference.food.spiciness", "status": "confirmed"}}],
+        "superseded": [{"selector": {"canonical_predicate": "preference.food.spiciness"}}],
+        "active_counts": [{"selector": {"canonical_predicate": "preference.food.spiciness"}, "min": 1, "max": 1}]
+      }
+    },
+    "MEM-008": {
+      "turns": [
+        {"gate": {"should_extract": true}, "claims": [{"selector": {"canonical_predicate": "preference.food.cuisine", "perspective": "user_reported"}}]},
+        {
+          "gate": {"should_extract": true},
+          "claims": [{"selector": {"canonical_predicate": "preference.activity.type", "perspective": "user_reported"}}],
+          "relations": [{"selector": {"canonical_predicate": "preference.activity.type"}, "allowed": ["complementary", "unrelated"]}]
+        }
+      ],
+      "final": {
+        "expected_active": [
+          {"selector": {"canonical_predicate": "preference.food.cuisine", "subject": "partner", "status": "confirmed"}},
+          {"selector": {"canonical_predicate": "preference.activity.type", "subject": "partner", "status": "confirmed"}}
+        ],
+        "active_counts": [{"selector": {"kind": "preference", "subject": "partner"}, "min": 2}]
+      }
+    },
+    "MEM-009": {
+      "turns": [
+        {"gate": {"should_extract": true}, "claims": [{"selector": {"canonical_predicate": "preference.food.spiciness", "perspective": "user_reported"}}]},
+        {"gate": {"should_extract": true}, "claims": [{"selector": {"perspective": "user_belief"}}]}
+      ],
+      "final": {
+        "protected_confirmed": [{"selector": {"canonical_predicate": "preference.food.spiciness", "perspective": "user_reported"}}],
+        "forbidden_active": [{"selector": {"canonical_predicate": "preference.food.spiciness", "perspective": "user_belief"}}],
+        "active_counts": [{"selector": {"canonical_predicate": "preference.food.spiciness"}, "min": 1, "max": 1}]
+      }
+    },
+    "MEM-010": {
+      "turns": [
+        {"gate": {"should_extract": true}, "claims": [{"selector": {"perspective": "user_belief"}}]}
+      ],
+      "final": {
+        "expected_active": [{"selector": {"perspective": "user_belief"}}],
+        "forbidden_active": [{"selector": {"perspective": "user_reported"}}],
+        "active_counts": [{"selector": {}, "min": 1, "max": 1}]
+      }
+    },
+    "MEM-011": {
+      "turns": [
+        {"gate": {"should_extract": true}, "claims": [{"selector": {"canonical_predicate": "interaction.initiation_balance", "state_value": "partner_to_user", "perspective": "user_reported"}}]},
+        {
+          "gate": {"should_extract": true},
+          "claims": [{"selector": {"memory_kind": "interaction_event", "perspective": "user_reported"}}],
+          "relations": [{"selector": {"memory_kind": "interaction_event"}, "allowed": ["complementary", "unrelated", "uncertain"]}]
+        }
+      ],
+      "final": {
+        "expected_active": [
+          {"selector": {"canonical_predicate": "interaction.initiation_balance", "state_value": "partner_to_user", "status": "confirmed"}},
+          {"selector": {"kind": "interaction_event", "perspective": "user_reported", "status": "confirmed"}}
+        ],
+        "protected_confirmed": [{"selector": {"canonical_predicate": "interaction.initiation_balance", "state_value": "partner_to_user"}}],
+        "context": {"expected_current": [{"selector": {"canonical_predicate": "interaction.initiation_balance", "state_value": "partner_to_user"}}]}
+      }
+    },
+    "MEM-012": {
+      "turns": [
+        {"gate": {"should_extract": true}, "claims": [{"selector": {"canonical_predicate": "interaction.initiation_balance", "state_dimension": "interaction.initiation_balance", "state_value": "partner_to_user", "perspective": "user_reported"}}]},
+        {
+          "gate": {"should_extract": true},
+          "claims": [{"selector": {"canonical_predicate": "interaction.initiation_balance", "state_dimension": "interaction.initiation_balance", "state_value": "user_to_partner", "perspective": "user_reported"}}],
+          "relations": [{"selector": {"canonical_predicate": "interaction.initiation_balance", "state_value": "user_to_partner"}, "allowed": ["update"]}]
+        }
+      ],
+      "final": {
+        "expected_active": [{"selector": {"canonical_predicate": "interaction.initiation_balance", "state_value": "user_to_partner", "status": "confirmed"}}],
+        "superseded": [{"selector": {"canonical_predicate": "interaction.initiation_balance", "state_value": "partner_to_user"}}],
+        "forbidden_active": [{"selector": {"canonical_predicate": "interaction.initiation_balance", "state_value": "partner_to_user"}}],
+        "duplicate_active_max": [{"selector": {"state_dimension": "interaction.initiation_balance"}, "max": 1}],
+        "context": {"expected_current": [{"selector": {"canonical_predicate": "interaction.initiation_balance", "state_value": "user_to_partner"}}]}
+      }
+    },
+    "MEM-013": {
+      "turns": [
+        {"gate": {"should_extract": true}, "claims": [{"selector": {"memory_kind": "interaction_pattern", "canonical_predicate": null, "perspective": "user_reported"}}]},
+        {
+          "gate": {"should_extract": true},
+          "claims": [{"selector": {"memory_kind": "interaction_event", "canonical_predicate": null, "perspective": "user_reported"}}],
+          "relations": [{"selector": {"memory_kind": "interaction_event", "canonical_predicate": null}, "allowed": ["complementary", "unrelated", "uncertain"]}]
+        }
+      ],
+      "final": {
+        "expected_active": [
+          {"selector": {"kind": "interaction_pattern", "canonical_predicate": null, "status": "confirmed"}},
+          {"selector": {"kind": "interaction_event", "canonical_predicate": null, "status": "confirmed"}}
+        ],
+        "protected_confirmed": [{"selector": {"kind": "interaction_pattern", "canonical_predicate": null}}]
+      }
+    },
+    "MEM-014": {
+      "turns": [
+        {"gate": {"should_extract": true}, "claims": [{"selector": {"memory_kind": "interaction_pattern", "canonical_predicate": null, "perspective": "user_reported"}}]},
+        {"gate": {"should_extract": true}, "claims": [{"selector": {"memory_kind": "interaction_pattern", "canonical_predicate": null, "perspective": "user_reported"}}]}
+      ],
+      "final": {
+        "forbidden_active": [{"selector": {"canonical_predicate": "relationship.familiarity"}}],
+        "active_counts": [
+          {"selector": {"kind": "interaction_pattern", "canonical_predicate": null, "perspective": "user_reported"}, "min": 2},
+          {"selector": {"kind": "interaction_pattern", "canonical_predicate": null, "perspective": "user_reported"}, "min": 4, "severity": "warning"}
+        ]
+      }
+    },
+    "MEM-015": {
+      "turns": [
+        {"gate": {"should_extract": true}, "claims": [{"selector": {"canonical_predicate": null, "custom_predicate": "social_circle_integration", "perspective": "user_reported"}}]},
+        {
+          "gate": {"should_extract": true},
+          "claims": [{"selector": {"canonical_predicate": null, "custom_predicate": "family_integration", "perspective": "user_reported"}}],
+          "relations": [{"selector": {"custom_predicate": "family_integration"}, "allowed": ["complementary", "unrelated", "uncertain"]}]
+        }
+      ],
+      "final": {
+        "expected_active": [
+          {"selector": {"canonical_predicate": null, "custom_predicate": "social_circle_integration", "status": "confirmed"}},
+          {"selector": {"canonical_predicate": null, "custom_predicate": "family_integration", "status": "confirmed"}}
+        ],
+        "forbidden_active": [{"selector": {"canonical_predicate": "relationship.familiarity"}}],
+        "active_counts": [{"selector": {"canonical_predicate": null}, "min": 2}],
+        "context": {
+          "expected_current": [
+            {"selector": {"custom_predicate": "social_circle_integration"}},
+            {"selector": {"custom_predicate": "family_integration"}}
+          ],
+          "forbidden_current": [{"selector": {"canonical_predicate": "relationship.familiarity"}}]
+        }
+      }
+    },
+    "MEM-016": {
+      "turns": [
+        {"gate": {"should_extract": false, "reason": "consultation_only"}}
+      ],
+      "final": {
+        "active_counts": [{"selector": {}, "min": 0, "max": 0}],
+        "context": {"forbidden_current": [{"selector": {}}]}
+      }
+    },
+    "MEM-017": {
+      "turns": [
+        {"gate": {"should_extract": false, "reason": "hypothetical"}}
+      ],
+      "final": {
+        "active_counts": [{"selector": {}, "min": 0, "max": 0}],
+        "context": {"forbidden_current": [{"selector": {}}]}
+      }
+    },
+    "MEM-018": {
+      "turns": [
+        {"gate": {"should_extract": true}, "claims": [{"selector": {"canonical_predicate": "relationship.conflict_status", "state_value": "active", "perspective": "user_reported"}}]},
+        {
+          "gate": {"should_extract": true},
+          "claims": [{"selector": {"canonical_predicate": "relationship.conflict_status", "state_value": "resolved", "perspective": "user_reported"}}],
+          "relations": [{"selector": {"canonical_predicate": "relationship.conflict_status", "state_value": "resolved"}, "allowed": ["update"]}]
+        }
+      ],
+      "final": {
+        "expected_active": [{"selector": {"canonical_predicate": "relationship.conflict_status", "state_value": "resolved", "status": "confirmed"}}],
+        "superseded": [{"selector": {"canonical_predicate": "relationship.conflict_status", "state_value": "active"}}],
+        "forbidden_active": [{"selector": {"canonical_predicate": "relationship.conflict_status", "state_value": "active"}}],
+        "duplicate_active_max": [{"selector": {"state_dimension": "relationship.conflict_status"}, "max": 1}],
+        "context": {
+          "expected_current": [{"selector": {"canonical_predicate": "relationship.conflict_status", "state_value": "resolved"}}],
+          "forbidden_current": [{"selector": {"canonical_predicate": "relationship.conflict_status", "state_value": "active"}}],
+          "fields": [{"path": "relationship_evidence.conflict_status", "expected": "resolved"}]
+        }
+      }
+    }
+  }
+}

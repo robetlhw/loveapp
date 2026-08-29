@@ -267,7 +267,7 @@ async def test_contact_status_reduction_closes_when_metric_is_restored() -> None
 @pytest.mark.parametrize(
     ("stale_kind", "expected_rule"),
     [
-        ("no_contact", "restore_contact_frequency"),
+        ("no_contact", "restore_contact"),
         ("unresponsive", "restore_contact"),
     ],
 )
