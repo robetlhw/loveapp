@@ -29,6 +29,7 @@ from loveapp.domain.memory import (
     MemoryStatus,
     MessageRole,
     PredicateType,
+    TemporalPrecision,
     TimeKind,
     memory_dedupe_key,
     normalize_candidate_predicate,
@@ -982,11 +983,28 @@ async def test_service_trace_exposes_complete_candidate_governance() -> None:
         item for item in trace.snapshot() if item.name == "memory_candidate_governance"
     )
     details = record.details
+    assert details["subject"] == "relationship"
+    assert details["confidence"] == pytest.approx(1.0)
+    assert details["perspective"] == "user_reported"
+    assert details["importance"] == 3
+    assert json.loads(str(details["evidence_spans_json"])) == [source_text]
     assert details["raw_predicate"] == "started_talking_again"
     assert details["canonical_predicate"] == "contact.status"
     assert details["alias_hit"] is True
     assert details["state_dimension"] == "relationship.contact_status"
     assert details["state_value"] == "restored"
+    assert details["extractor_model"] is None
+    assert details["verifier_model"] is None
+    assert details["prompt_version"] is None
+    assert details["lifecycle_review_required"] is False
+    assert details["time_kind"] == TimeKind.TIMELESS.value
+    assert details["occurred_at"] is None
+    assert details["period_start"] is None
+    assert details["period_end"] is None
+    assert details["temporal_precision"] == TemporalPrecision.UNKNOWN.value
+    payload = json.loads(str(details["payload_json"]))
+    assert payload["state_value"] == "restored"
+    assert payload["predicate"] == "started_talking_again"
     assert details["admission_decision"] == AdmissionDecision.CONFIRM.value
     assert details["admission_score"] == pytest.approx(0.95)
     breakdown = json.loads(str(details["score_breakdown_json"]))

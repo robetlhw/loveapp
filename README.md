@@ -190,7 +190,22 @@ uv run python scripts/benchmark_memory_extraction.py
 
 脚本不会输出 API Key，也不会写入 `.data/loveapp.db`；输出包含 Flash 直成功率、本地修复次数、强模型升级次数和每轮耗时。固定的多轮记忆评测集仍保存在 `evals/memory/conversations_v1.jsonl`，不与单元测试复用语料。
 
-逐轮观察 Memory V2 的完整治理过程时，使用观察脚本：
+需要逐轮检查真实 Memory pipeline、持久化 diff 和 Context 投影时，使用集成的
+Memory Inspector。默认身份固定为 `memory-debug-user` / `memory-debug-relationship` /
+`memory-debug-conversation`，可用 `/reset` 只清理该 relationship scope：
+
+```powershell
+uv run loveapp memory-test
+uv run loveapp memory-test --json --text "她喜欢安静的咖啡馆"
+uv run loveapp memory-test --isolated
+```
+
+交互模式支持 `/show`、`/show --all`、`/show <memory_id>`、`/context`、`/history`、
+`/runs`、`/reset`、`/json on|off`、`/help` 和 `/exit`。默认使用配置中的 Memory
+backend 和 extractor；`--isolated` 仅把 Store 切为进程内隔离实例，仍调用相同的
+`MemoryService`、Gate、Extractor、Admission、Relation 和 Lifecycle 链路。
+
+旧的专项观察脚本仍可用于 force-gate/dry-run 实验：
 
 ```powershell
 # 交互式多轮测试；默认使用隔离的内存 Store

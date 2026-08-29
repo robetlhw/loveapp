@@ -171,6 +171,14 @@ class OpenAICompatibleMemoryExtractor:
                     f"{claim.claim_id}:{claim.confidence:.2f}"
                     for claim in parsed.extraction.claims
                 )
+                details["claims_json"] = json.dumps(
+                    [
+                        claim.model_dump(mode="json")
+                        for claim in parsed.extraction.claims
+                    ],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
                 details["claim_predicates_json"] = json.dumps(
                     [
                         {

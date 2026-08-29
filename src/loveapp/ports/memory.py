@@ -99,6 +99,13 @@ class MemoryStore(Protocol):
 
     async def clear_memories(self, user_id: str, relationship_id: str | None = None) -> int: ...
 
+    async def reset_relationship_scope(
+        self,
+        *,
+        user_id: str,
+        relationship_id: str,
+    ) -> None: ...
+
     async def get_relationship_context(
         self,
         user_id: str,

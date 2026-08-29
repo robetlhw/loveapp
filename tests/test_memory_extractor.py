@@ -485,6 +485,17 @@ async def test_flash_trace_keeps_raw_predicate_before_canonicalization() -> None
             "raw_predicate": "contact_frequency_declined",
         }
     ]
+    claims = json.loads(str(flash_record.details["claims_json"]))
+    assert len(claims) == 1
+    assert claims[0]["claim_id"] == "contact-trend"
+    assert claims[0]["kind"] == "interaction_pattern"
+    assert claims[0]["subject"] == "relationship"
+    assert claims[0]["raw_predicate"] == "contact_frequency_declined"
+    assert claims[0]["confidence"] == pytest.approx(0.9)
+    assert claims[0]["evidence_spans"] == [source_text]
+    assert claims[0]["payload"] == {"metric": "contact_frequency"}
+    assert claims[0]["extractor_model"] == "flash-model"
+    assert claims[0]["prompt_version"] == "memory-v2.1"
     await extractor.aclose()
 
 

@@ -2,7 +2,7 @@ import asyncio
 import json
 from datetime import date as Date
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 import typer
@@ -24,6 +24,12 @@ from loveapp.bootstrap import (
     build_memory_container,
     build_qdrant_store,
     load_seed_documents,
+)
+from loveapp.cli_memory_inspector import (
+    DEFAULT_MEMORY_TEST_CONVERSATION_ID,
+    DEFAULT_MEMORY_TEST_RELATIONSHIP_ID,
+    DEFAULT_MEMORY_TEST_USER_ID,
+    run_memory_inspector_cli,
 )
 from loveapp.core.config import get_settings
 from loveapp.core.timing import ExecutionTrace
@@ -347,6 +353,58 @@ def remember_memory(
         console.print_json(result.model_dump_json())
         return
     _render_remember_result(result)
+
+
+@app.command("memory-test")
+def memory_test(
+    user_id: Annotated[str, typer.Option("--user-id")] = DEFAULT_MEMORY_TEST_USER_ID,
+    relationship_id: Annotated[
+        str,
+        typer.Option("--relationship-id"),
+    ] = DEFAULT_MEMORY_TEST_RELATIONSHIP_ID,
+    conversation_id: Annotated[
+        str,
+        typer.Option("--conversation-id"),
+    ] = DEFAULT_MEMORY_TEST_CONVERSATION_ID,
+    text: Annotated[
+        list[str] | None,
+        typer.Option("--text", help="Run a turn non-interactively; repeat for multiple turns."),
+    ] = None,
+    status: Annotated[
+        Literal["proposed", "confirmed"],
+        typer.Option("--status", case_sensitive=False, help="Requested input status."),
+    ] = "confirmed",
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit stable structured JSON."),
+    ] = False,
+    isolated: Annotated[
+        bool,
+        typer.Option(
+            "--isolated",
+            help="Use a process-local store while retaining the configured extractor.",
+        ),
+    ] = False,
+    limit: Annotated[int, typer.Option("--limit", min=1, max=1000)] = 200,
+) -> None:
+    """Inspect the real Memory pipeline in an isolated test identity."""
+
+    try:
+        asyncio.run(
+            run_memory_inspector_cli(
+                user_id=user_id,
+                relationship_id=relationship_id,
+                conversation_id=conversation_id,
+                requested_status=MemoryStatus(status),
+                texts=text or (),
+                json_output=json_output,
+                isolated=isolated,
+                limit=limit,
+            )
+        )
+    except Exception as exc:
+        console.print(f"[red]Memory Inspector failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
 
 
 @memory_app.command("list")

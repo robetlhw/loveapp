@@ -1642,7 +1642,16 @@ def _record_candidate_observation(
             {
                 "candidate_index": candidate_index,
                 "memory_kind": candidate.kind.value,
+                "subject": candidate.subject,
                 "summary": candidate.summary,
+                "confidence": candidate.confidence,
+                "perspective": candidate.perspective.value,
+                "importance": candidate.importance,
+                "evidence_spans_json": json.dumps(
+                    candidate.evidence_spans,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
                 "raw_predicate": candidate.raw_predicate,
                 "predicate_type": candidate.predicate_type.value,
                 "canonical_predicate": candidate.canonical_predicate,
@@ -1651,6 +1660,33 @@ def _record_candidate_observation(
                 "predicate_family": family if isinstance(family, str) else None,
                 "state_dimension": candidate.state_dimension,
                 "state_value": candidate.state_value,
+                "extractor_model": candidate.extractor_model,
+                "verifier_model": candidate.verifier_model,
+                "prompt_version": candidate.prompt_version,
+                "lifecycle_review_required": candidate.lifecycle_review_required,
+                "time_kind": candidate.time_kind.value,
+                "occurred_at": (
+                    candidate.occurred_at.isoformat()
+                    if candidate.occurred_at is not None
+                    else None
+                ),
+                "period_start": (
+                    candidate.period_start.isoformat()
+                    if candidate.period_start is not None
+                    else None
+                ),
+                "period_end": (
+                    candidate.period_end.isoformat()
+                    if candidate.period_end is not None
+                    else None
+                ),
+                "temporal_precision": candidate.temporal_precision.value,
+                "payload_json": json.dumps(
+                    candidate.payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                ),
                 "admission_decision": (
                     candidate.admission_decision.value
                     if candidate.admission_decision is not None

@@ -591,6 +591,29 @@ class InMemoryMemoryStore:
             del self._extraction_runs[run_id]
         return len(ids)
 
+    async def reset_relationship_scope(
+        self,
+        *,
+        user_id: str,
+        relationship_id: str,
+    ) -> None:
+        scope = (user_id, relationship_id)
+        self._contexts.pop(scope, None)
+        for collection in (
+            self._memories,
+            self._messages,
+            self._extraction_runs,
+            self._transition_audits,
+            self._relationship_plans,
+        ):
+            scoped_ids = [
+                item_id
+                for item_id, item in collection.items()
+                if (item.user_id, item.relationship_id) == scope
+            ]
+            for item_id in scoped_ids:
+                del collection[item_id]
+
     async def get_relationship_context(
         self,
         user_id: str,

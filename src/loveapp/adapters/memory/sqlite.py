@@ -778,6 +778,31 @@ class SQLiteMemoryStore:
         finally:
             await connection.close()
 
+    async def reset_relationship_scope(
+        self,
+        *,
+        user_id: str,
+        relationship_id: str,
+    ) -> None:
+        await self.initialize()
+        connection = await self._open_connection()
+        try:
+            await connection.execute(
+                "DELETE FROM memory_transition_audit "
+                "WHERE user_id = ? AND relationship_id = ?",
+                (user_id, relationship_id),
+            )
+            await connection.execute(
+                "DELETE FROM relationships WHERE user_id = ? AND id = ?",
+                (user_id, relationship_id),
+            )
+            await connection.commit()
+        except Exception:
+            await connection.rollback()
+            raise
+        finally:
+            await connection.close()
+
     async def get_relationship_context(
         self,
         user_id: str,
