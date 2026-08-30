@@ -81,6 +81,9 @@ class MemoryInspector:
             status=requested_status or self.requested_status,
             trace=trace,
         )
+        long_tail_shadow_pending_count = (
+            await self.memory_service.wait_for_long_tail_shadow()
+        )
         after_items = await self._snapshot_items()
         audits = await self.memory_store.list_transition_audits(
             user_id=self.user_id,
@@ -95,6 +98,7 @@ class MemoryInspector:
         _attach_candidate_memories(candidates, memory_index)
         contextual_update = _trace_payload(records, "memory_contextual_update")
         explicit_correction = _trace_payload(records, "memory_explicit_correction")
+        long_tail_relations = _long_tail_relation_traces(records)
         operations = _planned_operations(candidates)
         if (
             contextual_update is not None
@@ -138,6 +142,8 @@ class MemoryInspector:
             ),
             "contextual_update": contextual_update,
             "explicit_correction": explicit_correction,
+            "long_tail_relations": long_tail_relations,
+            "long_tail_shadow_pending_count": long_tail_shadow_pending_count,
             "model_outputs": _model_outputs(records),
             "before": before,
             "candidates": candidates,
@@ -366,6 +372,52 @@ def _trace_payload(records: list[Any], trace_name: str) -> dict[str, Any] | None
     details["trace_status"] = record.status.value
     details["trace_duration_ms"] = round(record.duration_ms, 4)
     return details
+
+
+def _long_tail_relation_traces(records: list[Any]) -> list[dict[str, Any]]:
+    trace_fields = {
+        "memory_long_tail_candidate_retrieval": (
+            "retrieval",
+            {
+                "retrieved_candidates_json": ("retrieved_candidates", []),
+            },
+        ),
+        "memory_semantic_relation_proposal": (
+            "proposal",
+            {
+                "target_memory_ids_json": ("target_memory_ids", []),
+            },
+        ),
+        "memory_long_tail_validator": (
+            "validator",
+            {
+                "validator_reasons_json": ("validator_reasons", []),
+                "checks_json": ("checks", {}),
+                "would_supersede_memory_ids_json": (
+                    "would_supersede_memory_ids",
+                    [],
+                ),
+            },
+        ),
+        "memory_long_tail_shadow_failure": ("failure", {}),
+    }
+    grouped: dict[int, dict[str, Any]] = {}
+    for record in records:
+        trace_shape = trace_fields.get(record.name)
+        if trace_shape is None:
+            continue
+        section, json_fields = trace_shape
+        details = dict(record.details)
+        raw_index = details.get("candidate_index")
+        candidate_index = int(raw_index) if isinstance(raw_index, int | str) else -1
+        for source, (target, fallback) in json_fields.items():
+            details[target] = _load_json(details.pop(source, None), fallback)
+        details["trace_status"] = record.status.value
+        details["trace_duration_ms"] = round(record.duration_ms, 4)
+        grouped.setdefault(candidate_index, {"candidate_index": candidate_index})[
+            section
+        ] = details
+    return [grouped[index] for index in sorted(grouped)]
 
 
 def _attach_candidate_memories(

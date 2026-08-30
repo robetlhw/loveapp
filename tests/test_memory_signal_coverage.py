@@ -246,6 +246,40 @@ def test_signal_coverage_does_not_admit_unrelated_or_casual_text(text: str) -> N
     assert decision.should_extract is False
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "这两周她已经很少邀请我出去。",
+        "最近她明显不再愿意聊自己的情绪。",
+        "最近一个月我们基本不再讨论未来计划。",
+        "最近她明显变得不愿意和我聊天。",
+    ],
+)
+def test_memory_gate_accepts_open_world_durable_behavioral_reversal(text: str) -> None:
+    decision = MemoryGate().evaluate(text)
+
+    assert decision.should_extract is True
+    assert decision.reason.value == "durable_signal"
+    assert "durable_behavioral_reversal" in decision.signals
+    assert decision.matched_rule is not None
+    assert decision.matched_span
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "昨天她没主动联系我一次。",
+        "我担心她以后会越来越少跟我聊天。",
+        "如果以后她不再回复我，我该怎么办？",
+    ],
+)
+def test_memory_gate_rejects_one_off_or_future_behavioral_reversal(text: str) -> None:
+    decision = MemoryGate().evaluate(text)
+
+    assert decision.should_extract is False
+    assert decision.reason.value in {"no_durable_signal", "hypothetical"}
+
+
 class _RecordingExtractor:
     def __init__(self) -> None:
         self.called = False

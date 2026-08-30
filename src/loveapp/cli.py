@@ -1,6 +1,7 @@
 import asyncio
 import json
 from datetime import date as Date
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from uuid import uuid4
@@ -14,13 +15,16 @@ from rich.table import Table
 from rich.text import Text
 
 from loveapp.adapters.knowledge.loader import load_knowledge_path, merge_knowledge_documents
+from loveapp.adapters.memory import OpenAICompatibleSemanticRelationJudge
 from loveapp.application.advice_presentation import (
     AdvicePresentationMode,
     choose_advice_presentation,
     format_compact_advice,
 )
+from loveapp.application.memory_retrieval import HybridMemoryRetriever
 from loveapp.bootstrap import (
     build_container,
+    build_embedding_provider,
     build_memory_container,
     build_qdrant_store,
     load_seed_documents,
@@ -59,10 +63,13 @@ from loveapp.domain.observability import TimingEvent
 from loveapp.domain.relationship_plan import PlanStatus, RelationshipPlan
 from loveapp.domain.routing import RouteResult
 from loveapp.evaluation import (
+    FixtureSemanticRelationJudge,
     evaluate_live_routing_conversations,
     evaluate_memory_foundation,
     evaluate_memory_lifecycle,
+    evaluate_memory_longtail_relations,
     evaluate_routing_conversations,
+    render_longtail_baseline_report,
     run_baseline,
 )
 
@@ -285,6 +292,169 @@ def memory_foundation_eval(
     for key, value in report["metrics"].items():
         table.add_row(key, str(value))
     console.print(table)
+
+
+@eval_app.command("memory-longtail-relations")
+def memory_longtail_relations_eval(
+    dataset: Annotated[
+        Path,
+        typer.Option("--dataset", help="Long-tail Memory relation 评测集路径。"),
+    ] = Path("evals/memory/longtail_relations_v1.jsonl"),
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", help="JSON 报告路径；默认保存到 .data/evals。"),
+    ] = None,
+    case: Annotated[
+        str | None,
+        typer.Option("--case", help="只运行指定 Case，例如 LT-001。"),
+    ] = None,
+    live: Annotated[
+        bool,
+        typer.Option(
+            "--live/--fixture",
+            help="调用真实 semantic judge，或回放 fixture proposal。",
+        ),
+    ] = False,
+    candidate_limit: Annotated[
+        int,
+        typer.Option("--candidate-limit", min=1, max=10, help="候选 Memory 上限。"),
+    ] = 5,
+) -> None:
+    """在 shadow mode 评测长尾语义 relation；永不写入 Memory Store。"""
+
+    mode = "live" if live else "fixture"
+    output_path = output or _default_memory_longtail_output_path(mode=mode)
+    try:
+        if live:
+            report = asyncio.run(
+                _run_live_memory_longtail_relation_eval(
+                    dataset,
+                    settings=get_settings(),
+                    case_id=case,
+                    candidate_limit=candidate_limit,
+                )
+            )
+        else:
+            judge = FixtureSemanticRelationJudge.from_path(dataset)
+            report = asyncio.run(
+                _run_memory_longtail_relation_eval(
+                    dataset,
+                    judge=judge,
+                    case_id=case,
+                    candidate_limit=candidate_limit,
+                )
+            )
+        report["semantic_judge_mode"] = mode
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        if case is None:
+            Path("MEMORY_LONGTAIL_BASELINE_REPORT.md").write_text(
+                render_longtail_baseline_report(report),
+                encoding="utf-8",
+            )
+    except Exception as exc:
+        console.print(f"[red]Long-tail Memory relation 评测失败：[/red]{exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[green]Long-tail Memory relation 评测已保存：[/green]{output_path}")
+    table = Table(title=f"Long-tail Memory Relation ({mode})")
+    table.add_column("指标")
+    table.add_column("值", justify="right")
+    table.add_row("case_count", str(report["case_count"]))
+    table.add_row("passed_case_count", str(report["passed_case_count"]))
+    table.add_row("store_mutation_permitted", str(report["store_mutation_permitted"]))
+    for key, value in report["metrics"].items():
+        if not isinstance(value, (dict, list)):
+            table.add_row(key, str(value))
+    console.print(table)
+
+
+def _default_memory_longtail_output_path(
+    *,
+    mode: str,
+    now: datetime | None = None,
+) -> Path:
+    timestamp = (now or datetime.now().astimezone()).strftime("%Y%m%d_%H%M%S_%f")
+    return Path(".data/evals") / f"memory_longtail_relations_{mode}_{timestamp}.json"
+
+
+def _build_live_memory_relation_judge(
+    settings: Any,
+) -> OpenAICompatibleSemanticRelationJudge:
+    if settings.memory_semantic_relation_provider != "llm":
+        raise ValueError(
+            "--live 需要 LOVEAPP_MEMORY_SEMANTIC_RELATION_PROVIDER=llm。"
+        )
+    if not settings.llm_api_key:
+        raise ValueError("LOVEAPP_LLM_API_KEY 未配置。")
+    if not settings.llm_base_url:
+        raise ValueError("LOVEAPP_LLM_BASE_URL 未配置。")
+    model = (
+        settings.memory_semantic_relation_model
+        or settings.memory_extraction_strong_model
+        or settings.memory_extraction_model
+        or settings.llm_model
+    )
+    if not model:
+        raise ValueError(
+            "LOVEAPP_MEMORY_SEMANTIC_RELATION_MODEL 或 LOVEAPP_LLM_MODEL 未配置。"
+        )
+    return OpenAICompatibleSemanticRelationJudge(
+        api_key=settings.llm_api_key,
+        base_url=settings.llm_base_url,
+        model=model,
+        timeout_seconds=settings.memory_semantic_relation_timeout_seconds,
+        max_retries=settings.memory_semantic_relation_max_retries,
+        max_tokens=settings.memory_semantic_relation_max_tokens,
+        thinking=settings.memory_semantic_relation_thinking,
+    )
+
+
+async def _run_memory_longtail_relation_eval(
+    dataset: Path,
+    *,
+    judge: Any,
+    retriever: HybridMemoryRetriever | None = None,
+    case_id: str | None,
+    candidate_limit: int,
+) -> dict[str, Any]:
+    try:
+        return await evaluate_memory_longtail_relations(
+            dataset,
+            judge=judge,
+            retriever=retriever,
+            case_id=case_id,
+            candidate_limit=candidate_limit,
+        )
+    finally:
+        close = getattr(judge, "aclose", None)
+        if close is not None:
+            await close()
+
+
+async def _run_live_memory_longtail_relation_eval(
+    dataset: Path,
+    *,
+    settings: Any,
+    case_id: str | None,
+    candidate_limit: int,
+) -> dict[str, Any]:
+    embedding_provider = build_embedding_provider(settings)
+    try:
+        judge = _build_live_memory_relation_judge(settings)
+        retriever = HybridMemoryRetriever(embedding_provider=embedding_provider)
+        return await _run_memory_longtail_relation_eval(
+            dataset,
+            judge=judge,
+            retriever=retriever,
+            case_id=case_id,
+            candidate_limit=candidate_limit,
+        )
+    finally:
+        await embedding_provider.aclose()
 
 
 @knowledge_app.command("validate")

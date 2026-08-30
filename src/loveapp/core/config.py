@@ -76,6 +76,18 @@ class Settings(BaseSettings):
     memory_extraction_strong_max_tokens: int = Field(default=4096, ge=512, le=16384)
     memory_extraction_strong_thinking: Literal["enabled", "disabled"] = "enabled"
     memory_extraction_upgrade_min_importance: int = Field(default=4, ge=1, le=5)
+    memory_semantic_relation_provider: Literal["disabled", "llm"] = "disabled"
+    memory_semantic_relation_model: str = ""
+    memory_semantic_relation_timeout_seconds: float = Field(default=30, ge=1, le=120)
+    memory_semantic_relation_max_retries: int = Field(default=0, ge=0, le=3)
+    memory_semantic_relation_max_tokens: int = Field(default=1000, ge=256, le=4096)
+    memory_semantic_relation_thinking: Literal["enabled", "disabled"] = "disabled"
+    memory_semantic_relation_candidate_limit: int = Field(default=5, ge=1, le=10)
+    memory_semantic_relation_confidence_threshold: float = Field(
+        default=0.9,
+        ge=0,
+        le=1,
+    )
     memory_min_confidence: float = Field(default=0.65, ge=0, le=1)
     memory_tentative_min_confidence: float = Field(default=0.5, ge=0, le=1)
     memory_belief_min_confidence: float = Field(default=0.4, ge=0, le=1)

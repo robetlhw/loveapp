@@ -99,6 +99,7 @@ from .memory_retrieval import (
     RetrievedMemory,
     resolve_memory_retrieval_mode,
 )
+from .memory_semantic_relations import LongTailRelationShadowEvaluator
 from .relationship_events import (
     build_contextual_relationship_candidate,
     build_pending_confession_candidate,
@@ -138,6 +139,7 @@ class MemoryService:
         verifier: StrongClaimVerifier | None = None,
         embedding_provider: EmbeddingProvider | None = None,
         context_token_budget: int = 4096,
+        long_tail_relation_evaluator: LongTailRelationShadowEvaluator | None = None,
     ) -> None:
         self.store = store
         self._extractor = extractor
@@ -157,11 +159,13 @@ class MemoryService:
             token_budget=context_token_budget,
         )
         self._memory_context_builder = MemoryContextBuilder()
+        self._long_tail_relation_evaluator = long_tail_relation_evaluator
         set_store_clock = getattr(store, "set_clock", None)
         if callable(set_store_clock):
             set_store_clock(clock)
         self._background_tasks: set[asyncio.Task] = set()
         self._background_task_scopes: dict[asyncio.Task, tuple[str, str]] = {}
+        self._long_tail_shadow_tasks: set[asyncio.Task] = set()
 
     async def remember_text(
         self,
@@ -571,6 +575,28 @@ class MemoryService:
                 if decision == AdmissionDecision.CONFIRM
                 else MemoryStatus.PROPOSED
             )
+            long_tail_shadow_candidate = (
+                self._long_tail_relation_evaluator is not None
+                and candidate.predicate_type == PredicateType.CUSTOM
+            )
+            if long_tail_shadow_candidate:
+                shadow_candidate = candidate.model_copy(
+                    update={
+                        "admission_score": assessment.score,
+                        "admission_decision": decision,
+                    }
+                )
+                self._start_long_tail_shadow_evaluation(
+                    incoming=shadow_candidate,
+                    existing_memories=active,
+                    user_id=message.user_id,
+                    relationship_id=message.relationship_id,
+                    incoming_status=incoming_status,
+                    incoming_source_message_id=message.id,
+                    reference_time=now,
+                    trace=trace,
+                    candidate_index=candidate_index,
+                )
             verification = None
             verification_error: str | None = None
             strong_called = False
@@ -1058,6 +1084,66 @@ class MemoryService:
             scope=(message.user_id, message.relationship_id),
         )
         return task
+
+    def _start_long_tail_shadow_evaluation(
+        self,
+        *,
+        incoming: MemoryCandidate,
+        existing_memories: list[MemoryItem],
+        user_id: str,
+        relationship_id: str,
+        incoming_status: MemoryStatus,
+        incoming_source_message_id: str,
+        reference_time: datetime,
+        trace: TraceRecorder | None,
+        candidate_index: int,
+    ) -> None:
+        evaluator = self._long_tail_relation_evaluator
+        if evaluator is None:
+            return
+
+        async def evaluate() -> None:
+            try:
+                await evaluator.evaluate(
+                    incoming=incoming,
+                    existing_memories=existing_memories,
+                    user_id=user_id,
+                    relationship_id=relationship_id,
+                    incoming_status=incoming_status,
+                    incoming_source_message_id=incoming_source_message_id,
+                    reference_time=reference_time,
+                    trace=trace,
+                    candidate_index=candidate_index,
+                )
+            except Exception as exc:
+                _record_long_tail_shadow_failure(trace, candidate_index, exc)
+
+        task = asyncio.create_task(
+            evaluate(),
+            name=f"loveapp-memory-long-tail-shadow-{candidate_index}",
+        )
+        self._long_tail_shadow_tasks.add(task)
+        task.add_done_callback(self._long_tail_shadow_tasks.discard)
+        # Shadow calls are intentionally not scoped: next-turn context reads
+        # must wait for official Memory writes, never for optional telemetry.
+        self.track_background_task(task)
+
+    async def wait_for_long_tail_shadow(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> int:
+        tasks = [task for task in self._long_tail_shadow_tasks if not task.done()]
+        if not tasks:
+            return 0
+        timeout = (
+            self._shutdown_grace_seconds
+            if timeout_seconds is None
+            else max(timeout_seconds, 0)
+        )
+        if timeout:
+            await asyncio.wait(tasks, timeout=timeout)
+        return sum(not task.done() for task in tasks)
 
     def _confidence_floor(self, candidate: MemoryCandidate) -> float:
         source_type = candidate.payload.get("source_type")
@@ -1889,6 +1975,24 @@ def _record_gate_trace(
                 "selected_target_memory_id": decision.selected_target_memory_id,
                 "target_guard_result": decision.target_guard_result,
                 "contextual_update_type": decision.contextual_update_type,
+            }
+        )
+
+
+def _record_long_tail_shadow_failure(
+    trace: TraceRecorder | None,
+    candidate_index: int,
+    error: Exception,
+) -> None:
+    if trace is None:
+        return
+    with trace.measure("memory_long_tail_shadow_failure") as details:
+        details.update(
+            {
+                "candidate_index": candidate_index,
+                "error_type": type(error).__name__,
+                "error": str(error)[:500],
+                "store_mutation_permitted": False,
             }
         )
 

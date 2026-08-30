@@ -107,6 +107,8 @@ class HybridMemoryRetriever:
         reference_time: datetime | None = None,
         token_budget: int | None = None,
         mode: MemoryRetrievalMode | None = None,
+        preserve_candidates: bool = False,
+        require_relevance: bool = True,
     ) -> list[RetrievedMemory]:
         mode = resolve_memory_retrieval_mode(query, mode)
         now = reference_time or utc_now()
@@ -143,7 +145,7 @@ class HybridMemoryRetriever:
             ):
                 semantic_similarity = _cosine(query_vector, document_vectors[index])
             predicate_match = _predicate_match(item, query_text)
-            if query_text and not _candidate_is_relevant(
+            if query_text and require_relevance and not _candidate_is_relevant(
                 item,
                 query_text,
                 lexical_similarity=lexical_similarity,
@@ -166,7 +168,14 @@ class HybridMemoryRetriever:
             )
 
         scored.sort(key=_retrieval_sort_key)
-        deduplicated = _deduplicate(scored, preserve_history=mode == MemoryRetrievalMode.HISTORY)
+        deduplicated = (
+            sorted(scored, key=_retrieval_sort_key)
+            if preserve_candidates
+            else _deduplicate(
+                scored,
+                preserve_history=mode == MemoryRetrievalMode.HISTORY,
+            )
+        )
         budget = self._token_budget if token_budget is None else max(token_budget, 0)
         selected: list[RetrievedMemory] = []
         used_tokens = 0

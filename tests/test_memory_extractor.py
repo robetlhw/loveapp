@@ -232,6 +232,119 @@ def test_parser_restores_missing_canonical_field_from_exact_registered_predicate
     assert "exact_canonical_predicate_alignment" in parsed.repair_steps
 
 
+@pytest.mark.parametrize(
+    ("text", "preference", "preference_type", "canonical"),
+    [
+        ("她喜欢日料。", "日料", "cuisine", "preference.food.cuisine"),
+        ("她喜欢看展。", "看展", "activity", "preference.activity.type"),
+    ],
+)
+def test_preference_canonical_domain_accepts_matching_values(
+    text: str,
+    preference: str,
+    preference_type: str,
+    canonical: str,
+) -> None:
+    raw_claim = {
+        "claim_id": "preference-domain-match",
+        "kind": "preference",
+        "subject": "partner",
+        "predicate": canonical,
+        "predicate_type": "canonical",
+        "canonical_predicate": canonical,
+        "summary": text.rstrip("。"),
+        "evidence_spans": [text.rstrip("。")],
+        "payload": {
+            "preference": preference,
+            "preference_type": preference_type,
+        },
+    }
+
+    parsed = parse_memory_response(
+        json.dumps({"claims": [raw_claim], "discarded_spans": []}, ensure_ascii=False),
+        source_text=text,
+    )
+
+    claim = parsed.extraction.claims[0]
+    assert claim.predicate_type == PredicateType.CANONICAL
+    assert claim.canonical_predicate == canonical
+
+
+@pytest.mark.parametrize(
+    ("canonical", "preference", "summary"),
+    [
+        (
+            "preference.food.cuisine",
+            "看展",
+            "对方喜欢看展",
+        ),
+        (
+            "preference.activity.type",
+            "日料",
+            "对方喜欢日料",
+        ),
+    ],
+)
+def test_preference_canonical_domain_rejects_mismatched_values(
+    canonical: str,
+    preference: str,
+    summary: str,
+) -> None:
+    text = f"她喜欢{preference}。"
+    raw_claim = {
+        "claim_id": "preference-domain-mismatch",
+        "kind": "preference",
+        "subject": "partner",
+        "predicate": canonical,
+        "predicate_type": "canonical",
+        "canonical_predicate": canonical,
+        "summary": summary,
+        "evidence_spans": [text.rstrip("。")],
+        "payload": {"preference": preference, "preference_type": "like"},
+    }
+
+    parsed = parse_memory_response(
+        json.dumps({"claims": [raw_claim], "discarded_spans": []}, ensure_ascii=False),
+        source_text=text,
+    )
+
+    claim = parsed.extraction.claims[0]
+    assert claim.canonical_predicate != canonical
+    assert (
+        claim.predicate_type == PredicateType.CUSTOM
+        or claim.canonical_predicate in {
+            "preference.food.cuisine",
+            "preference.food.spiciness",
+            "preference.activity.type",
+        }
+    )
+
+
+def test_preference_unknown_value_falls_back_to_custom_without_ontology_expansion() -> None:
+    text = "她喜欢在深夜去陌生街区散步。"
+    raw_claim = {
+        "claim_id": "preference-domain-unknown",
+        "kind": "preference",
+        "subject": "partner",
+        "predicate": "preference.general",
+        "predicate_type": "canonical",
+        "canonical_predicate": "preference.general",
+        "summary": "对方喜欢在深夜去陌生街区散步",
+        "evidence_spans": [text.rstrip("。")],
+        "payload": {"preference": "在深夜去陌生街区散步", "preference_type": "like"},
+    }
+
+    parsed = parse_memory_response(
+        json.dumps({"claims": [raw_claim], "discarded_spans": []}, ensure_ascii=False),
+        source_text=text,
+    )
+
+    claim = parsed.extraction.claims[0]
+    assert claim.canonical_predicate is None
+    assert claim.predicate_type == PredicateType.CUSTOM
+    assert claim.custom_predicate
+
+
 def test_exact_canonical_alignment_rejects_incompatible_kind_and_evidence() -> None:
     text = "她喜欢日料。"
     raw_claim = {

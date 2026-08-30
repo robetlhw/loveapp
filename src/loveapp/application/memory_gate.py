@@ -94,6 +94,31 @@ class MemoryGate:
                 matched_span=task_local_date_constraint,
             )
 
+        future_reversal = _first_match(
+            normalized,
+            _FUTURE_BEHAVIORAL_REVERSAL_PATTERNS,
+            "future_behavioral_reversal",
+        )
+        if future_reversal is not None:
+            return _skip(
+                MemoryGateReason.HYPOTHETICAL,
+                "future or speculative behavioral concern",
+                matched_rule=future_reversal.rule,
+                matched_span=future_reversal.span,
+            )
+        one_off_interaction = _first_match(
+            normalized,
+            _ONE_OFF_INTERACTION_EVENT_PATTERNS,
+            "single_interaction_event",
+        )
+        if one_off_interaction is not None:
+            return _skip(
+                MemoryGateReason.NO_DURABLE_SIGNAL,
+                "single short-lived interaction event",
+                matched_rule=one_off_interaction.rule,
+                matched_span=one_off_interaction.span,
+            )
+
         contextual_update = resolve_contextual_memory_update(
             text,
             conversation_history,
@@ -181,6 +206,13 @@ class MemoryGate:
         interaction_qualifier = _find_interaction_qualifier(normalized)
         if interaction_qualifier is not None and "interaction_qualifier" not in signals:
             signals.append("interaction_qualifier")
+        durable_reversal = _first_match(
+            normalized,
+            _DURABLE_BEHAVIORAL_REVERSAL_PATTERNS,
+            "durable_behavioral_reversal",
+        )
+        if durable_reversal is not None and "durable_behavioral_reversal" not in signals:
+            signals.append("durable_behavioral_reversal")
         if signals:
             if contextual_signal is not None:
                 signals.append(f"contextual_{contextual_signal.category}")
@@ -196,7 +228,11 @@ class MemoryGate:
                 else None
             )
             matched = (
-                contextual_match or interaction_decline or interaction_qualifier or generic_match
+                contextual_match
+                or interaction_decline
+                or interaction_qualifier
+                or generic_match
+                or durable_reversal
             )
             return MemoryGateDecision(
                 should_extract=True,
@@ -243,6 +279,15 @@ class MemoryGate:
                     if contextual_update.update_type is not None
                     else None
                 ),
+            )
+        if durable_reversal is not None:
+            return MemoryGateDecision(
+                should_extract=True,
+                reason=MemoryGateReason.DURABLE_SIGNAL,
+                signals=["durable_behavioral_reversal"],
+                matched_rule=durable_reversal.rule,
+                matched_span=durable_reversal.span,
+                contextual_probe=may_contain_contextual_memory_update(text),
             )
         consultation = _first_match(
             normalized,
@@ -487,6 +532,50 @@ _INTERACTION_DECLINE_RULES = (
         ),
     ),
     ("interaction_decline", re.compile(_INTERACTION_DECLINE_PHRASE)),
+)
+
+# Open-world durable reversal coverage.  The three dimensions are kept
+# separate so a time marker or a negative word alone cannot admit an ordinary
+# message into Memory.
+_REVERSAL_TIME_CUE = (
+    r"(?:最近|近来|这段时间|这几天|这周|这两周|这几个月|"
+    r"过去一段时间|前阵子|长期以来|一直以来|一个月来)"
+)
+_REVERSAL_CHANGE_CUE = (
+    r"(?:不再|不怎么|不太|很少|几乎不|不像以前|"
+    r"明显(?:减少|变少|变慢|变冷淡|变差)|越来越少|越来越慢|"
+    r"变少|变慢|下降|降低|恶化|开始回避|不愿意)"
+)
+_REVERSAL_BEHAVIOR_CUE = (
+    r"(?:联系|聊天|交流|沟通|互动|回复|回应|回消息|见面|碰面|"
+    r"邀请|约我|讨论|谈未来|未来计划|烦心事|情绪|矛盾|冲突|吵架|主动)"
+)
+_DURABLE_BEHAVIORAL_REVERSAL_PATTERNS = (
+    re.compile(
+        rf"{_REVERSAL_TIME_CUE}.{{0,24}}{_REVERSAL_CHANGE_CUE}.{{0,16}}{_REVERSAL_BEHAVIOR_CUE}"
+    ),
+    re.compile(
+        rf"{_REVERSAL_TIME_CUE}.{{0,24}}{_REVERSAL_BEHAVIOR_CUE}.{{0,16}}{_REVERSAL_CHANGE_CUE}"
+    ),
+)
+_FUTURE_BEHAVIORAL_REVERSAL_PATTERNS = (
+    re.compile(
+        r"(?:担心|害怕|怕|不知道|会不会).{0,20}"
+        r"(?:以后|将来|未来).{0,20}"
+        rf"{_REVERSAL_CHANGE_CUE}.{{0,12}}{_REVERSAL_BEHAVIOR_CUE}"
+    ),
+    re.compile(
+        r"(?:以后|将来|未来).{0,12}"
+        rf"{_REVERSAL_CHANGE_CUE}.{{0,12}}{_REVERSAL_BEHAVIOR_CUE}"
+        r".{0,8}(?:怎么办|怎么做|该怎么办)"
+    ),
+)
+_ONE_OFF_INTERACTION_EVENT_PATTERNS = (
+    re.compile(
+        r"(?:昨天|今天|刚刚|刚才).{0,18}"
+        r"(?:没|没有|未).{0,8}(?:主动)?(?:联系|回复|聊天|回应|回消息)"
+        r".{0,6}(?:一次|一回)[。.!！?？]*$"
+    ),
 )
 
 # These are independent observable interaction dimensions.  They deliberately

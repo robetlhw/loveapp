@@ -15,6 +15,7 @@ from loveapp.domain.memory import (
     MessageRole,
     StoredMessage,
 )
+from loveapp.domain.memory_semantic_relation import SemanticRelationProposal
 from loveapp.domain.memory_verification import ClaimVerification
 from loveapp.domain.memory_write import (
     MemoryTransitionAudit,
@@ -197,3 +198,15 @@ class StrongClaimVerifier(Protocol):
         allowed_target_ids: set[str],
         trace: TraceRecorder | None = None,
     ) -> ClaimVerification: ...
+
+
+class SemanticRelationJudge(Protocol):
+    """Propose open-world relations without authorizing lifecycle writes."""
+
+    async def propose_relation(
+        self,
+        *,
+        incoming: MemoryCandidate,
+        candidates: list[MemoryItem],
+        trace: TraceRecorder | None = None,
+    ) -> SemanticRelationProposal: ...

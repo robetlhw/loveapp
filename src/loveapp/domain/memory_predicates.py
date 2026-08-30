@@ -12,6 +12,10 @@ class CanonicalPredicateSpec:
     state_dimension: str | None = None
     allowed_values: frozenset[str] = frozenset()
     high_risk: bool = False
+    # Preference predicates use this bounded registry metadata to prevent a
+    # model from attaching an object from another semantic domain to a valid
+    # canonical name.  It is governance metadata, not a new memory field.
+    semantic_domain: str | None = None
 
 
 @dataclass(frozen=True)
@@ -139,13 +143,25 @@ CANONICAL_PREDICATES: dict[str, CanonicalPredicateSpec] = {
         state_dimension="interaction.emotional_disclosure",
     ),
     "preference.general": CanonicalPredicateSpec(name="preference.general"),
-    "preference.food.cuisine": CanonicalPredicateSpec(name="preference.food.cuisine"),
-    "preference.food.spiciness": CanonicalPredicateSpec(name="preference.food.spiciness"),
+    "preference.food.cuisine": CanonicalPredicateSpec(
+        name="preference.food.cuisine",
+        semantic_domain="food",
+    ),
+    "preference.food.spiciness": CanonicalPredicateSpec(
+        name="preference.food.spiciness",
+        semantic_domain="food",
+    ),
     "preference.environment.noise": CanonicalPredicateSpec(
         name="preference.environment.noise"
     ),
-    "preference.activity.type": CanonicalPredicateSpec(name="preference.activity.type"),
-    "preference.budget.range": CanonicalPredicateSpec(name="preference.budget.range"),
+    "preference.activity.type": CanonicalPredicateSpec(
+        name="preference.activity.type",
+        semantic_domain="activity",
+    ),
+    "preference.budget.range": CanonicalPredicateSpec(
+        name="preference.budget.range",
+        semantic_domain="budget",
+    ),
 }
 
 
@@ -342,6 +358,41 @@ _PREFERENCE_PREDICATES = {
     "price": "preference.budget.range",
 }
 
+# These are deliberately broad semantic markers, rather than a list of
+# individual preference values.  They are only used to reject a canonical
+# domain that is contradicted by the supplied value/evidence.  A value is
+# reclassified only when exactly one registered sibling domain is supported.
+_PREFERENCE_DOMAIN_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+    "food": (
+        re.compile(r"吃|食物|饮食|菜|料理|餐|饭|面|粥|汤|肉|鱼|辣|甜|咸|酸|苦|寿司|日料"),
+    ),
+    "activity": (
+        re.compile(
+            r"看展|展览|电影|博物馆|演出|音乐会|旅行|旅游|爬山|游泳|打球|运动|"
+            r"徒步|骑行|露营|摄影|桌游|聚会|约会"
+        ),
+    ),
+    "environment": (
+        re.compile(r"安静|热闹|噪音|环境|氛围|室内|户外|自然|灯光"),
+    ),
+    "budget": (
+        re.compile(r"预算|价格|花费|消费|便宜|实惠|省钱|贵|经济"),
+    ),
+}
+
+_PREFERENCE_DOMAIN_BY_TYPE = {
+    "cuisine": "food",
+    "food": "food",
+    "dish": "food",
+    "spiciness": "food",
+    "activity": "activity",
+    "date": "activity",
+    "noise": "environment",
+    "environment": "environment",
+    "budget": "budget",
+    "price": "budget",
+}
+
 _STATE_VALUE_ALIASES = {
     "contact.status": {
         "available": "normal",
@@ -403,6 +454,22 @@ def normalize_predicate(
 
     if kind_value == "preference":
         canonical = _preference_predicate(payload, requested_canonical or raw)
+        canonical, custom = _enforce_preference_domain(
+            canonical=canonical,
+            raw_predicate=raw,
+            requested_custom=requested_custom,
+            payload=payload,
+        )
+        if canonical is None:
+            return PredicateNormalization(
+                raw_predicate=raw or requested_canonical or requested_custom or "preference",
+                predicate_type="custom",
+                canonical_predicate=None,
+                custom_predicate=custom,
+                state_dimension=None,
+                state_value=None,
+                alias_hit=bool(requested_canonical),
+            )
         return PredicateNormalization(
             raw_predicate=raw or requested_canonical or canonical,
             predicate_type="canonical",
@@ -534,6 +601,86 @@ def _preference_predicate(payload: dict[str, Any], requested: str | None) -> str
         return requested
     preference_type = _normalize_identifier(str(payload.get("preference_type") or ""))
     return _PREFERENCE_PREDICATES.get(preference_type, "preference.general")
+
+
+def _enforce_preference_domain(
+    *,
+    canonical: str,
+    raw_predicate: str | None,
+    requested_custom: str | None,
+    payload: dict[str, Any],
+) -> tuple[str | None, str]:
+    """Keep registered preference predicates aligned with their value domain.
+
+    The model is allowed to propose a canonical predicate, but a registered
+    name is not evidence that the value belongs to that predicate's domain.
+    This guard intentionally fails closed when the available evidence cannot
+    identify one safe sibling predicate.
+    """
+
+    spec = CANONICAL_PREDICATES.get(canonical)
+    if spec is None:
+        return canonical, requested_custom or raw_predicate or canonical
+
+    explicit_domain = _explicit_preference_domain(payload)
+    observed_domains = _observed_preference_domains(payload)
+    if explicit_domain is not None:
+        observed_domains.add(explicit_domain)
+
+    if spec.semantic_domain is None:
+        # ``preference.general`` remains a compatibility fallback when the
+        # value has no reliable domain.  A uniquely recognizable domain can,
+        # however, use the corresponding registered sibling predicate.
+        sibling_candidates = {
+            name
+            for name, sibling in CANONICAL_PREDICATES.items()
+            if sibling.semantic_domain in observed_domains
+        }
+        if len(sibling_candidates) == 1:
+            return next(iter(sibling_candidates)), requested_custom or raw_predicate or canonical
+        # ``general`` is only a temporary model hint.  Without a unique
+        # registered domain, preserve the claim as Custom instead of allowing
+        # an untyped canonical preference into governance.
+        return None, requested_custom or raw_predicate or canonical
+
+    if not observed_domains:
+        # A canonical claim without a value cannot be proven inconsistent.
+        return canonical, requested_custom or raw_predicate or canonical
+    if observed_domains == {spec.semantic_domain}:
+        return canonical, requested_custom or raw_predicate or canonical
+
+    sibling_candidates = {
+        name
+        for name, sibling in CANONICAL_PREDICATES.items()
+        if sibling.semantic_domain in observed_domains
+    }
+    if len(sibling_candidates) == 1:
+        return next(iter(sibling_candidates)), requested_custom or raw_predicate or canonical
+
+    # Do not retain a known-but-contradicted canonical predicate.  The raw
+    # model predicate remains useful as a custom identifier for audit/debug.
+    return None, requested_custom or raw_predicate or canonical
+
+
+def _explicit_preference_domain(payload: dict[str, Any]) -> str | None:
+    preference_type = _normalize_identifier(str(payload.get("preference_type") or ""))
+    return _PREFERENCE_DOMAIN_BY_TYPE.get(preference_type)
+
+
+def _observed_preference_domains(payload: dict[str, Any]) -> set[str]:
+    values: list[str] = []
+    for key in ("preference", "object", "activity_type", "summary", "evidence", "evidence_spans"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            values.append(value)
+        elif isinstance(value, list):
+            values.extend(item for item in value if isinstance(item, str))
+    text = " ".join(values)
+    return {
+        domain
+        for domain, patterns in _PREFERENCE_DOMAIN_PATTERNS.items()
+        if any(pattern.search(text) for pattern in patterns)
+    }
 
 
 def _normalize_state_value(canonical_predicate: str, value: object) -> str | None:

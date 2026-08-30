@@ -644,13 +644,17 @@ class MemoryCompactionResult(BaseModel):
 
 
 def normalize_candidate_predicate(candidate: MemoryCandidate) -> MemoryCandidate:
+    semantic_payload = dict(candidate.payload)
+    semantic_payload.setdefault("summary", candidate.summary)
+    semantic_payload.setdefault("original_text", candidate.original_text)
+    semantic_payload.setdefault("evidence_spans", candidate.evidence_spans)
     normalized = normalize_predicate(
         kind=candidate.kind,
         raw_predicate=candidate.raw_predicate or candidate.payload.get("predicate"),
         canonical_predicate=candidate.canonical_predicate,
         custom_predicate=candidate.custom_predicate,
         predicate_type=candidate.predicate_type,
-        payload=candidate.payload,
+        payload=semantic_payload,
     )
     updates: dict[str, Any] = {
         "raw_predicate": normalized.raw_predicate,

@@ -7,9 +7,17 @@ from loveapp.application.memory_retrieval import (
     RetrievedMemory,
     resolve_memory_retrieval_mode,
 )
+from loveapp.application.memory_semantic_relations import (
+    LongTailRelationCandidateRetriever,
+    LongTailRelationShadowEvaluator,
+    LongTailSemanticRelationValidator,
+)
 
 __all__ = [
     "HybridMemoryRetriever",
+    "LongTailRelationCandidateRetriever",
+    "LongTailRelationShadowEvaluator",
+    "LongTailSemanticRelationValidator",
     "MemoryContextBuilder",
     "MemoryRetrievalMode",
     "MemoryRetrievalScore",

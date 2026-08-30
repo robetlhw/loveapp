@@ -644,6 +644,34 @@ def _normalize_claim_semantics(
             kind = MemoryKind.PREFERENCE.value
         if _align_exact_canonical_predicate(claim, claim_payload, kind):
             steps.append("exact_canonical_predicate_alignment")
+        if kind == MemoryKind.PREFERENCE.value:
+            semantic_payload = dict(claim_payload)
+            if claim.get("object") is not None:
+                semantic_payload.setdefault("object", claim["object"])
+            if claim.get("summary") is not None:
+                semantic_payload.setdefault("summary", claim["summary"])
+            if claim.get("evidence_spans") is not None:
+                semantic_payload.setdefault("evidence_spans", claim["evidence_spans"])
+            preference_normalization = normalize_predicate(
+                kind=kind,
+                raw_predicate=claim.get("predicate"),
+                canonical_predicate=claim.get("canonical_predicate"),
+                custom_predicate=claim.get("custom_predicate"),
+                predicate_type=claim.get("predicate_type"),
+                payload=semantic_payload,
+            )
+            if (
+                preference_normalization.predicate_type
+                != _enum_key(claim.get("predicate_type"))
+                or preference_normalization.canonical_predicate
+                != claim.get("canonical_predicate")
+                or preference_normalization.custom_predicate
+                != claim.get("custom_predicate")
+            ):
+                claim["predicate_type"] = preference_normalization.predicate_type
+                claim["canonical_predicate"] = preference_normalization.canonical_predicate
+                claim["custom_predicate"] = preference_normalization.custom_predicate
+                steps.append("preference_canonical_domain_alignment")
         uncertainty_dimension = normalize_state_dimension(
             claim_payload.get("uncertainty_type")
         )

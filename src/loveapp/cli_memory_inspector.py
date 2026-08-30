@@ -222,6 +222,7 @@ def render_inspection_report(console: Console, report: dict[str, Any]) -> None:
     _render_gate(console, report.get("gate") or {})
     _render_memories(console, report.get("before") or [], title="BEFORE (active)")
     _render_model_outputs(console, report.get("model_outputs") or [])
+    _render_long_tail_relations(console, report.get("long_tail_relations") or [])
     _render_candidates(
         console,
         report.get("candidates") or report.get("governance_candidates") or [],
@@ -384,6 +385,71 @@ def _render_model_outputs(console: Console, outputs: list[dict[str, Any]]) -> No
     if not outputs:
         table.add_row("-", "-", "-", "0", "-", "-", "No model attempt recorded")
     console.print(table)
+
+
+def _render_long_tail_relations(
+    console: Console,
+    evaluations: list[dict[str, Any]],
+) -> None:
+    for evaluation in evaluations:
+        candidate_index = evaluation.get("candidate_index", "-")
+        retrieval = evaluation.get("retrieval") or {}
+        candidates = retrieval.get("retrieved_candidates") or []
+        retrieval_table = Table(
+            title=f"LONG-TAIL CANDIDATE RETRIEVAL (candidate {candidate_index})"
+        )
+        retrieval_table.add_column("ID")
+        retrieval_table.add_column("Kind / subject")
+        retrieval_table.add_column("Score", justify="right")
+        retrieval_table.add_column("Summary")
+        for candidate in candidates:
+            score = candidate.get("score") or {}
+            retrieval_table.add_row(
+                str(candidate.get("memory_id") or "-"),
+                f"{candidate.get('kind') or '-'} / {candidate.get('subject') or '-'}",
+                str(score.get("total", "-")),
+                str(candidate.get("summary") or "-"),
+            )
+        if not candidates:
+            retrieval_table.add_row("-", "-", "-", "No candidates")
+        console.print(retrieval_table)
+
+        proposal = evaluation.get("proposal") or {}
+        proposal_table = Table(title="SEMANTIC RELATION PROPOSAL", show_header=False)
+        proposal_table.add_column(style="cyan", no_wrap=True)
+        proposal_table.add_column()
+        for key in (
+            "resolution_status",
+            "relation",
+            "target_memory_ids",
+            "same_semantic_dimension",
+            "confidence",
+            "reason",
+            "judge_model",
+            "judge_latency_ms",
+            "total_tokens",
+        ):
+            proposal_table.add_row(key, _display(proposal.get(key)))
+        console.print(proposal_table)
+
+        validator = evaluation.get("validator") or evaluation.get("failure") or {}
+        validator_table = Table(title="LOCAL VALIDATOR", show_header=False)
+        validator_table.add_column(style="cyan", no_wrap=True)
+        validator_table.add_column()
+        for key in (
+            "resolution_status",
+            "validator_pass",
+            "validated_relation",
+            "checks",
+            "validator_reasons",
+            "would_update",
+            "would_supersede_memory_ids",
+            "store_mutation_permitted",
+            "error",
+        ):
+            if key in validator:
+                validator_table.add_row(key, _display(validator.get(key)))
+        console.print(validator_table)
 
 
 def _render_candidates(console: Console, candidates: list[dict[str, Any]]) -> None:

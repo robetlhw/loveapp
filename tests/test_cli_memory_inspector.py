@@ -161,6 +161,59 @@ def test_skipped_and_failed_turn_render_without_losing_error() -> None:
     assert "same" in rendered
 
 
+def test_long_tail_shadow_render_is_explicitly_non_destructive() -> None:
+    report = _report("她最近很少再邀请我参加朋友聚会。")
+    report["long_tail_relations"] = [
+        {
+            "candidate_index": 0,
+            "retrieval": {
+                "retrieved_candidates": [
+                    {
+                        "memory_id": "memory-old",
+                        "kind": "interaction_pattern",
+                        "subject": "partner",
+                        "summary": "她以前经常邀请我参加朋友聚会。",
+                        "score": {"total": 0.91},
+                    }
+                ]
+            },
+            "proposal": {
+                "relation": "update",
+                "target_memory_ids": ["memory-old"],
+                "same_semantic_dimension": True,
+                "confidence": 0.97,
+                "reason": "sustained reversal",
+                "resolution_status": "semantic_update_proposed",
+            },
+            "validator": {
+                "validator_pass": True,
+                "validated_relation": "update",
+                "checks": {"target_active": True},
+                "validator_reasons": ["validated_shadow_update"],
+                "would_update": True,
+                "would_supersede_memory_ids": ["memory-old"],
+                "store_mutation_permitted": False,
+                "resolution_status": "validator_allowed_shadow",
+            },
+        }
+    ]
+    output = StringIO()
+
+    render_inspection_report(
+        Console(file=output, width=220, force_terminal=False, color_system=None),
+        report,
+    )
+
+    rendered = output.getvalue()
+    assert "LONG-TAIL CANDIDATE RETRIEVAL" in rendered
+    assert "SEMANTIC RELATION PROPOSAL" in rendered
+    assert "LOCAL VALIDATOR" in rendered
+    assert "store_mutation_permitted" in rendered
+    assert "semantic_update_proposed" in rendered
+    assert "validator_allowed_shadow" in rendered
+    assert "False" in rendered
+
+
 def _report(text: str) -> dict[str, Any]:
     return {
         "turn": 1,

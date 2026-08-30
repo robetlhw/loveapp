@@ -30,6 +30,7 @@ from loveapp.adapters.maps import AmapMapProvider, DemoMapProvider
 from loveapp.adapters.memory import (
     InMemoryMemoryStore,
     OpenAICompatibleMemoryExtractor,
+    OpenAICompatibleSemanticRelationJudge,
     SQLiteMemoryStore,
     TieredMemoryExtractor,
 )
@@ -48,6 +49,11 @@ from loveapp.agents import (
 from loveapp.application import MemoryService
 from loveapp.application.date_planning import DatePlanValidator
 from loveapp.application.memory import NoOpMemoryExtractor
+from loveapp.application.memory_retrieval import HybridMemoryRetriever
+from loveapp.application.memory_semantic_relations import (
+    LongTailRelationShadowEvaluator,
+    LongTailSemanticRelationValidator,
+)
 from loveapp.application.routing import HybridRouter
 from loveapp.core.config import Settings, get_settings
 from loveapp.domain.knowledge import KnowledgeDocument
@@ -207,6 +213,19 @@ def build_memory_container(
     memory_extractor = (
         _build_memory_extractor(settings) if enable_extraction else NoOpMemoryExtractor()
     )
+    semantic_relation_judge = _build_semantic_relation_judge(settings)
+    long_tail_relation_evaluator = None
+    if semantic_relation_judge is not None:
+        long_tail_relation_evaluator = LongTailRelationShadowEvaluator(
+            semantic_relation_judge,
+            retriever=HybridMemoryRetriever(embedding_provider),
+            validator=LongTailSemanticRelationValidator(
+                proposal_confidence_threshold=(
+                    settings.memory_semantic_relation_confidence_threshold
+                )
+            ),
+            candidate_limit=settings.memory_semantic_relation_candidate_limit,
+        )
     memory_service = MemoryService(
         memory_store,
         memory_extractor,
@@ -220,10 +239,15 @@ def build_memory_container(
         admission_policy_overrides=settings.memory_admission_policy_overrides,
         embedding_provider=embedding_provider,
         verifier=(memory_extractor if getattr(memory_extractor, "can_verify", False) else None),
+        long_tail_relation_evaluator=long_tail_relation_evaluator,
     )
-    resources: tuple[Any, ...] = (memory_store, memory_extractor, memory_service)
+    resources: tuple[Any, ...] = ()
     if owns_embedding_provider:
         resources += (embedding_provider,)
+    resources += (memory_store, memory_extractor)
+    if semantic_relation_judge is not None:
+        resources += (semantic_relation_judge,)
+    resources += (memory_service,)
     return MemoryContainer(
         memory_service=memory_service,
         memory_store=memory_store,
@@ -371,6 +395,36 @@ def _build_memory_extractor(settings: Settings):
         flash,
         strong,
         upgrade_min_importance=settings.memory_extraction_upgrade_min_importance,
+    )
+
+
+def _build_semantic_relation_judge(
+    settings: Settings,
+) -> OpenAICompatibleSemanticRelationJudge | None:
+    if settings.memory_semantic_relation_provider == "disabled":
+        return None
+    if not settings.llm_api_key:
+        raise ValueError("LOVEAPP_LLM_API_KEY 未配置。")
+    if not settings.llm_base_url:
+        raise ValueError("LOVEAPP_LLM_BASE_URL 未配置。")
+    model = (
+        settings.memory_semantic_relation_model
+        or settings.memory_extraction_strong_model
+        or settings.memory_extraction_model
+        or settings.llm_model
+    )
+    if not model:
+        raise ValueError(
+            "LOVEAPP_MEMORY_SEMANTIC_RELATION_MODEL 或 LOVEAPP_LLM_MODEL 未配置。"
+        )
+    return OpenAICompatibleSemanticRelationJudge(
+        api_key=settings.llm_api_key,
+        base_url=settings.llm_base_url,
+        model=model,
+        timeout_seconds=settings.memory_semantic_relation_timeout_seconds,
+        max_retries=settings.memory_semantic_relation_max_retries,
+        max_tokens=settings.memory_semantic_relation_max_tokens,
+        thinking=settings.memory_semantic_relation_thinking,
     )
 
 

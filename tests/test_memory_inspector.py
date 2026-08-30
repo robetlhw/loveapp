@@ -3,7 +3,11 @@ from datetime import UTC, datetime
 
 from loveapp.adapters.memory.in_memory import InMemoryMemoryStore
 from loveapp.application.memory import MemoryService
-from loveapp.application.memory_inspector import MemoryInspector, _model_outputs
+from loveapp.application.memory_inspector import (
+    MemoryInspector,
+    _long_tail_relation_traces,
+    _model_outputs,
+)
 from loveapp.core.timing import ExecutionTrace
 from loveapp.domain.memory import (
     AtomicClaim,
@@ -167,6 +171,57 @@ def test_inspector_exposes_schema_failure_snapshot_and_repair_result() -> None:
     assert output["validation_error"] == "missing state_value"
     assert output["repair_attempt"] == "relationship_stage_bounded_repair"
     assert output["repair_result"] == "unresolved"
+
+
+def test_inspector_groups_long_tail_shadow_traces_without_lifecycle_effect() -> None:
+    trace = ExecutionTrace()
+    with trace.measure("memory_long_tail_candidate_retrieval") as details:
+        details.update(
+            {
+                "candidate_index": 1,
+                "retrieved_candidates_json": json.dumps(
+                    [{"memory_id": "memory-old", "score": {"total": 0.92}}]
+                ),
+                "resolution_status": "retrieval_candidates_found",
+            }
+        )
+    with trace.measure("memory_semantic_relation_proposal") as details:
+        details.update(
+            {
+                "candidate_index": 1,
+                "relation": "update",
+                "target_memory_ids_json": json.dumps(["memory-old"]),
+                "confidence": 0.97,
+                "resolution_status": "semantic_update_proposed",
+            }
+        )
+    with trace.measure("memory_long_tail_validator") as details:
+        details.update(
+            {
+                "candidate_index": 1,
+                "validator_pass": True,
+                "validator_reasons_json": json.dumps(["validated_shadow_update"]),
+                "checks_json": json.dumps({"target_active": True}),
+                "would_update": True,
+                "would_supersede_memory_ids_json": json.dumps(["memory-old"]),
+                "store_mutation_permitted": False,
+                "resolution_status": "validator_allowed_shadow",
+            }
+        )
+
+    output = _long_tail_relation_traces(trace.snapshot())
+
+    assert output[0]["candidate_index"] == 1
+    assert output[0]["retrieval"]["retrieved_candidates"][0]["memory_id"] == (
+        "memory-old"
+    )
+    assert output[0]["proposal"]["target_memory_ids"] == ["memory-old"]
+    assert output[0]["validator"]["checks"] == {"target_active": True}
+    assert output[0]["validator"]["would_supersede_memory_ids"] == ["memory-old"]
+    assert output[0]["validator"]["store_mutation_permitted"] is False
+    assert output[0]["retrieval"]["resolution_status"] == "retrieval_candidates_found"
+    assert output[0]["proposal"]["resolution_status"] == "semantic_update_proposed"
+    assert output[0]["validator"]["resolution_status"] == "validator_allowed_shadow"
 
 
 def _sushi_claim(claim_id: str, evidence: str) -> AtomicClaim:
