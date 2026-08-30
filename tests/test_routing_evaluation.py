@@ -16,11 +16,13 @@ from loveapp.evaluation.routing import (
     _llm_call_count,
     evaluate_live_routing_conversations,
     evaluate_routing_conversations,
+    render_routing_report,
 )
 
 
-async def test_routing_v2_regression_set_is_multiturn_and_preserves_historical_expectations(
-) -> None:
+async def test_routing_v2_regression_set_is_multiturn_and_preserves_historical_expectations() -> (
+    None
+):
     dataset = Path(__file__).parents[1] / "evals" / "routing" / "cases_v2.jsonl"
 
     report = await evaluate_routing_conversations(dataset)
@@ -82,9 +84,7 @@ async def test_routing_v4_policy_report_has_118_turns_and_policy_metrics() -> No
     assert report["p50_live_router_latency_ms"] == 0
     assert report["p95_live_router_latency_ms"] == 0
     assert isinstance(report["acceptance_passed"], bool)
-    compound = next(
-        case for case in report["cases"] if case["id"] == "rt_v4_c29_compound_pending"
-    )
+    compound = next(case for case in report["cases"] if case["id"] == "rt_v4_c29_compound_pending")
     continuation = compound["turns"][1]
     assert continuation["pending_continuation"] is True
     assert continuation["forced_task"] == "date_planning"
@@ -105,9 +105,7 @@ async def test_routing_v4_policy_report_has_118_turns_and_policy_metrics() -> No
     assert clarification["turns"][1]["actual"]["clarification_exhausted"] is True
     assert clarification["turns"][1]["actual"]["route"] == "clarify_intent"
     deescalated = next(
-        case
-        for case in report["cases"]
-        if case["id"] == "rt_v4_c33_high_risk_deescalation"
+        case for case in report["cases"] if case["id"] == "rt_v4_c33_high_risk_deescalation"
     )
     assert deescalated["turns"][1]["actual"]["route"] == "sensitive_risk_response"
     guard_cases = {
@@ -124,9 +122,70 @@ async def test_routing_v4_policy_report_has_118_turns_and_policy_metrics() -> No
         "rt_v4_c46_guard_rejects_secondary_date",
     }
     assert all(
-        case["turns"][0]["actual"]["task_guard_applied"] is True
-        for case in guard_cases.values()
+        case["turns"][0]["actual"]["task_guard_applied"] is True for case in guard_cases.values()
     )
+
+
+async def test_router_resume_dataset_exposes_slice_metrics() -> None:
+    dataset = Path(__file__).parents[1] / "evals" / "routing" / "router_cases_v1.jsonl"
+
+    report = await evaluate_routing_conversations(dataset)
+
+    assert report["case_count"] >= 30
+    assert report["turn_count"] >= report["case_count"]
+    assert report["multi_turn_case_count"] / report["case_count"] >= 0.4
+    for key in (
+        "overall_route_accuracy",
+        "single_turn_accuracy",
+        "multi_turn_accuracy",
+        "continuation_accuracy",
+        "task_switch_accuracy",
+        "task_resume_accuracy",
+        "ambiguous_case_accuracy",
+        "fallback_count",
+        "fallback_rate",
+        "rule_decision_count",
+        "llm_correction_count",
+        "llm_correction_success_count",
+        "rule_only_accuracy",
+        "final_accuracy",
+        "correction_gain",
+    ):
+        assert key in report
+
+
+async def test_router_resume_dataset_supports_case_and_category_filters() -> None:
+    dataset = Path(__file__).parents[1] / "evals" / "routing" / "router_cases_v1.jsonl"
+
+    by_case = await evaluate_routing_conversations(
+        dataset,
+        case_id="rt_v4_c26_context_follow_up",
+    )
+    assert by_case["case_count"] == 1
+    assert by_case["case_filter"] == ["rt_v4_c26_context_follow_up"]
+
+    by_category = await evaluate_routing_conversations(
+        dataset,
+        category="task_switch",
+    )
+    assert by_category["case_count"] == 1
+    assert by_category["category_filter"] == ["task_switch"]
+
+
+def test_router_report_renderer_includes_metrics_and_failures() -> None:
+    markdown = render_routing_report(
+        {
+            "dataset": "router_cases_v1.jsonl",
+            "evaluation_mode": "policy",
+            "case_count": 1,
+            "turn_count": 1,
+            "overall_route_accuracy": 1.0,
+            "cases": [],
+        }
+    )
+
+    assert "# Router Evaluation Report" in markdown
+    assert "overall_route_accuracy" in markdown
 
 
 async def test_live_routing_eval_requires_explicit_environment_guard() -> None:

@@ -4,6 +4,7 @@
 
 - `routing/cases_v1.jsonl`：Task、Scenario、Goal 和上下文路由。
 - `routing/cases_v4.jsonl`：47 个会话、118 turns 的整改后 Policy/Live 路由固定集。
+- `routing/router_cases_v1.jsonl`：Resume 前 47 会话/118 turns 路由评估入口（含单轮、多轮、续接、切换、恢复和边界切片）。
 - `rag/cases_v1.jsonl`：每个查询允许多个相关文档 ID，统计 Recall@K 与 MRR。
 - `safety/cases_v1.jsonl`：高风险阳性和容易误报的阴性，统计召回率、精确率和特异度。
 - `memory/gate_v1.jsonl`：应抽取与不应抽取的输入。记忆污染率是不应持久化的输入中实际产生记忆的比例。

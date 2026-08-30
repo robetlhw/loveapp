@@ -1,7 +1,7 @@
 import hashlib
 import json
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from statistics import mean
@@ -110,6 +110,10 @@ async def evaluate_routing_conversations(
     clarification_threshold: float = 0.68,
     safety_context_turns: int = 4,
     prompt_version: str = "routing-v3.0",
+    case_id: str | None = None,
+    case_ids: Sequence[str] | None = None,
+    category: str | None = None,
+    categories: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Run deterministic Policy Eval without access to an external corrector."""
     return await _evaluate_routing_conversations(
@@ -123,6 +127,10 @@ async def evaluate_routing_conversations(
         clarification_threshold=clarification_threshold,
         safety_context_turns=safety_context_turns,
         prompt_version=prompt_version,
+        case_id=case_id,
+        case_ids=case_ids,
+        category=category,
+        categories=categories,
     )
 
 
@@ -138,6 +146,10 @@ async def _evaluate_routing_conversations(
     clarification_threshold: float,
     safety_context_turns: int,
     prompt_version: str,
+    case_id: str | None = None,
+    case_ids: Sequence[str] | None = None,
+    category: str | None = None,
+    categories: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Shared implementation; live access is restricted to the guarded public entry point.
 
@@ -152,6 +164,13 @@ async def _evaluate_routing_conversations(
         raise ValueError("Token 单价不能为负数。")
 
     cases = _load_cases(path)
+    cases = _filter_cases(
+        cases,
+        case_id=case_id,
+        case_ids=case_ids,
+        category=category,
+        categories=categories,
+    )
     rows: list[dict[str, Any]] = []
     task_counts = {
         task.value: {"true_positive": 0, "false_positive": 0, "false_negative": 0}
@@ -241,13 +260,10 @@ async def _evaluate_routing_conversations(
             counters["context_turn_count"] += int(has_context)
             flow_state = _apply_turn_flow_overrides(flow_state, turn)
             explicit_forced_task = _task_value(turn.get("forced_task"))
-            pending_continuation = (
-                "forced_task" not in turn
-                and is_pending_continuation(turn["query"], flow_state.pending_task)
+            pending_continuation = "forced_task" not in turn and is_pending_continuation(
+                turn["query"], flow_state.pending_task
             )
-            forced_task = (
-                flow_state.pending_task if pending_continuation else explicit_forced_task
-            )
+            forced_task = flow_state.pending_task if pending_continuation else explicit_forced_task
             flow_before = flow_state
             route_input = RouteInput(
                 latest_query=turn["query"],
@@ -336,6 +352,26 @@ async def _evaluate_routing_conversations(
                     "llm_calls": llm_calls_this_turn,
                     "router_correction_calls": calls_this_turn,
                     "actual": _route_summary(result),
+                    "rule_actual": _route_summary(rules),
+                    "recent_messages": [
+                        {
+                            "role": message.role.value,
+                            "content": message.content,
+                        }
+                        for message in route_input.recent_messages
+                    ],
+                    "correction": _correction_trace(turn, result),
+                    "route_annotated": _route_is_annotated(expected),
+                    "route_correct": _route_matches_expected(result, expected),
+                    "rule_route_correct": _route_matches_expected(rules, expected),
+                    "llm_correction_success": bool(calls_this_turn and result.llm_error is None),
+                    "fallback": result.fallback_reason is not None,
+                    "evaluation_tags": _evaluation_tags(
+                        case,
+                        turn,
+                        expected,
+                        pending_continuation=pending_continuation,
+                    ),
                     "flow_before": _flow_summary(flow_before),
                 }
             )
@@ -378,6 +414,10 @@ async def _evaluate_routing_conversations(
             "safety_context_turns": safety_context_turns,
             "prompt_version": prompt_version,
         },
+        case_id=case_id,
+        case_ids=case_ids,
+        category=category,
+        categories=categories,
     )
 
 
@@ -387,12 +427,15 @@ async def evaluate_live_routing_conversations(
     *,
     input_cost_per_million: float = 0,
     output_cost_per_million: float = 0,
+    case_id: str | None = None,
+    case_ids: Sequence[str] | None = None,
+    category: str | None = None,
+    categories: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Run a real-model eval only after the explicit environment guard is enabled."""
     if not settings.router_live_eval_enabled:
         raise RuntimeError(
-            "Live Router Eval 未启用；请显式设置 "
-            "LOVEAPP_ROUTER_LIVE_EVAL_ENABLED=true。"
+            "Live Router Eval 未启用；请显式设置 LOVEAPP_ROUTER_LIVE_EVAL_ENABLED=true。"
         )
     if not settings.llm_api_key:
         raise ValueError("LOVEAPP_LLM_API_KEY 未配置。")
@@ -424,6 +467,10 @@ async def evaluate_live_routing_conversations(
             clarification_threshold=settings.router_clarification_threshold,
             safety_context_turns=settings.router_context_risk_turns,
             prompt_version=settings.router_prompt_version,
+            case_id=case_id,
+            case_ids=case_ids,
+            category=category,
+            categories=categories,
         )
         report["live_configuration"] = {
             "model": model,
@@ -457,9 +504,7 @@ def _update_classification_metrics(
         actual_out_of_scope = actual_task == TaskType.OUT_OF_SCOPE.value
         counters["out_of_scope_cases"] += 1
         counters["out_of_scope_positive_cases"] += int(expected_out_of_scope)
-        counters["out_of_scope_correct"] += int(
-            actual_out_of_scope == expected_out_of_scope
-        )
+        counters["out_of_scope_correct"] += int(actual_out_of_scope == expected_out_of_scope)
 
     if "primary_scenario" in expected:
         counters["scenario_cases"] += 1
@@ -476,9 +521,7 @@ def _update_classification_metrics(
         counters["risk_cases"] += 1
         predicted_high = result.risk_level == RiskLevel.HIGH
         expected_high = expected["risk_level"] == RiskLevel.HIGH.value
-        counters["risk_correct"] += int(
-            result.risk_level.value == expected["risk_level"]
-        )
+        counters["risk_correct"] += int(result.risk_level.value == expected["risk_level"])
         counters["high_risk_cases"] += int(expected_high)
         counters["high_risk_true_positive"] += int(predicted_high and expected_high)
 
@@ -567,13 +610,10 @@ def _update_slot_metrics(
             counters["slot_false_negative"] += int(expected_value is not None)
     counters["slot_actual_fields"] += len(actual_slots)
     counters["slot_hallucinated_fields"] += sum(
-        actual_value != expected_slots.get(field)
-        for field, actual_value in actual_slots.items()
+        actual_value != expected_slots.get(field) for field, actual_value in actual_slots.items()
     )
     counters["slot_proposed_fields"] += len(set(actual_slots) | rejected_fields)
-    counters["slot_unsupported_attempt_fields"] += len(
-        unexpected_accepted | unsupported_rejected
-    )
+    counters["slot_unsupported_attempt_fields"] += len(unexpected_accepted | unsupported_rejected)
     counters["slot_blocked_unsupported_fields"] += len(unsupported_rejected)
 
 
@@ -596,9 +636,7 @@ def _update_operational_metrics(
         counters["invalid_json_count"] += int(
             "json" in error or "routecorrection" in error or "结构" in error
         )
-        counters["evidence_validation_failure_count"] += int(
-            "evidence" in error or "证据" in error
-        )
+        counters["evidence_validation_failure_count"] += int("evidence" in error or "证据" in error)
 
 
 def _llm_call_count(
@@ -638,6 +676,10 @@ def _build_report(
     input_cost_per_million: float,
     output_cost_per_million: float,
     routing_configuration: dict[str, str | int | float],
+    case_id: str | None = None,
+    case_ids: Sequence[str] | None = None,
+    category: str | None = None,
+    categories: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     goal_precision = _ratio(
         counters["goal_true_positive"],
@@ -649,13 +691,11 @@ def _build_report(
     )
     clarification_precision = _ratio(
         counters["clarification_true_positive"],
-        counters["clarification_true_positive"]
-        + counters["clarification_false_positive"],
+        counters["clarification_true_positive"] + counters["clarification_false_positive"],
     )
     clarification_recall = _ratio(
         counters["clarification_true_positive"],
-        counters["clarification_true_positive"]
-        + counters["clarification_false_negative"],
+        counters["clarification_true_positive"] + counters["clarification_false_negative"],
     )
     task_metrics = _task_metrics(task_counts)
     supported_task_metrics = [
@@ -688,6 +728,8 @@ def _build_report(
         "dataset_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         "code_revision": _code_revision(),
         "routing_configuration": routing_configuration,
+        "case_filter": _filter_values(case_id, case_ids),
+        "category_filter": _filter_values(category, categories),
         "case_count": len(cases),
         "turn_count": turn_count,
         "multi_turn_case_count": counters["multi_turn_case_count"],
@@ -696,9 +738,7 @@ def _build_report(
             counters["context_route_correct"], counters["context_route_cases"]
         ),
         "pass_rate": _ratio(counters["passed_turns"], turn_count),
-        "conversation_pass_rate": _ratio(
-            sum(row["passed"] for row in rows), len(rows)
-        ),
+        "conversation_pass_rate": _ratio(sum(row["passed"] for row in rows), len(rows)),
         "task_accuracy": _ratio(counters["task_correct"], counters["task_cases"]),
         "task_macro_precision": _average_metric(supported_task_metrics, "precision"),
         "task_macro_recall": _average_metric(supported_task_metrics, "recall"),
@@ -722,9 +762,7 @@ def _build_report(
         "clarification_precision": clarification_precision,
         "clarification_recall": clarification_recall,
         "clarification_f1": _f1(clarification_precision, clarification_recall),
-        "clarification_annotation_turn_count": counters[
-            "clarification_annotation_turn_count"
-        ],
+        "clarification_annotation_turn_count": counters["clarification_annotation_turn_count"],
         "clarification_exhausted_count": counters["clarification_exhausted_count"],
         "clarification_exhausted_annotation_turn_count": counters[
             "clarification_exhausted_annotation_turn_count"
@@ -765,9 +803,7 @@ def _build_report(
             counters["slot_blocked_unsupported_fields"],
             counters["slot_unsupported_attempt_fields"],
         ),
-        "slot_unsupported_attempt_field_count": counters[
-            "slot_unsupported_attempt_fields"
-        ],
+        "slot_unsupported_attempt_field_count": counters["slot_unsupported_attempt_fields"],
         "slot_annotation_turn_count": counters["slot_annotation_turn_count"],
         "slot_rejected_field_count": counters["slot_rejected_field_count"],
         "llm_call_count": llm_calls,
@@ -782,15 +818,11 @@ def _build_report(
         "guard_activation_rate": _ratio(counters["guard_activation_count"], llm_calls),
         "invalid_json_count": counters["invalid_json_count"],
         "invalid_json_rate": _ratio(counters["invalid_json_count"], llm_calls),
-        "evidence_validation_failure_count": counters[
-            "evidence_validation_failure_count"
-        ],
+        "evidence_validation_failure_count": counters["evidence_validation_failure_count"],
         "evidence_validation_failure_rate": _ratio(
             counters["evidence_validation_failure_count"], llm_calls
         ),
-        "mean_policy_latency_ms": round(mean(policy_latencies), 3)
-        if policy_latencies
-        else 0,
+        "mean_policy_latency_ms": round(mean(policy_latencies), 3) if policy_latencies else 0,
         "p50_policy_latency_ms": round(_percentile(policy_latencies, 0.50), 3),
         "p95_policy_latency_ms": round(_percentile(policy_latencies, 0.95), 3),
         "p50_live_router_latency_ms": round(_percentile(live_latencies, 0.50), 3),
@@ -805,15 +837,14 @@ def _build_report(
         "average_input_tokens_per_turn": _ratio(counters["input_tokens"], turn_count),
         "average_output_tokens_per_turn": _ratio(counters["output_tokens"], turn_count),
         "estimated_cost": round(estimated_cost, 8),
-        "estimated_cost_per_turn": round(estimated_cost / turn_count, 8)
-        if turn_count
-        else 0,
+        "estimated_cost_per_turn": round(estimated_cost / turn_count, 8) if turn_count else 0,
         "token_cost_assumptions_per_million": {
             "input": input_cost_per_million,
             "output": output_cost_per_million,
         },
         "cases": rows,
     }
+    report.update(_routing_alias_metrics(rows))
     report["acceptance_targets"] = _acceptance_targets(report)
     report["acceptance_passed"] = all(report["acceptance_targets"].values())
     return report
@@ -854,9 +885,7 @@ def _acceptance_targets(report: dict[str, Any]) -> dict[str, bool]:
     annotation_requirements = {
         "high_risk_recall_eq_1_00": report["high_risk_recall"] != 0,
         "out_of_scope_accuracy_gte_0_90": report["out_of_scope_positive_turn_count"] > 0,
-        "clarification_precision_gte_0_85": (
-            report["clarification_annotation_turn_count"] > 0
-        ),
+        "clarification_precision_gte_0_85": (report["clarification_annotation_turn_count"] > 0),
         "slot_hallucination_rate_lte_0_02": report["slot_annotation_turn_count"] > 0,
     }
     for name, annotated in annotation_requirements.items():
@@ -892,9 +921,7 @@ def _route_checks(
             for value in [result.primary_scenario, *result.secondary_scenarios]
             if value is not None
         }
-        checks["excluded_scenarios"] = not (
-            set(expected["excluded_scenarios"]) & actual
-        )
+        checks["excluded_scenarios"] = not (set(expected["excluded_scenarios"]) & actual)
     expected_goals = set(expected.get("goals", []))
     if expected.get("goal"):
         expected_goals.add(expected["goal"])
@@ -909,21 +936,15 @@ def _route_checks(
             value.value for value in result.secondary_tasks
         }
     if "clarification" in expected:
-        checks["clarification"] = (
-            result.clarification_triggered is expected["clarification"]
-        )
+        checks["clarification"] = result.clarification_triggered is expected["clarification"]
     if "clarification_exhausted" in expected:
         checks["clarification_exhausted"] = (
             result.clarification_exhausted is expected["clarification_exhausted"]
         )
     if "pending_continuation" in expected:
-        checks["pending_continuation"] = (
-            pending_continuation is expected["pending_continuation"]
-        )
+        checks["pending_continuation"] = pending_continuation is expected["pending_continuation"]
     if "task_guard_applied" in expected:
-        checks["task_guard_applied"] = (
-            result.task_guard_applied is expected["task_guard_applied"]
-        )
+        checks["task_guard_applied"] = result.task_guard_applied is expected["task_guard_applied"]
     if "pending_task" in expected:
         checks["pending_task"] = (
             result.pending_task.value if result.pending_task else None
@@ -944,11 +965,188 @@ def _route_checks(
             set(rejected) <= set(result.slot_rejected_fields)
             if isinstance(rejected, list)
             else all(
-                result.slot_rejected_fields.get(key) == value
-                for key, value in rejected.items()
+                result.slot_rejected_fields.get(key) == value for key, value in rejected.items()
             )
         )
     return checks
+
+
+def _route_is_annotated(expected: Mapping[str, Any]) -> bool:
+    """Return whether a turn has a task/branch expectation for route metrics."""
+
+    return "task_type" in expected or "route" in expected
+
+
+def _route_matches_expected(result: RouteResult, expected: Mapping[str, Any]) -> bool:
+    """Compare only the route dimensions, independently of scenario/slot checks."""
+
+    checks: list[bool] = []
+    if "task_type" in expected:
+        checks.append(result.task_type.value == expected["task_type"])
+    if "route" in expected:
+        checks.append(_route_branch(result) == expected["route"])
+    return all(checks) if checks else False
+
+
+def _evaluation_tags(
+    case: Mapping[str, Any],
+    turn: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    *,
+    pending_continuation: bool,
+) -> list[str]:
+    """Normalize optional dataset annotations used for slice metrics.
+
+    The evaluator keeps the fixture schema intentionally permissive: existing v1-v4
+    datasets use ``category`` while newer evaluation sets can add ``tags`` or explicit
+    boolean annotations without changing the Router contract.
+    """
+
+    raw_tags = turn.get("tags", case.get("tags", []))
+    if isinstance(raw_tags, str):
+        tags = {raw_tags.casefold()}
+    elif isinstance(raw_tags, list):
+        tags = {str(tag).casefold() for tag in raw_tags}
+    else:
+        tags = set()
+    category = str(turn.get("category", case.get("category", ""))).casefold()
+    if category:
+        tags.add(category)
+    if len(case.get("turns", [])) == 1:
+        tags.add("single_turn")
+    else:
+        tags.add("multi_turn")
+
+    if pending_continuation or expected.get("pending_continuation"):
+        tags.update({"continuation", "task_resume"})
+    if expected.get("task_switch") or "switch" in category:
+        tags.add("task_switch")
+    if expected.get("task_resume") or "resume" in category:
+        tags.add("task_resume")
+    if (
+        expected.get("ambiguous")
+        or expected.get("clarification")
+        or ("ambigu" in category or "clarif" in category)
+    ):
+        tags.update({"ambiguous", "ambiguity"})
+    if "follow" in category or "continu" in category:
+        tags.add("continuation")
+    if expected.get("fallback_reason") or "failure" in category:
+        tags.add("fallback")
+    if "negation" in category or "guard" in category or "anti_context" in tags:
+        tags.add("anti_context_bias")
+    return sorted(tags)
+
+
+def _routing_alias_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build the compact metrics required by the pre-resume Router evaluation.
+
+    ``rule_only_accuracy`` is the all-turn deterministic rule baseline, while
+    ``final_accuracy`` is measured after the optional correction/merge step.  Both
+    use the same annotated route denominator so ``correction_gain`` is meaningful.
+    """
+
+    turns = [turn for case in rows for turn in case["turns"]]
+    annotated = [turn for turn in turns if turn.get("route_annotated")]
+
+    def accuracy(values: list[dict[str, Any]], field: str = "route_correct") -> float:
+        eligible = [value for value in values if value.get("route_annotated")]
+        return _ratio(sum(bool(value.get(field)) for value in eligible), len(eligible))
+
+    def tagged_accuracy(tag: str) -> float:
+        return accuracy([turn for turn in turns if tag in set(turn.get("evaluation_tags", []))])
+
+    single_turns = [turn for case in rows if case["turn_count"] == 1 for turn in case["turns"]]
+    multi_turns = [turn for case in rows if case["turn_count"] > 1 for turn in case["turns"]]
+    llm_turns = [turn for turn in turns if turn.get("router_correction_calls", 0)]
+    untouched_turns = [turn for turn in turns if not turn.get("router_correction_calls", 0)]
+    fallback_count = sum(bool(turn.get("fallback")) for turn in turns)
+    llm_success_count = sum(bool(turn.get("llm_correction_success")) for turn in turns)
+    rule_accuracy = accuracy(annotated, field="rule_route_correct")
+    final_accuracy = accuracy(annotated)
+
+    return {
+        "overall_route_accuracy": final_accuracy,
+        "single_turn_accuracy": accuracy(single_turns),
+        "multi_turn_accuracy": accuracy(multi_turns),
+        "continuation_accuracy": tagged_accuracy("continuation"),
+        "task_switch_accuracy": tagged_accuracy("task_switch"),
+        "task_resume_accuracy": tagged_accuracy("task_resume"),
+        "ambiguous_case_accuracy": tagged_accuracy("ambiguous"),
+        "fallback_count": fallback_count,
+        "fallback_rate": _ratio(fallback_count, len(turns)),
+        "rule_decision_count": len(turns),
+        "llm_correction_count": sum(turn.get("router_correction_calls", 0) for turn in turns),
+        "llm_correction_success_count": llm_success_count,
+        "rule_only_accuracy": rule_accuracy,
+        "rule_only_untouched_accuracy": accuracy(untouched_turns),
+        "final_accuracy": final_accuracy,
+        "correction_gain": round(final_accuracy - rule_accuracy, 4),
+        "route_annotation_count": len(annotated),
+        "untouched_turn_count": len(untouched_turns),
+        "corrected_turn_count": len(llm_turns),
+    }
+
+
+def render_routing_report(report: Mapping[str, Any]) -> str:
+    """Render a concise Markdown summary while retaining JSON for full traces."""
+
+    metric_names = (
+        "overall_route_accuracy",
+        "single_turn_accuracy",
+        "multi_turn_accuracy",
+        "continuation_accuracy",
+        "task_switch_accuracy",
+        "task_resume_accuracy",
+        "ambiguous_case_accuracy",
+        "fallback_count",
+        "fallback_rate",
+        "rule_decision_count",
+        "llm_correction_count",
+        "llm_correction_success_count",
+        "rule_only_accuracy",
+        "final_accuracy",
+        "correction_gain",
+    )
+    lines = [
+        "# Router Evaluation Report",
+        "",
+        f"- Dataset: `{report.get('dataset', '')}`",
+        f"- Mode: `{report.get('evaluation_mode', '')}`",
+        f"- Cases: {report.get('case_count', 0)}",
+        f"- Turns: {report.get('turn_count', 0)}",
+        "",
+        "| Metric | Value |",
+        "| --- | ---: |",
+    ]
+    lines.extend(f"| `{name}` | {report.get(name, 0)} |" for name in metric_names)
+    lines.extend(
+        [
+            "",
+            "## Failed Turns",
+            "",
+            "| Case | Turn | Category | Expected | Actual |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+    )
+    failures = 0
+    for case in report.get("cases", []):
+        for turn in case.get("turns", []):
+            if turn.get("passed"):
+                continue
+            failures += 1
+            expected = (
+                ", ".join(key for key, value in turn.get("checks", {}).items() if not value)
+                or "unannotated"
+            )
+            actual = turn.get("actual", {}).get("route") or turn.get("actual", {}).get("task_type")
+            lines.append(
+                f"| `{case.get('id', '')}` | `{turn.get('turn_id', '')}` | "
+                f"`{turn.get('category', '') or ''}` | {expected} | {actual or ''} |"
+            )
+    if not failures:
+        lines.append("| - | - | - | none | - |")
+    return "\n".join(lines) + "\n"
 
 
 def _route_branch(result: RouteResult) -> str:
@@ -1059,9 +1257,7 @@ def _flow_summary(flow_state: ConversationFlowState) -> dict[str, Any]:
         "last_clarification_reason": flow_state.last_clarification_reason,
         "clarification_attempt_count": flow_state.clarification_attempt_count,
         "recent_risk_level": (
-            flow_state.recent_risk_state.level.value
-            if flow_state.recent_risk_state
-            else None
+            flow_state.recent_risk_state.level.value if flow_state.recent_risk_state else None
         ),
     }
 
@@ -1075,6 +1271,23 @@ def _correction_for_turn(
     data = _correction_from_rules(rules).model_dump(mode="json")
     data.update(payload)
     return RouteCorrection.model_validate(data)
+
+
+def _correction_trace(turn: dict[str, Any], result: RouteResult) -> dict[str, Any]:
+    """Record the correction fixture and the observable final override outcome."""
+
+    payload = turn.get("llm_correction")
+    return {
+        "fixture": payload if isinstance(payload, dict) else None,
+        "failure_fixture": turn.get("llm_failure"),
+        "llm_used": result.llm_used,
+        "llm_error": result.llm_error,
+        "fallback_reason": result.fallback_reason,
+        "rule_task_type": result.rule_task_type.value if result.rule_task_type else None,
+        "llm_task_type": result.llm_task_type.value if result.llm_task_type else None,
+        "final_task_type": result.task_type.value,
+        "task_guard_applied": result.task_guard_applied,
+    }
 
 
 def _correction_from_rules(result: RouteResult) -> RouteCorrection:
@@ -1147,9 +1360,7 @@ def _expected_for_mode(
     evaluation_mode: EvaluationMode,
 ) -> dict[str, Any]:
     expected = dict(turn.get("expected", {}))
-    if evaluation_mode == "live" and (
-        "llm_correction" in turn or "llm_failure" in turn
-    ):
+    if evaluation_mode == "live" and ("llm_correction" in turn or "llm_failure" in turn):
         # These checks describe deterministic fault/merge fixtures, not a desired
         # real-model output. Semantic route expectations still apply in Live Eval.
         expected.pop("fallback_reason", None)
@@ -1220,6 +1431,63 @@ def _load_cases(path: Path) -> list[dict[str, Any]]:
     return cases
 
 
+def _filter_values(
+    value: str | None,
+    values: Sequence[str] | None,
+) -> list[str]:
+    selected: list[str] = []
+    if value:
+        selected.append(value)
+    if values:
+        selected.extend(str(item) for item in values if str(item).strip())
+    return list(dict.fromkeys(selected))
+
+
+def _filter_cases(
+    cases: list[dict[str, Any]],
+    *,
+    case_id: str | None,
+    case_ids: Sequence[str] | None,
+    category: str | None,
+    categories: Sequence[str] | None,
+) -> list[dict[str, Any]]:
+    requested_ids = set(_filter_values(case_id, case_ids))
+    requested_categories = {item.casefold() for item in _filter_values(category, categories)}
+    available_ids = {str(case["id"]) for case in cases}
+    unknown_ids = requested_ids - available_ids
+    if unknown_ids:
+        raise ValueError("unknown routing case id(s): " + ", ".join(sorted(unknown_ids)))
+    available_categories = {
+        category_name for case in cases for category_name in _case_categories(case)
+    }
+    unknown_categories = requested_categories - available_categories
+    if unknown_categories:
+        raise ValueError("unknown routing category(ies): " + ", ".join(sorted(unknown_categories)))
+    filtered = [
+        case
+        for case in cases
+        if (not requested_ids or case["id"] in requested_ids)
+        and (not requested_categories or requested_categories & _case_categories(case))
+    ]
+    if not filtered:
+        raise ValueError("routing filters matched no cases")
+    return filtered
+
+
+def _case_categories(case: Mapping[str, Any]) -> set[str]:
+    categories: set[str] = set()
+    if case.get("category"):
+        categories.add(str(case["category"]).casefold())
+    turns = case.get("turns", [])
+    if isinstance(turns, list):
+        categories.update(
+            str(turn["category"]).casefold()
+            for turn in turns
+            if isinstance(turn, Mapping) and turn.get("category")
+        )
+    return categories
+
+
 def _validate_case(case: dict[str, Any], *, line_number: int) -> None:
     case_id = case.get("id")
     if not isinstance(case_id, str) or not case_id.strip():
@@ -1259,9 +1527,7 @@ def _validate_flow_fields(case_id: str, value: dict[str, Any]) -> None:
         "pending_task_turns_remaining",
         "clarification_attempt_count",
     ):
-        if field in value and (
-            not isinstance(value[field], int) or not 0 <= value[field] <= 4
-        ):
+        if field in value and (not isinstance(value[field], int) or not 0 <= value[field] <= 4):
             raise ValueError(f"路由评测案例 {case_id} 的 {field} 必须是 0 到 4 的整数。")
     for field in (
         "pending_task_reason",
@@ -1274,9 +1540,7 @@ def _validate_flow_fields(case_id: str, value: dict[str, Any]) -> None:
         try:
             RecentRiskState.model_validate(value["recent_risk_state"])
         except ValueError as exc:
-            raise ValueError(
-                f"路由评测案例 {case_id} 的 recent_risk_state 结构无效。"
-            ) from exc
+            raise ValueError(f"路由评测案例 {case_id} 的 recent_risk_state 结构无效。") from exc
 
 
 def _validate_messages(
@@ -1334,15 +1598,11 @@ def _validate_expected(case_id: str, expected: dict[str, Any]) -> None:
     if "clarification_exhausted" in expected and not isinstance(
         expected["clarification_exhausted"], bool
     ):
-        raise ValueError(
-            f"路由评测案例 {case_id} 的 clarification_exhausted 必须是 bool。"
-        )
+        raise ValueError(f"路由评测案例 {case_id} 的 clarification_exhausted 必须是 bool。")
     if "pending_continuation" in expected and not isinstance(
         expected["pending_continuation"], bool
     ):
-        raise ValueError(
-            f"路由评测案例 {case_id} 的 pending_continuation 必须是 bool。"
-        )
+        raise ValueError(f"路由评测案例 {case_id} 的 pending_continuation 必须是 bool。")
     if "slots" in expected:
         if not isinstance(expected["slots"], dict):
             raise ValueError(f"路由评测案例 {case_id} 的 slots 必须是 object。")
@@ -1352,9 +1612,7 @@ def _validate_expected(case_id: str, expected: dict[str, Any]) -> None:
             raise ValueError(f"路由评测案例 {case_id} 的 slots 结构无效。") from exc
     rejected = expected.get("slot_rejected_fields")
     if rejected is not None and not isinstance(rejected, (dict, list)):
-        raise ValueError(
-            f"路由评测案例 {case_id} 的 slot_rejected_fields 必须是 object 或 list。"
-        )
+        raise ValueError(f"路由评测案例 {case_id} 的 slot_rejected_fields 必须是 object 或 list。")
 
 
 def _validate_enum(

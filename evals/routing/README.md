@@ -12,6 +12,9 @@
 - `recent_messages`：只用于解析指代或省略的近期消息。
 - `active_task`：当前会话正在进行的任务，可为空。
 - `expected`：必须满足的主任务、主场景、次场景、目标或风险结果。
+- `category`：案例切片标签；可选的 `tags`（案例或 turn）用于 continuation、task switch、
+  task resume、ambiguity 和 anti-context-bias 等切片。`expected.pending_continuation`、
+  `expected.task_switch`、`expected.task_resume`、`expected.ambiguous` 也会自动生成对应标签。
 
 v2 字段约定：
 
@@ -31,6 +34,10 @@ v2 另外统计会话/轮次数量、上下文轮次准确率、LLM 调用率、
 续接、任务切换、复合任务、pending 未消费前的明确取消、澄清、否定、高风险上下文、Slot 提取/幻觉和 LLM 失败。
 旧版本数据集继续保留用于历史行为对比，不用 v4 覆盖它们。
 
+`router_cases_v1.jsonl` 是 Resume 前评估入口，沿用当前冻结的 47 个会话和 118 个 turns，
+其中 36 个会话为多轮（超过 40%）。它保留 v4 的期望值，并额外按 `category`/`tags` 提供
+continuation、task switch、task resume 和 ambiguity 切片；评估不会改变 Router 行为。
+
 默认运行确定性的 Policy Eval，不访问外部模型：
 
 ```powershell
@@ -40,6 +47,19 @@ uv run loveapp eval routing
 Policy 报告默认写入 `evals/baselines/routing_v4_current.json`，并明确记录
 `evaluation_mode=policy`、`corrector_kind=recording` 和数据集 SHA-256。`--fail-on-targets`
 可用于 CI 门禁；门禁只代表该固定集，不代表线上准确率。
+
+Resume 评估可以按案例或类别缩小范围（选项可重复，也接受逗号分隔），并把 `.md` 输出路径
+渲染成 Markdown 摘要：
+
+```powershell
+uv run loveapp eval routing --dataset evals/routing/router_cases_v1.jsonl `
+  --case rt_v4_c26_context_follow_up --category context_follow_up `
+  --output .data/evals/router_cases_v1.md
+```
+
+报告额外包含 `overall_route_accuracy`、单轮/多轮准确率、continuation/task switch/task
+resume/ambiguous 切片、fallback、rule-only 与最终准确率，以及 `correction_gain`。使用非
+`.md` 输出路径时会保存完整逐轮 JSON trace；Markdown 输出只用于人工摘要。
 
 Policy 报告包括 Task Macro Precision/Recall/F1 和各 Task 指标、Scenario/Goal、澄清
 Precision/Recall、`clarification_exhausted`、pending continuation/取消、Out-of-Scope Accuracy、Slot Exact Match、字段 Precision/Recall、Slot

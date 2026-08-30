@@ -64,12 +64,17 @@ from loveapp.domain.relationship_plan import PlanStatus, RelationshipPlan
 from loveapp.domain.routing import RouteResult
 from loveapp.evaluation import (
     FixtureSemanticRelationJudge,
+    evaluate_dateplan,
     evaluate_live_routing_conversations,
     evaluate_memory_foundation,
     evaluate_memory_lifecycle,
+    evaluate_memory_longtail_realistic,
     evaluate_memory_longtail_relations,
     evaluate_routing_conversations,
+    render_dateplan_report,
     render_longtail_baseline_report,
+    render_longtail_realistic_report,
+    render_routing_report,
     run_baseline,
 )
 
@@ -167,6 +172,20 @@ def routing_eval(
             help="未达到固定集验收目标时以非零状态退出。",
         ),
     ] = False,
+    case: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--case",
+            help="只评测指定案例 id；可重复传入或使用逗号分隔。",
+        ),
+    ] = None,
+    category: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--category",
+            help="只评测指定 category；可重复传入或使用逗号分隔。",
+        ),
+    ] = None,
 ) -> None:
     """运行确定性 Policy Eval，或显式启用的真实模型 Live Eval。"""
     output_path = output or Path(
@@ -176,6 +195,8 @@ def routing_eval(
     )
     try:
         settings = get_settings()
+        case_ids = _split_eval_filters(case)
+        categories = _split_eval_filters(category)
         if live:
             report = asyncio.run(
                 evaluate_live_routing_conversations(
@@ -183,6 +204,8 @@ def routing_eval(
                     settings,
                     input_cost_per_million=input_cost_per_million,
                     output_cost_per_million=output_cost_per_million,
+                    case_ids=case_ids or None,
+                    categories=categories or None,
                 )
             )
         else:
@@ -196,13 +219,23 @@ def routing_eval(
                     clarification_threshold=settings.router_clarification_threshold,
                     safety_context_turns=settings.router_context_risk_turns,
                     prompt_version=settings.router_prompt_version,
+                    case_ids=case_ids or None,
+                    categories=categories or None,
                 )
             )
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(
-            json.dumps(report, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        if output_path.suffix.casefold() == ".md":
+            output_path.write_text(render_routing_report(report), encoding="utf-8")
+        else:
+            output_path.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            if not case_ids and not categories:
+                Path("ROUTER_EVAL_REPORT.md").write_text(
+                    render_routing_report(report),
+                    encoding="utf-8",
+                )
     except Exception as exc:
         console.print(f"[red]路由评测失败：[/red]{exc}")
         raise typer.Exit(code=1) from exc
@@ -217,11 +250,84 @@ def routing_eval(
         table.add_row(key, str(value))
     console.print(table)
     if fail_on_targets and not report["acceptance_passed"]:
-        failed = [
-            name for name, passed in report["acceptance_targets"].items() if not passed
-        ]
+        failed = [name for name, passed in report["acceptance_targets"].items() if not passed]
         console.print(f"[red]未达到验收目标：[/red]{', '.join(failed)}")
         raise typer.Exit(code=2)
+
+
+def _split_eval_filters(values: list[str] | None) -> list[str]:
+    """Accept repeated CLI filters as well as a convenient comma-separated value."""
+
+    if not values:
+        return []
+    return [item.strip() for value in values for item in value.split(",") if item.strip()]
+
+
+@eval_app.command("dateplan")
+def dateplan_eval(
+    dataset: Annotated[
+        Path,
+        typer.Option("--dataset", help="DatePlan 评测集路径。"),
+    ] = Path("evals/dateplan/dateplan_cases_v1.jsonl"),
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", help="JSON/Markdown 报告路径；默认保存到 .data/evals。"),
+    ] = None,
+    case: Annotated[
+        str | None,
+        typer.Option("--case", help="只运行指定 scenario id。"),
+    ] = None,
+    category: Annotated[
+        str | None,
+        typer.Option("--category", help="只运行指定 category。"),
+    ] = None,
+) -> None:
+    """运行固定 reference clock 的 DatePlan state/patch/validation 评估。"""
+
+    output_path = output or Path(
+        ".data/evals/dateplan_" + datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f") + ".json"
+    )
+    try:
+        report = asyncio.run(
+            evaluate_dateplan(
+                dataset,
+                case_id=case,
+                category=category,
+                output=None,
+                trace_dir=Path(".data/evals"),
+            )
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if output_path.suffix.casefold() == ".md":
+            output_path.write_text(render_dateplan_report(report), encoding="utf-8")
+        else:
+            output_path.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            if case is None and category is None:
+                Path("DATEPLAN_EVAL_REPORT.md").write_text(
+                    render_dateplan_report(report),
+                    encoding="utf-8",
+                )
+    except Exception as exc:
+        console.print(f"[red]DatePlan 评估失败：[/red]{exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]DatePlan 评估已保存：[/green]{output_path}")
+    table = Table(title="DatePlan Evaluation")
+    table.add_column("指标")
+    table.add_column("值", justify="right")
+    for key in (
+        "scenario_count",
+        "turn_count",
+        "scenario_pass_rate",
+        "patch_accuracy",
+        "state_preservation_accuracy",
+        "validation_accuracy",
+        "final_plan_completion_rate",
+    ):
+        table.add_row(key, str(report.get(key, 0)))
+    console.print(table)
 
 
 @eval_app.command("memory-lifecycle")
@@ -381,13 +487,89 @@ def _default_memory_longtail_output_path(
     return Path(".data/evals") / f"memory_longtail_relations_{mode}_{timestamp}.json"
 
 
+@eval_app.command("memory-longtail-realistic")
+def memory_longtail_realistic_eval(
+    dataset: Annotated[
+        Path,
+        typer.Option("--dataset", help="Long-tail realistic Memory 评测集路径。"),
+    ] = Path("evals/memory/longtail_realistic_v1.jsonl"),
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", help="JSON/Markdown 报告路径；默认保存到 .data/evals。"),
+    ] = None,
+    case: Annotated[
+        str | None,
+        typer.Option("--case", help="只运行指定 scenario id。"),
+    ] = None,
+    category: Annotated[
+        str | None,
+        typer.Option("--category", help="只运行指定 category。"),
+    ] = None,
+    repeat: Annotated[
+        int,
+        typer.Option("--repeat", min=1, max=100, help="重复运行次数，用于观察 judge 波动。"),
+    ] = 1,
+    candidate_limit: Annotated[
+        int,
+        typer.Option("--candidate-limit", min=1, max=10, help="候选 Memory 上限。"),
+    ] = 5,
+) -> None:
+    """运行只读 Long-tail realistic Memory 评估，不提交 Store mutation。"""
+
+    output_path = output or Path(
+        ".data/evals/memory_longtail_realistic_"
+        + datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
+        + ".json"
+    )
+    try:
+        report = asyncio.run(
+            evaluate_memory_longtail_realistic(
+                dataset,
+                case_id=case,
+                category=category,
+                repeat=repeat,
+                candidate_limit=candidate_limit,
+            )
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if output_path.suffix.casefold() == ".md":
+            output_path.write_text(render_longtail_realistic_report(report), encoding="utf-8")
+        else:
+            output_path.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            if case is None and category is None:
+                Path("MEMORY_LONGTAIL_REALISTIC_EVAL_REPORT.md").write_text(
+                    render_longtail_realistic_report(report),
+                    encoding="utf-8",
+                )
+    except Exception as exc:
+        console.print(f"[red]Long-tail realistic Memory 评估失败：[/red]{exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Long-tail realistic Memory 评估已保存：[/green]{output_path}")
+    table = Table(title="Memory Long-tail Realistic")
+    table.add_column("指标")
+    table.add_column("值", justify="right")
+    for key in (
+        "scenario_count",
+        "turn_count",
+        "gate_recall",
+        "retrieval_recall_at_5",
+        "relation_accuracy",
+        "target_memory_precision",
+        "false_destructive_update_count",
+        "confirmed_overwrite_violation_count",
+    ):
+        table.add_row(key, str(report["metrics"].get(key, 0)))
+    console.print(table)
+
+
 def _build_live_memory_relation_judge(
     settings: Any,
 ) -> OpenAICompatibleSemanticRelationJudge:
     if settings.memory_semantic_relation_provider != "llm":
-        raise ValueError(
-            "--live 需要 LOVEAPP_MEMORY_SEMANTIC_RELATION_PROVIDER=llm。"
-        )
+        raise ValueError("--live 需要 LOVEAPP_MEMORY_SEMANTIC_RELATION_PROVIDER=llm。")
     if not settings.llm_api_key:
         raise ValueError("LOVEAPP_LLM_API_KEY 未配置。")
     if not settings.llm_base_url:
@@ -399,9 +581,7 @@ def _build_live_memory_relation_judge(
         or settings.llm_model
     )
     if not model:
-        raise ValueError(
-            "LOVEAPP_MEMORY_SEMANTIC_RELATION_MODEL 或 LOVEAPP_LLM_MODEL 未配置。"
-        )
+        raise ValueError("LOVEAPP_MEMORY_SEMANTIC_RELATION_MODEL 或 LOVEAPP_LLM_MODEL 未配置。")
     return OpenAICompatibleSemanticRelationJudge(
         api_key=settings.llm_api_key,
         base_url=settings.llm_base_url,
@@ -809,7 +989,7 @@ def list_memory_audits(
         typer.Option("--source-message-id"),
     ] = None,
     limit: Annotated[int, typer.Option("--limit", min=1, max=500)] = 100,
-    json_output: Annotated[bool, typer.Option("--json", help="输出 JSON。")]=False,
+    json_output: Annotated[bool, typer.Option("--json", help="输出 JSON。")] = False,
 ) -> None:
     """查看记忆准入、关系判断和生命周期迁移审计。"""
     audits = asyncio.run(
@@ -1718,9 +1898,7 @@ def _render_date_requirements(state: DatePlanningTaskState) -> None:
         )
         roles = list(
             dict.fromkeys(
-                role
-                for stop in requirement.alternatives
-                if (role := _format_date_stop_role(stop))
+                role for stop in requirement.alternatives if (role := _format_date_stop_role(stop))
             )
         )
         maximum = "*" if requirement.max_satisfied is None else str(requirement.max_satisfied)
@@ -1869,19 +2047,13 @@ def _render_date_validation(trace: ExecutionTrace) -> None:
             f"{operation_batch.get('operation_dedupe_input_count', 0)} -> "
             f"{operation_batch.get('operation_dedupe_output_count', 0)}"
         ),
-        "yes"
-        if operation_batch.get("mutation_policy_preserve_unmentioned")
-        else "no",
+        "yes" if operation_batch.get("mutation_policy_preserve_unmentioned") else "no",
     )
     console.print(table)
 
 
 def _render_date_plan_telemetry(trace: ExecutionTrace) -> None:
-    records = [
-        record
-        for record in trace.snapshot()
-        if "date_plan_changed" in record.details
-    ]
+    records = [record for record in trace.snapshot() if "date_plan_changed" in record.details]
     if not records:
         return
     table = Table(title="Date Plan Telemetry")
@@ -1942,8 +2114,7 @@ def _format_stop_reference(reference: StopReference | None) -> str:
 def _format_date_operation_payload(operation: DatePlanOperation) -> str:
     if operation.constraint_field is not None:
         return (
-            f"{operation.constraint_field.value}="
-            f"{_format_debug_value(operation.constraint_value)}"
+            f"{operation.constraint_field.value}={_format_debug_value(operation.constraint_value)}"
         )
     if operation.payload is not None:
         payload = _format_desired_date_stop(operation.payload)
