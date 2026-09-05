@@ -20,6 +20,7 @@ from loveapp.domain.memory_dimensions import (
     INTERACTION_PATTERN_DIMENSIONS,
     is_relationship_interaction_subject,
     normalize_interaction_pattern_payload,
+    normalize_interaction_state_value,
     normalize_state_dimension,
     normalize_state_value,
     relationship_state_ttl,
@@ -285,8 +286,29 @@ def memory_predicate(memory: MemoryCandidate) -> str:
 
 def memory_concept(memory: MemoryCandidate) -> str:
     normalized = normalize_candidate_predicate(memory)
-    canonical = normalized.canonical_predicate
+    canonical = normalized.canonical_predicate or memory.canonical_predicate
     state_value = normalized.state_value
+    # The general predicate normalizer derives interaction state from
+    # ``current``/``direction``/``frequency``.  Lifecycle fixtures and some
+    # legacy callers provide the equivalent value in the typed top-level or
+    # payload ``state_value`` field.  Preserve that value at this boundary so
+    # semantic transition rules remain representation-aware without changing
+    # the shared normalization contract.
+    if canonical in {
+        "interaction.contact_frequency",
+        "interaction.response_engagement",
+    } and state_value is None:
+        metric = canonical.removeprefix("interaction.")
+        for raw_value in (
+            memory.state_value,
+            memory.payload.get("state_value"),
+            memory.payload.get("current"),
+            memory.payload.get("direction"),
+            memory.payload.get("frequency"),
+        ):
+            state_value = normalize_interaction_state_value(metric, raw_value)
+            if state_value is not None:
+                break
     if canonical == "contact.status" and state_value:
         if state_value in {"normal", "restored"}:
             return "contact_restored"
@@ -595,6 +617,7 @@ def plan_memory_transitions(
                 for item in active_memories
                 if item.id not in claimed_targets
                 and memory_concept(item) in rule.closes_concepts
+                and _semantic_transition_applies(rule, trigger, item)
                 and _trigger_can_close_target(
                     trigger,
                     item,
@@ -737,6 +760,7 @@ _GOVERNED_INTERACTION_STATE_VALUES = {
     "interaction.initiation_balance": frozenset(
         {"partner_to_user", "balanced", "user_to_partner", "mixed"}
     ),
+    "interaction.emotional_disclosure": frozenset({"high", "low"}),
     "interaction.response_engagement": frozenset(
         {
             "unresponsive",
@@ -802,9 +826,70 @@ def _has_preference_payload(memory: MemoryCandidate) -> bool:
 def _is_strictly_older(target: MemoryItem, trigger: MemoryCandidate) -> bool:
     if not isinstance(trigger, MemoryItem):
         return True
-    target_time = target.occurred_at or target.period_end or target.updated_at
-    trigger_time = trigger.occurred_at or trigger.period_end or trigger.updated_at
+    target_time, trigger_time = _legacy_comparison_times(target, trigger)
     return target.id != trigger.id and target_time < trigger_time
+
+
+def _legacy_comparison_times(
+    target: MemoryItem,
+    trigger: MemoryItem,
+) -> tuple[datetime, datetime]:
+    """Choose one shared business-time field for legacy ordering.
+
+    Comparing an occurrence timestamp on one row with an update timestamp on
+    another can reverse the persisted sequence.  Use a field only when both
+    memories provide it, then fall back to the always-present ``updated_at``.
+    """
+
+    for field in ("occurred_at", "period_end", "updated_at"):
+        target_time = getattr(target, field)
+        trigger_time = getattr(trigger, field)
+        if target_time is not None and trigger_time is not None:
+            return target_time, trigger_time
+    return target.updated_at, trigger.updated_at
+
+
+def _semantic_transition_applies(
+    rule: StateTransitionRule,
+    trigger: MemoryCandidate,
+    target: MemoryItem,
+) -> bool:
+    """Keep specialized contact-frequency ownership representation-safe."""
+
+    if rule.name != "restore_contact_frequency":
+        return True
+    if _is_interaction_contact_frequency(trigger) or _is_interaction_contact_frequency(
+        target
+    ):
+        return True
+    # A legacy stable-fact contact.status surface predates the explicit
+    # relationship-state dimension and is intentionally kept on this rule.
+    return not (
+        _has_explicit_contact_status_dimension(trigger)
+        and _has_explicit_contact_status_dimension(target)
+    )
+
+
+def _is_interaction_contact_frequency(memory: MemoryCandidate) -> bool:
+    canonical = memory.canonical_predicate
+    if canonical == "interaction.contact_frequency":
+        return True
+    metric = memory.payload.get("metric")
+    return isinstance(metric, str) and metric.casefold() == "contact_frequency"
+
+
+def _has_explicit_contact_status_dimension(memory: MemoryCandidate) -> bool:
+    if memory.kind != MemoryKind.RELATIONSHIP_STATE:
+        return False
+    if memory.canonical_predicate != "contact.status":
+        return False
+    return any(
+        isinstance(value, str) and value.strip()
+        for value in (
+            memory.state_dimension,
+            memory.payload.get("state_dimension"),
+        )
+    )
 
 
 def _trigger_can_close_target(

@@ -26,13 +26,16 @@ from loveapp.domain.memory import (
 )
 from loveapp.domain.memory_predicates import CANONICAL_PREDICATES
 from loveapp.domain.memory_verification import ClaimVerification
+from loveapp.domain.runtime_context import PendingMemoryContext
 from loveapp.ports.memory import MemoryAttemptCallback
 from loveapp.ports.observability import TraceRecorder
 
-_MEMORY_PROMPT_VERSION = "memory-v2.2"
+_MEMORY_PROMPT_VERSION = "memory-v2.6"
 
 
 class OpenAICompatibleMemoryExtractor:
+    requires_semantic_gate_contract = True
+
     def __init__(
         self,
         *,
@@ -44,12 +47,16 @@ class OpenAICompatibleMemoryExtractor:
         max_tokens: int = 4096,
         tier: str = "flash",
         thinking: Literal["enabled", "disabled"] | None = None,
+        validation_mode: Literal["legacy", "raw"] = "legacy",
     ) -> None:
+        if validation_mode not in {"legacy", "raw"}:
+            raise ValueError(f"unsupported validation_mode: {validation_mode}")
         self._model = model
         self._max_tokens = max_tokens
         self._sdk_max_retries = max_retries
         self._tier = tier
         self._thinking = thinking
+        self._validation_mode = validation_mode
         self._client = AsyncOpenAI(
             api_key=api_key.get_secret_value(),
             base_url=base_url,
@@ -64,6 +71,7 @@ class OpenAICompatibleMemoryExtractor:
         reference_time: datetime,
         existing_memories: list[MemoryItem],
         conversation_history: list[StoredMessage],
+        pending_memory_context: PendingMemoryContext | None = None,
         trace: TraceRecorder | None = None,
         attempt_callback: MemoryAttemptCallback | None = None,
     ) -> AtomicExtraction:
@@ -72,6 +80,7 @@ class OpenAICompatibleMemoryExtractor:
             reference_time=reference_time,
             existing_memories=existing_memories,
             conversation_history=conversation_history,
+            pending_memory_context=pending_memory_context,
             trace=trace,
             attempt_callback=attempt_callback,
             attempt_number=1,
@@ -90,6 +99,7 @@ class OpenAICompatibleMemoryExtractor:
         reference_time: datetime,
         existing_memories: list[MemoryItem],
         conversation_history: list[StoredMessage],
+        pending_memory_context: PendingMemoryContext | None = None,
         trace: TraceRecorder | None,
         attempt_callback: MemoryAttemptCallback | None,
         attempt_number: int,
@@ -104,6 +114,7 @@ class OpenAICompatibleMemoryExtractor:
                     reference_time,
                     existing_memories,
                     conversation_history,
+                    pending_memory_context,
                 ),
             },
         ]
@@ -137,7 +148,11 @@ class OpenAICompatibleMemoryExtractor:
                 details["finish_reason"] = getattr(choice, "finish_reason", None)
                 content = choice.message.content
                 try:
-                    parsed = parse_memory_response(content, source_text=text)
+                    parsed = parse_memory_response(
+                        content,
+                        source_text=text,
+                        validation_mode=self._validation_mode,
+                    )
                 except MemoryResponseError as exc:
                     # The trace context stores its details when it exits, so
                     # record the parse category before re-raising.
@@ -165,9 +180,7 @@ class OpenAICompatibleMemoryExtractor:
                             "claims": [
                                 claim.model_copy(
                                     update={
-                                        "raw_predicate": (
-                                            claim.raw_predicate or claim.predicate
-                                        ),
+                                        "raw_predicate": (claim.raw_predicate or claim.predicate),
                                         "prompt_version": _MEMORY_PROMPT_VERSION,
                                         "extractor_model": self._model,
                                     }
@@ -178,20 +191,30 @@ class OpenAICompatibleMemoryExtractor:
                     ),
                 )
                 details["repair_status"] = parsed.repair_status
+                details["validation_mode"] = parsed.validation_mode
+                details["validation_boundary"] = (
+                    "raw_generic" if parsed.validation_mode == "raw" else "legacy_combined"
+                )
+                details["extraction_status"] = parsed.extraction_status
+                details["semantic_gate_should_extract"] = parsed.extraction.should_extract
+                details["semantic_gate_reason"] = (
+                    parsed.extraction.gate_reason.value
+                    if parsed.extraction.gate_reason is not None
+                    else None
+                )
+                details["semantic_gate_contract"] = (
+                    "present" if parsed.extraction.should_extract is not None else "legacy_missing"
+                )
                 details["claim_count"] = len(parsed.extraction.claims)
                 details["original_claim_count"] = parsed.original_claim_count
                 details["repaired_claim_count"] = parsed.repaired_claim_count
                 details["discarded_claim_count"] = parsed.discarded_claim_count
                 details["discarded_span_count"] = len(parsed.extraction.discarded_spans)
                 details["claim_confidences"] = ",".join(
-                    f"{claim.claim_id}:{claim.confidence:.2f}"
-                    for claim in parsed.extraction.claims
+                    f"{claim.claim_id}:{claim.confidence:.2f}" for claim in parsed.extraction.claims
                 )
                 details["claims_json"] = json.dumps(
-                    [
-                        claim.model_dump(mode="json")
-                        for claim in parsed.extraction.claims
-                    ],
+                    [claim.model_dump(mode="json") for claim in parsed.extraction.claims],
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
@@ -216,9 +239,7 @@ class OpenAICompatibleMemoryExtractor:
                         )
                 if parsed.invalid_claim_count:
                     details["invalid_claim_count"] = parsed.invalid_claim_count
-                    details["invalid_claim_reasons"] = " | ".join(
-                        parsed.invalid_claim_reasons
-                    )
+                    details["invalid_claim_reasons"] = " | ".join(parsed.invalid_claim_reasons)
                     details["discard_reason"] = "partial_claims_discarded"
         except MemoryResponseError as exc:
             details["failure_category"] = exc.category
@@ -311,6 +332,8 @@ class OpenAICompatibleMemoryExtractor:
 class TieredMemoryExtractor:
     """Run Flash first and use a strong model only for important uncertainty."""
 
+    requires_semantic_gate_contract = True
+
     def __init__(
         self,
         flash: OpenAICompatibleMemoryExtractor,
@@ -356,6 +379,7 @@ class TieredMemoryExtractor:
         reference_time: datetime,
         existing_memories: list[MemoryItem],
         conversation_history: list[StoredMessage],
+        pending_memory_context: PendingMemoryContext | None = None,
         trace: TraceRecorder | None = None,
         attempt_callback: MemoryAttemptCallback | None = None,
     ) -> AtomicExtraction:
@@ -366,6 +390,7 @@ class TieredMemoryExtractor:
                 reference_time=reference_time,
                 existing_memories=existing_memories,
                 conversation_history=conversation_history,
+                pending_memory_context=pending_memory_context,
                 trace=trace,
                 attempt_callback=flash_attempts.append,
                 attempt_number=1,
@@ -399,6 +424,7 @@ class TieredMemoryExtractor:
                 reference_time=reference_time,
                 existing_memories=existing_memories,
                 conversation_history=conversation_history,
+                pending_memory_context=pending_memory_context,
                 trace=trace,
                 attempt_callback=attempt_callback,
                 fallback_extraction=None,
@@ -409,12 +435,25 @@ class TieredMemoryExtractor:
             raise
 
         flash_extraction = flash_parsed.extraction
+        if flash_extraction.should_extract is False:
+            decision = MemoryUpgradeDecision(
+                should_upgrade=False,
+                reason="semantic_gate_rejected",
+                signals=("semantic_gate_false",),
+            )
+            self._record_decision(trace, decision)
+            self._annotate_attempt(
+                flash_attempts,
+                upgrade_reason=decision.reason,
+            )
+            _flush_attempts(flash_attempts, attempt_callback)
+            return flash_extraction
         decision = assess_memory_upgrade(
             text,
             existing_memories=existing_memories,
             conversation_history=conversation_history,
             extraction=flash_extraction,
-            partial=flash_parsed.invalid_claim_count > 0,
+            partial=_is_partial_extraction(flash_parsed),
             min_importance=self._upgrade_min_importance,
         )
         self._record_decision(trace, decision)
@@ -434,6 +473,7 @@ class TieredMemoryExtractor:
             reference_time=reference_time,
             existing_memories=existing_memories,
             conversation_history=conversation_history,
+            pending_memory_context=pending_memory_context,
             trace=trace,
             attempt_callback=attempt_callback,
             fallback_extraction=flash_extraction,
@@ -447,6 +487,7 @@ class TieredMemoryExtractor:
         reference_time: datetime,
         existing_memories: list[MemoryItem],
         conversation_history: list[StoredMessage],
+        pending_memory_context: PendingMemoryContext | None,
         trace: TraceRecorder | None,
         attempt_callback: MemoryAttemptCallback | None,
         fallback_extraction: AtomicExtraction | None,
@@ -459,6 +500,7 @@ class TieredMemoryExtractor:
                 reference_time=reference_time,
                 existing_memories=existing_memories,
                 conversation_history=conversation_history,
+                pending_memory_context=pending_memory_context,
                 trace=trace,
                 attempt_callback=strong_attempts.append,
                 attempt_number=2,
@@ -478,6 +520,13 @@ class TieredMemoryExtractor:
                 return fallback_extraction
             raise
         self._annotate_attempt(strong_attempts, upgrade_reason=decision.reason)
+        if parsed.extraction.should_extract is False:
+            self._annotate_attempt(
+                strong_attempts,
+                discard_reason="strong_semantic_gate_rejected",
+            )
+            _flush_attempts(strong_attempts, attempt_callback)
+            return fallback_extraction or parsed.extraction
         if (
             fallback_extraction is not None
             and fallback_extraction.claims
@@ -493,6 +542,13 @@ class TieredMemoryExtractor:
             _flush_attempts(strong_attempts, attempt_callback)
             return fallback_extraction
         _flush_attempts(strong_attempts, attempt_callback)
+        if fallback_extraction is not None:
+            return parsed.extraction.model_copy(
+                update={
+                    "should_extract": fallback_extraction.should_extract,
+                    "gate_reason": fallback_extraction.gate_reason,
+                }
+            )
         return parsed.extraction
 
     @staticmethod
@@ -511,9 +567,7 @@ class TieredMemoryExtractor:
             updates["discard_reason"] = discard_reason
         if not updates:
             return
-        attempts[-1] = attempts[-1].model_copy(
-            update=updates
-        )
+        attempts[-1] = attempts[-1].model_copy(update=updates)
 
     @staticmethod
     def _record_decision(
@@ -547,6 +601,7 @@ def _build_prompt(
     reference_time: datetime,
     existing_memories: list[MemoryItem],
     conversation_history: list[StoredMessage],
+    pending_memory_context: PendingMemoryContext | None = None,
 ) -> str:
     payload = {
         "reference_time": reference_time.isoformat(),
@@ -555,6 +610,16 @@ def _build_prompt(
             {"role": message.role.value, "content": message.content}
             for message in conversation_history[-6:]
         ],
+        "runtime_context": {
+            "l0_route": (
+                "CONTEXT_PASS" if pending_memory_context is not None else None
+            ),
+            "pending_memory_context": (
+                pending_memory_context.model_dump(mode="json")
+                if pending_memory_context is not None
+                else None
+            ),
+        },
         "existing_active_memories": [
             {
                 "id": item.id,
@@ -692,20 +757,17 @@ def _build_attempt(
             if details.get("invalid_claim_reasons")
             else None
         ),
+        extraction_status=(
+            str(details.get("extraction_status"))
+            if details.get("extraction_status")
+            else None
+        ),
         failure_category=(
-            str(details.get("failure_category"))
-            if details.get("failure_category")
-            else None
+            str(details.get("failure_category")) if details.get("failure_category") else None
         ),
-        repair_status=(
-            str(details.get("repair_status"))
-            if details.get("repair_status")
-            else None
-        ),
+        repair_status=(str(details.get("repair_status")) if details.get("repair_status") else None),
         repair_steps=(
-            str(details.get("repair_steps"))[:1000]
-            if details.get("repair_steps")
-            else None
+            str(details.get("repair_steps"))[:1000] if details.get("repair_steps") else None
         ),
         raw_model_response=(
             str(details.get("raw_model_response"))[:2000]
@@ -718,33 +780,21 @@ def _build_attempt(
             else None
         ),
         validation_error=(
-            str(details.get("validation_error"))[:1000]
-            if details.get("validation_error")
-            else None
+            str(details.get("validation_error"))[:1000] if details.get("validation_error") else None
         ),
         repair_attempt=(
-            str(details.get("repair_attempt"))[:160]
-            if details.get("repair_attempt")
-            else None
+            str(details.get("repair_attempt"))[:160] if details.get("repair_attempt") else None
         ),
         repair_result=(
-            str(details.get("repair_result"))[:500]
-            if details.get("repair_result")
-            else None
+            str(details.get("repair_result"))[:500] if details.get("repair_result") else None
         ),
         upgrade_reason=(
-            str(details.get("upgrade_reason"))
-            if details.get("upgrade_reason")
-            else None
+            str(details.get("upgrade_reason")) if details.get("upgrade_reason") else None
         ),
         discard_reason=(
-            str(details.get("discard_reason"))
-            if details.get("discard_reason")
-            else None
+            str(details.get("discard_reason")) if details.get("discard_reason") else None
         ),
-        retry_reason=(
-            str(details.get("retry_reason")) if details.get("retry_reason") else None
-        ),
+        retry_reason=(str(details.get("retry_reason")) if details.get("retry_reason") else None),
         error=error[:500] if error else None,
     )
 
@@ -760,6 +810,15 @@ def _repair_attempt_from_steps(steps: str) -> str:
     return "none"
 
 
+def _is_partial_extraction(parsed: ParsedMemoryResponse) -> bool:
+    repair_steps = {value.strip() for value in parsed.repair_steps.split(",") if value.strip()}
+    return bool(
+        parsed.invalid_claim_count
+        or parsed.repaired_claim_count
+        or "partial_discarded_spans" in repair_steps
+    )
+
+
 def _relationship_stage_repair_result(extraction: AtomicExtraction) -> str:
     values = [
         claim.payload.get("state_value")
@@ -767,11 +826,7 @@ def _relationship_stage_repair_result(extraction: AtomicExtraction) -> str:
         if claim.canonical_predicate == "relationship.stage"
     ]
     normalized = [str(value) for value in values if value]
-    return (
-        f"relationship.stage={','.join(normalized)}"
-        if normalized
-        else "unresolved"
-    )
+    return f"relationship.stage={','.join(normalized)}" if normalized else "unresolved"
 
 
 def _safe_model_response_snapshot(content: object, *, limit: int = 2000) -> str:
@@ -789,7 +844,7 @@ def _safe_model_response_snapshot(content: object, *, limit: int = 2000) -> str:
         )
     sensitive_field = re.compile(
         r'(?i)(["\']?(?:api[ _-]?key|authorization|password|secret|token|'
-        r'access[ _-]?token|refresh[ _-]?token|client[ _-]?secret|private[ _-]?key)'
+        r"access[ _-]?token|refresh[ _-]?token|client[ _-]?secret|private[ _-]?key)"
         r'["\']?\s*:\s*)'
         r'(?:(?:"(?:\\.|[^"\\])*")|(?:\'(?:\\.|[^\'\\])*\')|[^\r\n,}\]]+)'
     )
@@ -801,9 +856,7 @@ def _redact_snapshot_value(value: object) -> object:
     if isinstance(value, dict):
         return {
             str(key): (
-                "[REDACTED]"
-                if _is_sensitive_snapshot_key(key)
-                else _redact_snapshot_value(child)
+                "[REDACTED]" if _is_sensitive_snapshot_key(key) else _redact_snapshot_value(child)
             )
             for key, child in value.items()
         }
@@ -824,9 +877,7 @@ def _is_sensitive_snapshot_key(value: object) -> bool:
         "refreshtoken",
         "clientsecret",
         "privatekey",
-    } or normalized.endswith(
-        ("apikey", "password", "secret", "token", "privatekey")
-    )
+    } or normalized.endswith(("apikey", "password", "secret", "token", "privatekey"))
 
 
 def _discard_reason_for_failure(failure: MemoryResponseError) -> str:
@@ -836,6 +887,7 @@ def _discard_reason_for_failure(failure: MemoryResponseError) -> str:
         "root_shape": "root_shape_invalid",
         "unsupported_enum": "unsupported_enum",
         "schema_validation": "schema_validation_failed",
+        "semantic_gate_contract": "semantic_gate_contract_violation",
         "semantic_validation": "semantic_validation_failed",
         "missing_temporal_anchor": "missing_temporal_anchor",
         "atomicity_validation": "atomicity_validation_failed",
@@ -878,7 +930,69 @@ evidence_sufficient 必须为 false，不能把推测验证成事实。你只提
 
 _SYSTEM_PROMPT = """
 你是 LoveApp 的关系记忆原子声明抽取器，只输出一个合法 JSON 对象：
-{"claims": [...], "discarded_spans": [...]}。
+{"should_extract": true, "gate_reason": "STABLE_FACT", "claims": [...],
+ "discarded_spans": [...]}。
+
+你必须在这同一次响应中同时完成语义 Gate 判断和原子声明抽取，禁止省略 should_extract 或
+gate_reason，也不要输出额外解释。should_extract 只能是 JSON 布尔值。gate_reason 只能是：
+STABLE_FACT、PREFERENCE、INTERACTION_PATTERN、RELATIONSHIP_STATE、RELATIONSHIP_CHANGE、
+PARTIAL_CHANGE、USER_BELIEF、PLANNED_EVENT、ACTION_INTENT、ADVICE_OUTCOME、
+COMPOUND_MEMORY、CONTEXT_DEPENDENT_REPLY、TRANSIENT、SMALL_TALK、NO_MEMORY。
+
+语义 Gate 规则：
+- 未来咨询仍可能有用的稳定事实、偏好、持续互动模式、关系状态或变化、用户持续信念、明确计划、
+  行动承诺、建议结果和上下文相关回答，should_extract=true，并选择对应的正向 gate_reason。
+- 一次性瞬时情绪或无持续价值的单次反应用 TRANSIENT；寒暄用 SMALL_TALK；普通咨询问题、拒绝
+  提供信息、纯操作内容或没有可保存信息时用 NO_MEMORY。以上三类必须 should_extract=false。
+- 语义 Gate 和 claim 可构造性分开判断。若 user_message 是对 recent_conversation 中最近一条
+  Assistant 关系记忆追问的具体回答（时长、原因、主体、是否、频率或其他明确值），必须
+  should_extract=true 且 gate_reason=CONTEXT_DEPENDENT_REPLY。即使当前不能安全构造完整
+  claim，也应返回 claims=[]，不得因短答本身不完整而改判 NO_MEMORY。只有明确不知道、
+  拒绝回答或切换到无可记忆信息的话题时才 should_extract=false。
+- 当 runtime_context.l0_route=CONTEXT_PASS 且包含 pending_memory_context 时，优先将
+  previous_assistant_question 与 user_message 联合解释。极短、省略或代词回答不能仅因脱离问题
+  后不完整而拒绝。Q+A 形成具体关系事实时返回 true；“我不知道”等无信息回答、拒答或无记忆的
+  话题中断返回 false。若用户切换话题但独立提供新的 durable fact，抽取该独立事实，不要填入
+  pending expected_slot。
+- CONTEXT_PASS 语义示例（仅示范 Gate，不要求强行构造 claim）：
+  Q“你们为什么吵架？”+A“消费观。” => true/CONTEXT_DEPENDENT_REPLY；
+  Q“是谁先提的分手？”+A“她。” => true/CONTEXT_DEPENDENT_REPLY；
+  Q“你们为什么吵架？”+A“我也不知道。” => false/NO_MEMORY；
+  Q“你们为什么吵架？”+A“对了，她特别喜欢寿司。” => true/PREFERENCE，且寿司不是冲突原因。
+- pending_memory_context 处于 active 且当前回答直接填充 expected_slot 时，必须将结构化的
+  previous_assistant_question、expected_slot、topic 与当前回答共同解释为一个 proposition；不要把
+  问答文本拼成新的 user_message。短回答本身可以成为完整记忆，claim 的 evidence_spans 仍只能逐字
+  摘自当前 user_message，requires_inference=true。例：actor 问答“这次是谁先提的分手？”+“她。”
+  表示 partner 是分手发起者；cause 问答“你们主要因为什么吵起来？”+“消费观。”表示消费观是冲突
+  原因；interaction_state 问答“她后来主动道歉了吗？”+“没有。”表示 partner 没有主动道歉。
+  当问题描述一次有边界的过去行为时，actor/cause/是否答案应补全为 interaction_event，不得为发起者、
+  原因等开放属性伪造 relationship_state 或未注册 state_dimension；只有明确的当前状态才使用
+  relationship_state。
+  不得超出问题与回答发明事实。“不知道/不确定/不想说”等未知或拒答不构造 claim；发生话题切换时
+  只抽取新话题中独立陈述的 durable fact，不得用它填充原 expected_slot。
+- USER_BELIEF 只有在该判断持续、反复出现、涉及关系层面的长期判断，或对未来建议和决策仍有
+  持续价值时才应保存。仅由一个刚发生的单次事件触发、用户明确描述为瞬间反应、且没有持续或
+  重复证据的主观解释属于 TRANSIENT；不得仅因 perspective 是 user_belief，或出现“感觉/觉得/
+  怀疑/是不是”，就判为 USER_BELIEF。若同一句同时包含“今天/突然”和过去数周或数月的持续
+  belief，以持续时间语义为准，不得按瞬时猜测丢弃。
+- 上述持续性门槛只用于区分主观 USER_BELIEF 与 TRANSIENT_BELIEF，不适用于具体事实、偏好、
+  互动模式、关系变化或 CONTEXT_PASS 的明确 slot answer；这些类型继续按各自 Gate policy 判断。
+- USER_BELIEF / TRANSIENT 边界示例（仅示范 Gate）：
+  “她刚刚回消息有点冷，我突然觉得她是不是生气了。” => false/TRANSIENT；
+  “她今天没主动找我，我一下觉得她是不是烦我了。” => false/TRANSIENT；
+  “最近一个多月我一直觉得她在刻意回避和我聊未来。” => true/USER_BELIEF；
+  “我这两三个月总担心她可能会离开这段关系。” => true/USER_BELIEF。
+- PLANNED_EVENT 必须至少有明确的承诺、协调结果或可执行安排。仅有可能性、随口提及、尚未
+  讨论或纯设想时 should_extract=false 且 gate_reason=NO_MEMORY。
+- 若用户明确将一次过去事件限定为偶发、已有一次性解释、之前没有同类模式且无当前持续影响，
+  该事件整体用 TRANSIENT，不要拆成 STABLE_FACT 或 interaction pattern。
+- should_extract=false 时 claims 必须为空。should_extract=true 但无法安全形成合法 claim 时允许
+  claims 暂时为空；不得为了填充 claims 发明事实。
+- recent_conversation 只用于理解省略、指代和 Assistant 紧邻追问。Assistant 的问题不是用户事实；
+  用户明确不知道、不愿回答或已切换到无记忆话题时仍应 should_extract=false。
+- 只根据输入中的 user_message、recent_conversation、reference_time 和
+  existing_active_memories 判断。
+  不得猜测任何外部标签、标准答案、评测理由或 extraction hint。
 
 只记录未来咨询或约会规划中仍可能有用的用户信息。没有值得记录的内容时 claims 返回空数组。
 允许的 kind 只有：stable_fact、preference、interaction_event、
@@ -953,8 +1067,32 @@ _SYSTEM_PROMPT = """
    无法确定时留 null，
    temporal_precision 使用 exact、day、week、month、approximate、unknown。
 10. time_kind 只能是 point、interval、timeless、unknown。稳定事实和偏好通常为 timeless。
-10. subject 优先使用 user、partner、relationship；确有必要时才使用更具体的短标签。
-   predicate 使用稳定的英文 snake_case 动词或状态，object 是可选的规范化宾语。
+10. subject 回答“这个 proposition 描述哪个实体或哪段关系”；perspective 回答“该 proposition 从谁的
+   认知立场得知”；payload.actor 只记录事件或行为的执行者。三者相互独立。subject 只使用 user、
+   partner、relationship，不要把第三方、belief holder 或 payload.actor 复制到 subject。不要仅因句子
+   以“我觉得/我担心/我认为”开头就选择 subject=user。
+   例如：“我觉得她可能在躲我”使用 subject=partner、perspective=user_belief；“我担心我们可能
+   越来越疏远”使用 subject=relationship、perspective=user_belief；“我不喜欢酒吧”使用
+   subject=user、perspective=user_reported；“她明确说自己不想结婚”使用 subject=partner、
+   perspective=user_reported；“我们昨天因为消费观吵了一架”使用 subject=relationship、
+   perspective=user_reported。当 proposition 明确回答“谁执行了这个动作”（如谁先提出分手）时，
+   执行动作的 user 或 partner 是 subject；当 proposition 描述双方共同经历的争吵、联系、关系状态或
+   interaction metric，且没有以单个 actor 为语义焦点时，subject=relationship。Advice 对关系产生的
+   outcome 也使用 relationship，即使证据表现为 partner 的反应。predicate 使用稳定的英文 snake_case
+   动词或状态，object 是可选的规范化宾语。
+   subject hard contrasts：
+   先按 proposition 的语义焦点判定：单个 actor 的个人行为/事件 => 该 user 或 partner；partner 的个人
+   状态或意图（即使出现在关系语境、由用户转述或属于 user_belief）=> partner；只有双方共享的当前
+   关系状态、共同事件或 interaction metric => relationship。USER_BELIEF 的 holder 只决定
+   perspective，
+   proposition target 才决定 subject。
+   “是我先提出暂停联系” => user；“我们已经暂停联系两周” => relationship；
+   “她先提了分手” => partner；“我们已经正式分手” => relationship；
+   “过去三个月每次吵完都是我先道歉” => user；“她的消息持续变短”作为双方通信 metric => relationship；
+   “她明确说自己是单身” => partner；“我们现在处于冷战” => relationship；
+   “我觉得她不想结婚” => partner + user_belief；
+   “我担心我们越来越疏远” => relationship + user_belief；
+   “按建议讲清预算后她反馈更舒服”作为 advice outcome => relationship，partner 反应放 payload.actor。
 11. perspective 只能是 user_reported、user_belief、model_inferred。
     除非非常必要，不使用 model_inferred。
     kind 与 perspective 是两个独立字段，绝不能把 user_belief、hearsay 或 subjective 当成 kind。
@@ -967,6 +1105,16 @@ _SYSTEM_PROMPT = """
 14. payload 放可复用的规范值，例如偏好可写 {"preference": "安静", "preference_type": "like"}。
     preference 和 preference_type 必须是单个字符串，禁止使用数组合并多个偏好。
 15. 原子性是硬约束：一条 claim 只能表达一个能够被独立确认、更新或删除的信息。
+    如果两个 proposition 未来可以被独立确认、更新、否定、supersede 或删除，就必须拆成两条
+    claims。不要仅因多个维度共享 engagement、social inclusion 或 relationship progress 等宽泛主题
+    就合并。回复速度、消息长度、主动发起、话题范围、互动渠道、社交邀请、介绍朋友均是可独立
+    更新的维度；同时出现时分别抽取。
+    例如“她会邀请我参加朋友聚会，也会主动把我介绍给她的朋友”必须拆成 social invitation 与
+    friend introduction 两条；“我按建议先倾听，她愿意继续沟通，我们把矛盾说开了”应将建议效果
+    advice_outcome 与当前冲突已解决的 relationship_state 分开。相反，同一 metric 的 baseline 与
+    current（如隔天回复变为每天回复）仍是一条变化 claim，不要过度拆分。
+    “回复越来越慢、消息越来越短、也不再主动开启话题”必须分别抽取 reply speed、message length、
+    topic initiation 三条 claims，不得合成笼统的 response engagement。
     一条输入含多个事实、偏好、事件或模式时，必须输出多个 claim 对象。
     例如“我不喜欢酒吧，她喜欢话剧”必须拆成 user 的 dislike 和 partner 的 like 两条 preference。
     一个 interaction_pattern 可以用多个 evidence_spans 表达同一指标从 baseline 到 current 的变化，

@@ -390,7 +390,10 @@ class LongTailRelationShadowEvaluator:
                     subject=result.item.subject,
                     summary=result.item.summary,
                     status=result.item.status,
-                    score=result.score.as_dict(),
+                    score={
+                        **result.score.as_dict(),
+                        **_relation_priority_components(incoming, result.item),
+                    },
                 )
                 for result in retrieved
             ],
@@ -413,21 +416,93 @@ def _relation_query(incoming: MemoryCandidate) -> str:
 def _relation_rank(
     incoming: MemoryCandidate,
     result: RetrievedMemory,
-) -> tuple[float, float, float, str]:
+) -> tuple[float | str, ...]:
     item = result.item
-    compatibility_bonus = 0.0
-    if _subject_key(item.subject) == _subject_key(incoming.subject):
-        compatibility_bonus += 0.12
-    if item.kind == incoming.kind:
-        compatibility_bonus += 0.08
-    if memory_role(item) == memory_role(incoming):
-        compatibility_bonus += 0.05
+    priority = _relation_priority_components(incoming, item)
     return (
-        -(result.score.total + compatibility_bonus),
-        -result.score.semantic_similarity,
+        -priority["predicate_priority"],
+        -priority["subject_priority"],
+        -priority["entity_priority"],
+        -priority["temporal_priority"],
+        -priority["kind_priority"],
+        -priority["role_priority"],
         -result.score.predicate_match,
+        -result.score.semantic_similarity,
+        -result.score.total,
         item.id,
     )
+
+
+def _relation_priority_components(
+    incoming: MemoryCandidate,
+    item: MemoryItem,
+) -> dict[str, float]:
+    """Return explainable relation-ranking features.
+
+    These features only order retrieved candidates.  They do not authorize a
+    relation or a write; authorization remains the validator/resolver's job.
+    Predicate identity is intentionally placed before embedding similarity.
+    """
+
+    incoming_predicate = _predicate_identity(incoming)
+    item_predicate = _predicate_identity(item)
+    if incoming_predicate and incoming_predicate == item_predicate:
+        predicate_priority = 1.0
+    elif (
+        incoming.state_dimension
+        and item.state_dimension
+        and incoming.state_dimension == item.state_dimension
+    ):
+        predicate_priority = 0.9
+    elif (
+        incoming.payload.get("metric")
+        and incoming.payload.get("metric") == item.payload.get("metric")
+    ):
+        predicate_priority = 0.8
+    else:
+        predicate_priority = 0.0
+
+    subject_priority = float(_subject_key(item.subject) == _subject_key(incoming.subject))
+    entity_priority = float(_entity_identity(incoming) == _entity_identity(item))
+    if _entity_identity(incoming) is None or _entity_identity(item) is None:
+        entity_priority = 0.0
+    temporal_priority = _temporal_priority(incoming, item)
+    kind_priority = float(item.kind == incoming.kind)
+    role_priority = float(memory_role(item) == memory_role(incoming))
+    return {
+        "predicate_priority": predicate_priority,
+        "subject_priority": subject_priority,
+        "entity_priority": entity_priority,
+        "temporal_priority": temporal_priority,
+        "kind_priority": kind_priority,
+        "role_priority": role_priority,
+    }
+
+
+def _predicate_identity(memory: MemoryCandidate) -> str | None:
+    return memory.canonical_predicate or memory.custom_predicate or memory.raw_predicate
+
+
+def _entity_identity(memory: MemoryCandidate) -> str | None:
+    for key in ("entity", "target_entity", "subject_entity", "object_entity"):
+        value = memory.payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.casefold().strip()
+    return None
+
+
+def _temporal_priority(incoming: MemoryCandidate, item: MemoryCandidate) -> float:
+    incoming_family = incoming.payload.get("event_family")
+    item_family = item.payload.get("event_family")
+    if (
+        isinstance(incoming_family, str)
+        and isinstance(item_family, str)
+        and incoming_family.casefold() == item_family.casefold()
+    ):
+        return 1.0
+    incoming_time = incoming.occurred_at or incoming.period_end or incoming.period_start
+    item_time = item.occurred_at or item.period_end or item.period_start
+    return float(incoming_time is not None and item_time is not None)
 
 
 def _subject_key(value: str) -> str:
@@ -501,7 +576,10 @@ def _record_retrieval_trace(
                             "subject": result.item.subject,
                             "summary": result.item.summary,
                             "status": result.item.status.value,
-                            "score": result.score.as_dict(),
+                            "score": {
+                                **result.score.as_dict(),
+                                **_relation_priority_components(incoming, result.item),
+                            },
                         }
                         for result in retrieved
                     ],

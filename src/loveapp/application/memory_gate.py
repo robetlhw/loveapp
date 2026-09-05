@@ -11,14 +11,39 @@ from loveapp.application.contextual_memory_updates import (
 from loveapp.application.date_planning.clause_parsing import split_date_clauses
 from loveapp.application.relationship_events import resolve_contextual_relationship_event
 from loveapp.domain.enums import TaskType
-from loveapp.domain.memory import MemoryGateDecision, MemoryGateReason, MemoryItem, StoredMessage
+from loveapp.domain.memory import (
+    MemoryGateDecision,
+    MemoryGateReason,
+    MemoryItem,
+    MemoryL0Route,
+    MemorySemanticGateReason,
+    MessageRole,
+    StoredMessage,
+)
 from loveapp.domain.relationship_plan import has_retrospective_event_semantics
+from loveapp.domain.runtime_context import PendingMemoryContext
 
 
 @dataclass(frozen=True)
 class _GateMatch:
     rule: str
     span: str
+
+
+@dataclass(frozen=True)
+class _PendingMemoryQuestion:
+    category: str
+    rule: str
+    text: str
+
+
+@dataclass(frozen=True)
+class _L0RouteMatch:
+    semantic_reason: MemorySemanticGateReason
+    signal: str
+    rule: str
+    span: str
+    legacy_reason: MemoryGateReason = MemoryGateReason.DURABLE_SIGNAL
 
 
 class MemoryGate:
@@ -307,6 +332,467 @@ class MemoryGate:
             matched_rule="no_durable_signal",
         )
 
+    def route_v2(
+        self,
+        text: str,
+        *,
+        conversation_history: Iterable[StoredMessage] = (),
+        existing_memories: Iterable[MemoryItem] = (),
+        active_task: TaskType | None = None,
+        pending_memory_context: PendingMemoryContext | None = None,
+    ) -> MemoryGateDecision:
+        """Route a turn to the existing extractor without deciding its semantics.
+
+        The legacy ``evaluate`` method remains the A-side baseline.  V2 only
+        hard-drops input when the absence of memory value is cheap and clear;
+        ambiguous input is deliberately delegated to the extractor's semantic
+        gate.  A pending Assistant memory question takes precedence because a
+        short answer may be meaningless in isolation.
+        """
+
+        history = list(conversation_history)
+        pending_source: str | None = None
+        pending_match: _PendingMemoryQuestion | None = None
+        pending = (
+            pending_memory_context
+            if pending_memory_context is not None
+            and pending_memory_context.memory_relevant
+            else None
+        )
+        if pending is not None:
+            pending_source = "structured"
+        elif pending_memory_context is None:
+            pending_match = _pending_memory_question(history)
+            if pending_match is not None:
+                latest_assistant = next(
+                    (
+                        message
+                        for message in reversed(history)
+                        if message.role == MessageRole.ASSISTANT
+                        and message.content.strip()
+                    ),
+                    None,
+                )
+                pending = _pending_context_from_match(
+                    pending_match,
+                    question=(
+                        latest_assistant.content.strip()
+                        if latest_assistant is not None
+                        else pending_match.text
+                    ),
+                    created_turn="history:legacy",
+                )
+                pending_source = "history_fallback"
+            else:
+                pending_match = None
+        if pending is not None:
+            return _v2_decision(
+                MemoryL0Route.CONTEXT_PASS,
+                semantic_reason=MemorySemanticGateReason.CONTEXT_DEPENDENT_REPLY,
+                signal=f"pending_memory_question:{pending.expected_slot or 'unspecified'}",
+                matched_rule=(
+                    "structured_pending_memory_context"
+                    if pending_source == "structured"
+                    else (
+                        pending_match.rule
+                        if pending_match is not None
+                        else _pending_rule_for_slot(pending.expected_slot)
+                    )
+                ),
+                matched_span=pending.previous_assistant_question,
+                history_loaded=bool(history),
+                pending_memory_context=pending,
+                pending_memory_context_source=pending_source,
+            )
+
+        normalized = _normalize(text)
+        compact = _compact(normalized)
+        legacy = self.evaluate(
+            text,
+            conversation_history=history,
+            existing_memories=existing_memories,
+            active_task=active_task,
+        )
+        if legacy.contextual_probe and (
+            legacy.reason == MemoryGateReason.CONTEXTUAL_UPDATE
+            or legacy.target_guard_result is not None
+        ):
+            # Keep the existing antecedent resolver's authorization result.
+            # V2 may send an unresolved contextual turn to Flash for semantic
+            # review, but Flash must never turn a denied target guard into a
+            # write authorization.
+            return legacy.model_copy(
+                update={
+                    "should_extract": True,
+                    "l0_route": MemoryL0Route.SEMANTIC_REVIEW,
+                    "l0_semantic_hint": None,
+                    "semantic_gate_reason": None,
+                    "history_loaded_for_gate": bool(history),
+                }
+            )
+        hard_drop = _l0_hard_drop(normalized, compact, legacy=legacy)
+        if hard_drop is not None:
+            return _v2_decision(
+                MemoryL0Route.HARD_DROP,
+                semantic_reason=hard_drop.semantic_reason,
+                signal=hard_drop.signal,
+                matched_rule=hard_drop.rule,
+                matched_span=hard_drop.span,
+                history_loaded=bool(history),
+                legacy_reason=hard_drop.legacy_reason,
+            )
+
+        hard_pass = _l0_hard_pass(normalized)
+        if hard_pass is not None:
+            return _v2_decision(
+                MemoryL0Route.HARD_PASS,
+                semantic_reason=hard_pass.semantic_reason,
+                signal=hard_pass.signal,
+                matched_rule=hard_pass.rule,
+                matched_span=hard_pass.span,
+                history_loaded=bool(history),
+            )
+
+        return _v2_decision(
+            MemoryL0Route.SEMANTIC_REVIEW,
+            semantic_reason=None,
+            signal=(legacy.signals[0] if legacy.signals else "semantic_review"),
+            matched_rule=legacy.matched_rule or "semantic_review_default",
+            matched_span=legacy.matched_span,
+            history_loaded=bool(history),
+            legacy_decision=legacy,
+        )
+
+
+def _v2_decision(
+    route: MemoryL0Route,
+    *,
+    semantic_reason: MemorySemanticGateReason | None,
+    signal: str,
+    matched_rule: str,
+    matched_span: str | None,
+    history_loaded: bool,
+    legacy_reason: MemoryGateReason = MemoryGateReason.DURABLE_SIGNAL,
+    legacy_decision: MemoryGateDecision | None = None,
+    pending_memory_context: PendingMemoryContext | None = None,
+    pending_memory_context_source: str | None = None,
+) -> MemoryGateDecision:
+    signals = [f"l0_{route.value}", signal]
+    if legacy_decision is not None:
+        signals = list(dict.fromkeys([f"l0_{route.value}", *legacy_decision.signals]))
+    return MemoryGateDecision(
+        should_extract=route != MemoryL0Route.HARD_DROP,
+        reason=(
+            legacy_reason
+            if route == MemoryL0Route.HARD_DROP
+            else MemoryGateReason.DURABLE_SIGNAL
+        ),
+        signals=signals,
+        matched_rule=matched_rule,
+        matched_span=matched_span,
+        history_loaded_for_gate=history_loaded,
+        l0_route=route,
+        l0_semantic_hint=semantic_reason,
+        pending_memory_context=pending_memory_context,
+        pending_memory_context_source=pending_memory_context_source,
+    )
+
+
+def build_pending_memory_context(
+    questions: Iterable[str],
+    *,
+    created_turn: str,
+    expires_after_turns: int = 2,
+    previous_context: PendingMemoryContext | None = None,
+) -> PendingMemoryContext | None:
+    """Register one unambiguous structured Assistant memory follow-up."""
+
+    normalized_questions = [question.strip() for question in questions if question.strip()]
+    matches = [
+        (question, matched)
+        for question in normalized_questions
+        for matched in [_match_memory_question(question)]
+        if matched is not None
+    ]
+    if len(matches) == 1:
+        question, matched = matches[0]
+        return _pending_context_from_match(
+            matched,
+            question=question,
+            created_turn=created_turn,
+            expires_after_turns=expires_after_turns,
+        )
+    if (
+        not matches
+        and len(normalized_questions) == 1
+        and previous_context is not None
+        and _PENDING_CONFIRMATION_PATTERN.search(normalized_questions[0]) is not None
+    ):
+        return previous_context.model_copy(
+            update={
+                "previous_assistant_question": normalized_questions[0],
+                "created_turn": created_turn,
+                "expires_after_turns": expires_after_turns,
+            }
+        )
+    return None
+
+
+def pending_memory_context_from_history(
+    conversation_history: Iterable[StoredMessage],
+    *,
+    created_turn: str | None = None,
+) -> PendingMemoryContext | None:
+    """Compatibility adapter for transcripts created before structured context."""
+
+    history = list(conversation_history)
+    pending = _pending_memory_question(history)
+    if pending is None:
+        return None
+    latest_assistant = next(
+        (
+            message
+            for message in reversed(history)
+            if message.role == MessageRole.ASSISTANT and message.content.strip()
+        ),
+        None,
+    )
+    source_turn = created_turn or (
+        f"message:{latest_assistant.id}" if latest_assistant is not None else "history:unknown"
+    )
+    return _pending_context_from_match(
+        pending,
+        question=(
+            latest_assistant.content.strip()
+            if latest_assistant is not None
+            else pending.text
+        ),
+        created_turn=source_turn,
+    )
+
+
+def _pending_context_from_match(
+    pending: _PendingMemoryQuestion,
+    *,
+    question: str,
+    created_turn: str,
+    expires_after_turns: int = 2,
+) -> PendingMemoryContext:
+    return PendingMemoryContext(
+        previous_assistant_question=question,
+        memory_relevant=True,
+        expected_slot=_pending_slot(pending.category),
+        topic=_pending_topic(question),
+        created_turn=created_turn,
+        expires_after_turns=expires_after_turns,
+    )
+
+
+def _pending_slot(category: str) -> str:
+    return {
+        "cause_scope": "cause",
+        "relationship_interaction": "interaction_state",
+    }.get(category, category)
+
+
+def _pending_rule_for_slot(slot: str | None) -> str:
+    return {
+        "duration": "pending_memory_duration_question",
+        "cause": "pending_memory_cause_question",
+        "actor": "pending_memory_actor_question",
+        "interaction_state": "pending_memory_interaction_question",
+    }.get(slot or "", "pending_memory_context_history_fallback")
+
+
+def _pending_topic(question: str) -> str:
+    if re.search(r"分手|复合|在一起", question):
+        return "relationship_transition"
+    if re.search(r"冷战|吵|矛盾|冲突", question):
+        return "conflict"
+    if re.search(r"联系|回复|聊天|交流|沟通|见面|道歉|情绪", question):
+        return "interaction"
+    return "relationship"
+
+
+def _pending_memory_question(
+    conversation_history: list[StoredMessage],
+) -> _PendingMemoryQuestion | None:
+    latest_assistant_index = next(
+        (
+            index
+            for index in range(len(conversation_history) - 1, -1, -1)
+            if conversation_history[index].role == MessageRole.ASSISTANT
+            and conversation_history[index].content.strip()
+        ),
+        None,
+    )
+    if latest_assistant_index is None:
+        return None
+    user_turns_since = sum(
+        message.role == MessageRole.USER
+        for message in conversation_history[latest_assistant_index + 1 :]
+    )
+    # The current turn can be the first or second user answer. Older questions
+    # must not keep routing unrelated conversation into Memory indefinitely.
+    if user_turns_since >= 2:
+        return None
+
+    latest = conversation_history[latest_assistant_index].content.strip()
+    direct = _match_memory_question(latest)
+    if direct is not None:
+        return direct
+    confirmation = _PENDING_CONFIRMATION_PATTERN.search(latest)
+    if confirmation is None:
+        return None
+
+    # A confirmation question is itself sufficient pending Memory context.
+    # Earlier turns can refine its category, but are not required (the eval
+    # and production history window may begin at this Assistant message).
+    fallback = _PendingMemoryQuestion(
+        category="confirmation",
+        rule="pending_memory_confirmation",
+        text=confirmation.group(0),
+    )
+
+    prior_user_turns = user_turns_since
+    for message in reversed(conversation_history[:latest_assistant_index]):
+        if message.role == MessageRole.USER:
+            prior_user_turns += 1
+            if prior_user_turns >= 2:
+                break
+            continue
+        if message.role != MessageRole.ASSISTANT or not message.content.strip():
+            continue
+        prior = _match_memory_question(message.content.strip())
+        if prior is not None:
+            return _PendingMemoryQuestion(
+                category=prior.category,
+                rule="pending_memory_confirmation",
+                text=latest,
+            )
+    return fallback
+
+
+def _match_memory_question(text: str) -> _PendingMemoryQuestion | None:
+    if _QUESTION_MARK_PATTERN.search(text) is None:
+        return None
+    for category, rule, pattern in _PENDING_MEMORY_QUESTION_RULES:
+        match = pattern.search(text)
+        if match is not None:
+            return _PendingMemoryQuestion(
+                category=category,
+                rule=rule,
+                text=match.group(0),
+            )
+    return None
+
+
+def _l0_hard_drop(
+    text: str,
+    compact: str,
+    *,
+    legacy: MemoryGateDecision,
+) -> _L0RouteMatch | None:
+    if compact in _L0_ACKNOWLEDGEMENT_MESSAGES:
+        return _L0RouteMatch(
+            semantic_reason=MemorySemanticGateReason.NO_MEMORY,
+            signal="acknowledgement",
+            rule="l0_acknowledgement",
+            span=text,
+            legacy_reason=MemoryGateReason.CASUAL,
+        )
+    if (
+        legacy.reason == MemoryGateReason.CONSULTATION_ONLY
+        and (legacy.matched_rule or "").startswith(
+            "relationship_action_consultation_"
+        )
+    ):
+        return _L0RouteMatch(
+            semantic_reason=MemorySemanticGateReason.NO_MEMORY,
+            signal="pure_relationship_action_consultation",
+            rule=legacy.matched_rule or "l0_relationship_action_consultation",
+            span=legacy.matched_span or text,
+            legacy_reason=legacy.reason,
+        )
+    casual = _first_match(text, _L0_SMALL_TALK_PATTERNS, "l0_small_talk")
+    if casual is not None:
+        return _L0RouteMatch(
+            semantic_reason=MemorySemanticGateReason.SMALL_TALK,
+            signal="small_talk",
+            rule=casual.rule,
+            span=casual.span,
+            legacy_reason=MemoryGateReason.CASUAL,
+        )
+    if legacy.reason in {
+        MemoryGateReason.CASUAL,
+        MemoryGateReason.KNOWLEDGE_QUESTION,
+        MemoryGateReason.OPERATION,
+        MemoryGateReason.HYPOTHETICAL,
+    }:
+        semantic_reason = (
+            MemorySemanticGateReason.SMALL_TALK
+            if legacy.reason == MemoryGateReason.CASUAL
+            else MemorySemanticGateReason.NO_MEMORY
+        )
+        return _L0RouteMatch(
+            semantic_reason=semantic_reason,
+            signal=f"legacy_{legacy.reason.value}",
+            rule=legacy.matched_rule or f"l0_{legacy.reason.value}",
+            span=legacy.matched_span or text,
+            legacy_reason=legacy.reason,
+        )
+    if not legacy.should_extract:
+        consultation = _first_match(
+            text,
+            _L0_PURE_CONSULTATION_PATTERNS,
+            "l0_pure_consultation",
+        )
+        if consultation is not None:
+            return _L0RouteMatch(
+                semantic_reason=MemorySemanticGateReason.NO_MEMORY,
+                signal="pure_consultation",
+                rule=consultation.rule,
+                span=consultation.span,
+                legacy_reason=MemoryGateReason.CONSULTATION_ONLY,
+            )
+    unrelated = _first_match(
+        text,
+        _L0_UNRELATED_TRANSIENT_PATTERNS,
+        "l0_unrelated_transient",
+    )
+    if unrelated is not None and _RELATIONSHIP_MENTION_PATTERN.search(text) is None:
+        return _L0RouteMatch(
+            semantic_reason=MemorySemanticGateReason.NO_MEMORY,
+            signal="unrelated_transient",
+            rule=unrelated.rule,
+            span=unrelated.span,
+            legacy_reason=MemoryGateReason.NO_DURABLE_SIGNAL,
+        )
+    return None
+
+
+def _l0_hard_pass(text: str) -> _L0RouteMatch | None:
+    explicit_remember = _L0_EXPLICIT_REMEMBER_PATTERN.search(text)
+    if explicit_remember is not None:
+        return _L0RouteMatch(
+            semantic_reason=MemorySemanticGateReason.STABLE_FACT,
+            signal="explicit_remember",
+            rule="l0_explicit_remember",
+            span=explicit_remember.group(0),
+        )
+    if _L0_SEMANTIC_REVIEW_CUE_PATTERN.search(text) is not None:
+        return None
+    for semantic_reason, signal, rule, pattern in _L0_HARD_PASS_RULES:
+        match = pattern.search(text)
+        if match is not None:
+            return _L0RouteMatch(
+                semantic_reason=semantic_reason,
+                signal=signal,
+                rule=rule,
+                span=match.group(0),
+            )
+    return None
+
 
 def _normalize(value: str) -> str:
     return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", value).casefold()).strip()
@@ -409,6 +895,160 @@ def _durable_preference_clause(text: str) -> str | None:
         if any(pattern.search(clause.text) for pattern in preference_patterns):
             return clause.text
     return None
+
+
+_QUESTION_MARK_PATTERN = re.compile(r"[?？]|(?:吗|呢|么|没有)[。.!！]?$")
+_PENDING_CONFIRMATION_PATTERN = re.compile(
+    r"(?:对|是这样|没错|正确)吗[?？。.!！]*$"
+)
+_PENDING_MEMORY_QUESTION_RULES: tuple[
+    tuple[str, str, re.Pattern[str]],
+    ...,
+] = (
+    (
+        "duration",
+        "pending_memory_duration_question",
+        re.compile(r"(?:多久|多长时间|持续.{0,5}(?:多久|多长))"),
+    ),
+    (
+        "cause_scope",
+        "pending_memory_cause_question",
+        re.compile(r"(?:为什么|因为什么|什么原因|主要.{0,5}(?:原因|为什么))"),
+    ),
+    (
+        "actor",
+        "pending_memory_actor_question",
+        re.compile(r"(?:(?:是|由)?谁.{0,8}(?:先|提|发起)|哪一方.{0,8}(?:先|提|发起))"),
+    ),
+    (
+        "relationship_interaction",
+        "pending_memory_interaction_question",
+        re.compile(
+            r"(?:她|他|对方|你们|你俩|双方).{0,28}"
+            r"(?:主动|道歉|联系|回复|聊天|聊|交流|沟通|见面|情绪|烦心事|"
+            r"分手|冷战).{0,10}(?:吗|呢|没有|多久)"
+        ),
+    ),
+)
+
+_L0_ACKNOWLEDGEMENT_MESSAGES = {
+    "好",
+    "好的",
+    "好吧",
+    "行",
+    "可以",
+    "知道了",
+    "我知道了",
+    "好的我知道了",
+    "明白",
+    "明白了",
+    "收到",
+    "那就这样",
+    "thanks",
+    "thankyou",
+    "thankyou.",
+    "thankyou!",
+    "thanks.",
+    "thanks!",
+}
+_L0_SMALL_TALK_PATTERNS = (
+    re.compile(
+        r"^(?!.*(?:她|他|对象|伴侣|我们|我俩|生日|喜欢|不喜欢|分手|冷战|"
+        r"联系|回复|见面))(?:哈){2,}.{0,16}[。.!！~～]*$"
+    ),
+)
+_L0_PURE_CONSULTATION_PATTERNS = (
+    re.compile(r"^(?:那)?我(?:现在)?(?:应该|该|要)?怎么(?:回|回复|说|做|处理).*[?？]?$"),
+    re.compile(r"^你觉得.{0,24}(?:正常|合适|合理)吗[?？]?$"),
+    re.compile(r"^(?:你能不能|能不能|请)?帮我分析.{0,30}(?:想什么|怎么想).*[?？]?$"),
+)
+_L0_UNRELATED_TRANSIENT_PATTERNS = (
+    re.compile(
+        r"(?:今天|昨天|刚才|刚刚).{0,20}"
+        r"(?:堵车|路上堵|迟到|快递|天气|网络|心率|系统|开会)"
+    ),
+    re.compile(
+        r"(?:我|自己).{0,12}(?:一天|每天|每周|每月).{0,12}"
+        r"(?:吃药|喝水|喝咖啡|跑步|运动|睡觉|工作)"
+    ),
+    re.compile(
+        r"(?:我|自己).{0,8}(?:一天|每天|每周|每月).{0,12}"
+        r"(?:次|杯|小时).{0,8}(?:吃药|喝水|喝咖啡|跑步|运动|睡觉|工作)?"
+    ),
+    re.compile(r"(?:最近|近来|这段时间).{0,12}(?:工作|学习).{0,8}(?:越来越|变得)"),
+)
+_RELATIONSHIP_MENTION_PATTERN = re.compile(
+    r"(?:我和她|我和他|我俩|我们|她|他|对方|对象|伴侣|女朋友|男朋友)"
+)
+_L0_SEMANTIC_REVIEW_CUE_PATTERN = re.compile(
+    r"(?:我发现|我感觉|我觉得|我怀疑|我担心|听说|可能|也许|好像|"
+    r"不确定|突然|最近|近来|这段时间|随口|没认真|还没|以前|之前)"
+)
+_L0_EXPLICIT_REMEMBER_PATTERN = re.compile(r"(?:请)?记住[：:]?|记一下[：:]?")
+_L0_HARD_PASS_RULES: tuple[
+    tuple[MemorySemanticGateReason, str, str, re.Pattern[str]],
+    ...,
+] = (
+    (
+        MemorySemanticGateReason.STABLE_FACT,
+        "explicit_remember",
+        "l0_explicit_remember",
+        _L0_EXPLICIT_REMEMBER_PATTERN,
+    ),
+    (
+        MemorySemanticGateReason.STABLE_FACT,
+        "stable_birthday",
+        "l0_stable_birthday",
+        re.compile(
+            r"(?:她|他|对象|伴侣).{0,8}(?:生日|出生日期)"
+            r".{0,10}(?:\d{1,2}月\d{1,2}[日号]?|[一二三四五六七八九十]+月)"
+        ),
+    ),
+    (
+        MemorySemanticGateReason.STABLE_FACT,
+        "stable_work_or_residence",
+        "l0_stable_work_or_residence",
+        re.compile(
+            r"(?:她|他|对象|伴侣).{0,16}"
+            r"(?:(?:在|于).{1,12}工作|工作在.{1,12}|住在.{1,12}|居住在.{1,12})"
+        ),
+    ),
+    (
+        MemorySemanticGateReason.RELATIONSHIP_STATE,
+        "explicit_relationship_state",
+        "l0_explicit_relationship_state",
+        re.compile(
+            r"(?:我和她|我和他|我俩|我们).{0,24}"
+            r"(?:(?:确定|确认|建立|开始)(?:了)?关系|正式在一起|已经在一起|"
+            r"现在还在冷战|目前还在冷战)"
+        ),
+    ),
+    (
+        MemorySemanticGateReason.PREFERENCE,
+        "explicit_preference",
+        "l0_explicit_preference",
+        re.compile(
+            r"(?:她|他|对象|伴侣).{0,36}"
+            r"(?:特别能吃辣|很能吃辣|能吃辣|特别喜欢|很喜欢|更喜欢|不喜欢|"
+            r"偏好|爱吃|不吃|不怎么喝|更愿意)"
+        ),
+    ),
+    (
+        MemorySemanticGateReason.PLANNED_EVENT,
+        "confirmed_planned_event",
+        "l0_confirmed_planned_event",
+        re.compile(
+            r"(?:(?:已经|都)?约好.{0,40}(?:订好|订了|买好|买了)|"
+            r"(?:酒店|车票|机票|门票).{0,8}(?:已经|都)?(?:订好|订了|买好|买了))"
+        ),
+    ),
+    (
+        MemorySemanticGateReason.ACTION_INTENT,
+        "high_impact_action_intent",
+        "l0_high_impact_action_intent",
+        re.compile(r"(?:准备|打算|决定).{0,12}(?:跟|和|向)?(?:她|他|对方)?.{0,4}(?:提)?分手"),
+    ),
+)
 
 
 _CASUAL_MESSAGES = {

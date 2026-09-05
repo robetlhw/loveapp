@@ -3,11 +3,60 @@ from pathlib import Path
 import pytest
 
 from loveapp.evaluation.memory_longtail_realistic import (
+    _load_cases,
     evaluate_memory_longtail_realistic,
     render_longtail_realistic_report,
 )
 
 DATASET = Path(__file__).parents[1] / "evals" / "memory" / "longtail_realistic_v1.jsonl"
+
+
+def test_realistic_longtail_custom_semantic_reviews_are_explicit_and_scoped() -> None:
+    cases = {case["id"]: case for case in _load_cases(DATASET.read_bytes())}
+
+    def claim(case_id: str, turn_id: str, claim_id: str) -> dict[str, object]:
+        case = cases[case_id]
+        turn = next(item for item in case["turns"] if item["turn_id"] == turn_id)
+        return next(item for item in turn["claims"] if item["id"] == claim_id)
+
+    reviewed = {
+        ("LT-R-003", "t1", "friends-old"): "social_circle_integration",
+        ("LT-R-003", "t2", "friends-new"): "social_circle_integration",
+        ("LT-S-002", "t1", "same-friends-old"): "social_circle_integration",
+        ("LT-S-002", "t2", "same-friends-new"): "social_circle_integration",
+        ("LT-E-001", "t2", "event-pattern-new"): "contact_absence",
+        ("LT-E-002", "t1", "event-invite-old"): "social_circle_integration",
+        ("LT-E-002", "t2", "event-invite-new"): "excluded_from_gathering",
+        ("LT-P-001", "t1", "belief-old"): "social_circle_integration",
+        ("LT-A-002", "t2", "partial-intro"): "social_circle_integration",
+        ("LT-B-001", "t1", "ambiguous-invite"): "social_circle_integration",
+        ("LT-B-001", "t1", "ambiguous-intro"): "social_circle_integration",
+        ("LT-B-001", "t2", "ambiguous-new"): "social_circle_integration",
+        ("LT-H-002", "t1", "topic-conflict"): "conflict_frequency",
+    }
+    for key, alias in reviewed.items():
+        representations = claim(*key)["acceptable_representations"]
+        matching = [
+            representation
+            for representation in representations
+            if alias in representation.get("custom_predicates", [])
+        ]
+        assert len(matching) == 1
+        reviewed_alias = matching[0]
+        assert reviewed_alias.get("payload_constraints") or reviewed_alias.get(
+            "evidence_contains_any"
+        )
+
+    excluded = (
+        ("LT-P-001", "t2", "belief-new"),
+        ("LT-C-001", "t1", "comp-friend"),
+        ("LT-C-001", "t2", "comp-parent"),
+        ("LT-A-002", "t1", "partial-invite-intro"),
+        ("LT-U-001", "t2", "unrelated-social"),
+        ("LT-U-002", "t2", "unrelated-restaurant"),
+    )
+    for key in excluded:
+        assert "acceptable_representations" not in claim(*key)
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,17 @@ from loveapp.domain.enums import (
 )
 
 
+class PendingMemoryContext(BaseModel):
+    """Machine-readable context for one short answer to an Assistant follow-up."""
+
+    previous_assistant_question: str = Field(min_length=1, max_length=500)
+    memory_relevant: bool = True
+    expected_slot: str | None = Field(default=None, max_length=80)
+    topic: str | None = Field(default=None, max_length=80)
+    created_turn: str = Field(min_length=1, max_length=160)
+    expires_after_turns: int = Field(default=2, ge=1, le=4)
+
+
 class DatePlanRuntimeContext(BaseModel):
     """Read-only committed date-planning state exposed to a single turn."""
 
@@ -51,5 +62,6 @@ class RuntimeContext(BaseModel):
     relationship_stage: RelationshipStage
     active_task: TaskType | None = None
     active_date_plan: DatePlanRuntimeContext | None = None
+    pending_memory_context: PendingMemoryContext | None = None
     timezone: str = "Asia/Shanghai"
     now: datetime

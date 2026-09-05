@@ -8,6 +8,7 @@ that is absent from the user's text.
 import json
 import re
 from dataclasses import dataclass
+from typing import Literal
 
 from pydantic import ValidationError
 
@@ -18,6 +19,7 @@ from loveapp.domain.memory import (
     EvidenceExplicitness,
     MemoryKind,
     MemoryPerspective,
+    MemorySemanticGateReason,
     MemoryValence,
     PredicateType,
     RelationshipImpact,
@@ -44,6 +46,8 @@ from loveapp.domain.memory_predicates import CANONICAL_PREDICATES, normalize_pre
 class ParsedMemoryResponse:
     extraction: AtomicExtraction
     repair_status: str
+    extraction_status: str = "success"
+    validation_mode: str = "legacy"
     repair_steps: str = ""
     original_claim_count: int = 0
     repaired_claim_count: int = 0
@@ -85,8 +89,19 @@ def parse_memory_response(
     content: str | None,
     *,
     source_text: str | None = None,
+    validation_mode: Literal["legacy", "raw"] = "legacy",
 ) -> ParsedMemoryResponse:
-    """Parse a response after only safe, deterministic normalization."""
+    """Parse a model response at either the legacy or raw claim boundary.
+
+    ``raw`` is the production boundary: parser repair keeps only structural
+    meaning and Generic Validator checks.  Canonical/state/metric ownership is
+    deferred to ``normalize_memory_candidate_contract``.  ``legacy`` remains
+    available for older diagnostics and callers that historically consumed the
+    parser's pre-normalized representation.
+    """
+
+    if validation_mode not in {"legacy", "raw"}:
+        raise ValueError(f"unsupported validation_mode: {validation_mode}")
 
     if not content or not content.strip():
         raise MemoryResponseError(
@@ -141,9 +156,46 @@ def parse_memory_response(
         steps.append("default_fields")
     if _normalize_enum_aliases(normalized):
         steps.append("enum_aliases")
-    steps.extend(_normalize_claim_semantics(normalized, source_text=source_text))
+    if _normalize_semantic_gate_fields(normalized):
+        steps.append("semantic_gate_enum_alias")
+    if validation_mode == "legacy":
+        steps.extend(_normalize_claim_semantics(normalized, source_text=source_text))
+    else:
+        steps.extend(_normalize_raw_claim_structure(normalized))
 
-    _validate_root_shape(normalized)
+    _validate_semantic_gate_payload(normalized)
+    try:
+        _validate_root_shape(normalized)
+    except MemoryResponseError as exc:
+        if not _has_semantic_gate_contract(normalized):
+            raise
+        # The Gate contract is independently valid. Keep that verdict while
+        # discarding an unsafe extraction container so schema failure cannot
+        # be misreported as a semantic Gate decision.
+        invalid_count = (
+            max(1, len(raw_claims_snapshot))
+            if isinstance(raw_claims_snapshot, list)
+            else 1
+        )
+        steps.extend(("claim_container_invalid", "all_claims_invalid"))
+        return ParsedMemoryResponse(
+            extraction=AtomicExtraction(
+                should_extract=normalized.get("should_extract"),
+                gate_reason=normalized.get("gate_reason"),
+            ),
+            repair_status="local_repair",
+            extraction_status="claim_schema_invalid",
+            validation_mode=validation_mode,
+            repair_steps=",".join(dict.fromkeys(steps)),
+            original_claim_count=(
+                len(raw_claims_snapshot)
+                if isinstance(raw_claims_snapshot, list)
+                else 0
+            ),
+            discarded_claim_count=invalid_count,
+            invalid_claim_count=invalid_count,
+            invalid_claim_reasons=(str(exc)[:1000],),
+        )
     valid_claims: list[AtomicClaim] = []
     invalid_claim_reasons: list[str] = []
     repaired_claim_count = 0
@@ -151,12 +203,21 @@ def parse_memory_response(
     for index, raw_claim in enumerate(normalized["claims"]):
         try:
             claim = AtomicClaim.model_validate(raw_claim)
-            validate_memory_claim(claim, source_text, claim_ids)
+            validator = (
+                validate_memory_claim
+                if validation_mode == "legacy"
+                else validate_memory_claim_generic
+            )
+            validator(claim, source_text, claim_ids)
         except ClaimAtomicityError as exc:
-            repaired_claim = _repair_non_atomic_claim(claim, source_text)
+            repaired_claim = _repair_non_atomic_claim(
+                claim,
+                source_text,
+                semantic_normalization=validation_mode == "legacy",
+            )
             if repaired_claim is not None:
                 try:
-                    validate_memory_claim(repaired_claim, source_text, claim_ids)
+                    validator(repaired_claim, source_text, claim_ids)
                 except (ValidationError, ValueError) as repair_exc:
                     invalid_claim_reasons.append(
                         f"claims.{index} - {_validation_error_text(repair_exc)}"
@@ -192,28 +253,38 @@ def parse_memory_response(
             continue
         valid_discarded.append(discarded)
 
-    if normalized["claims"] and not valid_claims:
+    all_claims_invalid = bool(normalized["claims"] and not valid_claims)
+    if all_claims_invalid:
         category = _claim_failure_category(invalid_claim_reasons)
         detail = "; ".join(invalid_claim_reasons[:5])
-        failure = MemoryResponseError(
-            f"记忆抽取结果不是约定的 JSON 结构：{detail}",
-            category=category,
-            repair_status="local_repair" if steps else "none",
-            repair_steps=",".join(steps),
+        gate_contract_present = (
+            normalized.get("should_extract") is not None
+            and normalized.get("gate_reason") is not None
         )
-        failure.details.update(
-            {
-                "invalid_claim_count": len(invalid_claim_reasons),
-                "invalid_claim_reasons": " | ".join(invalid_claim_reasons[:5]),
-                "invalid_claim_snapshot": _safe_json_snapshot(raw_claims_snapshot),
-                "validation_error": detail[:1000],
-                "repair_attempt": _repair_attempt_name(steps),
-                "repair_result": "unresolved",
-                "repair_status": failure.repair_status,
-                "repair_steps": failure.repair_steps,
-            }
-        )
-        raise failure
+        if not gate_contract_present:
+            failure = MemoryResponseError(
+                f"记忆抽取结果不是约定的 JSON 结构：{detail}",
+                category=category,
+                repair_status="local_repair" if steps else "none",
+                repair_steps=",".join(steps),
+            )
+            failure.details.update(
+                {
+                    "invalid_claim_count": len(invalid_claim_reasons),
+                    "invalid_claim_reasons": " | ".join(invalid_claim_reasons[:5]),
+                    "invalid_claim_snapshot": _safe_json_snapshot(raw_claims_snapshot),
+                    "validation_error": detail[:1000],
+                    "repair_attempt": _repair_attempt_name(steps),
+                    "repair_result": "unresolved",
+                    "repair_status": failure.repair_status,
+                    "repair_steps": failure.repair_steps,
+                }
+            )
+            raise failure
+        # The semantic Gate contract has already been parsed and validated.
+        # Keep its verdict while failing closed on every invalid claim; claim
+        # validation must never rewrite a valid Gate decision.
+        steps.append("all_claims_invalid")
 
     if invalid_claim_reasons:
         steps.append("partial_claims")
@@ -221,13 +292,31 @@ def parse_memory_response(
         steps.append("partial_discarded_spans")
     if any("与已保存声明证据重叠" in reason for reason in invalid_discarded_reasons):
         steps.append("discarded_overlap")
-    extraction = AtomicExtraction(
-        claims=valid_claims,
-        discarded_spans=valid_discarded,
-    )
+    try:
+        extraction = AtomicExtraction(
+            should_extract=normalized.get("should_extract"),
+            gate_reason=normalized.get("gate_reason"),
+            claims=valid_claims,
+            discarded_spans=valid_discarded,
+        )
+    except ValidationError as exc:
+        raise MemoryResponseError(
+            "记忆语义 Gate 结果不符合约定：" + _validation_detail(exc),
+            category="semantic_gate_contract",
+            repair_status="local_repair" if steps else "none",
+            repair_steps=",".join(steps),
+        ) from exc
     return ParsedMemoryResponse(
         extraction=extraction,
         repair_status="local_repair" if steps else "direct",
+        extraction_status=(
+            "claim_schema_invalid"
+            if all_claims_invalid
+            else "empty_claims"
+            if extraction.should_extract is True and not extraction.claims
+            else "success"
+        ),
+        validation_mode=validation_mode,
         repair_steps=",".join(dict.fromkeys(steps)),
         original_claim_count=len(normalized["claims"]),
         repaired_claim_count=repaired_claim_count,
@@ -257,44 +346,29 @@ def validate_memory_claim(
     source_text: str | None,
     claim_ids: set[str],
 ) -> None:
+    validate_memory_claim_generic(claim, source_text, claim_ids)
+    validate_normalized_memory_claim(claim)
+
+
+def validate_memory_claim_generic(
+    claim: AtomicClaim,
+    source_text: str | None,
+    claim_ids: set[str],
+) -> None:
+    """Validate raw claim structure without requiring canonical completeness."""
+
     if claim.claim_id in claim_ids:
         raise ValueError(f"原子声明 ID 重复：{claim.claim_id}")
-    if (
-        claim.predicate_type == PredicateType.CANONICAL
-        and claim.canonical_predicate not in CANONICAL_PREDICATES
-    ):
-        raise ValueError(
-            f"声明 {claim.claim_id} 使用了未注册的 canonical predicate："
-            f"{claim.canonical_predicate or '<missing>'}"
-        )
-    if (
-        claim.predicate_type == PredicateType.CUSTOM
-        and not (claim.custom_predicate or claim.predicate)
-    ):
-        raise ValueError(f"声明 {claim.claim_id} 的 custom predicate 为空")
-    if claim.canonical_predicate and claim.custom_predicate:
-        raise ValueError(f"声明 {claim.claim_id} 不能同时提供 canonical 和 custom predicate")
     if source_text is not None:
         for evidence in claim.evidence_spans:
             if evidence not in source_text:
                 raise ValueError(f"证据片段不在用户原文中：{evidence}")
+    _validate_raw_semantic_hints(claim)
     if not re.search(r"[\u4e00-\u9fff]", claim.summary):
         raise ValueError(f"声明 {claim.claim_id} 的 summary 必须使用简体中文")
     preference = claim.payload.get("preference")
     if claim.kind == MemoryKind.PREFERENCE and isinstance(preference, list):
         raise ValueError(f"偏好声明 {claim.claim_id} 包含多个 preference，必须拆分")
-    if claim.kind == MemoryKind.INTERACTION_PATTERN:
-        metric = normalize_interaction_metric(claim.payload.get("metric"))
-        if metric is None:
-            raise ValueError(f"互动模式 {claim.claim_id} 缺少单一 payload.metric")
-    if claim.kind == MemoryKind.RELATIONSHIP_STATE:
-        dimension, value = _registered_relationship_state(claim)
-        if (dimension is None or value is None) and not (
-            _is_open_world_social_integration_claim(claim)
-        ):
-            raise ValueError(
-                f"关系状态 {claim.claim_id} 缺少已注册的 state_dimension/state_value"
-            )
     if claim.kind in {
         MemoryKind.STABLE_FACT,
         MemoryKind.INTERACTION_PATTERN,
@@ -325,9 +399,82 @@ def validate_memory_claim(
     claim_ids.add(claim.claim_id)
 
 
+_RAW_SEMANTIC_HINT_FIELDS = (
+    "metric_hint",
+    "preference_type_hint",
+    "state_dimension_hint",
+    "state_value_hint",
+)
+
+_RAW_SUBJECT_VALUES = frozenset(
+    {
+        "user",
+        "partner",
+        "relationship",
+        "other_person",
+        "对方",
+        "伴侣",
+        "她",
+        "他",
+        "我",
+        "我们",
+        "双方",
+        "关系",
+    }
+)
+
+
+def _validate_raw_semantic_hints(claim: AtomicClaim) -> None:
+    """Check hint shape only; registration and mapping belong downstream."""
+
+    subject = claim.subject.casefold().strip()
+    if subject not in _RAW_SUBJECT_VALUES:
+        raise ValueError(f"原始声明 subject 不在受控枚举中：{claim.subject}")
+    for field in _RAW_SEMANTIC_HINT_FIELDS:
+        value = claim.payload.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"原始语义提示 {field} 必须是非空字符串")
+
+
+def validate_normalized_memory_claim(claim: AtomicClaim) -> None:
+    """Validate canonical/state contracts after deterministic normalization."""
+
+    if (
+        claim.predicate_type == PredicateType.CANONICAL
+        and claim.canonical_predicate not in CANONICAL_PREDICATES
+    ):
+        raise ValueError(
+            f"声明 {claim.claim_id} 使用了未注册的 canonical predicate："
+            f"{claim.canonical_predicate or '<missing>'}"
+        )
+    if (
+        claim.predicate_type == PredicateType.CUSTOM
+        and not (claim.custom_predicate or claim.predicate)
+    ):
+        raise ValueError(f"声明 {claim.claim_id} 的 custom predicate 为空")
+    if claim.canonical_predicate and claim.custom_predicate:
+        raise ValueError(f"声明 {claim.claim_id} 不能同时提供 canonical 和 custom predicate")
+    if claim.kind == MemoryKind.INTERACTION_PATTERN:
+        metric = normalize_interaction_metric(claim.payload.get("metric"))
+        if metric is None:
+            raise ValueError(f"互动模式 {claim.claim_id} 缺少单一 payload.metric")
+    if claim.kind == MemoryKind.RELATIONSHIP_STATE:
+        dimension, value = _registered_relationship_state(claim)
+        if (dimension is None or value is None) and not (
+            _is_open_world_social_integration_claim(claim)
+        ):
+            raise ValueError(
+                f"关系状态 {claim.claim_id} 缺少已注册的 state_dimension/state_value"
+            )
+
+
 def _repair_non_atomic_claim(
     claim: AtomicClaim,
     source_text: str | None,
+    *,
+    semantic_normalization: bool = True,
 ) -> AtomicClaim | None:
     """Narrow over-broad evidence without inventing a second proposition.
 
@@ -387,7 +534,7 @@ def _repair_non_atomic_claim(
         "summary": summary[:500],
         "evidence_spans": selected[:8],
     }
-    if claim.kind == MemoryKind.INTERACTION_PATTERN:
+    if semantic_normalization and claim.kind == MemoryKind.INTERACTION_PATTERN:
         pattern_dimensions = combined_dimensions & INTERACTION_PATTERN_DIMENSIONS
         if len(pattern_dimensions) == 1:
             repaired_dimension = next(iter(pattern_dimensions))
@@ -401,6 +548,24 @@ def _repair_non_atomic_claim(
             if dimension_for_predicate(claim.predicate) is None:
                 updates["predicate"] = repaired_dimension
     return claim.model_copy(update=updates)
+
+
+def _normalize_raw_claim_structure(payload: dict[str, object]) -> list[str]:
+    """Apply only structural repairs allowed before deterministic normalization.
+
+    Evidence objects contain transport metadata (offsets/labels) that the
+    domain claim does not retain. Their text can be narrowed safely, but no
+    hint, predicate, state, preference, or kind is interpreted here.
+    """
+
+    claims = payload.get("claims")
+    if not isinstance(claims, list):
+        return []
+    steps: list[str] = []
+    for claim in claims:
+        if isinstance(claim, dict) and _narrow_structured_evidence_spans(claim):
+            steps.append("structured_evidence_text_narrowing")
+    return list(dict.fromkeys(steps))
 
 
 def _evidence_fragments(
@@ -428,7 +593,12 @@ def _semantic_features(value: str) -> set[str]:
 
 
 def _validate_root_shape(payload: dict[str, object]) -> None:
-    unknown = set(payload) - {"claims", "discarded_spans"}
+    unknown = set(payload) - {
+        "should_extract",
+        "gate_reason",
+        "claims",
+        "discarded_spans",
+    }
     if unknown:
         names = ", ".join(sorted(str(value) for value in unknown)[:5])
         raise MemoryResponseError(
@@ -447,6 +617,67 @@ def _validate_root_shape(payload: dict[str, object]) -> None:
                 f"记忆抽取结果字段 {field} 超过最多 12 项。",
                 category="schema_validation",
             )
+
+
+def _normalize_semantic_gate_fields(payload: dict[str, object]) -> bool:
+    gate_reason = payload.get("gate_reason")
+    if not isinstance(gate_reason, str):
+        return False
+    normalized = gate_reason.strip().upper()
+    if normalized == gate_reason:
+        return False
+    payload["gate_reason"] = normalized
+    return True
+
+
+def _validate_semantic_gate_payload(payload: dict[str, object]) -> None:
+    has_should_extract = "should_extract" in payload
+    has_gate_reason = "gate_reason" in payload
+    if not has_should_extract and not has_gate_reason:
+        return
+    if not has_should_extract or not has_gate_reason:
+        raise MemoryResponseError(
+            "记忆语义 Gate 必须同时返回 should_extract 和 gate_reason。",
+            category="semantic_gate_contract",
+        )
+
+    should_extract = payload.get("should_extract")
+    gate_reason = payload.get("gate_reason")
+    if type(should_extract) is not bool:
+        raise MemoryResponseError(
+            "记忆语义 Gate 字段 should_extract 必须是布尔值。",
+            category="semantic_gate_contract",
+        )
+    try:
+        reason = MemorySemanticGateReason(gate_reason)
+    except (TypeError, ValueError) as exc:
+        raise MemoryResponseError(
+            "记忆语义 Gate 字段 gate_reason 不在受控枚举中。",
+            category="semantic_gate_contract",
+        ) from exc
+
+    negative_reasons = {
+        MemorySemanticGateReason.TRANSIENT,
+        MemorySemanticGateReason.SMALL_TALK,
+        MemorySemanticGateReason.NO_MEMORY,
+    }
+    if should_extract and reason in negative_reasons:
+        raise MemoryResponseError(
+            "记忆语义 Gate 的正向结论与 gate_reason 冲突。",
+            category="semantic_gate_contract",
+        )
+    if not should_extract and reason not in negative_reasons:
+        raise MemoryResponseError(
+            "记忆语义 Gate 的负向结论与 gate_reason 冲突。",
+            category="semantic_gate_contract",
+        )
+
+
+def _has_semantic_gate_contract(payload: dict[str, object]) -> bool:
+    return (
+        payload.get("should_extract") is not None
+        and payload.get("gate_reason") is not None
+    )
 
 
 def _normalize_enum_aliases(payload: dict[str, object]) -> bool:
@@ -512,6 +743,18 @@ def _normalize_enum_aliases(payload: dict[str, object]) -> bool:
             and claim.get("perspective") != perspective_key
         ):
             claim["perspective"] = perspective_key
+            changed = True
+        relationship_impact_aliases = {
+            "supportive": RelationshipImpact.IMPROVING.value,
+            "positive": RelationshipImpact.IMPROVING.value,
+            "harmful": RelationshipImpact.DAMAGING.value,
+            "negative": RelationshipImpact.DAMAGING.value,
+        }
+        relationship_impact_key = _enum_key(claim.get("relationship_impact"))
+        if relationship_impact_key in relationship_impact_aliases:
+            claim["relationship_impact"] = relationship_impact_aliases[
+                relationship_impact_key
+            ]
             changed = True
         for field, enum_type in (
             ("time_kind", TimeKind),
@@ -630,8 +873,31 @@ def _normalize_claim_semantics(
             normalized_claims.append(raw_claim)
             continue
         claim = dict(raw_claim)
+        if _narrow_structured_evidence_spans(claim):
+            steps.append("structured_evidence_text_narrowing")
         raw_payload = claim.get("payload")
         claim_payload = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+        if claim_payload.get("metric") is None and claim_payload.get("metric_hint") is not None:
+            claim_payload["metric"] = claim_payload["metric_hint"]
+            steps.append("interaction_metric_hint")
+        if (
+            claim_payload.get("preference_type") is None
+            and claim_payload.get("preference_type_hint") is not None
+        ):
+            claim_payload["preference_type"] = claim_payload["preference_type_hint"]
+            steps.append("preference_type_hint")
+        if (
+            claim_payload.get("state_dimension") is None
+            and claim_payload.get("state_dimension_hint") is not None
+        ):
+            claim_payload["state_dimension"] = claim_payload["state_dimension_hint"]
+            steps.append("state_dimension_hint")
+        if (
+            claim_payload.get("state_value") is None
+            and claim_payload.get("state_value_hint") is not None
+        ):
+            claim_payload["state_value"] = claim_payload["state_value_hint"]
+            steps.append("state_value_hint")
         for field in ("state_dimension", "state_value"):
             if claim.get(field) is not None:
                 claim_payload.setdefault(field, claim[field])
@@ -642,6 +908,8 @@ def _normalize_claim_semantics(
             claim["kind"] = MemoryKind.PREFERENCE.value
             steps.append("preference_kind")
             kind = MemoryKind.PREFERENCE.value
+        if _reconcile_registered_canonical_declaration(claim, claim_payload, kind):
+            steps.append("canonical_custom_predicate_reconciliation")
         if _align_exact_canonical_predicate(claim, claim_payload, kind):
             steps.append("exact_canonical_predicate_alignment")
         if kind == MemoryKind.PREFERENCE.value:
@@ -821,6 +1089,101 @@ def _normalize_claim_semantics(
         normalized_claims.append(claim)
     payload["claims"] = normalized_claims
     return list(dict.fromkeys(steps))
+
+
+_STRUCTURED_EVIDENCE_KEYS = frozenset({"text", "start", "end", "offset"})
+
+
+def _narrow_structured_evidence_spans(claim: dict[str, object]) -> bool:
+    """Discard span offsets only when every structured entry has a safe shape."""
+
+    evidence = claim.get("evidence_spans")
+    if not isinstance(evidence, list):
+        return False
+
+    narrowed: list[object] = []
+    changed = False
+    for span in evidence:
+        if isinstance(span, str):
+            narrowed.append(span)
+            continue
+        if not isinstance(span, dict) or not _is_safe_structured_evidence_span(span):
+            return False
+        narrowed.append(span["text"])
+        changed = True
+    if changed:
+        claim["evidence_spans"] = narrowed
+    return changed
+
+
+def _is_safe_structured_evidence_span(span: dict[object, object]) -> bool:
+    if "text" not in span or not set(span) <= _STRUCTURED_EVIDENCE_KEYS:
+        return False
+    text = span["text"]
+    if not isinstance(text, str) or not text.strip():
+        return False
+
+    offsets: dict[str, int] = {}
+    for field in ("start", "end", "offset"):
+        value = span.get(field)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return False
+        offsets[field] = value
+    return not ("start" in offsets and "end" in offsets and offsets["start"] > offsets["end"])
+
+
+def _reconcile_registered_canonical_declaration(
+    claim: dict[str, object],
+    claim_payload: dict[str, object],
+    kind: str,
+) -> bool:
+    """Drop a redundant custom declaration only when both normalize identically."""
+
+    canonical = claim.get("canonical_predicate")
+    custom = claim.get("custom_predicate")
+    predicate_type = _enum_key(claim.get("predicate_type"))
+    if (
+        not isinstance(canonical, str)
+        or canonical not in CANONICAL_PREDICATES
+        or not isinstance(custom, str)
+        or not custom.strip()
+        or predicate_type not in {PredicateType.CANONICAL.value, PredicateType.CUSTOM.value}
+    ):
+        return False
+
+    canonical_view = normalize_predicate(
+        kind=kind,
+        raw_predicate=claim.get("raw_predicate") or claim.get("predicate"),
+        canonical_predicate=canonical,
+        predicate_type=PredicateType.CANONICAL.value,
+        payload=claim_payload,
+    )
+    if canonical_view.canonical_predicate != canonical:
+        return False
+
+    declaration_payload: dict[str, object] = {}
+    custom_dimension = dimension_for_predicate(custom)
+    if custom_dimension in INTERACTION_PATTERN_DIMENSIONS:
+        declaration_payload["metric_hint"] = custom_dimension
+    custom_view = normalize_predicate(
+        kind=kind,
+        raw_predicate=custom,
+        custom_predicate=custom,
+        predicate_type=PredicateType.CUSTOM.value,
+        payload=declaration_payload,
+    )
+    if custom_view.canonical_predicate != canonical:
+        return False
+
+    claim["predicate_type"] = PredicateType.CANONICAL.value
+    claim.pop("custom_predicate", None)
+    if canonical_view.state_dimension is not None:
+        claim["state_dimension"] = canonical_view.state_dimension
+    if canonical_view.state_value is not None:
+        claim["state_value"] = canonical_view.state_value
+    return True
 
 
 def _normalize_relationship_stage_claim(

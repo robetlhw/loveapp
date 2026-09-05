@@ -1,9 +1,16 @@
 import asyncio
+import inspect
+from dataclasses import dataclass
 from typing import TypedDict
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from langgraph.graph import END, START, StateGraph
 
 from loveapp.application import MemoryService
+from loveapp.application.contextual_memory_updates import (
+    may_contain_contextual_memory_update,
+)
+from loveapp.application.memory_gate import MemoryGate
 from loveapp.application.routing import route_by_rules
 from loveapp.application.scenario_policy import (
     ScenarioPolicyRegistry,
@@ -12,15 +19,21 @@ from loveapp.application.scenario_policy import (
 )
 from loveapp.core.timing import ExecutionTrace
 from loveapp.domain.advice import (
+    AdviceGenerationAttempt,
+    AdviceLogicalTurn,
+    AdviceLogicalTurnStatus,
     AdviceRequest,
     AdviceResponse,
+    AdviceStreamEvent,
+    AdviceTurnClaimError,
     AdviceTurnResult,
     RelationshipContext,
 )
 from loveapp.domain.enums import AdviceScenario, RiskLevel, TaskType
 from loveapp.domain.knowledge import KnowledgeFilters, RetrievedDocument
-from loveapp.domain.memory import MessageRole, RememberResult, StoredMessage
+from loveapp.domain.memory import MessageRole, RememberResult, StoredMessage, utc_now
 from loveapp.domain.policy import ResolvedScenarioPolicy
+from loveapp.domain.relationship_plan import has_retrospective_event_semantics
 from loveapp.domain.routing import RouteInput, RouteResult
 from loveapp.ports.advice import AdviceComposer, AdviceStreamCallback
 from loveapp.ports.knowledge import KnowledgeRetriever
@@ -44,6 +57,16 @@ class AdviceState(TypedDict, total=False):
     trace: ExecutionTrace
     stream_callback: AdviceStreamCallback | None
     wait_for_memory: bool
+    generation_attempts: list[AdviceGenerationAttempt]
+    synchronize_current_turn: bool
+    logical_turn: AdviceLogicalTurn
+    generation_no: int
+    execution: "_AdviceTurnExecution"
+
+
+@dataclass
+class _AdviceTurnExecution:
+    owns_failure_transition: bool = False
 
 
 class AdviceAgent:
@@ -76,6 +99,13 @@ class AdviceAgent:
         wait_for_memory: bool = True,
     ) -> AdviceTurnResult:
         trace = trace or ExecutionTrace()
+        request = request.model_copy(
+            update={
+                "conversation_id": request.conversation_id or str(uuid4()),
+                "logical_turn_id": request.logical_turn_id or str(uuid4()),
+            }
+        )
+        execution = _AdviceTurnExecution()
         try:
             state = await self._graph.ainvoke(
                 {
@@ -83,15 +113,25 @@ class AdviceAgent:
                     "trace": trace,
                     "stream_callback": stream_callback,
                     "wait_for_memory": wait_for_memory,
+                    "execution": execution,
                 }
             )
-        except BaseException:
-            await trace.cancel_background_tasks()
+        except asyncio.CancelledError as exc:
+            await asyncio.shield(
+                self._fail_recorded_turn(request, exc, trace, execution)
+            )
+            raise
+        except AdviceTurnClaimError:
+            raise
+        except Exception as exc:
+            await self._fail_recorded_turn(request, exc, trace, execution)
             raise
         return AdviceTurnResult(
             response=state["response"],
             conversation_id=state["current_message"].conversation_id,
             memory_result=state.get("memory_result"),
+            generation_attempts=state.get("generation_attempts", []),
+            logical_turn_id=state["request"].logical_turn_id,
         )
 
     def _build_graph(self):
@@ -100,6 +140,7 @@ class AdviceAgent:
         graph.add_node("record_sensitive", self._record_message)
         graph.add_node("record_high", self._record_message)
         graph.add_node("load_context", self._load_context)
+        graph.add_node("synchronize_current_turn", self._synchronize_current_turn)
         graph.add_node("classify", self._classify)
         graph.add_node("assess_safety", self._assess_safety)
         graph.add_node("resolve_policy", self._resolve_policy)
@@ -121,7 +162,8 @@ class AdviceAgent:
                 "high": "record_high",
             },
         )
-        graph.add_edge("record_normal", "load_context")
+        graph.add_edge("record_normal", "synchronize_current_turn")
+        graph.add_edge("synchronize_current_turn", "load_context")
         graph.add_edge("record_normal", "resolve_policy")
         graph.add_edge("record_high", "compose_safety")
         graph.add_edge("record_sensitive", "compose_sensitive_safety")
@@ -136,7 +178,31 @@ class AdviceAgent:
 
     async def _record_message(self, state: AdviceState) -> dict:
         request = state["request"]
-        with state["trace"].measure("user_message_persistence"):
+        logical_turn_id = _required_logical_turn_id(request)
+        existing_turn = await self._memory_service.get_advice_logical_turn(
+            logical_turn_id,
+            user_id=request.user_id,
+            relationship_id=request.relationship_id,
+            conversation_id=_required_conversation_id(request),
+        )
+        if existing_turn is not None:
+            _validate_logical_turn_request(existing_turn, request)
+            if not request.retry_generation:
+                raise AdviceTurnClaimError(
+                    "该建议逻辑轮次已经提交，不能并发或重复生成。"
+                )
+        if request.retry_generation:
+            if existing_turn is None:
+                raise ValueError("没有找到可重试的建议轮次。")
+            if existing_turn.status != AdviceLogicalTurnStatus.GENERATION_FAILED:
+                raise ValueError("该建议轮次当前不可重试。")
+
+        user_message_id = (
+            existing_turn.user_message_id
+            if existing_turn is not None
+            else _logical_message_id(logical_turn_id, MessageRole.USER)
+        )
+        with state["trace"].measure("user_message_persistence") as details:
             message = await self._memory_service.record_message(
                 user_id=request.user_id,
                 relationship_id=request.relationship_id,
@@ -144,13 +210,68 @@ class AdviceAgent:
                 role=MessageRole.USER,
                 content=request.query,
                 relationship_stage=request.relationship_stage,
+                message_id=user_message_id,
             )
+            details["logical_turn_id"] = logical_turn_id
+            details["message_reused"] = existing_turn is not None
+
+        logical_turn = existing_turn
+        if logical_turn is None:
+            now = utc_now()
+            logical_turn = await self._memory_service.create_advice_logical_turn(
+                AdviceLogicalTurn(
+                    id=logical_turn_id,
+                    user_id=request.user_id,
+                    relationship_id=request.relationship_id,
+                    conversation_id=message.conversation_id,
+                    user_message_id=message.id,
+                    query=request.query,
+                    request_payload=request.model_dump(mode="json"),
+                    status=AdviceLogicalTurnStatus.MEMORY_STARTED,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                reject_existing=True,
+            )
+            state["execution"].owns_failure_transition = True
+        if request.retry_generation:
+            return {
+                "request": request,
+                "current_message": message,
+                "logical_turn": logical_turn,
+                "synchronize_current_turn": False,
+            }
+
         memory_task = self._memory_service.start_background_extraction(
             message=message,
             text=request.query,
             trace=state["trace"],
+            pending_memory_context=request.pending_memory_context,
         )
-        return {"current_message": message, "memory_task": memory_task}
+        return {
+            "request": request,
+            "current_message": message,
+            "logical_turn": logical_turn,
+            "memory_task": memory_task,
+            "synchronize_current_turn": _requires_current_turn_state_sync(request.query),
+        }
+
+    async def _synchronize_current_turn(self, state: AdviceState) -> dict:
+        required = state.get("synchronize_current_turn", False)
+        memory_task = state.get("memory_task")
+        with state["trace"].measure("current_turn_state_sync") as details:
+            details["required"] = required
+            if not required or memory_task is None:
+                details["waited"] = False
+                return {}
+            details["waited"] = True
+            result = await asyncio.shield(memory_task)
+            details["gate_reason"] = (
+                result.gate_decision.reason.value if result.gate_decision else None
+            )
+            details["saved_count"] = len(result.saved)
+            details["extraction_error"] = result.extraction_error
+            return {"memory_result": result}
 
     async def _load_context(self, state: AdviceState) -> dict:
         with state["trace"].measure("context_load"):
@@ -275,44 +396,140 @@ class AdviceAgent:
             return {"documents": documents}
 
     async def _compose(self, state: AdviceState) -> dict:
-        with state["trace"].measure("answer_generation"):
-            response = await self._composer.compose(
-                request=state["request"],
-                scenario=state["scenario"],
-                context=state["context"],
-                documents=state.get("documents", []),
-                conversation_history=state.get("conversation_history", []),
-                policy=state["policy"],
-                stream_callback=state.get("stream_callback"),
-            )
-            return {"response": response}
+        attempts: list[AdviceGenerationAttempt] = []
+        request = state["request"]
+        logical_turn_id = _required_logical_turn_id(request)
+        logical_turn = await self._memory_service.begin_advice_generation(
+            logical_turn_id,
+            user_id=request.user_id,
+            relationship_id=request.relationship_id,
+            conversation_id=_required_conversation_id(request),
+            retry=request.retry_generation,
+        )
+        state["execution"].owns_failure_transition = True
+        with state["trace"].measure("answer_generation") as details:
+            details["logical_turn_id"] = logical_turn_id
+            details["generation_no"] = logical_turn.generation_count
+            kwargs = {
+                "request": request,
+                "scenario": state["scenario"],
+                "context": state["context"],
+                "documents": state.get("documents", []),
+                "conversation_history": state.get("conversation_history", []),
+                "policy": state["policy"],
+                # Model fragments are not trusted presentation content.
+                "stream_callback": None,
+            }
+            if _supports_keyword(self._composer.compose, "attempt_callback"):
+                kwargs["attempt_callback"] = attempts.append
+            if _supports_keyword(self._composer.compose, "trace"):
+                kwargs["trace"] = state["trace"]
+            try:
+                response = await self._composer.compose(**kwargs)
+                await self._memory_service.save_advice_generation_attempts(
+                    logical_turn_id,
+                    logical_turn.generation_count,
+                    attempts,
+                    user_id=request.user_id,
+                    relationship_id=request.relationship_id,
+                    conversation_id=_required_conversation_id(request),
+                )
+            except Exception as exc:
+                if attempts:
+                    await self._memory_service.save_advice_generation_attempts(
+                        logical_turn_id,
+                        logical_turn.generation_count,
+                        attempts,
+                        user_id=request.user_id,
+                        relationship_id=request.relationship_id,
+                        conversation_id=_required_conversation_id(request),
+                    )
+                await self._memory_service.fail_advice_logical_turn(
+                    logical_turn_id,
+                    user_id=request.user_id,
+                    relationship_id=request.relationship_id,
+                    conversation_id=_required_conversation_id(request),
+                    last_error_type=_generation_error_name(attempts, exc),
+                    fallback_used=False,
+                )
+                raise
+            details["attempt_count"] = len(attempts) or 1
+            details["fallback_used"] = any(item.fallback_used for item in attempts)
+            return {
+                "response": response,
+                "generation_attempts": attempts,
+                "logical_turn": logical_turn,
+                "generation_no": logical_turn.generation_count,
+            }
 
     def _enforce_policy(self, state: AdviceState) -> dict:
         with state["trace"].measure("policy_enforcement"):
-            return {
-                "response": enforce_scenario_policy(
-                    state["response"],
-                    state["policy"],
-                    state["request"].query,
-                    state["context"],
-                )
-            }
+            response = enforce_scenario_policy(
+                state["response"],
+                state["policy"],
+                state["request"].query,
+                state["context"],
+            )
+            return {"response": response}
 
     async def _save_response(self, state: AdviceState) -> dict:
         memory_task = state.get("memory_task")
-        memory_result: RememberResult | None = None
-        if memory_task is not None and state.get("wait_for_memory", True):
-            memory_result = await memory_task
-        with state["trace"].measure("assistant_message_persistence"):
-            request = state["request"]
-            await self._memory_service.record_message(
-                user_id=request.user_id,
-                relationship_id=request.relationship_id,
-                conversation_id=state["current_message"].conversation_id,
-                role=MessageRole.ASSISTANT,
-                content=_response_to_history_text(state["response"]),
-                relationship_stage=request.relationship_stage,
-            )
+        memory_result: RememberResult | None = state.get("memory_result")
+        if (
+            memory_result is None
+            and memory_task is not None
+            and state.get("wait_for_memory", True)
+        ):
+            memory_result = await asyncio.shield(memory_task)
+        request = state["request"]
+        logical_turn_id = _required_logical_turn_id(request)
+        fallback_used = any(
+            attempt.fallback_used for attempt in state.get("generation_attempts", [])
+        )
+        with state["trace"].measure("assistant_message_persistence") as details:
+            details["logical_turn_id"] = logical_turn_id
+            details["fallback_used"] = fallback_used
+            if fallback_used:
+                await self._memory_service.fail_advice_logical_turn(
+                    logical_turn_id,
+                    user_id=request.user_id,
+                    relationship_id=request.relationship_id,
+                    conversation_id=_required_conversation_id(request),
+                    last_error_type=_generation_error_name(
+                        state.get("generation_attempts", [])
+                    ),
+                    fallback_used=True,
+                )
+                details["persisted"] = False
+            else:
+                if "generation_no" not in state:
+                    logical_turn = await self._memory_service.begin_advice_generation(
+                        logical_turn_id,
+                        user_id=request.user_id,
+                        relationship_id=request.relationship_id,
+                        conversation_id=_required_conversation_id(request),
+                        retry=request.retry_generation,
+                    )
+                    state["execution"].owns_failure_transition = True
+                    state["generation_no"] = logical_turn.generation_count
+                await self._memory_service.ensure_context(
+                    request.user_id,
+                    request.relationship_id,
+                    request.relationship_stage,
+                )
+                await self._memory_service.complete_advice_logical_turn(
+                    logical_turn_id,
+                    user_id=request.user_id,
+                    relationship_id=request.relationship_id,
+                    conversation_id=_required_conversation_id(request),
+                    message_id=_logical_message_id(
+                        logical_turn_id,
+                        MessageRole.ASSISTANT,
+                    ),
+                    content=_response_to_history_text(state["response"]),
+                )
+                details["persisted"] = True
+        _emit_validated_response(state["response"], state.get("stream_callback"))
         if memory_task is not None and memory_result is None:
             if memory_task.done():
                 try:
@@ -328,6 +545,58 @@ class AdviceAgent:
                     pending=True,
                 )
         return {"memory_result": memory_result} if memory_result else {}
+
+    async def _fail_recorded_turn(
+        self,
+        request: AdviceRequest,
+        error: BaseException,
+        trace: ExecutionTrace,
+        execution: _AdviceTurnExecution,
+    ) -> None:
+        logical_turn_id = request.logical_turn_id
+        if logical_turn_id is None:
+            return
+        with trace.measure("advice_turn_failure") as details:
+            details["logical_turn_id"] = logical_turn_id
+            details["error_type"] = type(error).__name__
+            details["owned"] = execution.owns_failure_transition
+            if not execution.owns_failure_transition:
+                details["status_persisted"] = False
+                details["reason"] = "logical_turn_not_owned"
+                return
+            try:
+                turn = await self._memory_service.get_advice_logical_turn(
+                    logical_turn_id,
+                    user_id=request.user_id,
+                    relationship_id=request.relationship_id,
+                    conversation_id=_required_conversation_id(request),
+                )
+                if turn is None or not _logical_turn_matches_request_scope(turn, request):
+                    details["status_persisted"] = False
+                    return
+                if turn.status == AdviceLogicalTurnStatus.GENERATION_FAILED:
+                    details["status_persisted"] = True
+                    details["already_failed"] = True
+                    return
+                if turn.status not in {
+                    AdviceLogicalTurnStatus.MEMORY_STARTED,
+                    AdviceLogicalTurnStatus.GENERATION_IN_PROGRESS,
+                }:
+                    details["status_persisted"] = False
+                    details["terminal_status"] = turn.status.value
+                    return
+                await self._memory_service.fail_advice_logical_turn(
+                    logical_turn_id,
+                    user_id=request.user_id,
+                    relationship_id=request.relationship_id,
+                    conversation_id=_required_conversation_id(request),
+                    last_error_type=_generation_error_name([], error),
+                    fallback_used=False,
+                )
+                details["status_persisted"] = True
+            except Exception as persistence_error:
+                details["status_persisted"] = False
+                details["persistence_error"] = type(persistence_error).__name__
 
     def _compose_safety(self, state: AdviceState) -> dict:
         with state["trace"].measure("safety_response"):
@@ -393,3 +662,118 @@ def _response_to_history_text(response: AdviceResponse) -> str:
     if response.clarifying_questions:
         parts.append("待确认：" + "；".join(response.clarifying_questions))
     return "\n".join(parts)
+
+
+def _supports_keyword(callable_object: object, keyword: str) -> bool:
+    try:
+        parameters = inspect.signature(callable_object).parameters
+    except (TypeError, ValueError):
+        return True
+    return keyword in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+
+
+def _logical_message_id(logical_turn_id: str, role: MessageRole) -> str:
+    return str(uuid5(NAMESPACE_URL, f"loveapp:advice:{logical_turn_id}:{role.value}"))
+
+
+def _required_logical_turn_id(request: AdviceRequest) -> str:
+    if request.logical_turn_id is None:  # guarded by _record_message
+        raise RuntimeError("advice logical turn was not initialized")
+    return request.logical_turn_id
+
+
+def _required_conversation_id(request: AdviceRequest) -> str:
+    if request.conversation_id is None:  # normalized by advise_turn
+        raise RuntimeError("advice conversation was not initialized")
+    return request.conversation_id
+
+
+def _validate_logical_turn_request(
+    turn: AdviceLogicalTurn,
+    request: AdviceRequest,
+) -> None:
+    if (
+        turn.user_id,
+        turn.relationship_id,
+        turn.conversation_id,
+        turn.query,
+    ) != (
+        request.user_id,
+        request.relationship_id,
+        request.conversation_id,
+        request.query,
+    ):
+        raise ValueError("建议轮次与当前用户、关系、会话或内容不匹配。")
+
+
+def _logical_turn_matches_request_scope(
+    turn: AdviceLogicalTurn,
+    request: AdviceRequest,
+) -> bool:
+    return (
+        turn.user_id == request.user_id
+        and turn.relationship_id == request.relationship_id
+        and turn.conversation_id == request.conversation_id
+    )
+
+
+def _generation_error_name(
+    attempts: list[AdviceGenerationAttempt],
+    error: BaseException | None = None,
+) -> str:
+    if attempts and attempts[-1].parse_error_type is not None:
+        return attempts[-1].parse_error_type.value
+    return type(error).__name__ if error is not None else "unknown_generation_error"
+
+
+def _emit_validated_response(
+    response: AdviceResponse,
+    callback: AdviceStreamCallback | None,
+) -> None:
+    if callback is None:
+        return
+    events = [
+        AdviceStreamEvent(field="problem_summary", text=response.problem_summary),
+        AdviceStreamEvent(field="assessment", text=response.assessment),
+    ]
+    for field in (
+        "clarifying_questions",
+        "recommended_actions",
+        "sample_phrases",
+        "alternatives",
+        "avoid_actions",
+        "risk_notes",
+    ):
+        events.extend(
+            AdviceStreamEvent(field=field, text=value, index=index)
+            for index, value in enumerate(getattr(response, field))
+        )
+    for event in events:
+        try:
+            callback(event)
+        except Exception:
+            continue
+
+
+_CURRENT_TURN_STATE_SIGNALS = frozenset(
+    {
+        "relationship_state",
+        "relationship_transition",
+        "durable_behavioral_reversal",
+        "contextual_correction",
+        "contextual_restoration",
+        "contextual_recurrence",
+    }
+)
+
+
+def _requires_current_turn_state_sync(query: str) -> bool:
+    if has_retrospective_event_semantics(query):
+        return True
+    if may_contain_contextual_memory_update(query):
+        return True
+    decision = MemoryGate().evaluate(query)
+    return bool(_CURRENT_TURN_STATE_SIGNALS.intersection(decision.signals))

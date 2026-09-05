@@ -325,15 +325,23 @@ def _build_advice_composer(settings: Settings):
         raise ValueError("LOVEAPP_LLM_API_KEY 未配置。")
     if not settings.llm_base_url:
         raise ValueError("LOVEAPP_LLM_BASE_URL 未配置。")
-    if not settings.llm_model:
-        raise ValueError("LOVEAPP_LLM_MODEL 未配置。")
+    advice_model = settings.advice_model or settings.llm_model
+    if not advice_model:
+        raise ValueError("LOVEAPP_ADVICE_MODEL 或 LOVEAPP_LLM_MODEL 未配置。")
     return OpenAICompatibleAdviceComposer(
         api_key=settings.llm_api_key,
         base_url=settings.llm_base_url,
-        model=settings.llm_model,
+        model=advice_model,
         timeout_seconds=settings.llm_timeout_seconds,
         max_retries=settings.llm_max_retries,
-        max_tokens=settings.llm_max_tokens,
+        max_tokens=settings.advice_max_tokens,
+        thinking=(
+            settings.advice_thinking
+            if settings.llm_provider.casefold() == "deepseek"
+            else None
+        ),
+        temperature=settings.advice_temperature,
+        structured_retries=settings.advice_structured_retries,
     )
 
 
@@ -377,6 +385,7 @@ def _build_memory_extractor(settings: Settings):
         max_tokens=settings.memory_extraction_max_tokens,
         tier="flash",
         thinking=settings.memory_extraction_thinking,
+        validation_mode="raw",
     )
     strong_model = settings.memory_extraction_strong_model or settings.llm_model
     strong = None
@@ -390,6 +399,7 @@ def _build_memory_extractor(settings: Settings):
             max_tokens=settings.memory_extraction_strong_max_tokens,
             tier="strong",
             thinking=settings.memory_extraction_strong_thinking,
+            validation_mode="raw",
         )
     return TieredMemoryExtractor(
         flash,

@@ -21,8 +21,10 @@ from loveapp.application.advice_presentation import (
     choose_advice_presentation,
     format_compact_advice,
 )
+from loveapp.application.memory import NoOpMemoryExtractor
 from loveapp.application.memory_retrieval import HybridMemoryRetriever
 from loveapp.bootstrap import (
+    _build_memory_extractor,
     build_container,
     build_embedding_provider,
     build_memory_container,
@@ -66,16 +68,55 @@ from loveapp.evaluation import (
     FixtureSemanticRelationJudge,
     evaluate_dateplan,
     evaluate_live_routing_conversations,
+    evaluate_memory_admission_integration,
+    evaluate_memory_admission_v1,
+    evaluate_memory_extraction_v1,
     evaluate_memory_foundation,
+    evaluate_memory_gate_v2,
     evaluate_memory_lifecycle,
     evaluate_memory_longtail_realistic,
     evaluate_memory_longtail_relations,
+    evaluate_memory_longtail_write_integration,
+    evaluate_memory_longtail_write_v1,
+    evaluate_memory_normalization_boundary,
+    evaluate_memory_normalization_v1,
     evaluate_routing_conversations,
     render_dateplan_report,
     render_longtail_baseline_report,
     render_longtail_realistic_report,
+    render_memory_admission_integration_diagnostic,
+    render_memory_admission_policy_review,
+    render_memory_admission_strong_review_audit,
+    render_memory_admission_v1_report,
+    render_memory_extraction_v1_report,
+    render_memory_gate_v2_report,
+    render_memory_longtail_write_integration_diagnostic,
+    render_memory_longtail_write_policy_review,
+    render_memory_longtail_write_v1_report,
+    render_memory_normalization_boundary_report,
+    render_memory_normalization_v1_report,
     render_routing_report,
     run_baseline,
+)
+from loveapp.evaluation.memory_extraction_alignment import (
+    OpenAICompatibleExtractionAlignmentJudge,
+)
+from loveapp.evaluation.memory_extraction_langsmith import (
+    DEFAULT_DATASET_NAME as MEMORY_EXTRACTION_LANGSMITH_DATASET,
+)
+from loveapp.evaluation.memory_extraction_langsmith import (
+    LangSmithExtractionObserver,
+    langsmith_configured,
+    sync_memory_extraction_dataset,
+)
+from loveapp.evaluation.memory_longtail_realistic import HARD_CASE_IDS
+from loveapp.evaluation.memory_longtail_write_v2 import (
+    collect_memory_longtail_write_v2_repository_metadata,
+    compare_memory_longtail_write_v2_reports,
+    evaluate_memory_longtail_write_v2,
+    evaluate_memory_longtail_write_v2_fixture,
+    finalize_memory_longtail_write_v2_live_validation,
+    render_memory_longtail_write_v2_report,
 )
 
 app = typer.Typer(
@@ -90,6 +131,59 @@ eval_app = typer.Typer(help="运行固定数据集评测并保存 baseline。")
 app.add_typer(knowledge_app, name="knowledge")
 app.add_typer(memory_app, name="memory")
 app.add_typer(eval_app, name="eval")
+
+
+class _ObservedEmbeddingProvider:
+    """Record whether a live evaluation actually used vector embeddings."""
+
+    def __init__(self, delegate: Any) -> None:
+        self._delegate = delegate
+        self.query_call_count = 0
+        self.document_call_count = 0
+        self.document_text_count = 0
+        self.failure_types: dict[str, int] = {}
+
+    async def embed_query(self, text: str) -> list[float]:
+        self.query_call_count += 1
+        try:
+            return await self._delegate.embed_query(text)
+        except Exception as exc:
+            self._record_failure(exc)
+            raise
+
+    async def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        self.document_call_count += 1
+        self.document_text_count += len(texts)
+        try:
+            return await self._delegate.embed_documents(texts)
+        except Exception as exc:
+            self._record_failure(exc)
+            raise
+
+    def summary(self, *, model: str, dimension: int) -> dict[str, Any]:
+        attempted = self.query_call_count > 0 or self.document_call_count > 0
+        confirmed = bool(
+            attempted
+            and self.query_call_count > 0
+            and self.document_call_count > 0
+            and not self.failure_types
+        )
+        return {
+            "provider": "sentence_transformers",
+            "model": model,
+            "dimension": dimension,
+            "query_call_count": self.query_call_count,
+            "document_call_count": self.document_call_count,
+            "document_text_count": self.document_text_count,
+            "failure_count": sum(self.failure_types.values()),
+            "failure_types": dict(sorted(self.failure_types.items())),
+            "embedding_retrieval_attempted": attempted,
+            "embedding_backed_retrieval_confirmed": confirmed,
+        }
+
+    def _record_failure(self, exc: Exception) -> None:
+        name = type(exc).__name__
+        self.failure_types[name] = self.failure_types.get(name, 0) + 1
 
 
 @eval_app.command("baseline")
@@ -400,6 +494,574 @@ def memory_foundation_eval(
     console.print(table)
 
 
+@eval_app.command("memory-admission-v1")
+def memory_admission_v1_eval(
+    dataset: Annotated[
+        Path,
+        typer.Option("--dataset", help="Memory Admission V1 72-case JSONL path."),
+    ] = Path("evals/memory/admission_v1.jsonl"),
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", help="Complete Admission baseline JSON path."),
+    ] = None,
+    integration_output: Annotated[
+        Path | None,
+        typer.Option("--integration-output", help="Integration diagnostic JSON path."),
+    ] = None,
+    case: Annotated[
+        str | None,
+        typer.Option("--case", help="Run one Admission case, for example ADM-001."),
+    ] = None,
+    slice_name: Annotated[
+        str | None,
+        typer.Option("--slice", help="Run one Admission evaluation slice."),
+    ] = None,
+    contract_status: Annotated[
+        str | None,
+        typer.Option("--contract-status", help="Filter by EXACT or POLICY_REVIEW."),
+    ] = None,
+    fail_on_error: Annotated[
+        bool,
+        typer.Option("--fail-on-error", help="Stop on evaluator execution errors."),
+    ] = False,
+) -> None:
+    """Run the Admission V1 baseline and isolated integration diagnostic."""
+
+    filtered_run = any(value is not None for value in (case, slice_name, contract_status))
+    output_path = output or Path(".data/evals/memory_admission_v1_baseline.json")
+    integration_path = integration_output or Path(
+        ".data/evals/memory_admission_v1_integration.json"
+    )
+    try:
+        report = evaluate_memory_admission_v1(
+            dataset,
+            case_id=case,
+            slice_name=slice_name,
+            contract_status=contract_status,
+            fail_on_error=fail_on_error,
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        output_path.with_suffix(".md").write_text(
+            render_memory_admission_v1_report(report),
+            encoding="utf-8",
+        )
+        if not filtered_run:
+            Path("MEMORY_ADMISSION_V1_BASELINE_REPORT.md").write_text(
+                render_memory_admission_v1_report(report),
+                encoding="utf-8",
+            )
+            Path("MEMORY_ADMISSION_POLICY_REVIEW.md").write_text(
+                render_memory_admission_policy_review(report),
+                encoding="utf-8",
+            )
+            Path("MEMORY_ADMISSION_STRONG_REVIEW_AUDIT.md").write_text(
+                render_memory_admission_strong_review_audit(report),
+                encoding="utf-8",
+            )
+            integration = asyncio.run(evaluate_memory_admission_integration(dataset))
+            integration_path.parent.mkdir(parents=True, exist_ok=True)
+            integration_path.write_text(
+                json.dumps(integration, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            integration_markdown = render_memory_admission_integration_diagnostic(integration)
+            integration_path.with_suffix(".md").write_text(
+                integration_markdown,
+                encoding="utf-8",
+            )
+            Path("MEMORY_ADMISSION_V1_INTEGRATION_DIAGNOSTIC.md").write_text(
+                integration_markdown,
+                encoding="utf-8",
+            )
+    except Exception as exc:
+        console.print(f"[red]Memory Admission V1 evaluation failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[green]Memory Admission V1 saved:[/green] {output_path}")
+    table = Table(title="Memory Admission V1")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    metrics = report["metrics"]
+    table.add_row("strict_case_count", str(metrics["strict_case_count"]))
+    table.add_row("strict_passed_case_count", str(metrics["strict_passed_case_count"]))
+    table.add_row("decision_accuracy", str(metrics["decision_accuracy"]))
+    table.add_row("reason_accuracy", str(metrics["reason_accuracy"]))
+    table.add_row("score_mae", str(metrics["score_mae"]))
+    table.add_row("status", report["status"])
+    console.print(table)
+
+
+@eval_app.command("memory-extraction-v1-sync-langsmith")
+def memory_extraction_v1_sync_langsmith(
+    dataset: Annotated[
+        Path,
+        typer.Option("--dataset", help="Local Extraction V1 golden JSONL path."),
+    ] = Path("evals/memory/extraction_v1_70.jsonl"),
+    dataset_name: Annotated[
+        str,
+        typer.Option("--dataset-name", help="Stable LangSmith dataset name."),
+    ] = MEMORY_EXTRACTION_LANGSMITH_DATASET,
+) -> None:
+    """Idempotently sync the synthetic Extraction V1 golden set to LangSmith."""
+
+    try:
+        result = sync_memory_extraction_dataset(
+            dataset,
+            dataset_name=dataset_name,
+        )
+    except Exception as exc:
+        console.print(f"[red]LangSmith dataset sync failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        "[green]LangSmith dataset synced:[/green] "
+        f"{result['dataset_name']} ({result['example_count']} examples)"
+    )
+
+
+@eval_app.command("memory-extraction-v1")
+def memory_extraction_v1_eval(
+    dataset: Annotated[
+        Path,
+        typer.Option("--dataset", help="Memory Extraction V1 70-case JSONL path."),
+    ] = Path("evals/memory/extraction_v1_70.jsonl"),
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", help="Complete JSON report path."),
+    ] = None,
+    case: Annotated[
+        str | None,
+        typer.Option("--case", help="Run one case, for example EXT-055."),
+    ] = None,
+    langsmith: Annotated[
+        bool,
+        typer.Option("--langsmith/--no-langsmith", help="Upload synthetic eval traces."),
+    ] = False,
+    sync_langsmith: Annotated[
+        bool,
+        typer.Option("--sync-langsmith", help="Idempotently sync the local golden dataset first."),
+    ] = False,
+    langsmith_dataset: Annotated[
+        str,
+        typer.Option("--langsmith-dataset", help="LangSmith dataset name."),
+    ] = MEMORY_EXTRACTION_LANGSMITH_DATASET,
+    fail_on_error: Annotated[
+        bool,
+        typer.Option("--fail-on-error", help="Stop on the first case execution failure."),
+    ] = False,
+) -> None:
+    """Evaluate Flash raw, safe repair, and the production extraction cascade."""
+
+    settings = get_settings()
+    output_path = output or Path(
+        ".data/evals/memory_extraction_v1_"
+        + datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
+        + ".json"
+    )
+
+    async def run() -> dict[str, Any]:
+        cascade = _build_memory_extractor(settings)
+        if isinstance(cascade, NoOpMemoryExtractor):
+            raise ValueError("Memory Extraction V1 requires the configured Flash extractor.")
+        flash = getattr(cascade, "_flash", None)
+        if flash is None:
+            raise ValueError("Memory Extraction V1 requires TieredMemoryExtractor.")
+        if not settings.llm_api_key or not settings.llm_base_url:
+            raise ValueError("LOVEAPP_LLM_API_KEY and LOVEAPP_LLM_BASE_URL are required.")
+        matcher_model = (
+            settings.memory_extraction_strong_model
+            or settings.llm_model
+            or settings.memory_extraction_model
+        )
+        if not matcher_model:
+            raise ValueError("No model is configured for semantic claim alignment.")
+        matcher = OpenAICompatibleExtractionAlignmentJudge(
+            api_key=settings.llm_api_key,
+            base_url=settings.llm_base_url,
+            model=matcher_model,
+            timeout_seconds=settings.memory_extraction_strong_timeout_seconds,
+            max_retries=settings.memory_extraction_strong_max_retries,
+            max_tokens=settings.memory_extraction_strong_max_tokens,
+            thinking=settings.memory_extraction_strong_thinking,
+        )
+        observer = LangSmithExtractionObserver(
+            enabled=langsmith,
+            dataset_name=langsmith_dataset,
+        )
+        if langsmith and not observer.enabled:
+            console.print(
+                "[yellow]LangSmith upload disabled:[/yellow] "
+                "LANGSMITH_API_KEY is not configured; continuing local evaluation."
+            )
+        try:
+            return await evaluate_memory_extraction_v1(
+                dataset,
+                flash_extractor=flash,
+                cascade_extractor=cascade,
+                semantic_matcher=matcher,
+                observer=observer,
+                case_id=case,
+                fail_on_error=fail_on_error,
+            )
+        finally:
+            await matcher.aclose()
+            close = getattr(cascade, "aclose", None)
+            if callable(close):
+                await close()
+
+    try:
+        if sync_langsmith:
+            if langsmith_configured():
+                sync_result = sync_memory_extraction_dataset(
+                    dataset,
+                    dataset_name=langsmith_dataset,
+                )
+                console.print(
+                    "[green]LangSmith dataset synced:[/green] "
+                    f"{sync_result['dataset_name']} "
+                    f"({sync_result['example_count']} examples)"
+                )
+            else:
+                console.print(
+                    "[yellow]LangSmith dataset sync skipped:[/yellow] "
+                    "LANGSMITH_API_KEY is not configured; continuing local evaluation."
+                )
+        report = asyncio.run(run())
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        flash_path = Path(".data/evals/memory_extraction_v1_flash_diagnostic.json")
+        cascade_path = Path(".data/evals/memory_extraction_v1_production_cascade.json")
+        flash_path.parent.mkdir(parents=True, exist_ok=True)
+        flash_path.write_text(
+            json.dumps(
+                {
+                    "evaluation": report["evaluation"],
+                    "dataset": report["dataset"],
+                    "models": report["models"],
+                    "flash_raw": report["layers"]["flash_raw"],
+                    "flash_post_repair": report["layers"]["flash_post_repair"],
+                    "cases": [
+                        {
+                            "case_id": row["case_id"],
+                            "flash_diagnostic": row["flash_diagnostic"],
+                            "flash_raw": row["layers"]["flash_raw"],
+                            "flash_post_repair": row["layers"]["flash_post_repair"],
+                        }
+                        for row in report["cases"]
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        cascade_path.write_text(
+            json.dumps(
+                {
+                    "evaluation": report["evaluation"],
+                    "dataset": report["dataset"],
+                    "models": report["models"],
+                    "production_cascade": report["layers"]["production_cascade"],
+                    "contributions": report["contributions"],
+                    "cases": [
+                        {
+                            "case_id": row["case_id"],
+                            "attempts": row["cascade_attempts"],
+                            "result": row["layers"]["production_cascade"],
+                        }
+                        for row in report["cases"]
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        markdown = render_memory_extraction_v1_report(report)
+        Path("MEMORY_EXTRACTION_V1_EVAL_REPORT.md").write_text(markdown, encoding="utf-8")
+        output_path.with_suffix(".md").write_text(markdown, encoding="utf-8")
+    except Exception as exc:
+        console.print(f"[red]Memory Extraction V1 evaluation failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    metrics = report["layers"]["production_cascade"]["metrics"]
+    console.print(f"[green]Memory Extraction V1 saved:[/green] {output_path}")
+    table = Table(title="Memory Extraction V1 Production Cascade")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    for key in (
+        "claim_recall",
+        "spurious_claim_rate",
+        "perspective_accuracy",
+        "atomization_accuracy",
+        "context_reply_recall",
+        "empty_positive_rate",
+        "negative_restraint_false_positive_rate",
+    ):
+        table.add_row(key, str(metrics[key]))
+    console.print(table)
+
+
+@eval_app.command("memory-normalization-v1")
+def memory_normalization_v1_eval(
+    dataset: Annotated[
+        Path,
+        typer.Option("--dataset", help="Memory Normalization V1 56-case JSONL path."),
+    ] = Path("evals/memory/normalization_v1.jsonl"),
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", help="Complete local JSON baseline path."),
+    ] = None,
+    case: Annotated[
+        str | None,
+        typer.Option("--case", help="Run one case, for example NORM-011."),
+    ] = None,
+    slice_name: Annotated[
+        str | None,
+        typer.Option("--slice", help="Run one normalization slice."),
+    ] = None,
+    fail_on_error: Annotated[
+        bool,
+        typer.Option("--fail-on-error", help="Stop on infrastructure execution errors."),
+    ] = False,
+) -> None:
+    """Run the offline fixed-claim Normalization V1 baseline."""
+
+    filtered_run = case is not None or slice_name is not None
+    if output is not None:
+        output_path = output
+    elif filtered_run:
+        filter_label = case or str(slice_name).replace("_", "-")
+        output_path = Path(
+            ".data/evals/memory_normalization_v1_"
+            + filter_label
+            + "_"
+            + datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
+            + ".json"
+        )
+    else:
+        output_path = Path(".data/evals/memory_normalization_v1_baseline.json")
+
+    try:
+        report = evaluate_memory_normalization_v1(
+            dataset,
+            case_id=case,
+            slice_name=slice_name,
+            fail_on_error=fail_on_error,
+            require_complete=case is None and slice_name is None,
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        markdown = render_memory_normalization_v1_report(report)
+        if not filtered_run:
+            Path("MEMORY_NORMALIZATION_V1_EVAL_REPORT.md").write_text(
+                markdown,
+                encoding="utf-8",
+            )
+        output_path.with_suffix(".md").write_text(markdown, encoding="utf-8")
+    except Exception as exc:
+        console.print(f"[red]Memory Normalization V1 evaluation failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[green]Memory Normalization V1 saved:[/green] {output_path}")
+    table = Table(title="Memory Normalization V1")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("case_count", str(report["case_count"]))
+    table.add_row("passed_case_count", str(report["passed_case_count"]))
+    for name in (
+        "canonical_mapping_accuracy",
+        "state_dimension_accuracy",
+        "state_value_accuracy",
+        "custom_preservation_accuracy",
+        "unsafe_canonicalization_rate",
+        "schema_validity",
+        "idempotency_accuracy",
+        "canonical_coverage",
+    ):
+        table.add_row(name, str(report["metrics"][name]))
+    console.print(table)
+
+
+@eval_app.command("memory-normalization-boundary")
+def memory_normalization_boundary_eval(
+    dataset: Annotated[
+        Path,
+        typer.Option("--dataset", help="Raw/Normalized validation boundary JSONL path."),
+    ] = Path("evals/memory/normalization_boundary_v1.jsonl"),
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", help="Complete local JSON report path."),
+    ] = None,
+    markdown: Annotated[
+        Path | None,
+        typer.Option("--markdown", help="Local Markdown report path."),
+    ] = None,
+    case: Annotated[
+        str | None,
+        typer.Option("--case", help="Run one boundary case, for example BND-001."),
+    ] = None,
+    fail_on_error: Annotated[
+        bool,
+        typer.Option("--fail-on-error", help="Stop on infrastructure execution errors."),
+    ] = False,
+) -> None:
+    """Audit the Generic Validator/Normalizer/Canonical Validator boundary."""
+
+    filtered_run = case is not None
+    if output is not None:
+        output_path = output
+    elif filtered_run:
+        output_path = Path(
+            ".data/evals/memory_normalization_boundary_"
+            + (case or "case")
+            + "_"
+            + datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
+            + ".json"
+        )
+    else:
+        output_path = Path(".data/evals/memory_normalization_boundary_v1.json")
+    markdown_path = markdown or output_path.with_suffix(".md")
+    try:
+        report = evaluate_memory_normalization_boundary(
+            dataset,
+            case_id=case,
+            fail_on_error=fail_on_error,
+            require_complete=case is None,
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        markdown_path.parent.mkdir(parents=True, exist_ok=True)
+        markdown_path.write_text(
+            render_memory_normalization_boundary_report(report),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        console.print(f"[red]Memory normalization boundary evaluation failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Memory normalization boundary saved:[/green] {output_path}")
+    table = Table(title="Memory Normalization Boundary")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("case_count", str(report["case_count"]))
+    table.add_row("passed_case_count", str(report["passed_case_count"]))
+    for name in (
+        "generic_validation_acceptance_rate",
+        "false_pre_normalization_rejection_rate",
+        "normalizer_recovery_accuracy",
+        "validation_boundary_rejection_count",
+    ):
+        table.add_row(name, str(report["metrics"][name]))
+    console.print(table)
+
+
+@eval_app.command("memory-gate-v2")
+def memory_gate_v2_eval(
+    dataset: Annotated[
+        Path,
+        typer.Option("--dataset", help="Memory Gate V2 60-case JSONL 路径。"),
+    ] = Path("evals/memory/gate_v2_60.jsonl"),
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", help="JSON 或 Markdown 报告路径。"),
+    ] = None,
+    case: Annotated[
+        str | None,
+        typer.Option("--case", help="只运行指定 Gate case id。"),
+    ] = None,
+    category: Annotated[
+        str | None,
+        typer.Option("--category", help="只运行指定 Gate category。"),
+    ] = None,
+    fail_on_error: Annotated[
+        bool,
+        typer.Option("--fail-on-error", help="首次 Flash 调用异常时立即停止。"),
+    ] = False,
+) -> None:
+    """用真实 Flash 同调用契约运行 Gate-only A/B 评测。"""
+
+    output_path = output or Path(
+        ".data/evals/memory_gate_v2_"
+        + datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
+        + ".json"
+    )
+
+    async def run() -> dict[str, Any]:
+        extractor = _build_memory_extractor(get_settings())
+        if isinstance(extractor, NoOpMemoryExtractor):
+            raise ValueError(
+                "Memory Gate V2 live eval requires the configured LLM Flash extractor."
+            )
+        try:
+            return await evaluate_memory_gate_v2(
+                dataset,
+                extractor=extractor,
+                fail_on_error=fail_on_error,
+                case_id=case,
+                category=category,
+            )
+        finally:
+            close = getattr(extractor, "aclose", None)
+            if callable(close):
+                await close()
+
+    try:
+        report = asyncio.run(run())
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        markdown = render_memory_gate_v2_report(report)
+        if output_path.suffix.casefold() == ".md":
+            output_path.write_text(markdown, encoding="utf-8")
+        else:
+            output_path.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            output_path.with_suffix(".md").write_text(markdown, encoding="utf-8")
+        Path("MEMORY_GATE_V2_EVAL_REPORT.md").write_text(
+            markdown,
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        console.print(f"[red]Memory Gate V2 评测失败：[/red]{exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[green]Memory Gate V2 评测已保存：[/green]{output_path}")
+    table = Table(title="Memory Gate V2")
+    table.add_column("指标")
+    table.add_column("Current", justify="right")
+    table.add_column("Hybrid", justify="right")
+    table.add_row(
+        "Recall",
+        str(report["baseline"]["recall"]),
+        str(report["hybrid"]["recall"]),
+    )
+    table.add_row(
+        "Precision",
+        str(report["baseline"]["precision"]),
+        str(report["hybrid"]["precision"]),
+    )
+    table.add_row(
+        "Specificity",
+        str(report["baseline"]["specificity"]),
+        str(report["hybrid"]["specificity"]),
+    )
+    table.add_row(
+        "L0 routing accuracy",
+        "-",
+        str(report["metrics"]["routing_accuracy"]),
+    )
+    console.print(table)
+
+
 @eval_app.command("memory-longtail-relations")
 def memory_longtail_relations_eval(
     dataset: Annotated[
@@ -487,6 +1149,322 @@ def _default_memory_longtail_output_path(
     return Path(".data/evals") / f"memory_longtail_relations_{mode}_{timestamp}.json"
 
 
+@eval_app.command("memory-longtail-write-v1")
+def memory_longtail_write_v1_eval(
+    dataset: Annotated[
+        Path,
+        typer.Option("--dataset", help="Long-tail Memory Write V1 Golden Set 路径。"),
+    ] = Path("evals/memory/longtail_write_v1.jsonl"),
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", help="JSON 报告路径；默认保存到 .data/evals。"),
+    ] = None,
+    case: Annotated[
+        str | None,
+        typer.Option("--case", help="只运行指定 Case，例如 LTW-017。"),
+    ] = None,
+    slice_name: Annotated[
+        str | None,
+        typer.Option("--slice", help="只运行指定 Golden slice。"),
+    ] = None,
+    relation: Annotated[
+        str | None,
+        typer.Option("--relation", help="只运行指定 relation。"),
+    ] = None,
+    length_band: Annotated[
+        str | None,
+        typer.Option("--length-band", help="只运行 short/medium/long。"),
+    ] = None,
+    contract_status: Annotated[
+        str | None,
+        typer.Option("--contract-status", help="EXACT 或 POLICY_REVIEW。"),
+    ] = None,
+    live_subset: Annotated[
+        bool | None,
+        typer.Option("--live-subset/--no-live-subset", help="按 live_semantic_subset 过滤。"),
+    ] = None,
+    integration: Annotated[
+        bool,
+        typer.Option("--integration", help="额外运行隔离 InMemoryMemoryStore integration。"),
+    ] = False,
+    fail_on_error: Annotated[
+        bool,
+        typer.Option("--fail-on-error", help="遇到 fixture/evaluator 错误立即失败。"),
+    ] = False,
+) -> None:
+    """评估 Long-tail Write V1；所有 Store 写入均限于隔离诊断实例。"""
+
+    output_path = output or Path(".data/evals/memory_longtail_write_v1_baseline.json")
+    try:
+        report = evaluate_memory_longtail_write_v1(
+            dataset,
+            case_id=case,
+            slice_name=slice_name,
+            relation=relation,
+            length_band=length_band,
+            contract_status=contract_status,
+            live_subset=live_subset,
+            fail_on_error=fail_on_error,
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        markdown = render_memory_longtail_write_v1_report(report)
+        markdown_path = output_path.with_suffix(".md")
+        markdown_path.write_text(markdown, encoding="utf-8")
+        Path("MEMORY_LONGTAIL_WRITE_V1_BASELINE_REPORT.md").write_text(markdown, encoding="utf-8")
+        Path("MEMORY_LONGTAIL_WRITE_V1_POLICY_REVIEW.md").write_text(
+            render_memory_longtail_write_policy_review(report), encoding="utf-8"
+        )
+        if integration:
+            integration_report = asyncio.run(
+                evaluate_memory_longtail_write_integration(
+                    dataset,
+                    fail_on_error=fail_on_error,
+                )
+            )
+            integration_path = Path(".data/evals/memory_longtail_write_v1_integration.json")
+            integration_path.write_text(
+                json.dumps(integration_report, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            Path("MEMORY_LONGTAIL_WRITE_V1_INTEGRATION_DIAGNOSTIC.md").write_text(
+                render_memory_longtail_write_integration_diagnostic(integration_report),
+                encoding="utf-8",
+            )
+    except Exception as exc:
+        console.print(f"[red]Long-tail Memory Write V1 评测失败：[/red]{exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[green]Long-tail Memory Write V1 报告已保存：[/green]{output_path}")
+    console.print(
+        f"strict={report['strict_case_count']} passed={report['strict_passed_case_count']} "
+        f"status={report['status']}"
+    )
+
+
+@eval_app.command("memory-longtail-write-v2")
+def memory_longtail_write_v2_eval(
+    dataset: Annotated[
+        Path,
+        typer.Option(
+            "--dataset",
+            "--case-dataset",
+            help="Long-tail Write V2 case overlay dataset path.",
+        ),
+    ] = Path("evals/memory/longtail_write_v2_cases_draft1.jsonl"),
+    shared_bank: Annotated[
+        Path,
+        typer.Option("--shared-bank", help="Long-tail Write V2 shared memory bank path."),
+    ] = Path("evals/memory/longtail_write_v2_shared_bank_draft1.jsonl"),
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", help="JSON report path; a Markdown sidecar is also written."),
+    ] = None,
+    case: Annotated[
+        str | None,
+        typer.Option("--case", help="Run one case, for example LTW2-011."),
+    ] = None,
+    slice_name: Annotated[
+        str | None,
+        typer.Option("--slice", help="Run one V2 semantic slice."),
+    ] = None,
+    vector_limit: Annotated[
+        int,
+        typer.Option("--vector-limit", min=1, help="Vector retrieval candidate limit."),
+    ] = 20,
+    rank_limit: Annotated[
+        int,
+        typer.Option("--rank-limit", min=1, help="Cheap-ranker output and Judge input limit."),
+    ] = 5,
+    fail_on_error: Annotated[
+        bool,
+        typer.Option("--fail-on-error", help="Stop on provider or evaluator errors."),
+    ] = False,
+    mode: Annotated[
+        Literal["fixture", "live"],
+        typer.Option("--mode", help="Run deterministic fixture or real model adapters."),
+    ] = "live",
+    repeat: Annotated[
+        int,
+        typer.Option("--repeat", min=1, max=100, help="Repeat each case for judge drift analysis."),
+    ] = 1,
+    hard_cases: Annotated[
+        bool,
+        typer.Option("--hard-cases", help="Run the fixed V2 hard-case identifier subset."),
+    ] = False,
+    compare_fixture: Annotated[
+        bool,
+        typer.Option(
+            "--compare-fixture/--no-compare-fixture",
+            help="Attach a same-scope fixture comparison in live mode.",
+        ),
+    ] = True,
+    final_live_validation: Annotated[
+        bool,
+        typer.Option(
+            "--final-live-validation",
+            help="Run the fixed 40x1 Live evaluation and 8x3 hard-case validation.",
+        ),
+    ] = False,
+) -> None:
+    """Run the retrieval-aware V2 benchmark in shadow-only mode."""
+
+    if rank_limit > vector_limit:
+        raise typer.BadParameter("--rank-limit must not exceed --vector-limit")
+    if hard_cases and case is not None:
+        raise typer.BadParameter("--hard-cases cannot be combined with --case")
+    if hard_cases and slice_name is not None:
+        raise typer.BadParameter("--hard-cases cannot be combined with --slice")
+    if final_live_validation and mode != "live":
+        raise typer.BadParameter("--final-live-validation requires --mode live")
+    if final_live_validation and (case is not None or slice_name is not None or hard_cases):
+        raise typer.BadParameter(
+            "--final-live-validation cannot be combined with --case, --slice, or --hard-cases"
+        )
+    if final_live_validation and repeat != 1:
+        raise typer.BadParameter("--final-live-validation manages its own 1x and 3x repeats")
+    effective_repeat = 3 if hard_cases and repeat == 1 else repeat
+    output_path = output or (
+        Path(".data/evals/memory_longtail_write_v2_final_live.json")
+        if final_live_validation
+        else _default_memory_longtail_write_v2_output_path()
+    )
+    if output_path.suffix.casefold() == ".md":
+        raise typer.BadParameter("--output must be a JSON path; Markdown is written beside it")
+
+    try:
+        if final_live_validation:
+            full_report, hard_report = asyncio.run(
+                _run_final_live_memory_longtail_write_v2_eval(
+                    dataset,
+                    shared_bank,
+                    settings=get_settings(),
+                    vector_limit=vector_limit,
+                    rank_limit=rank_limit,
+                    fail_on_error=fail_on_error,
+                    compare_fixture=compare_fixture,
+                )
+            )
+            hard_output_path = output_path.with_name(f"{output_path.stem}_hard.json")
+            _write_memory_longtail_write_v2_artifact(full_report, output_path)
+            _write_memory_longtail_write_v2_artifact(hard_report, hard_output_path)
+            console.print(
+                f"[green]Final Live JSON saved:[/green] {output_path}\n"
+                f"[green]Hard-case JSON saved:[/green] {hard_output_path}\n"
+                f"status={full_report['status']}"
+            )
+            return
+        if mode == "live":
+            report = asyncio.run(
+                _run_live_memory_longtail_write_v2_eval(
+                    dataset,
+                    shared_bank,
+                    settings=get_settings(),
+                    case_id=case,
+                    slice_name=slice_name,
+                    vector_limit=vector_limit,
+                    rank_limit=rank_limit,
+                    fail_on_error=fail_on_error,
+                    repeat=effective_repeat,
+                    hard_cases=hard_cases,
+                )
+            )
+        else:
+            report = asyncio.run(
+                evaluate_memory_longtail_write_v2_fixture(
+                    dataset,
+                    shared_bank,
+                    case_id=case,
+                    slice_name=slice_name,
+                    vector_limit=vector_limit,
+                    rank_limit=rank_limit,
+                    fail_on_error=fail_on_error,
+                    repeat=effective_repeat,
+                    hard_cases=hard_cases,
+                )
+            )
+        if mode == "live" and compare_fixture:
+            if dataset.exists() and shared_bank.exists():
+                fixture_report = asyncio.run(
+                    evaluate_memory_longtail_write_v2_fixture(
+                        dataset,
+                        shared_bank,
+                        case_id=case,
+                        slice_name=slice_name,
+                        vector_limit=vector_limit,
+                        rank_limit=rank_limit,
+                        fail_on_error=fail_on_error,
+                        repeat=effective_repeat,
+                        hard_cases=hard_cases,
+                    )
+                )
+                report["fixture_comparison"] = compare_memory_longtail_write_v2_reports(
+                    fixture_report,
+                    report,
+                )
+                report["fixture_baseline"] = {
+                    "evaluation_mode": fixture_report.get("evaluation_mode"),
+                    "case_count": fixture_report.get("case_count"),
+                    "passed_case_count": fixture_report.get("passed_case_count"),
+                    "repeat": fixture_report.get("repeat"),
+                }
+            else:
+                report["fixture_comparison"] = {
+                    "status": "UNAVAILABLE",
+                    "methodology": "Fixture dataset paths were not available.",
+                    "metrics": {},
+                }
+        report["evaluation_mode_requested"] = mode
+        report["store_mutation_permitted"] = False
+        markdown_path = _write_memory_longtail_write_v2_artifact(report, output_path)
+        markdown = markdown_path.read_text(encoding="utf-8")
+        # Keep the root convenience reports mode-specific.  A fixture run
+        # must not overwrite the Live report (and vice versa); timestamped
+        # artifacts remain the source of truth for filtered/repeated runs.
+        if case is None and slice_name is None and not hard_cases:
+            root_report = (
+                "MEMORY_LONGTAIL_WRITE_V2_FIXTURE_REPORT.md"
+                if mode == "fixture"
+                else "MEMORY_LONGTAIL_WRITE_V2_RETRIEVAL_AWARE_REPORT.md"
+            )
+            Path(root_report).write_text(markdown, encoding="utf-8")
+    except Exception as exc:
+        console.print(f"[red]Long-tail Memory Write V2 evaluation failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[green]Long-tail Memory Write V2 JSON saved:[/green] {output_path}")
+    console.print(f"[green]Markdown report saved:[/green] {markdown_path}")
+    console.print(
+        f"cases={report['case_count']} passed={report['passed_case_count']} "
+        f"status={report['status']}"
+    )
+
+
+def _default_memory_longtail_write_v2_output_path(*, now: datetime | None = None) -> Path:
+    timestamp = (now or datetime.now().astimezone()).strftime("%Y%m%d_%H%M%S_%f")
+    return Path(".data/evals") / f"memory_longtail_write_v2_{timestamp}.json"
+
+
+def _write_memory_longtail_write_v2_artifact(
+    report: dict[str, Any],
+    output_path: Path,
+) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    markdown_path = output_path.with_suffix(".md")
+    markdown_path.write_text(
+        render_memory_longtail_write_v2_report(report),
+        encoding="utf-8",
+    )
+    return markdown_path
+
+
 @eval_app.command("memory-longtail-realistic")
 def memory_longtail_realistic_eval(
     dataset: Annotated[
@@ -509,6 +1487,21 @@ def memory_longtail_realistic_eval(
         int,
         typer.Option("--repeat", min=1, max=100, help="重复运行次数，用于观察 judge 波动。"),
     ] = 1,
+    mode: Annotated[
+        Literal["fixture", "live"],
+        typer.Option("--mode", help="fixture 或真实模型 live（始终 shadow-only）"),
+    ] = "fixture",
+    hard_cases: Annotated[
+        bool,
+        typer.Option("--hard-cases", help="Run the fixed live hard-case subset."),
+    ] = False,
+    compare_fixture: Annotated[
+        bool,
+        typer.Option(
+            "--compare-fixture/--no-compare-fixture",
+            help="Attach a fixture baseline for the same live-evaluation scope.",
+        ),
+    ] = True,
     candidate_limit: Annotated[
         int,
         typer.Option("--candidate-limit", min=1, max=10, help="候选 Memory 上限。"),
@@ -516,21 +1509,61 @@ def memory_longtail_realistic_eval(
 ) -> None:
     """运行只读 Long-tail realistic Memory 评估，不提交 Store mutation。"""
 
+    if hard_cases and mode != "live":
+        raise typer.BadParameter("--hard-cases only supports --mode live")
+    if hard_cases and (case is not None or category is not None):
+        raise typer.BadParameter("--hard-cases cannot be combined with --case or --category")
+    if mode == "fixture" and not compare_fixture:
+        raise typer.BadParameter("--no-compare-fixture only applies to --mode live")
+    if mode == "live" and candidate_limit > 5:
+        raise typer.BadParameter("live mode requires --candidate-limit between 1 and 5")
+    effective_repeat = 3 if hard_cases and repeat == 1 else repeat
+    output_label = f"{mode}_hard_cases" if hard_cases else mode
     output_path = output or Path(
         ".data/evals/memory_longtail_realistic_"
+        + output_label
+        + "_"
         + datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
         + ".json"
     )
     try:
         report = asyncio.run(
-            evaluate_memory_longtail_realistic(
+            _run_live_memory_longtail_realistic_eval(
+                dataset,
+                settings=get_settings(),
+                case_id=case,
+                category=category,
+                hard_cases=hard_cases,
+                repeat=effective_repeat,
+                candidate_limit=candidate_limit,
+            )
+            if mode == "live"
+            else evaluate_memory_longtail_realistic(
                 dataset,
                 case_id=case,
                 category=category,
-                repeat=repeat,
+                hard_cases=hard_cases,
+                repeat=effective_repeat,
                 candidate_limit=candidate_limit,
+                mode="fixture",
             )
         )
+        if mode == "live" and compare_fixture:
+            fixture = asyncio.run(
+                evaluate_memory_longtail_realistic(
+                    dataset,
+                    case_id=case,
+                    category=category,
+                    hard_cases=hard_cases,
+                    repeat=1,
+                    candidate_limit=candidate_limit,
+                    mode="fixture",
+                )
+            )
+            report["fixture_comparison"] = _longtail_fixture_comparison(fixture, report)
+        if hard_cases:
+            report["hard_case_ids"] = list(HARD_CASE_IDS)
+            report["source_dataset"] = str(dataset)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         if output_path.suffix.casefold() == ".md":
             output_path.write_text(render_longtail_realistic_report(report), encoding="utf-8")
@@ -539,8 +1572,18 @@ def memory_longtail_realistic_eval(
                 json.dumps(report, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            if case is None and category is None:
+            if case is None and category is None and mode == "fixture":
                 Path("MEMORY_LONGTAIL_REALISTIC_EVAL_REPORT.md").write_text(
+                    render_longtail_realistic_report(report),
+                    encoding="utf-8",
+                )
+            if case is None and category is None and mode == "live" and not hard_cases:
+                Path("MEMORY_LONGTAIL_REALISTIC_LIVE_EVAL_REPORT_V3.md").write_text(
+                    render_longtail_realistic_report(report),
+                    encoding="utf-8",
+                )
+            if case is None and category is None and mode == "live" and hard_cases:
+                Path("MEMORY_LONGTAIL_REALISTIC_LIVE_HARD_CASE_REPORT.md").write_text(
                     render_longtail_realistic_report(report),
                     encoding="utf-8",
                 )
@@ -565,8 +1608,80 @@ def memory_longtail_realistic_eval(
     console.print(table)
 
 
+def _longtail_fixture_comparison(
+    fixture: dict[str, Any],
+    live: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    metric_names = (
+        "scenario_pass_rate",
+        "gate_recall",
+        "extraction_semantic_success_rate",
+        "overall_semantic_identity_match_rate",
+        "canonical_semantic_identity_match_rate",
+        "custom_semantic_identity_match_rate",
+        "semantic_identity_match_rate",
+        "retrieval_hit_at_3",
+        "retrieval_hit_at_5",
+        "retrieval_recall_at_5",
+        "relation_accuracy",
+        "judge_relation_accuracy",
+        "judge_first_attempt_parse_failure_count",
+        "judge_final_parse_failure_count",
+        "update_precision",
+        "target_memory_accuracy",
+        "target_memory_precision",
+        "false_destructive_update_count",
+        "extractor_latency_p50",
+        "extractor_latency_p95",
+        "strong_upgrade_count",
+        "strong_latency_p95",
+        "strong_no_value_added_count",
+    )
+    fixture_metrics = fixture.get("metrics") or {}
+    live_metrics = live.get("metrics") or {}
+    return {
+        name: {
+            "fixture": fixture_metrics.get(name),
+            "live_before": _LONGTAIL_LIVE_V1_BASELINE.get(name),
+            "live_after": live_metrics.get(name),
+            # Retain the V1 public key for callers that render old artifacts.
+            "live": live_metrics.get(name),
+        }
+        for name in metric_names
+    }
+
+
+_LONGTAIL_LIVE_V1_BASELINE: dict[str, int | float | None] = {
+    "scenario_pass_rate": 6 / 26,
+    "gate_recall": 0.7872,
+    "extraction_semantic_success_rate": 30 / 38,
+    "overall_semantic_identity_match_rate": None,
+    "canonical_semantic_identity_match_rate": None,
+    "custom_semantic_identity_match_rate": None,
+    "semantic_identity_match_rate": None,
+    "retrieval_hit_at_3": 1.0,
+    "retrieval_hit_at_5": 1.0,
+    "retrieval_recall_at_5": 1.0,
+    "relation_accuracy": 0.6667,
+    "judge_relation_accuracy": 1.0,
+    "judge_first_attempt_parse_failure_count": 2,
+    "judge_final_parse_failure_count": 2,
+    "update_precision": 1.0,
+    "target_memory_accuracy": 1.0,
+    "target_memory_precision": 1.0,
+    "false_destructive_update_count": 0,
+    "extractor_latency_p50": 2522.61,
+    "extractor_latency_p95": 71633.999,
+    "strong_upgrade_count": 6,
+    "strong_latency_p95": 69492.171,
+    "strong_no_value_added_count": 2,
+}
+
+
 def _build_live_memory_relation_judge(
     settings: Any,
+    *,
+    max_target_count: int = 1,
 ) -> OpenAICompatibleSemanticRelationJudge:
     if settings.memory_semantic_relation_provider != "llm":
         raise ValueError("--live 需要 LOVEAPP_MEMORY_SEMANTIC_RELATION_PROVIDER=llm。")
@@ -590,6 +1705,145 @@ def _build_live_memory_relation_judge(
         max_retries=settings.memory_semantic_relation_max_retries,
         max_tokens=settings.memory_semantic_relation_max_tokens,
         thinking=settings.memory_semantic_relation_thinking,
+        max_target_count=max_target_count,
+    )
+
+
+async def _run_live_memory_longtail_write_v2_eval(
+    dataset: Path,
+    shared_bank: Path,
+    *,
+    settings: Any,
+    case_id: str | None,
+    slice_name: str | None,
+    vector_limit: int,
+    rank_limit: int,
+    fail_on_error: bool,
+    repeat: int = 1,
+    hard_cases: bool = False,
+) -> dict[str, Any]:
+    """Own live adapters while the evaluator remains isolated from production stores."""
+
+    if not settings.llm_api_key:
+        raise ValueError("live V2 evaluation requires LOVEAPP_LLM_API_KEY")
+    if not settings.llm_base_url:
+        raise ValueError("live V2 evaluation requires LOVEAPP_LLM_BASE_URL")
+    provider_overridden = settings.memory_semantic_relation_provider != "llm"
+    live_settings = (
+        settings.model_copy(update={"memory_semantic_relation_provider": "llm"})
+        if provider_overridden
+        else settings
+    )
+    judge_model = _configured_semantic_relation_model(live_settings)
+    if not judge_model:
+        raise ValueError(
+            "live V2 evaluation requires LOVEAPP_MEMORY_SEMANTIC_RELATION_MODEL or an LLM model"
+        )
+
+    embedding_provider = build_embedding_provider(live_settings)
+    judge: OpenAICompatibleSemanticRelationJudge | None = None
+    try:
+        judge = _build_live_memory_relation_judge(
+            live_settings,
+            # The Live evaluator measures semantic target selection separately
+            # from write authority. Explicit multi-claim cases may propose up to
+            # the adapter's bounded maximum; the unchanged production validator
+            # still denies destructive multi-target writes.
+            max_target_count=5,
+        )
+        report = await evaluate_memory_longtail_write_v2(
+            dataset,
+            shared_bank,
+            embedding_provider=embedding_provider,
+            judge=judge,
+            case_id=case_id,
+            slice_name=slice_name,
+            vector_limit=vector_limit,
+            rank_limit=rank_limit,
+            fail_on_error=fail_on_error,
+            repeat=repeat,
+            hard_cases=hard_cases,
+            use_production_retriever=True,
+        )
+        report["live_configuration"] = {
+            "embedding_provider": live_settings.embedding_provider,
+            "embedding_model": live_settings.embedding_model,
+            "semantic_relation_judge_model": judge_model,
+            "semantic_relation_provider_overridden_in_process": provider_overridden,
+            "judge_max_target_count": 5,
+        }
+        report["evaluation_mode"] = "shadow_live"
+        report["methodology"] = (
+            "production_hybrid_retriever_with_production_embedding_and_semantic_judge_"
+            "plus_deterministic_validator_and_isolated_store_shadow"
+        )
+        report["store_mutation_permitted"] = False
+        return report
+    finally:
+        if judge is not None:
+            await judge.aclose()
+        await embedding_provider.aclose()
+
+
+async def _run_final_live_memory_longtail_write_v2_eval(
+    dataset: Path,
+    shared_bank: Path,
+    *,
+    settings: Any,
+    vector_limit: int,
+    rank_limit: int,
+    fail_on_error: bool,
+    compare_fixture: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run the complete full + hard Live validation with isolated adapters."""
+
+    full_report = await _run_live_memory_longtail_write_v2_eval(
+        dataset,
+        shared_bank,
+        settings=settings,
+        case_id=None,
+        slice_name=None,
+        vector_limit=vector_limit,
+        rank_limit=rank_limit,
+        fail_on_error=fail_on_error,
+        repeat=1,
+        hard_cases=False,
+    )
+    hard_report = await _run_live_memory_longtail_write_v2_eval(
+        dataset,
+        shared_bank,
+        settings=settings,
+        case_id=None,
+        slice_name=None,
+        vector_limit=vector_limit,
+        rank_limit=rank_limit,
+        fail_on_error=fail_on_error,
+        repeat=3,
+        hard_cases=True,
+    )
+    if compare_fixture:
+        fixture_report = await evaluate_memory_longtail_write_v2_fixture(
+            dataset,
+            shared_bank,
+            vector_limit=vector_limit,
+            rank_limit=rank_limit,
+            fail_on_error=fail_on_error,
+        )
+        full_report["fixture_comparison"] = compare_memory_longtail_write_v2_reports(
+            fixture_report,
+            full_report,
+        )
+        full_report["fixture_baseline"] = {
+            "evaluation_mode": fixture_report.get("evaluation_mode"),
+            "case_count": fixture_report.get("case_count"),
+            "passed_case_count": fixture_report.get("passed_case_count"),
+            "repeat": fixture_report.get("repeat"),
+        }
+    repository = collect_memory_longtail_write_v2_repository_metadata()
+    return finalize_memory_longtail_write_v2_live_validation(
+        full_report,
+        hard_report,
+        repository=repository,
     )
 
 
@@ -635,6 +1889,105 @@ async def _run_live_memory_longtail_relation_eval(
         )
     finally:
         await embedding_provider.aclose()
+
+
+async def _run_live_memory_longtail_realistic_eval(
+    dataset: Path,
+    *,
+    settings: Any,
+    case_id: str | None,
+    category: str | None,
+    hard_cases: bool,
+    repeat: int,
+    candidate_limit: int,
+) -> dict[str, Any]:
+    """Run realistic scenarios with production extractor and judge in shadow mode."""
+    live_settings, semantic_relation_override = _live_longtail_realistic_settings(settings)
+    embedding_provider = build_embedding_provider(live_settings)
+    observed_embedding_provider = _ObservedEmbeddingProvider(embedding_provider)
+    extractor = _build_memory_extractor(live_settings)
+    judge: OpenAICompatibleSemanticRelationJudge | None = None
+    try:
+        if isinstance(extractor, NoOpMemoryExtractor):
+            raise ValueError("live mode requires an enabled OpenAI-compatible Memory extractor")
+        embedding_dimension = await embedding_provider.dimension()
+        judge = _build_live_memory_relation_judge(live_settings)
+        retriever = HybridMemoryRetriever(embedding_provider=observed_embedding_provider)
+        report = await evaluate_memory_longtail_realistic(
+            dataset,
+            case_id=case_id,
+            category=category,
+            hard_cases=hard_cases,
+            repeat=repeat,
+            candidate_limit=candidate_limit,
+            retriever=retriever,
+            judge=judge,
+            extractor=extractor,
+            mode="live",
+        )
+        report["live_models"] = {
+            "extractor": _configured_memory_extraction_model(live_settings),
+            "semantic_relation_judge": _configured_semantic_relation_model(live_settings),
+            "embedding": live_settings.embedding_model,
+        }
+        report["embedding_telemetry"] = observed_embedding_provider.summary(
+            model=live_settings.embedding_model,
+            dimension=embedding_dimension,
+        )
+        report["semantic_relation_provider_overridden_in_process"] = semantic_relation_override
+        return report
+    finally:
+        close_extractor = getattr(extractor, "aclose", None)
+        if close_extractor is not None:
+            await close_extractor()
+        if judge is not None:
+            close_judge = getattr(judge, "aclose", None)
+            if close_judge is not None:
+                await close_judge()
+        await embedding_provider.aclose()
+
+
+def _live_longtail_realistic_settings(settings: Any) -> tuple[Any, bool]:
+    if not settings.llm_api_key:
+        raise ValueError("live mode requires LOVEAPP_LLM_API_KEY")
+    if not settings.llm_base_url:
+        raise ValueError("live mode requires LOVEAPP_LLM_BASE_URL")
+    use_extraction_llm = settings.memory_extraction_provider == "llm" or (
+        settings.memory_extraction_provider == "auto" and settings.llm_provider != "demo"
+    )
+    if not use_extraction_llm:
+        raise ValueError(
+            "live mode requires LOVEAPP_MEMORY_EXTRACTION_PROVIDER=llm "
+            "or an auto provider backed by a non-demo LLM"
+        )
+    if not _configured_memory_extraction_model(settings):
+        raise ValueError("live mode requires LOVEAPP_MEMORY_EXTRACTION_MODEL or LOVEAPP_LLM_MODEL")
+
+    semantic_relation_override = settings.memory_semantic_relation_provider != "llm"
+    live_settings = (
+        settings.model_copy(update={"memory_semantic_relation_provider": "llm"})
+        if semantic_relation_override
+        else settings
+    )
+    if not _configured_semantic_relation_model(live_settings):
+        raise ValueError(
+            "live mode requires LOVEAPP_MEMORY_SEMANTIC_RELATION_MODEL or an LLM model"
+        )
+    return live_settings, semantic_relation_override
+
+
+def _configured_memory_extraction_model(settings: Any) -> str:
+    return str(settings.memory_extraction_model or settings.llm_model or "")
+
+
+def _configured_semantic_relation_model(settings: Any) -> str:
+    return str(
+        settings.memory_semantic_relation_model
+        or settings.memory_extraction_strong_model
+        or settings.memory_extraction_model
+        or settings.llm_model
+        or ""
+    )
 
 
 @knowledge_app.command("validate")
@@ -1449,7 +2802,7 @@ async def _run_chat(
     active_task: TaskType | None = None
     console.print(
         f"[dim]会话 {conversation_id} · 关系 {relationship_id} · "
-        "输入 /quit 退出，/new 新建会话[/dim]"
+        "输入 /quit 退出，/new 新建会话，/retry 重试失败回答[/dim]"
     )
     try:
         while True:
@@ -1476,18 +2829,27 @@ async def _run_chat(
             trace = ExecutionTrace(live_display.on_timing)
             live_display.start()
             try:
-                turn = await container.conversation_agent.chat(
-                    ConversationRequest(
+                if command == "/retry":
+                    turn = await container.conversation_agent.retry_last_failed_advice(
                         user_id=user_id,
                         relationship_id=relationship_id,
                         conversation_id=conversation_id,
-                        query=query,
-                        relationship_stage=stage,
-                        active_task=active_task,
-                    ),
-                    trace=trace,
-                    stream_callback=live_display.on_stream if stream_output else None,
-                )
+                        trace=trace,
+                        stream_callback=(live_display.on_stream if stream_output else None),
+                    )
+                else:
+                    turn = await container.conversation_agent.chat(
+                        ConversationRequest(
+                            user_id=user_id,
+                            relationship_id=relationship_id,
+                            conversation_id=conversation_id,
+                            query=query,
+                            relationship_stage=stage,
+                            active_task=active_task,
+                        ),
+                        trace=trace,
+                        stream_callback=(live_display.on_stream if stream_output else None),
+                    )
             except Exception as exc:
                 live_display.stop()
                 _render_turn_error(exc, trace)
@@ -1497,7 +2859,10 @@ async def _run_chat(
             active_task = turn.active_task
             console.print("\n[bold green]LoveApp[/bold green]")
             if turn.advice is not None:
-                _render_advice(turn.advice, query=query)
+                _render_advice(
+                    turn.advice,
+                    query=None if command == "/retry" else query,
+                )
             elif turn.date_plan is not None:
                 if turn.message:
                     console.print(turn.message)

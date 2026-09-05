@@ -2,7 +2,12 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Protocol
 
-from loveapp.domain.advice import RelationshipContext
+from loveapp.domain.advice import (
+    AdviceGenerationAttempt,
+    AdviceGenerationAttemptRecord,
+    AdviceLogicalTurn,
+    RelationshipContext,
+)
 from loveapp.domain.memory import (
     AtomicExtraction,
     MemoryCandidate,
@@ -23,6 +28,7 @@ from loveapp.domain.memory_write import (
     MemoryWriteBatchResult,
 )
 from loveapp.domain.relationship_plan import PlanStatus, RelationshipPlan
+from loveapp.domain.runtime_context import PendingMemoryContext
 from loveapp.ports.observability import TraceRecorder
 
 MemoryAttemptCallback = Callable[[MemoryExtractionAttempt], None]
@@ -37,7 +43,84 @@ class MemoryStore(Protocol):
         role: MessageRole,
         content: str,
         conversation_id: str | None = None,
+        message_id: str | None = None,
     ) -> StoredMessage: ...
+
+    async def create_advice_logical_turn(
+        self,
+        turn: AdviceLogicalTurn,
+        *,
+        reject_existing: bool = False,
+    ) -> AdviceLogicalTurn: ...
+
+    async def get_advice_logical_turn(
+        self,
+        logical_turn_id: str,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+    ) -> AdviceLogicalTurn | None: ...
+
+    async def latest_retryable_advice_turn(
+        self,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+    ) -> AdviceLogicalTurn | None: ...
+
+    async def begin_advice_generation(
+        self,
+        logical_turn_id: str,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+        retry: bool,
+    ) -> AdviceLogicalTurn: ...
+
+    async def save_advice_generation_attempts(
+        self,
+        logical_turn_id: str,
+        generation_no: int,
+        attempts: list[AdviceGenerationAttempt],
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+    ) -> list[AdviceGenerationAttemptRecord]: ...
+
+    async def fail_advice_logical_turn(
+        self,
+        logical_turn_id: str,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+        last_error_type: str | None = None,
+        fallback_used: bool = False,
+    ) -> AdviceLogicalTurn | None: ...
+
+    async def complete_advice_logical_turn(
+        self,
+        logical_turn_id: str,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+        message_id: str,
+        content: str,
+    ) -> tuple[AdviceLogicalTurn, StoredMessage]: ...
+
+    async def list_advice_generation_attempts(
+        self,
+        logical_turn_id: str,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+    ) -> list[AdviceGenerationAttemptRecord]: ...
 
     async def list_messages(
         self,
@@ -183,6 +266,7 @@ class MemoryExtractor(Protocol):
         reference_time: datetime,
         existing_memories: list[MemoryItem],
         conversation_history: list[StoredMessage],
+        pending_memory_context: PendingMemoryContext | None = None,
         trace: TraceRecorder | None = None,
         attempt_callback: MemoryAttemptCallback | None = None,
     ) -> AtomicExtraction: ...

@@ -8,7 +8,15 @@ from uuid import uuid4
 
 import aiosqlite
 
-from loveapp.domain.advice import RelationshipContext
+from loveapp.domain.advice import (
+    MAX_ADVICE_GENERATIONS,
+    AdviceGenerationAttempt,
+    AdviceGenerationAttemptRecord,
+    AdviceLogicalTurn,
+    AdviceLogicalTurnStatus,
+    AdviceTurnClaimError,
+    RelationshipContext,
+)
 from loveapp.domain.contextual_memory import apply_contextual_memory_update
 from loveapp.domain.enums import RelationshipStage
 from loveapp.domain.memory import (
@@ -90,14 +98,41 @@ class SQLiteMemoryStore:
         role: MessageRole,
         content: str,
         conversation_id: str | None = None,
+        message_id: str | None = None,
     ) -> StoredMessage:
         await self.initialize()
         now = self._clock()
-        message_id = str(uuid4())
-        conversation_id = conversation_id or str(uuid4())
+        message_id = message_id or str(uuid4())
         connection = await self._open_connection()
         try:
+            await connection.execute("BEGIN IMMEDIATE")
             await _ensure_scope(connection, user_id, relationship_id, now)
+            existing_message = await _fetchone(
+                connection,
+                "SELECT * FROM messages WHERE id = ?",
+                (message_id,),
+            )
+            if existing_message is not None:
+                expected_conversation = conversation_id or existing_message["conversation_id"]
+                if (
+                    existing_message["user_id"],
+                    existing_message["relationship_id"],
+                    existing_message["conversation_id"],
+                    existing_message["role"],
+                    existing_message["content"],
+                ) != (
+                    user_id,
+                    relationship_id,
+                    expected_conversation,
+                    role.value,
+                    content,
+                ):
+                    raise ValueError(
+                        "message_id belongs to different message content or scope"
+                    )
+                await connection.commit()
+                return _row_to_stored_message(existing_message)
+            conversation_id = conversation_id or str(uuid4())
             existing = await _fetchone(
                 connection,
                 "SELECT user_id, relationship_id FROM conversations WHERE id = ?",
@@ -140,6 +175,9 @@ class SQLiteMemoryStore:
                 ),
             )
             await connection.commit()
+        except Exception:
+            await connection.rollback()
+            raise
         finally:
             await connection.close()
         return StoredMessage(
@@ -178,18 +216,553 @@ class SQLiteMemoryStore:
             cursor = await connection.execute(query, values)
             rows = list(reversed(await cursor.fetchall()))
             await cursor.close()
-            return [
-                StoredMessage(
-                    id=row["id"],
-                    conversation_id=row["conversation_id"],
-                    user_id=row["user_id"],
-                    relationship_id=row["relationship_id"],
-                    role=row["role"],
-                    content=row["content"],
-                    created_at=_load_datetime(row["created_at"]),
+            return [_row_to_stored_message(row) for row in rows]
+        finally:
+            await connection.close()
+
+    async def create_advice_logical_turn(
+        self,
+        turn: AdviceLogicalTurn,
+        *,
+        reject_existing: bool = False,
+    ) -> AdviceLogicalTurn:
+        turn.assert_initial_state()
+        await self.initialize()
+        connection = await self._open_connection()
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            message = await _fetchone(
+                connection,
+                "SELECT * FROM messages WHERE id = ?",
+                (turn.user_message_id,),
+            )
+            if message is None:
+                raise ValueError("logical turn user message does not exist")
+            if (
+                message["user_id"],
+                message["relationship_id"],
+                message["conversation_id"],
+                message["role"],
+                message["content"],
+            ) != (
+                turn.user_id,
+                turn.relationship_id,
+                turn.conversation_id,
+                MessageRole.USER.value,
+                turn.query,
+            ):
+                raise ValueError("logical turn user message content or scope mismatch")
+            cursor = await connection.execute(
+                """
+                INSERT INTO advice_logical_turns (
+                    id, user_id, relationship_id, conversation_id, user_message_id,
+                    query, request_json, status, assistant_message_id,
+                    generation_count, last_error_type, fallback_used,
+                    created_at, updated_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (
+                    turn.id,
+                    turn.user_id,
+                    turn.relationship_id,
+                    turn.conversation_id,
+                    turn.user_message_id,
+                    turn.query,
+                    _dump_json(turn.request_payload),
+                    turn.status.value,
+                    turn.assistant_message_id,
+                    turn.generation_count,
+                    turn.last_error_type,
+                    int(turn.fallback_used),
+                    _dump_datetime(turn.created_at),
+                    _dump_datetime(turn.updated_at),
+                    _dump_datetime(turn.completed_at),
+                ),
+            )
+            created = cursor.rowcount == 1
+            await cursor.close()
+            row = await _fetchone(
+                connection,
+                "SELECT * FROM advice_logical_turns WHERE id = ?",
+                (turn.id,),
+            )
+            await connection.commit()
+            if row is None:
+                raise RuntimeError("logical turn disappeared during creation")
+            existing = _row_to_advice_logical_turn(row)
+            if (
+                existing.user_id,
+                existing.relationship_id,
+                existing.conversation_id,
+                existing.user_message_id,
+                existing.query,
+                existing.request_payload,
+            ) != (
+                turn.user_id,
+                turn.relationship_id,
+                turn.conversation_id,
+                turn.user_message_id,
+                turn.query,
+                turn.request_payload,
+            ):
+                raise ValueError("logical_turn_id belongs to different content or scope")
+            if not created and reject_existing:
+                raise AdviceTurnClaimError(
+                    "logical turn is already owned by another generation"
                 )
-                for row in rows
-            ]
+            return existing
+        except sqlite3.IntegrityError as exc:
+            await connection.rollback()
+            if "advice_logical_turns.user_message_id" in str(exc):
+                raise ValueError(
+                    "user_message_id already belongs to another logical turn"
+                ) from exc
+            raise
+        except Exception:
+            await connection.rollback()
+            raise
+        finally:
+            await connection.close()
+
+    async def get_advice_logical_turn(
+        self,
+        logical_turn_id: str,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+    ) -> AdviceLogicalTurn | None:
+        await self.initialize()
+        connection = await self._open_connection()
+        try:
+            row = await _fetchone(
+                connection,
+                """
+                SELECT * FROM advice_logical_turns
+                WHERE id = ? AND user_id = ? AND relationship_id = ?
+                  AND conversation_id = ?
+                """,
+                (logical_turn_id, user_id, relationship_id, conversation_id),
+            )
+            return _row_to_advice_logical_turn(row) if row is not None else None
+        finally:
+            await connection.close()
+
+    async def latest_retryable_advice_turn(
+        self,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+    ) -> AdviceLogicalTurn | None:
+        await self.initialize()
+        connection = await self._open_connection()
+        try:
+            row = await _fetchone(
+                connection,
+                """
+                SELECT * FROM advice_logical_turns
+                WHERE user_id = ? AND relationship_id = ? AND conversation_id = ?
+                  AND status = ? AND generation_count < ?
+                ORDER BY updated_at DESC, rowid DESC
+                LIMIT 1
+                """,
+                (
+                    user_id,
+                    relationship_id,
+                    conversation_id,
+                    AdviceLogicalTurnStatus.GENERATION_FAILED.value,
+                    MAX_ADVICE_GENERATIONS,
+                ),
+            )
+            return _row_to_advice_logical_turn(row) if row is not None else None
+        finally:
+            await connection.close()
+
+    async def begin_advice_generation(
+        self,
+        logical_turn_id: str,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+        retry: bool,
+    ) -> AdviceLogicalTurn:
+        await self.initialize()
+        connection = await self._open_connection()
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            row = await _fetchone(
+                connection,
+                "SELECT * FROM advice_logical_turns WHERE id = ?",
+                (logical_turn_id,),
+            )
+            if row is None:
+                raise ValueError("logical turn does not exist")
+            turn = _row_to_advice_logical_turn(row)
+            _require_advice_turn_scope(
+                turn,
+                user_id=user_id,
+                relationship_id=relationship_id,
+                conversation_id=conversation_id,
+            )
+            expected = (
+                AdviceLogicalTurnStatus.GENERATION_FAILED
+                if retry
+                else AdviceLogicalTurnStatus.MEMORY_STARTED
+            )
+            if turn.status != expected:
+                raise AdviceTurnClaimError(
+                    "logical turn is not eligible for generation"
+                )
+            if turn.generation_count >= MAX_ADVICE_GENERATIONS:
+                raise AdviceTurnClaimError("logical turn generation limit reached")
+            now = self._clock()
+            await connection.execute(
+                """
+                UPDATE advice_logical_turns
+                SET status = ?, generation_count = generation_count + 1,
+                    last_error_type = NULL, fallback_used = 0, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    AdviceLogicalTurnStatus.GENERATION_IN_PROGRESS.value,
+                    _dump_datetime(now),
+                    logical_turn_id,
+                ),
+            )
+            updated = await _fetchone(
+                connection,
+                "SELECT * FROM advice_logical_turns WHERE id = ?",
+                (logical_turn_id,),
+            )
+            await connection.commit()
+            if updated is None:
+                raise RuntimeError("logical turn disappeared during generation claim")
+            return _row_to_advice_logical_turn(updated)
+        except Exception:
+            await connection.rollback()
+            raise
+        finally:
+            await connection.close()
+
+    async def save_advice_generation_attempts(
+        self,
+        logical_turn_id: str,
+        generation_no: int,
+        attempts: list[AdviceGenerationAttempt],
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+    ) -> list[AdviceGenerationAttemptRecord]:
+        await self.initialize()
+        connection = await self._open_connection()
+        saved: list[AdviceGenerationAttemptRecord] = []
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            row = await _fetchone(
+                connection,
+                "SELECT * FROM advice_logical_turns WHERE id = ?",
+                (logical_turn_id,),
+            )
+            if row is None:
+                raise ValueError("logical turn does not exist")
+            turn = _row_to_advice_logical_turn(row)
+            _require_advice_turn_scope(
+                turn,
+                user_id=user_id,
+                relationship_id=relationship_id,
+                conversation_id=conversation_id,
+            )
+            if (
+                turn.status != AdviceLogicalTurnStatus.GENERATION_IN_PROGRESS
+                or generation_no != turn.generation_count
+            ):
+                raise ValueError(
+                    "generation attempts do not belong to active generation"
+                )
+            now = self._clock()
+            for attempt in attempts:
+                existing = await _fetchone(
+                    connection,
+                    """
+                    SELECT * FROM advice_generation_attempts
+                    WHERE logical_turn_id = ? AND generation_no = ? AND attempt_no = ?
+                    """,
+                    (logical_turn_id, generation_no, attempt.attempt),
+                )
+                if existing is not None:
+                    record = _row_to_advice_generation_attempt(existing)
+                    if record.attempt != attempt:
+                        raise ValueError("generation attempt identity collision")
+                    saved.append(record)
+                    continue
+                record = AdviceGenerationAttemptRecord(
+                    id=str(uuid4()),
+                    logical_turn_id=logical_turn_id,
+                    generation_no=generation_no,
+                    attempt=attempt,
+                    created_at=now,
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO advice_generation_attempts (
+                        id, logical_turn_id, generation_no, attempt_no,
+                        attempt_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.id,
+                        logical_turn_id,
+                        generation_no,
+                        attempt.attempt,
+                        _dump_json(attempt.model_dump(mode="json")),
+                        _dump_datetime(now),
+                    ),
+                )
+                saved.append(record)
+            await connection.commit()
+            return saved
+        except Exception:
+            await connection.rollback()
+            raise
+        finally:
+            await connection.close()
+
+    async def fail_advice_logical_turn(
+        self,
+        logical_turn_id: str,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+        last_error_type: str | None = None,
+        fallback_used: bool = False,
+    ) -> AdviceLogicalTurn | None:
+        await self.initialize()
+        connection = await self._open_connection()
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            row = await _fetchone(
+                connection,
+                "SELECT * FROM advice_logical_turns WHERE id = ?",
+                (logical_turn_id,),
+            )
+            if row is None:
+                return None
+            turn = _row_to_advice_logical_turn(row)
+            _require_advice_turn_scope(
+                turn,
+                user_id=user_id,
+                relationship_id=relationship_id,
+                conversation_id=conversation_id,
+            )
+            if turn.status not in {
+                AdviceLogicalTurnStatus.MEMORY_STARTED,
+                AdviceLogicalTurnStatus.GENERATION_IN_PROGRESS,
+            }:
+                raise ValueError("logical turn cannot fail from its current state")
+            if not last_error_type:
+                raise ValueError("failed logical turn requires last_error_type")
+            now = self._clock()
+            await connection.execute(
+                """
+                UPDATE advice_logical_turns
+                SET status = ?, last_error_type = ?, fallback_used = ?,
+                    updated_at = ?, completed_at = NULL
+                WHERE id = ?
+                """,
+                (
+                    AdviceLogicalTurnStatus.GENERATION_FAILED.value,
+                    last_error_type,
+                    int(fallback_used),
+                    _dump_datetime(now),
+                    logical_turn_id,
+                ),
+            )
+            updated = await _fetchone(
+                connection,
+                "SELECT * FROM advice_logical_turns WHERE id = ?",
+                (logical_turn_id,),
+            )
+            await connection.commit()
+            return _row_to_advice_logical_turn(updated) if updated is not None else None
+        except Exception:
+            await connection.rollback()
+            raise
+        finally:
+            await connection.close()
+
+    async def list_advice_generation_attempts(
+        self,
+        logical_turn_id: str,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+    ) -> list[AdviceGenerationAttemptRecord]:
+        await self.initialize()
+        connection = await self._open_connection()
+        try:
+            row = await _fetchone(
+                connection,
+                "SELECT * FROM advice_logical_turns WHERE id = ?",
+                (logical_turn_id,),
+            )
+            if row is None:
+                return []
+            _require_advice_turn_scope(
+                _row_to_advice_logical_turn(row),
+                user_id=user_id,
+                relationship_id=relationship_id,
+                conversation_id=conversation_id,
+            )
+            cursor = await connection.execute(
+                """
+                SELECT * FROM advice_generation_attempts
+                WHERE logical_turn_id = ?
+                ORDER BY generation_no, attempt_no
+                """,
+                (logical_turn_id,),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            return [_row_to_advice_generation_attempt(row) for row in rows]
+        finally:
+            await connection.close()
+
+    async def complete_advice_logical_turn(
+        self,
+        logical_turn_id: str,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+        message_id: str,
+        content: str,
+    ) -> tuple[AdviceLogicalTurn, StoredMessage]:
+        await self.initialize()
+        connection = await self._open_connection()
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            row = await _fetchone(
+                connection,
+                "SELECT * FROM advice_logical_turns WHERE id = ?",
+                (logical_turn_id,),
+            )
+            if row is None:
+                raise ValueError("logical turn does not exist")
+            turn = _row_to_advice_logical_turn(row)
+            _require_advice_turn_scope(
+                turn,
+                user_id=user_id,
+                relationship_id=relationship_id,
+                conversation_id=conversation_id,
+            )
+            if turn.status == AdviceLogicalTurnStatus.COMPLETED:
+                if turn.assistant_message_id != message_id:
+                    raise ValueError("logical turn already completed with another message")
+                message_row = await _fetchone(
+                    connection,
+                    "SELECT * FROM messages WHERE id = ?",
+                    (message_id,),
+                )
+                if message_row is None or (
+                    message_row["conversation_id"],
+                    message_row["user_id"],
+                    message_row["relationship_id"],
+                    message_row["role"],
+                    message_row["content"],
+                ) != (
+                    turn.conversation_id,
+                    turn.user_id,
+                    turn.relationship_id,
+                    MessageRole.ASSISTANT.value,
+                    content,
+                ):
+                    raise ValueError("assistant message identity collision")
+                await connection.commit()
+                return turn, _row_to_stored_message(message_row)
+            if turn.status != AdviceLogicalTurnStatus.GENERATION_IN_PROGRESS:
+                raise ValueError("logical turn is not eligible for completion")
+
+            existing_message = await _fetchone(
+                connection,
+                "SELECT * FROM messages WHERE id = ?",
+                (message_id,),
+            )
+            if existing_message is not None:
+                if (
+                    existing_message["conversation_id"],
+                    existing_message["user_id"],
+                    existing_message["relationship_id"],
+                    existing_message["role"],
+                    existing_message["content"],
+                ) != (
+                    turn.conversation_id,
+                    turn.user_id,
+                    turn.relationship_id,
+                    MessageRole.ASSISTANT.value,
+                    content,
+                ):
+                    raise ValueError("assistant message identity collision")
+            else:
+                now = self._clock()
+                await connection.execute(
+                    """
+                    INSERT INTO messages (
+                        id, conversation_id, user_id, relationship_id,
+                        role, content, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        message_id,
+                        turn.conversation_id,
+                        turn.user_id,
+                        turn.relationship_id,
+                        MessageRole.ASSISTANT.value,
+                        content,
+                        _dump_datetime(now),
+                    ),
+                )
+                existing_message = await _fetchone(
+                    connection,
+                    "SELECT * FROM messages WHERE id = ?",
+                    (message_id,),
+                )
+            now = self._clock()
+            await connection.execute(
+                """
+                UPDATE advice_logical_turns
+                SET status = ?, assistant_message_id = ?, last_error_type = NULL,
+                    fallback_used = 0, updated_at = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (
+                    AdviceLogicalTurnStatus.COMPLETED.value,
+                    message_id,
+                    _dump_datetime(now),
+                    _dump_datetime(now),
+                    logical_turn_id,
+                ),
+            )
+            completed_row = await _fetchone(
+                connection,
+                "SELECT * FROM advice_logical_turns WHERE id = ?",
+                (logical_turn_id,),
+            )
+            await connection.commit()
+            if completed_row is None or existing_message is None:
+                raise RuntimeError("logical turn disappeared during completion")
+            return (
+                _row_to_advice_logical_turn(completed_row),
+                _row_to_stored_message(existing_message),
+            )
+        except Exception:
+            await connection.rollback()
+            raise
         finally:
             await connection.close()
 
@@ -1192,6 +1765,33 @@ class SQLiteMemoryStore:
                     run.gate_decision.matched_span,
                     _dump_json(
                         {
+                            "l0_route": (
+                                run.gate_decision.l0_route.value
+                                if run.gate_decision.l0_route is not None
+                                else None
+                            ),
+                            "l0_semantic_hint": (
+                                run.gate_decision.l0_semantic_hint.value
+                                if run.gate_decision.l0_semantic_hint is not None
+                                else None
+                            ),
+                            "semantic_gate_should_extract": (
+                                run.gate_decision.semantic_gate_should_extract
+                            ),
+                            "semantic_gate_reason": (
+                                run.gate_decision.semantic_gate_reason.value
+                                if run.gate_decision.semantic_gate_reason is not None
+                                else None
+                            ),
+                            "semantic_gate_contract_violation": (
+                                run.gate_decision.semantic_gate_contract_violation
+                            ),
+                            "semantic_gate_contract_violation_reason": (
+                                run.gate_decision.semantic_gate_contract_violation_reason
+                            ),
+                            "extraction_warning": (
+                                run.gate_decision.extraction_warning
+                            ),
                             "contextual_probe": run.gate_decision.contextual_probe,
                             "history_loaded_for_gate": run.gate_decision.history_loaded_for_gate,
                             "antecedent_candidate_ids": run.gate_decision.antecedent_candidate_ids,
@@ -2196,6 +2796,65 @@ def _memory_values(
     )
 
 
+def _row_to_stored_message(row: aiosqlite.Row) -> StoredMessage:
+    return StoredMessage(
+        id=row["id"],
+        conversation_id=row["conversation_id"],
+        user_id=row["user_id"],
+        relationship_id=row["relationship_id"],
+        role=row["role"],
+        content=row["content"],
+        created_at=_load_datetime(row["created_at"]),
+    )
+
+
+def _require_advice_turn_scope(
+    turn: AdviceLogicalTurn,
+    *,
+    user_id: str,
+    relationship_id: str,
+    conversation_id: str,
+) -> None:
+    if not turn.is_in_scope(
+        user_id=user_id,
+        relationship_id=relationship_id,
+        conversation_id=conversation_id,
+    ):
+        raise ValueError("logical turn belongs to different scope")
+
+
+def _row_to_advice_logical_turn(row: aiosqlite.Row) -> AdviceLogicalTurn:
+    return AdviceLogicalTurn(
+        id=row["id"],
+        user_id=row["user_id"],
+        relationship_id=row["relationship_id"],
+        conversation_id=row["conversation_id"],
+        user_message_id=row["user_message_id"],
+        query=row["query"],
+        request_payload=json.loads(row["request_json"]),
+        status=row["status"],
+        assistant_message_id=row["assistant_message_id"],
+        generation_count=row["generation_count"],
+        last_error_type=row["last_error_type"],
+        fallback_used=bool(row["fallback_used"]),
+        created_at=_load_datetime(row["created_at"]),
+        updated_at=_load_datetime(row["updated_at"]),
+        completed_at=_load_datetime(row["completed_at"]),
+    )
+
+
+def _row_to_advice_generation_attempt(
+    row: aiosqlite.Row,
+) -> AdviceGenerationAttemptRecord:
+    return AdviceGenerationAttemptRecord(
+        id=row["id"],
+        logical_turn_id=row["logical_turn_id"],
+        generation_no=row["generation_no"],
+        attempt=json.loads(row["attempt_json"]),
+        created_at=_load_datetime(row["created_at"]),
+    )
+
+
 def _row_to_memory(row: aiosqlite.Row) -> MemoryItem:
     item = MemoryItem(
         id=row["id"],
@@ -2446,7 +3105,7 @@ async def _migrate_schema(connection: aiosqlite.Connection) -> None:
             await connection.execute(
                 f"ALTER TABLE memory_extraction_runs ADD COLUMN {column} {declaration}"
             )
-    await connection.execute("PRAGMA user_version = 7")
+    await connection.execute("PRAGMA user_version = 8")
 
 
 _SCHEMA = """
@@ -2487,6 +3146,47 @@ CREATE TABLE IF NOT EXISTS messages (
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
     FOREIGN KEY (user_id, relationship_id)
         REFERENCES relationships(user_id, id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS advice_logical_turns (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    relationship_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    user_message_id TEXT NOT NULL UNIQUE,
+    query TEXT NOT NULL,
+    request_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL,
+    assistant_message_id TEXT UNIQUE,
+    generation_count INTEGER NOT NULL DEFAULT 0,
+    last_error_type TEXT,
+    fallback_used INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id, relationship_id)
+        REFERENCES relationships(user_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (user_message_id) REFERENCES messages(id) ON DELETE CASCADE,
+    FOREIGN KEY (assistant_message_id) REFERENCES messages(id) ON DELETE SET NULL,
+    CHECK (status IN (
+        'memory_started', 'generation_in_progress', 'generation_failed', 'completed'
+    )),
+    CHECK (generation_count >= 0),
+    CHECK (fallback_used IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS advice_generation_attempts (
+    id TEXT PRIMARY KEY,
+    logical_turn_id TEXT NOT NULL,
+    generation_no INTEGER NOT NULL,
+    attempt_no INTEGER NOT NULL,
+    attempt_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (logical_turn_id) REFERENCES advice_logical_turns(id) ON DELETE CASCADE,
+    UNIQUE (logical_turn_id, generation_no, attempt_no),
+    CHECK (generation_no >= 1),
+    CHECK (attempt_no >= 1)
 );
 
 CREATE TABLE IF NOT EXISTS memory_items (
@@ -2638,6 +3338,12 @@ CREATE INDEX IF NOT EXISTS idx_memory_message_identity
     WHERE source_message_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_messages_scope
     ON messages(user_id, relationship_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_advice_logical_turns_retry
+    ON advice_logical_turns(
+        user_id, relationship_id, conversation_id, status, updated_at
+    );
+CREATE INDEX IF NOT EXISTS idx_advice_generation_attempts_turn
+    ON advice_generation_attempts(logical_turn_id, generation_no, attempt_no);
 
 CREATE INDEX IF NOT EXISTS idx_memory_extraction_runs_scope
     ON memory_extraction_runs(user_id, relationship_id, updated_at);
@@ -2645,5 +3351,5 @@ CREATE INDEX IF NOT EXISTS idx_memory_extraction_runs_scope
 CREATE INDEX IF NOT EXISTS idx_memory_transition_audit_scope
     ON memory_transition_audit(user_id, relationship_id, created_at);
 
-PRAGMA user_version = 7;
+PRAGMA user_version = 8;
 """

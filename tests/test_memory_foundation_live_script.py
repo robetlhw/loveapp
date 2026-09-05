@@ -131,7 +131,7 @@ def test_live_fixture_encodes_documented_relaxed_expectations() -> None:
     mem002 = cases["MEM-002"]["final"]
     assert "active_memory_count" not in mem002
     assert mem002["duplicate_active_max"] == [
-        {"selector": {"state_dimension": "relationship.conflict_status"}, "max": 1}
+        {"selector": {"state_dimension": "conflict_status"}, "max": 1}
     ]
 
     mem006_turn2 = cases["MEM-006"]["turns"][1]
@@ -388,7 +388,7 @@ async def test_declarative_expectations_cover_lifecycle_and_current_context(
                             {
                                 "selector": {
                                     "canonical_predicate": "relationship.conflict_status",
-                                    "state_dimension": "relationship.conflict_status",
+                                    "state_dimension": "conflict_status",
                                     "state_value": "active",
                                     "perspective": "user_reported",
                                 }
@@ -401,7 +401,7 @@ async def test_declarative_expectations_cover_lifecycle_and_current_context(
                             {
                                 "selector": {
                                     "canonical_predicate": "relationship.conflict_status",
-                                    "state_dimension": "relationship.conflict_status",
+                                    "state_dimension": "conflict_status",
                                     "state_value": "resolved",
                                     "perspective": "user_reported",
                                 }

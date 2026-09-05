@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import uuid4
 
-from loveapp.domain.advice import RelationshipContext
+from loveapp.domain.advice import (
+    AdviceGenerationAttempt,
+    AdviceGenerationAttemptRecord,
+    AdviceLogicalTurn,
+    RelationshipContext,
+)
 from loveapp.domain.enums import RelationshipStage, TaskType
 from loveapp.domain.memory import (
     AdmissionDecision,
@@ -37,15 +42,19 @@ from loveapp.domain.memory import (
     utc_now,
 )
 from loveapp.domain.memory_context import select_context_memories
+from loveapp.domain.memory_dimensions import (
+    normalize_state_dimension,
+    normalize_state_value,
+)
 from loveapp.domain.memory_lifecycle import (
     governed_state_identity,
     governed_state_value,
     legacy_transition_target_ids,
     memory_concept,
-    normalize_memory_candidate,
     plan_memory_transitions,
     semantic_duplicate_ids,
 )
+from loveapp.domain.memory_normalization import normalize_memory_candidate_contract
 from loveapp.domain.memory_predicates import CANONICAL_PREDICATES, normalize_predicate
 from loveapp.domain.memory_verification import ClaimVerification
 from loveapp.domain.memory_write import (
@@ -70,6 +79,7 @@ from loveapp.domain.relationship_plan import (
     memory_with_plan,
     suppressed_plan_ids_for_text,
 )
+from loveapp.domain.runtime_context import PendingMemoryContext
 from loveapp.ports.embeddings import EmbeddingProvider
 from loveapp.ports.memory import MemoryExtractor, MemoryStore, StrongClaimVerifier
 from loveapp.ports.observability import TraceRecorder
@@ -81,6 +91,7 @@ from .contextual_memory_updates import (
     resolve_explicit_memory_correction,
 )
 from .memory_admission import (
+    assess_governed_transition_eligibility,
     assess_memory_admission,
     build_admission_policies,
     interaction_pattern_has_frequency,
@@ -179,6 +190,7 @@ class MemoryService:
         raise_on_extraction_error: bool = False,
         trace: TraceRecorder | None = None,
         active_task: TaskType | None = None,
+        pending_memory_context: PendingMemoryContext | None = None,
     ) -> RememberResult:
         conversation_history = (
             await self.get_conversation_history(
@@ -204,6 +216,7 @@ class MemoryService:
             conversation_history=conversation_history,
             trace=trace,
             active_task=active_task,
+            pending_memory_context=pending_memory_context,
         )
 
     async def remember_recorded_message(
@@ -216,14 +229,16 @@ class MemoryService:
         conversation_history: list[StoredMessage] | None = None,
         trace: TraceRecorder | None = None,
         active_task: TaskType | None = None,
+        pending_memory_context: PendingMemoryContext | None = None,
     ) -> RememberResult:
         retrospective_probe = has_retrospective_event_semantics(text)
         contextual_probe = may_contain_contextual_relationship_event(text)
         contextual_update_probe = may_contain_contextual_memory_update(text)
         preloaded_memories: list[MemoryItem] | None = None
         history_loaded_for_gate = conversation_history is not None
+        hybrid_gate = callable(getattr(self._gate, "route_v2", None))
         if conversation_history is None and (
-            contextual_probe or retrospective_probe or contextual_update_probe
+            hybrid_gate or contextual_probe or retrospective_probe or contextual_update_probe
         ):
             conversation_history = await self.get_conversation_history(
                 message.user_id,
@@ -244,12 +259,11 @@ class MemoryService:
             conversation_history=conversation_history or [],
             existing_memories=preloaded_memories or [],
             active_task=active_task,
+            pending_memory_context=pending_memory_context,
         )
         gate_decision = gate_decision.model_copy(
             update={
-                "contextual_probe": (
-                    gate_decision.contextual_probe or contextual_update_probe
-                ),
+                "contextual_probe": (gate_decision.contextual_probe or contextual_update_probe),
                 "history_loaded_for_gate": history_loaded_for_gate,
             }
         )
@@ -376,9 +390,14 @@ class MemoryService:
             _record_explicit_correction_trace(trace, correction_resolution)
         attempts: list[MemoryExtractionAttempt] = []
         extraction_failure: Exception | None = None
-        if correction_resolution.detected or correction_resolution.idempotent or (
-            contextual_update.resolved
-            and gate_decision.reason == MemoryGateReason.CONTEXTUAL_UPDATE
+        extraction_invoked = False
+        if (
+            correction_resolution.detected
+            or correction_resolution.idempotent
+            or (
+                contextual_update.resolved
+                and gate_decision.reason == MemoryGateReason.CONTEXTUAL_UPDATE
+            )
         ):
             # The current turn only qualifies a known fact.  Invoking the
             # extractor here would invite it to turn the attached consultation
@@ -386,6 +405,7 @@ class MemoryService:
             extraction = AtomicExtraction()
         else:
             try:
+                extraction_invoked = True
                 extraction_kwargs = {
                     "reference_time": self._clock(),
                     "existing_memories": select_context_memories(
@@ -401,6 +421,17 @@ class MemoryService:
                 # callback is adopted by the extractor port.
                 if _supports_keyword(self._extractor.extract, "attempt_callback"):
                     extraction_kwargs["attempt_callback"] = attempts.append
+                effective_pending_context = gate_decision.pending_memory_context
+                if (
+                    effective_pending_context is not None
+                    and _supports_keyword(
+                        self._extractor.extract,
+                        "pending_memory_context",
+                    )
+                ):
+                    extraction_kwargs["pending_memory_context"] = (
+                        effective_pending_context
+                    )
                 extraction = await self._extractor.extract(text, **extraction_kwargs)
             except asyncio.CancelledError:
                 await self._finish_extraction_run(
@@ -429,11 +460,50 @@ class MemoryService:
                 extraction_failure = exc
                 extraction = AtomicExtraction()
 
+        gate_decision = _apply_semantic_gate_decision(
+            gate_decision,
+            extraction,
+            require_contract=(
+                extraction_invoked
+                and bool(
+                    getattr(
+                        self._extractor,
+                        "requires_semantic_gate_contract",
+                        False,
+                    )
+                )
+            ),
+        )
+        extraction_run = extraction_run.model_copy(update={"gate_decision": gate_decision})
+        _record_semantic_gate_trace(trace, gate_decision, extraction)
+        if not gate_decision.should_extract:
+            result = RememberResult(
+                message=message,
+                extraction_error=(
+                    str(extraction_failure) if extraction_failure is not None else None
+                ),
+                discarded_spans=extraction.discarded_spans,
+                gate_decision=gate_decision,
+                extraction_run_id=extraction_run.id,
+            )
+            await self._finish_extraction_run(
+                extraction_run,
+                (
+                    MemoryExtractionStatus.FAILED
+                    if extraction_failure is not None
+                    else MemoryExtractionStatus.COMPLETED
+                ),
+                attempts=attempts,
+                discarded_spans=extraction.discarded_spans,
+                error=(str(extraction_failure) if extraction_failure is not None else None),
+            )
+            if extraction_failure is not None and raise_on_extraction_error:
+                raise extraction_failure
+            return result
+
         result = RememberResult(
             message=message,
-            extraction_error=(
-                str(extraction_failure) if extraction_failure is not None else None
-            ),
+            extraction_error=(str(extraction_failure) if extraction_failure is not None else None),
             discarded_spans=extraction.discarded_spans,
             gate_decision=gate_decision,
             extraction_run_id=extraction_run.id,
@@ -466,15 +536,10 @@ class MemoryService:
                 payload = dict(extracted.payload)
                 payload.update(deterministic.payload)
                 if extracted.payload.get("temporal_expression"):
-                    payload["temporal_expression"] = extracted.payload[
-                        "temporal_expression"
-                    ]
+                    payload["temporal_expression"] = extracted.payload["temporal_expression"]
                 extracted_predicate = _candidate_predicate(extracted)
                 deterministic_predicate = _candidate_predicate(deterministic)
-                if (
-                    extracted_predicate
-                    and extracted_predicate != deterministic_predicate
-                ):
+                if extracted_predicate and extracted_predicate != deterministic_predicate:
                     payload.setdefault(
                         "merged_extractor_predicate",
                         extracted_predicate,
@@ -513,19 +578,17 @@ class MemoryService:
             )
             had_explicit_expiration = candidate.expires_at is not None
             candidate = add_plan_identity(
-                normalize_memory_candidate(candidate, now),
+                normalize_memory_candidate_contract(
+                    candidate,
+                    now,
+                    allow_legacy_open_world=True,
+                ),
                 identity_scope=message.id,
             )
             admission_policy = self._admission_policies[candidate.kind]
-            if (
-                not had_explicit_expiration
-                and admission_policy.default_ttl_days is not None
-            ):
+            if not had_explicit_expiration and admission_policy.default_ttl_days is not None:
                 candidate = candidate.model_copy(
-                    update={
-                        "expires_at": now
-                        + timedelta(days=admission_policy.default_ttl_days)
-                    }
+                    update={"expires_at": now + timedelta(days=admission_policy.default_ttl_days)}
                 )
             if candidate.confidence < self._confidence_floor(candidate):
                 result.skipped_low_confidence += 1
@@ -558,11 +621,17 @@ class MemoryService:
             if updates:
                 candidate = candidate.model_copy(update=updates)
             conflict = has_local_conflict(candidate, active)
+            governed_transition_eligibility = assess_governed_transition_eligibility(
+                candidate,
+                text,
+                active,
+            )
             assessment = assess_memory_admission(
                 candidate,
                 text,
                 conflict=conflict,
                 policies=self._admission_policies,
+                governed_transition_eligibility=governed_transition_eligibility,
             )
             decision = (
                 AdmissionDecision.CONFIRM
@@ -610,12 +679,8 @@ class MemoryService:
                         limit=8,
                         reference_time=now,
                     )
-                    strong_compared_memory_ids = [
-                        item.id for item in verification_memories
-                    ]
-                    verifier_allowed_ids = {
-                        item.id for item in verification_memories
-                    }
+                    strong_compared_memory_ids = [item.id for item in verification_memories]
+                    verifier_allowed_ids = {item.id for item in verification_memories}
                     verification = await self._verifier.verify_claim(
                         text,
                         candidate=candidate,
@@ -631,23 +696,27 @@ class MemoryService:
                     payload = dict(candidate.payload)
                     canonical = verification.canonical_predicate
                     if canonical in CANONICAL_PREDICATES:
-                        if verification.state_dimension is not None:
-                            payload["state_dimension"] = verification.state_dimension
-                        if verification.state_value is not None:
-                            payload["state_value"] = verification.state_value
-                        candidate = normalize_memory_candidate(
+                        verified_dimension, verified_value = _normalized_verification_state(
+                            verification,
+                        )
+                        if verified_dimension is not None:
+                            payload["state_dimension"] = verified_dimension
+                        if verified_value is not None:
+                            payload["state_value"] = verified_value
+                        candidate = normalize_memory_candidate_contract(
                             candidate.model_copy(
                                 update={
                                     "payload": payload,
                                     "predicate_type": PredicateType.CANONICAL,
                                     "canonical_predicate": canonical,
                                     "custom_predicate": None,
-                                    "state_dimension": verification.state_dimension,
-                                    "state_value": verification.state_value,
+                                    "state_dimension": verified_dimension,
+                                    "state_value": verified_value,
                                     "verifier_model": verification.verifier_model,
                                 }
                             ),
                             now,
+                            allow_legacy_open_world=True,
                         )
                     elif verification.verifier_model:
                         candidate = candidate.model_copy(
@@ -928,15 +997,11 @@ class MemoryService:
                 score_breakdown=observation.score_breakdown,
                 compared_memory_ids=list(observation.compared_memory_ids),
                 strong_called=observation.strong_called,
-                strong_compared_memory_ids=list(
-                    observation.strong_compared_memory_ids
-                ),
+                strong_compared_memory_ids=list(observation.strong_compared_memory_ids),
                 relation=relation,
                 relation_rule=rule_name,
                 relation_reason=reason,
-                relation_target_memory_ids=list(
-                    observation.relation_target_memory_ids
-                ),
+                relation_target_memory_ids=list(observation.relation_target_memory_ids),
                 planned_action=_planned_memory_action(relation),
                 planned_target_memory_ids=target_ids,
                 target_operation_indexes=target_operation_indexes,
@@ -944,9 +1009,7 @@ class MemoryService:
         status_updates: list[MemoryStatusUpdate] = []
         plan_updates: list[RelationshipPlanStatusUpdate] = []
         contextual_updates = (
-            [contextual_update.to_update(reference_time=now)]
-            if contextual_update.resolved
-            else []
+            [contextual_update.to_update(reference_time=now)] if contextual_update.resolved else []
         )
         for transition in plan_transitions:
             candidate = prepared[transition.candidate_index]
@@ -966,9 +1029,8 @@ class MemoryService:
                 matched_plan = plans_by_id.get(transition.plan_id)
                 if matched_plan is not None:
                     for memory in active:
-                        if (
-                            memory.kind == MemoryKind.ACTION_INTENT
-                            and memory_references_plan(memory, matched_plan)
+                        if memory.kind == MemoryKind.ACTION_INTENT and memory_references_plan(
+                            memory, matched_plan
                         ):
                             status_updates.append(
                                 MemoryStatusUpdate(
@@ -1039,6 +1101,7 @@ class MemoryService:
         conversation_history: list[StoredMessage] | None = None,
         trace: TraceRecorder | None = None,
         active_task: TaskType | None = None,
+        pending_memory_context: PendingMemoryContext | None = None,
         name: str = "loveapp-memory-extraction",
     ) -> asyncio.Task[RememberResult]:
         """Start the shared memory sidecar without blocking the main task.
@@ -1055,6 +1118,7 @@ class MemoryService:
                     status=status,
                     conversation_history=conversation_history,
                     active_task=active_task,
+                    pending_memory_context=pending_memory_context,
                 )
 
             with trace.measure("memory_extraction") as details:
@@ -1065,6 +1129,7 @@ class MemoryService:
                     conversation_history=conversation_history,
                     trace=trace,
                     active_task=active_task,
+                    pending_memory_context=pending_memory_context,
                 )
                 if result.gate_decision is not None:
                     details["gate_reason"] = result.gate_decision.reason.value
@@ -1137,9 +1202,7 @@ class MemoryService:
         if not tasks:
             return 0
         timeout = (
-            self._shutdown_grace_seconds
-            if timeout_seconds is None
-            else max(timeout_seconds, 0)
+            self._shutdown_grace_seconds if timeout_seconds is None else max(timeout_seconds, 0)
         )
         if timeout:
             await asyncio.wait(tasks, timeout=timeout)
@@ -1246,9 +1309,7 @@ class MemoryService:
             limit=1000,
         )
         active = [
-            item
-            for item in items
-            if item.status in {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}
+            item for item in items if item.status in {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}
         ]
         grouped: dict[str, list[MemoryItem]] = {}
         for item in active:
@@ -1288,6 +1349,7 @@ class MemoryService:
         content: str,
         conversation_id: str | None = None,
         relationship_stage: RelationshipStage = RelationshipStage.UNKNOWN,
+        message_id: str | None = None,
     ) -> StoredMessage:
         await self.ensure_context(user_id, relationship_id, relationship_stage)
         return await self.store.add_message(
@@ -1295,6 +1357,135 @@ class MemoryService:
             relationship_id=relationship_id,
             role=role,
             content=content,
+            conversation_id=conversation_id,
+            message_id=message_id,
+        )
+
+    async def create_advice_logical_turn(
+        self,
+        turn: AdviceLogicalTurn,
+        *,
+        reject_existing: bool = False,
+    ) -> AdviceLogicalTurn:
+        return await self.store.create_advice_logical_turn(
+            turn,
+            reject_existing=reject_existing,
+        )
+
+    async def get_advice_logical_turn(
+        self,
+        logical_turn_id: str,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+    ) -> AdviceLogicalTurn | None:
+        return await self.store.get_advice_logical_turn(
+            logical_turn_id,
+            user_id=user_id,
+            relationship_id=relationship_id,
+            conversation_id=conversation_id,
+        )
+
+    async def latest_retryable_advice_turn(
+        self,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+    ) -> AdviceLogicalTurn | None:
+        return await self.store.latest_retryable_advice_turn(
+            user_id=user_id,
+            relationship_id=relationship_id,
+            conversation_id=conversation_id,
+        )
+
+    async def begin_advice_generation(
+        self,
+        logical_turn_id: str,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+        retry: bool,
+    ) -> AdviceLogicalTurn:
+        return await self.store.begin_advice_generation(
+            logical_turn_id,
+            user_id=user_id,
+            relationship_id=relationship_id,
+            conversation_id=conversation_id,
+            retry=retry,
+        )
+
+    async def save_advice_generation_attempts(
+        self,
+        logical_turn_id: str,
+        generation_no: int,
+        attempts: list[AdviceGenerationAttempt],
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+    ) -> list[AdviceGenerationAttemptRecord]:
+        return await self.store.save_advice_generation_attempts(
+            logical_turn_id,
+            generation_no,
+            attempts,
+            user_id=user_id,
+            relationship_id=relationship_id,
+            conversation_id=conversation_id,
+        )
+
+    async def fail_advice_logical_turn(
+        self,
+        logical_turn_id: str,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+        last_error_type: str | None,
+        fallback_used: bool,
+    ) -> AdviceLogicalTurn | None:
+        return await self.store.fail_advice_logical_turn(
+            logical_turn_id,
+            user_id=user_id,
+            relationship_id=relationship_id,
+            conversation_id=conversation_id,
+            last_error_type=last_error_type,
+            fallback_used=fallback_used,
+        )
+
+    async def complete_advice_logical_turn(
+        self,
+        logical_turn_id: str,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+        message_id: str,
+        content: str,
+    ) -> tuple[AdviceLogicalTurn, StoredMessage]:
+        return await self.store.complete_advice_logical_turn(
+            logical_turn_id,
+            user_id=user_id,
+            relationship_id=relationship_id,
+            conversation_id=conversation_id,
+            message_id=message_id,
+            content=content,
+        )
+
+    async def list_advice_generation_attempts(
+        self,
+        logical_turn_id: str,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+    ) -> list[AdviceGenerationAttemptRecord]:
+        return await self.store.list_advice_generation_attempts(
+            logical_turn_id,
+            user_id=user_id,
+            relationship_id=relationship_id,
             conversation_id=conversation_id,
         )
 
@@ -1432,10 +1623,7 @@ class MemoryService:
         active_memories: list[MemoryItem],
     ) -> None:
         for memory in active_memories:
-            if (
-                memory.kind == MemoryKind.ACTION_INTENT
-                and memory_references_plan(memory, plan)
-            ):
+            if memory.kind == MemoryKind.ACTION_INTENT and memory_references_plan(memory, plan):
                 await self.store.set_memory_status(
                     memory.id,
                     user_id,
@@ -1479,9 +1667,7 @@ class MemoryService:
                 plan_id=transition.plan_id,
                 user_id=user_id,
                 status=transition.target_status,
-                transitioned_at=(
-                    event.occurred_at or event.period_end or event.updated_at
-                ),
+                transitioned_at=(event.occurred_at or event.period_end or event.updated_at),
                 source_event_memory_id=event.id,
             )
             if transitioned is not None:
@@ -1551,11 +1737,7 @@ class MemoryService:
         current_view = _filter_memories_for_plan_status(current, plans)
         active = list(current_view)
         if mode == MemoryRetrievalMode.HISTORY:
-            active.extend(
-                item
-                for item in memories
-                if item.status == MemoryStatus.SUPERSEDED
-            )
+            active.extend(item for item in memories if item.status == MemoryStatus.SUPERSEDED)
         standardized_evidence = standardize_relationship_evidence(
             current_view,
             reference_time=context_time,
@@ -1567,30 +1749,18 @@ class MemoryService:
         active_plans = [
             plan
             for plan in plans
-            if plan.status in ACTIVE_PLAN_STATUSES
-            and plan.plan_id not in reconciled_plan_ids
+            if plan.status in ACTIVE_PLAN_STATUSES and plan.plan_id not in reconciled_plan_ids
         ]
-        suppressed_plan_ids = (
-            suppressed_plan_ids_for_text(query, active_plans) if query else set()
-        )
-        visible_plans = [
-            plan for plan in active_plans if plan.plan_id not in suppressed_plan_ids
-        ]
+        suppressed_plan_ids = suppressed_plan_ids_for_text(query, active_plans) if query else set()
+        visible_plans = [plan for plan in active_plans if plan.plan_id not in suppressed_plan_ids]
         visible_plan_memory_ids = {
-            plan.source_memory_id
-            for plan in visible_plans
-            if plan.source_memory_id is not None
+            plan.source_memory_id for plan in visible_plans if plan.source_memory_id is not None
         }
-        suppressed_plans = [
-            plan for plan in active_plans if plan.plan_id in suppressed_plan_ids
-        ]
+        suppressed_plans = [plan for plan in active_plans if plan.plan_id in suppressed_plan_ids]
         active = [
             item
             for item in active
-            if (
-                item.kind != MemoryKind.PLANNED_EVENT
-                or item.id in visible_plan_memory_ids
-            )
+            if (item.kind != MemoryKind.PLANNED_EVENT or item.id in visible_plan_memory_ids)
             and not (
                 item.kind == MemoryKind.ACTION_INTENT
                 and any(memory_references_plan(item, plan) for plan in suppressed_plans)
@@ -1646,11 +1816,7 @@ class MemoryService:
         if reconciled_ids:
             active = [item for item in active if item.id not in reconciled_ids]
         if mode == MemoryRetrievalMode.HISTORY:
-            active.extend(
-                item
-                for item in memories
-                if item.status == MemoryStatus.SUPERSEDED
-            )
+            active.extend(item for item in memories if item.status == MemoryStatus.SUPERSEDED)
         return await self._memory_retriever.retrieve(
             active,
             query=query,
@@ -1663,9 +1829,7 @@ class MemoryService:
 def _reconciled_active_ids(active_memories: list[MemoryItem]) -> set[str]:
     """Identify stale active rows without applying lifecycle mutations."""
 
-    return legacy_transition_target_ids(active_memories) | semantic_duplicate_ids(
-        active_memories
-    )
+    return legacy_transition_target_ids(active_memories) | semantic_duplicate_ids(active_memories)
 
 
 def _memory_is_current(item: MemoryItem, reference_time: datetime) -> bool:
@@ -1776,9 +1940,7 @@ def _record_candidate_observation(
                 "lifecycle_review_required": candidate.lifecycle_review_required,
                 "time_kind": candidate.time_kind.value,
                 "occurred_at": (
-                    candidate.occurred_at.isoformat()
-                    if candidate.occurred_at is not None
-                    else None
+                    candidate.occurred_at.isoformat() if candidate.occurred_at is not None else None
                 ),
                 "period_start": (
                     candidate.period_start.isoformat()
@@ -1786,9 +1948,7 @@ def _record_candidate_observation(
                     else None
                 ),
                 "period_end": (
-                    candidate.period_end.isoformat()
-                    if candidate.period_end is not None
-                    else None
+                    candidate.period_end.isoformat() if candidate.period_end is not None else None
                 ),
                 "temporal_precision": candidate.temporal_precision.value,
                 "payload_json": json.dumps(
@@ -1812,32 +1972,22 @@ def _record_candidate_observation(
                 ),
                 "compared_memory_ids_json": json.dumps(compared_memory_ids),
                 "strong_called": strong_called,
-                "strong_compared_memory_ids_json": json.dumps(
-                    strong_compared_memory_ids
-                ),
+                "strong_compared_memory_ids_json": json.dumps(strong_compared_memory_ids),
                 "claim_relation": relation.value,
                 "relation_rule": relation_rule,
                 "relation_reason": relation_reason,
-                "relation_target_memory_ids_json": json.dumps(
-                    relation_target_memory_ids
-                ),
+                "relation_target_memory_ids_json": json.dumps(relation_target_memory_ids),
                 "planned_action": planned_action,
                 "planned_status": planned_status,
-                "planned_target_memory_ids_json": json.dumps(
-                    planned_target_memory_ids
-                ),
-                "target_operation_indexes_json": json.dumps(
-                    target_operation_indexes
-                ),
+                "planned_target_memory_ids_json": json.dumps(planned_target_memory_ids),
+                "target_operation_indexes_json": json.dumps(target_operation_indexes),
                 "planned_actions_json": json.dumps(
                     actions,
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ),
                 "expires_at": (
-                    candidate.expires_at.isoformat()
-                    if candidate.expires_at is not None
-                    else None
+                    candidate.expires_at.isoformat() if candidate.expires_at is not None else None
                 ),
             }
         )
@@ -1941,8 +2091,9 @@ def _evaluate_gate(
     conversation_history: list[StoredMessage],
     existing_memories: list[MemoryItem],
     active_task: TaskType | None,
+    pending_memory_context: PendingMemoryContext | None,
 ) -> MemoryGateDecision:
-    evaluate = gate.evaluate
+    evaluate = getattr(gate, "route_v2", gate.evaluate)
     if _supports_keyword(evaluate, "conversation_history"):
         kwargs = {
             "conversation_history": conversation_history,
@@ -1950,8 +2101,57 @@ def _evaluate_gate(
         }
         if _supports_keyword(evaluate, "active_task"):
             kwargs["active_task"] = active_task
+        if (
+            pending_memory_context is not None
+            and _supports_keyword(evaluate, "pending_memory_context")
+        ):
+            kwargs["pending_memory_context"] = pending_memory_context
         return evaluate(text, **kwargs)
     return evaluate(text)
+
+
+def _apply_semantic_gate_decision(
+    decision: MemoryGateDecision,
+    extraction: AtomicExtraction,
+    *,
+    require_contract: bool = False,
+) -> MemoryGateDecision:
+    """Apply the same-call Flash verdict before any claim governance or write."""
+
+    guard_denied = bool(
+        decision.target_guard_result and decision.target_guard_result != "compatible_active_target"
+    )
+    if extraction.should_extract is None:
+        # Deterministic contextual mutations and legacy scripted extractors do
+        # not carry the V2 contract. Their already-governed L0 behavior stays
+        # backward compatible; production Flash responses always carry it.
+        if require_contract:
+            return decision.model_copy(
+                update={
+                    "should_extract": False,
+                    "semantic_gate_contract_violation": True,
+                    "semantic_gate_contract_violation_reason": ("missing_gate_contract"),
+                }
+            )
+        return decision.model_copy(update={"should_extract": False}) if guard_denied else decision
+    contract_violation = not extraction.should_extract and bool(extraction.claims)
+    extraction_warning = (
+        "empty_claims" if extraction.should_extract and not extraction.claims else None
+    )
+    return decision.model_copy(
+        update={
+            "should_extract": (
+                extraction.should_extract and not contract_violation and not guard_denied
+            ),
+            "semantic_gate_should_extract": extraction.should_extract,
+            "semantic_gate_reason": extraction.gate_reason,
+            "semantic_gate_contract_violation": contract_violation,
+            "semantic_gate_contract_violation_reason": (
+                "false_with_claims" if contract_violation else None
+            ),
+            "extraction_warning": extraction_warning,
+        }
+    )
 
 
 def _record_gate_trace(
@@ -1965,16 +2165,48 @@ def _record_gate_trace(
             {
                 "gate_reason": decision.reason.value,
                 "gate_should_extract": decision.should_extract,
+                "l0_route": (decision.l0_route.value if decision.l0_route is not None else None),
+                "l0_semantic_hint": (
+                    decision.l0_semantic_hint.value
+                    if decision.l0_semantic_hint is not None
+                    else None
+                ),
                 "matched_rule": decision.matched_rule,
                 "matched_span": decision.matched_span,
                 "contextual_probe": decision.contextual_probe,
                 "history_loaded_for_gate": decision.history_loaded_for_gate,
-                "antecedent_candidate_ids_json": json.dumps(
-                    decision.antecedent_candidate_ids
-                ),
+                "antecedent_candidate_ids_json": json.dumps(decision.antecedent_candidate_ids),
                 "selected_target_memory_id": decision.selected_target_memory_id,
                 "target_guard_result": decision.target_guard_result,
                 "contextual_update_type": decision.contextual_update_type,
+            }
+        )
+
+
+def _record_semantic_gate_trace(
+    trace: TraceRecorder | None,
+    decision: MemoryGateDecision,
+    extraction: AtomicExtraction,
+) -> None:
+    if trace is None or extraction.should_extract is None:
+        return
+    with trace.measure("memory_semantic_gate") as details:
+        details.update(
+            {
+                "l0_route": (decision.l0_route.value if decision.l0_route is not None else None),
+                "semantic_gate_should_extract": (decision.semantic_gate_should_extract),
+                "semantic_gate_reason": (
+                    decision.semantic_gate_reason.value
+                    if decision.semantic_gate_reason is not None
+                    else None
+                ),
+                "semantic_gate_contract_violation": (decision.semantic_gate_contract_violation),
+                "semantic_gate_contract_violation_reason": (
+                    decision.semantic_gate_contract_violation_reason
+                ),
+                "extraction_warning": decision.extraction_warning,
+                "claim_count": len(extraction.claims),
+                "final_should_extract": decision.should_extract,
             }
         )
 
@@ -2007,12 +2239,8 @@ def _record_contextual_update_trace(
         details.update(
             {
                 "contextual_update_probe": True,
-                "antecedent_candidate_ids_json": json.dumps(
-                    list(resolution.candidate_ids)
-                ),
-                "semantic_candidate_ids_json": json.dumps(
-                    list(resolution.semantic_candidate_ids)
-                ),
+                "antecedent_candidate_ids_json": json.dumps(list(resolution.candidate_ids)),
+                "semantic_candidate_ids_json": json.dumps(list(resolution.semantic_candidate_ids)),
                 "compatible_candidate_ids_json": json.dumps(
                     list(resolution.compatible_candidate_ids)
                 ),
@@ -2027,14 +2255,10 @@ def _record_contextual_update_trace(
                     resolution.target.id if resolution.target is not None else None
                 ),
                 "target_guard_result": (
-                    "compatible_active_target"
-                    if resolution.resolved
-                    else resolution.reason
+                    "compatible_active_target" if resolution.resolved else resolution.reason
                 ),
                 "contextual_update_type": (
-                    resolution.update_type.value
-                    if resolution.update_type is not None
-                    else None
+                    resolution.update_type.value if resolution.update_type is not None else None
                 ),
                 "evidence_span": resolution.evidence_span,
                 "reason": resolution.reason,
@@ -2055,9 +2279,7 @@ def _record_explicit_correction_trace(
                 "correction_type": resolution.correction_type,
                 "correction_value": resolution.correction_value,
                 "correction_unit": resolution.correction_unit,
-                "semantic_candidate_ids_json": json.dumps(
-                    list(resolution.semantic_candidate_ids)
-                ),
+                "semantic_candidate_ids_json": json.dumps(list(resolution.semantic_candidate_ids)),
                 "compatible_candidate_ids_json": json.dumps(
                     list(resolution.compatible_candidate_ids)
                 ),
@@ -2151,12 +2373,9 @@ def _verification_can_confirm(candidate: MemoryCandidate) -> bool:
     if candidate.kind in {MemoryKind.RELATIONSHIP_STATE, MemoryKind.STABLE_FACT}:
         return candidate.explicitness == EvidenceExplicitness.EXPLICIT
     if candidate.kind == MemoryKind.INTERACTION_PATTERN:
-        return (
-            candidate.explicitness == EvidenceExplicitness.EXPLICIT
-            and (
-                interaction_pattern_has_frequency(candidate)
-                or interaction_pattern_has_multiple_evidence(candidate)
-            )
+        return candidate.explicitness == EvidenceExplicitness.EXPLICIT and (
+            interaction_pattern_has_frequency(candidate)
+            or interaction_pattern_has_multiple_evidence(candidate)
         )
     return candidate.explicitness in {
         EvidenceExplicitness.EXPLICIT,
@@ -2177,13 +2396,51 @@ def _validate_claim_verification(
     spec = CANONICAL_PREDICATES.get(canonical)
     if spec is None:
         raise ValueError("claim verifier returned an unregistered canonical predicate")
-    if (
-        verification.state_dimension is not None
-        and verification.state_dimension != spec.state_dimension
-    ):
+    expected_dimension = _verifier_state_dimension(spec.state_dimension) or spec.state_dimension
+    verified_dimension = (
+        _verifier_state_dimension(verification.state_dimension)
+        or verification.state_dimension
+    )
+    if verification.state_dimension is not None and verified_dimension != expected_dimension:
         raise ValueError("claim verifier returned an incompatible state dimension")
-    if spec.allowed_values and verification.state_value not in spec.allowed_values:
+    verified_value = (
+        normalize_state_value(expected_dimension, verification.state_value)
+        or verification.state_value
+    )
+    if spec.allowed_values and verified_value not in spec.allowed_values:
         raise ValueError("claim verifier returned an unsupported state value")
+
+
+def _normalized_verification_state(
+    verification: ClaimVerification,
+) -> tuple[str | None, str | None]:
+    canonical = verification.canonical_predicate
+    spec = CANONICAL_PREDICATES.get(canonical or "")
+    if spec is None:
+        return verification.state_dimension, verification.state_value
+    dimension = _verifier_state_dimension(verification.state_dimension)
+    if dimension is None:
+        dimension = _verifier_state_dimension(spec.state_dimension)
+    dimension = dimension or verification.state_dimension
+    value = normalize_state_value(dimension, verification.state_value)
+    return dimension, value or verification.state_value
+
+
+def _verifier_state_dimension(value: object) -> str | None:
+    """Map verifier state names to the bounded lifecycle namespace.
+
+    Verifier fixtures and older model responses may use the dotted canonical
+    predicate dimension.  Only dotted names whose underscore form is already
+    registered as a lifecycle policy are bridged; interaction metrics and
+    other open dimensions remain untouched.
+    """
+
+    dimension = normalize_state_dimension(value)
+    if dimension is not None:
+        return dimension
+    if isinstance(value, str) and "." in value:
+        return normalize_state_dimension(value.replace(".", "_"))
+    return None
 
 
 def _attach_plan_metadata(
@@ -2191,9 +2448,7 @@ def _attach_plan_metadata(
     plans: list[RelationshipPlan],
 ) -> list[MemoryItem]:
     plans_by_source = {
-        plan.source_memory_id: plan
-        for plan in plans
-        if plan.source_memory_id is not None
+        plan.source_memory_id: plan for plan in plans if plan.source_memory_id is not None
     }
     return [
         memory_with_plan(memory, plan)
@@ -2216,10 +2471,7 @@ def _filter_memories_for_plan_status(
     return [
         memory
         for memory in memories
-        if (
-            memory.kind != MemoryKind.PLANNED_EVENT
-            or memory.id in active_plan_memory_ids
-        )
+        if (memory.kind != MemoryKind.PLANNED_EVENT or memory.id in active_plan_memory_ids)
         and not (
             memory.kind == MemoryKind.ACTION_INTENT
             and any(memory_references_plan(memory, plan) for plan in terminal_plans)

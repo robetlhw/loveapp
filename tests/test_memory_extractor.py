@@ -17,6 +17,7 @@ from loveapp.core.timing import ExecutionTrace
 from loveapp.domain.memory import (
     AtomicClaim,
     AtomicExtraction,
+    MemoryItem,
     MemoryKind,
     MemoryPerspective,
     PredicateType,
@@ -1314,7 +1315,7 @@ async def test_flash_trace_keeps_raw_predicate_before_canonicalization() -> None
     assert claims[0]["evidence_spans"] == [source_text]
     assert claims[0]["payload"] == {"metric": "contact_frequency"}
     assert claims[0]["extractor_model"] == "flash-model"
-    assert claims[0]["prompt_version"] == "memory-v2.2"
+    assert claims[0]["prompt_version"] == "memory-v2.6"
     await extractor.aclose()
 
 
@@ -1511,6 +1512,143 @@ async def test_low_confidence_important_memory_is_upgraded() -> None:
     assert result.claims[0].claim_id == "contact-trend-strong"
     assert flash_completions.calls == 1
     assert strong_completions.calls == 1
+    await extractor.aclose()
+
+
+async def test_explicit_governed_conflict_does_not_upgrade_to_strong() -> None:
+    text = "昨天已经说开了，现在和好了。"
+    flash_response = _governed_conflict_response(
+        explicitness="explicit",
+        confidence=0.95,
+    )
+    flash_completions = _FakeCompletions([flash_response])
+    strong_completions = _FakeCompletions(["not-used"])
+    extractor = _build_tiered_extractor(flash_completions, strong_completions)
+    trace = ExecutionTrace()
+
+    result = await extractor.extract(
+        text,
+        reference_time=datetime(2026, 7, 18, tzinfo=UTC),
+        existing_memories=[_active_conflict_memory()],
+        conversation_history=[],
+        trace=trace,
+    )
+
+    assert result.claims[0].state_value == "resolved"
+    assert flash_completions.calls == 1
+    assert strong_completions.calls == 0
+    upgrade_record = next(
+        record
+        for record in trace.records
+        if record.name == "memory_extraction_upgrade_gate"
+    )
+    assert upgrade_record.details["should_upgrade"] is False
+    assert "existing_memory_conflict" in str(upgrade_record.details["signals"])
+    assert "governed_conflict_local_resolution" in str(
+        upgrade_record.details["signals"]
+    )
+    await extractor.aclose()
+
+
+async def test_implied_governed_conflict_still_upgrades_to_strong() -> None:
+    text = "昨天已经说开了，现在和好了。"
+    flash_completions = _FakeCompletions(
+        [
+            _governed_conflict_response(
+                explicitness="strongly_implied",
+                confidence=0.95,
+            )
+        ]
+    )
+    strong_completions = _FakeCompletions(
+        [_governed_conflict_response(explicitness="explicit", confidence=0.96)]
+    )
+    extractor = _build_tiered_extractor(flash_completions, strong_completions)
+    attempts = []
+
+    result = await extractor.extract(
+        text,
+        reference_time=datetime(2026, 7, 18, tzinfo=UTC),
+        existing_memories=[_active_conflict_memory()],
+        conversation_history=[],
+        attempt_callback=attempts.append,
+    )
+
+    assert result.claims[0].explicitness.value == "explicit"
+    assert flash_completions.calls == 1
+    assert strong_completions.calls == 1
+    assert attempts[0].upgrade_reason == "existing_memory_conflict"
+    await extractor.aclose()
+
+
+async def test_invalid_discarded_span_blocks_local_conflict_resolution() -> None:
+    text = "昨天已经说开了，现在和好了。"
+    flash_payload = json.loads(
+        _governed_conflict_response(explicitness="explicit", confidence=0.95)
+    )
+    flash_payload["discarded_spans"] = [
+        {"text": "不在用户原文里的片段", "reason": "ephemeral"}
+    ]
+    flash_completions = _FakeCompletions(
+        [json.dumps(flash_payload, ensure_ascii=False)]
+    )
+    strong_completions = _FakeCompletions(
+        [_governed_conflict_response(explicitness="explicit", confidence=0.96)]
+    )
+    extractor = _build_tiered_extractor(flash_completions, strong_completions)
+    attempts = []
+
+    await extractor.extract(
+        text,
+        reference_time=datetime(2026, 7, 18, tzinfo=UTC),
+        existing_memories=[_active_conflict_memory()],
+        conversation_history=[],
+        attempt_callback=attempts.append,
+    )
+
+    assert flash_completions.calls == 1
+    assert strong_completions.calls == 1
+    assert "partial_discarded_spans" in str(attempts[0].repair_steps)
+    assert attempts[0].upgrade_reason == "existing_memory_conflict"
+    await extractor.aclose()
+
+
+async def test_atomic_evidence_repair_blocks_local_conflict_resolution() -> None:
+    text = "最近联系很少，通常也都是我先联系她。"
+    flash_completions = _FakeCompletions(
+        [
+            _contact_frequency_response(
+                evidence=text,
+                explicitness="explicit",
+                confidence=0.95,
+            )
+        ]
+    )
+    strong_completions = _FakeCompletions(
+        [
+            _contact_frequency_response(
+                evidence="最近联系很少",
+                explicitness="explicit",
+                confidence=0.96,
+            )
+        ]
+    )
+    extractor = _build_tiered_extractor(flash_completions, strong_completions)
+    attempts = []
+
+    await extractor.extract(
+        text,
+        reference_time=datetime(2026, 7, 18, tzinfo=UTC),
+        existing_memories=[_normal_contact_frequency_memory()],
+        conversation_history=[],
+        attempt_callback=attempts.append,
+    )
+
+    assert flash_completions.calls == 1
+    assert strong_completions.calls == 1
+    assert attempts[0].repaired_claim_count == 1
+    assert "atomic_evidence_narrowing" in str(attempts[0].repair_steps)
+    assert attempts[0].upgrade_reason == "existing_memory_conflict"
     await extractor.aclose()
 
 
@@ -1772,6 +1910,7 @@ def _build_single_extractor(
         max_retries=0,
         tier=tier,
         thinking="disabled" if tier == "flash" else "enabled",
+        validation_mode="legacy",
     )
     extractor._client = SimpleNamespace(
         chat=SimpleNamespace(completions=completions),
@@ -1796,4 +1935,129 @@ def _claim_response(
         f'"predicate":"{predicate}","summary":"{summary}",'
         f'"evidence_spans":["{evidence}"],{extra}'
         '}],"discarded_spans":[]}'
+    )
+
+
+def _governed_conflict_response(*, explicitness: str, confidence: float) -> str:
+    return json.dumps(
+        {
+            "claims": [
+                {
+                    "claim_id": "resolved-conflict",
+                    "kind": "relationship_state",
+                    "subject": "relationship",
+                    "predicate": "relationship.conflict_status",
+                    "predicate_type": "canonical",
+                    "canonical_predicate": "relationship.conflict_status",
+                    "summary": "双方当前冲突已经解决",
+                    "evidence_spans": ["现在和好了"],
+                    "confidence": confidence,
+                    "perspective": "user_reported",
+                    "explicitness": explicitness,
+                    "requires_inference": False,
+                    "payload": {
+                        "state_dimension": "relationship.conflict_status",
+                        "state_value": "resolved",
+                    },
+                }
+            ],
+            "discarded_spans": [],
+        },
+        ensure_ascii=False,
+    )
+
+
+def _contact_frequency_response(
+    *,
+    evidence: str,
+    explicitness: str,
+    confidence: float,
+) -> str:
+    return json.dumps(
+        {
+            "claims": [
+                {
+                    "claim_id": "reduced-contact-frequency",
+                    "kind": "interaction_pattern",
+                    "subject": "relationship",
+                    "predicate": "interaction.contact_frequency",
+                    "predicate_type": "canonical",
+                    "canonical_predicate": "interaction.contact_frequency",
+                    "summary": "双方最近联系很少",
+                    "evidence_spans": [evidence],
+                    "confidence": confidence,
+                    "perspective": "user_reported",
+                    "explicitness": explicitness,
+                    "requires_inference": False,
+                    "payload": {
+                        "metric": "contact_frequency",
+                        "current": "low",
+                        "state_dimension": "interaction.contact_frequency",
+                        "state_value": "low",
+                    },
+                }
+            ],
+            "discarded_spans": [],
+        },
+        ensure_ascii=False,
+    )
+
+
+def _active_conflict_memory() -> MemoryItem:
+    text = "双方目前仍处于冷战冲突状态"
+    now = datetime(2026, 7, 17, tzinfo=UTC)
+    return MemoryItem(
+        id="active-conflict",
+        user_id="extractor-test-user",
+        relationship_id="extractor-test-relationship",
+        dedupe_key="active-conflict-key",
+        kind=MemoryKind.RELATIONSHIP_STATE,
+        subject="relationship",
+        summary=text,
+        original_text=text,
+        evidence_spans=[text],
+        confidence=0.95,
+        payload={
+            "predicate": "relationship.conflict_status",
+            "state_dimension": "relationship.conflict_status",
+            "state_value": "active",
+        },
+        raw_predicate="relationship.conflict_status",
+        predicate_type=PredicateType.CANONICAL,
+        canonical_predicate="relationship.conflict_status",
+        state_dimension="relationship.conflict_status",
+        state_value="active",
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def _normal_contact_frequency_memory() -> MemoryItem:
+    text = "双方联系频率正常"
+    now = datetime(2026, 7, 17, tzinfo=UTC)
+    return MemoryItem(
+        id="normal-contact-frequency",
+        user_id="extractor-test-user",
+        relationship_id="extractor-test-relationship",
+        dedupe_key="normal-contact-frequency-key",
+        kind=MemoryKind.INTERACTION_PATTERN,
+        subject="relationship",
+        summary=text,
+        original_text=text,
+        evidence_spans=[text],
+        confidence=0.95,
+        payload={
+            "predicate": "interaction.contact_frequency",
+            "metric": "contact_frequency",
+            "current": "normal",
+            "state_dimension": "interaction.contact_frequency",
+            "state_value": "normal",
+        },
+        raw_predicate="interaction.contact_frequency",
+        predicate_type=PredicateType.CANONICAL,
+        canonical_predicate="interaction.contact_frequency",
+        state_dimension="interaction.contact_frequency",
+        state_value="normal",
+        created_at=now,
+        updated_at=now,
     )

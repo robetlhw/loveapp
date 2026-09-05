@@ -7,10 +7,12 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from loveapp.domain.memory_dimensions import normalize_state_dimension, normalize_state_value
 from loveapp.domain.memory_predicates import (
     normalize_predicate,
     normalize_preference_value,
 )
+from loveapp.domain.runtime_context import PendingMemoryContext
 
 
 def utc_now() -> datetime:
@@ -140,9 +142,54 @@ class MemoryGateReason(StrEnum):
     NO_DURABLE_SIGNAL = "no_durable_signal"
 
 
+class MemoryGateRoute(StrEnum):
+    """Deterministic routing decision before the semantic memory gate."""
+
+    HARD_DROP = "HARD_DROP"
+    HARD_PASS = "HARD_PASS"
+    SEMANTIC_REVIEW = "SEMANTIC_REVIEW"
+    CONTEXT_PASS = "CONTEXT_PASS"
+
+
+class MemorySemanticGateReason(StrEnum):
+    """Bounded reason taxonomy returned by the Flash semantic gate."""
+
+    STABLE_FACT = "STABLE_FACT"
+    PREFERENCE = "PREFERENCE"
+    INTERACTION_PATTERN = "INTERACTION_PATTERN"
+    RELATIONSHIP_STATE = "RELATIONSHIP_STATE"
+    RELATIONSHIP_CHANGE = "RELATIONSHIP_CHANGE"
+    PARTIAL_CHANGE = "PARTIAL_CHANGE"
+    USER_BELIEF = "USER_BELIEF"
+    PLANNED_EVENT = "PLANNED_EVENT"
+    ACTION_INTENT = "ACTION_INTENT"
+    ADVICE_OUTCOME = "ADVICE_OUTCOME"
+    COMPOUND_MEMORY = "COMPOUND_MEMORY"
+    CONTEXT_DEPENDENT_REPLY = "CONTEXT_DEPENDENT_REPLY"
+    TRANSIENT = "TRANSIENT"
+    SMALL_TALK = "SMALL_TALK"
+    NO_MEMORY = "NO_MEMORY"
+
+
+# Transitional aliases keep the contract easy to consume without creating a
+# second enum with different identity or persisted values.
+MemoryL0Route = MemoryGateRoute
+MemoryGateL0Route = MemoryGateRoute
+SemanticGateReason = MemorySemanticGateReason
+
+
 class MemoryGateDecision(BaseModel):
     should_extract: bool
     reason: MemoryGateReason
+    l0_route: MemoryGateRoute | None = None
+    l0_semantic_hint: MemorySemanticGateReason | None = None
+    semantic_gate_should_extract: bool | None = None
+    semantic_gate_reason: MemorySemanticGateReason | None = None
+    semantic_gate_contract_violation: bool = False
+    semantic_gate_contract_violation_reason: str | None = None
+    extraction_warning: str | None = None
+    pending_memory_context: PendingMemoryContext | None = None
+    pending_memory_context_source: str | None = None
     signals: list[str] = Field(default_factory=list)
     matched_rule: str | None = None
     matched_span: str | None = None
@@ -219,6 +266,7 @@ class MemoryExtractionAttempt(BaseModel):
     claim_confidences: str | None = None
     invalid_claim_count: int | None = Field(default=None, ge=0)
     invalid_claim_reasons: str | None = None
+    extraction_status: str | None = None
     failure_category: str | None = None
     repair_status: str | None = None
     repair_steps: str | None = None
@@ -470,7 +518,9 @@ class AtomicClaim(BaseModel):
         if self.period_start and self.period_end and self.period_start > self.period_end:
             raise ValueError("period_start cannot be later than period_end")
         if not self.predicate:
-            replacement = self.canonical_predicate or self.custom_predicate
+            # Raw extraction is allowed to carry only the source predicate.
+            # Canonical/custom resolution remains the normalizer's authority.
+            replacement = self.raw_predicate or self.canonical_predicate or self.custom_predicate
             if not replacement:
                 raise ValueError("predicate or canonical/custom predicate is required")
             self.predicate = replacement
@@ -519,8 +569,36 @@ class AtomicClaim(BaseModel):
 class AtomicExtraction(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Optional only for parsing pre-Gate-V2 fixtures and stored diagnostics.
+    # New model calls are instructed to return both fields in the same response.
+    should_extract: bool | None = None
+    gate_reason: MemorySemanticGateReason | None = None
     claims: list[AtomicClaim] = Field(default_factory=list, max_length=12)
     discarded_spans: list[DiscardedSpan] = Field(default_factory=list, max_length=12)
+
+    @model_validator(mode="after")
+    def validate_semantic_gate_contract(self) -> "AtomicExtraction":
+        fields_present = self.should_extract is not None or self.gate_reason is not None
+        if not fields_present:
+            return self
+        if self.should_extract is None or self.gate_reason is None:
+            raise ValueError(
+                "should_extract and gate_reason must be provided together"
+            )
+        negative_reasons = {
+            MemorySemanticGateReason.TRANSIENT,
+            MemorySemanticGateReason.SMALL_TALK,
+            MemorySemanticGateReason.NO_MEMORY,
+        }
+        if self.should_extract and self.gate_reason in negative_reasons:
+            raise ValueError(
+                "should_extract=true requires a memory-positive gate_reason"
+            )
+        if not self.should_extract and self.gate_reason not in negative_reasons:
+            raise ValueError(
+                "should_extract=false requires a non-memory gate_reason"
+            )
+        return self
 
 
 class MemoryItem(MemoryCandidate):
@@ -665,10 +743,31 @@ def normalize_candidate_predicate(candidate: MemoryCandidate) -> MemoryCandidate
         "state_value": normalized.state_value,
     }
     payload = dict(candidate.payload)
+    if normalized.predicate_type == PredicateType.CANONICAL.value:
+        if normalized.canonical_predicate and normalized.canonical_predicate.startswith(
+            "interaction."
+        ):
+            metric = normalized.canonical_predicate.removeprefix("interaction.")
+            payload["metric"] = metric
+        if candidate.kind == MemoryKind.PREFERENCE:
+            preference_hint = payload.get("preference_type_hint")
+            if isinstance(preference_hint, str) and preference_hint.strip():
+                payload["preference_type"] = preference_hint.strip()
     if normalized.state_dimension is not None:
-        payload.setdefault("state_dimension", normalized.state_dimension)
+        lifecycle_dimension = normalize_state_dimension(normalized.state_dimension)
+        lifecycle_value = normalize_state_value(
+            lifecycle_dimension,
+            normalized.state_value,
+        )
+        authoritative_dimension = lifecycle_dimension or normalized.state_dimension
+        authoritative_value = lifecycle_value or normalized.state_value
+        updates["state_dimension"] = authoritative_dimension
+        updates["state_value"] = authoritative_value
+        payload["state_dimension"] = authoritative_dimension
+        if authoritative_value is not None:
+            payload["state_value"] = authoritative_value
     if normalized.state_value is not None:
-        payload["state_value"] = normalized.state_value
+        payload["state_value"] = updates.get("state_value", normalized.state_value)
     if payload != candidate.payload:
         updates["payload"] = payload
     if normalized.predicate_type == PredicateType.CUSTOM.value:
@@ -740,6 +839,25 @@ def _memory_identity_parts(candidate: MemoryCandidate) -> tuple[str, ...]:
         if isinstance(dimension, str) and isinstance(value, str):
             return (kind, subject, "state", dimension, value)
 
+    # ``contact.status`` can legitimately arrive as a legacy stable fact
+    # before lifecycle normalization upgrades it. Its registered state value
+    # must still participate in identity; otherwise opposite contact states
+    # dedupe as SAME and shadow the governed transition. Keep this scoped so
+    # ordinary event/plan identity (including temporal evidence) is unchanged.
+    if (
+        candidate.kind == MemoryKind.STABLE_FACT
+        and predicate.canonical_predicate == "contact.status"
+        and isinstance(predicate.state_dimension, str)
+        and isinstance(predicate.state_value, str)
+    ):
+        return (
+            kind,
+            subject,
+            "state",
+            predicate.state_dimension,
+            predicate.state_value,
+        )
+
     if predicate_name:
         object_value = _canonical_object(
             payload.get("object"),
@@ -807,7 +925,12 @@ def _canonical_object(
 
 
 def _canonical_pattern_state(payload: dict[str, Any]) -> str:
-    raw = payload.get("current") or payload.get("direction") or payload.get("frequency")
+    raw = (
+        payload.get("current")
+        or payload.get("direction")
+        or payload.get("frequency")
+        or payload.get("state_value")
+    )
     normalized = _normalize_key_part(str(raw or "unknown")).replace(" ", "_")
     aliases = {
         "rare": "low",

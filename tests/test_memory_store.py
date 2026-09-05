@@ -579,7 +579,7 @@ async def test_sqlite_migrates_legacy_episode_and_evidence_column(tmp_path: Path
     assert item.kind == MemoryKind.INTERACTION_EVENT
     assert item.evidence_spans == ["周一我们一起参观了科技馆"]
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
         run_columns = {
             row[1]
             for row in connection.execute("PRAGMA table_info(memory_extraction_runs)")

@@ -8,6 +8,13 @@ from loveapp.bootstrap import build_memory_container
 from loveapp.core.config import Settings
 
 
+def test_memory_strong_extraction_defaults_use_bounded_non_thinking_output() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.memory_extraction_strong_max_tokens == 2048
+    assert settings.memory_extraction_strong_thinking == "disabled"
+
+
 async def test_memory_container_keeps_flash_and_strong_budgets_independent() -> None:
     settings = Settings(
         _env_file=None,

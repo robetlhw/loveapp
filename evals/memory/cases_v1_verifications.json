@@ -5,7 +5,9 @@
     "canonical_predicate": "relationship.conflict_status",
     "state_dimension": "relationship.conflict_status",
     "state_value": "resolved",
-    "target_refs": ["conflict_active"],
+    "target_refs": [
+      "conflict_active"
+    ],
     "reason": "Recorded verifier result for the canonical conflict resolution.",
     "evidence_sufficient": true
   },
@@ -15,7 +17,9 @@
     "canonical_predicate": "relationship.conflict_status",
     "state_dimension": "relationship.conflict_status",
     "state_value": "active",
-    "target_refs": ["conflict_resolved_old"],
+    "target_refs": [
+      "conflict_resolved_old"
+    ],
     "reason": "Recorded verifier result for the new current conflict state.",
     "evidence_sufficient": true
   },
@@ -25,7 +29,9 @@
     "canonical_predicate": "relationship.contact_opportunity",
     "state_dimension": "relationship.contact_opportunity",
     "state_value": "moderate",
-    "target_refs": ["contact_opportunity_low"],
+    "target_refs": [
+      "contact_opportunity_low"
+    ],
     "reason": "Recorded verifier result for restored contact opportunity.",
     "evidence_sufficient": true
   },
@@ -35,7 +41,9 @@
     "canonical_predicate": "relationship.stage",
     "state_dimension": "relationship.stage",
     "state_value": "dating",
-    "target_refs": ["stage_acquaintance"],
+    "target_refs": [
+      "stage_acquaintance"
+    ],
     "reason": "Recorded verifier result for the relationship stage transition.",
     "evidence_sufficient": true
   },
@@ -45,7 +53,9 @@
     "canonical_predicate": "preference.food.spiciness",
     "state_dimension": null,
     "state_value": null,
-    "target_refs": ["pref_spicy_old"],
+    "target_refs": [
+      "pref_spicy_old"
+    ],
     "reason": "Recorded verifier result for the explicit preference correction.",
     "evidence_sufficient": true
   },
@@ -55,7 +65,9 @@
     "canonical_predicate": "interaction.initiation_balance",
     "state_dimension": "interaction.initiation_balance",
     "state_value": "user_to_partner",
-    "target_refs": ["initiation_partner_led"],
+    "target_refs": [
+      "initiation_partner_led"
+    ],
     "reason": "Recorded verifier result for the initiation balance transition.",
     "evidence_sufficient": true
   },
@@ -65,7 +77,9 @@
     "canonical_predicate": "relationship.conflict_status",
     "state_dimension": "relationship.conflict_status",
     "state_value": "resolved",
-    "target_refs": ["historical_conflict_active"],
+    "target_refs": [
+      "historical_conflict_active"
+    ],
     "reason": "Recorded verifier result for the history projection case.",
     "evidence_sufficient": true
   },

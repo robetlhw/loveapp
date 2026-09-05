@@ -1,16 +1,20 @@
 from datetime import UTC, datetime
 
+import pytest
+
 from loveapp.application.memory_repair import MemoryResponseError
 from loveapp.application.memory_upgrade import assess_memory_upgrade
 from loveapp.domain.memory import (
     AtomicClaim,
     AtomicExtraction,
+    EvidenceExplicitness,
     MemoryItem,
     MemoryKind,
     MemoryPerspective,
     MemoryStatus,
     MemoryValence,
     MessageRole,
+    PredicateType,
     RelationshipImpact,
     StoredMessage,
     TimeKind,
@@ -142,6 +146,466 @@ def test_opposite_existing_pattern_is_detected_as_conflict() -> None:
     assert decision.should_upgrade is True
     assert decision.reason == "existing_memory_conflict"
     assert "existing_memory_conflict" in decision.signals
+    assert "governed_conflict_local_resolution" not in decision.signals
+
+
+def test_explicit_canonical_relationship_state_conflict_stays_on_flash_path() -> None:
+    existing = _governed_memory(
+        kind=MemoryKind.RELATIONSHIP_STATE,
+        canonical_predicate="relationship.conflict_status",
+        state_dimension="relationship.conflict_status",
+        state_value="active",
+    )
+    text = "昨天已经说开了，现在和好了。"
+    extraction = AtomicExtraction(
+        claims=[
+            _governed_claim(
+                kind=MemoryKind.RELATIONSHIP_STATE,
+                canonical_predicate="relationship.conflict_status",
+                state_dimension="relationship.conflict_status",
+                state_value="resolved",
+                evidence="现在和好了",
+            )
+        ]
+    )
+
+    decision = assess_memory_upgrade(
+        text,
+        existing_memories=[existing],
+        conversation_history=[],
+        extraction=extraction,
+    )
+
+    assert decision.should_upgrade is False
+    assert decision.reason is None
+    assert "existing_memory_conflict" in decision.signals
+    assert "governed_conflict_local_resolution" in decision.signals
+
+
+def test_explicit_canonical_interaction_state_conflict_stays_on_flash_path() -> None:
+    existing = _governed_memory(
+        kind=MemoryKind.INTERACTION_PATTERN,
+        canonical_predicate="interaction.response_engagement",
+        state_dimension="interaction.response_engagement",
+        state_value="unresponsive",
+    )
+    text = "她现在回复已经恢复正常了。"
+    extraction = AtomicExtraction(
+        claims=[
+            _governed_claim(
+                kind=MemoryKind.INTERACTION_PATTERN,
+                canonical_predicate="interaction.response_engagement",
+                state_dimension="interaction.response_engagement",
+                state_value="normal",
+                evidence="回复已经恢复正常了",
+            )
+        ]
+    )
+
+    decision = assess_memory_upgrade(
+        text,
+        existing_memories=[existing],
+        conversation_history=[],
+        extraction=extraction,
+    )
+
+    assert decision.should_upgrade is False
+    assert "governed_conflict_local_resolution" in decision.signals
+
+
+@pytest.mark.parametrize(
+    ("confidence", "explicitness", "evidence", "requires_inference"),
+    [
+        (0.89, EvidenceExplicitness.EXPLICIT, "现在和好了", False),
+        (0.95, EvidenceExplicitness.STRONGLY_IMPLIED, "现在和好了", False),
+        (0.95, EvidenceExplicitness.EXPLICIT, "已经和好了", False),
+        (0.95, EvidenceExplicitness.EXPLICIT, "现在和好了", True),
+    ],
+    ids=[
+        "below-confidence-threshold",
+        "strongly-implied",
+        "evidence-not-in-source",
+        "requires-inference",
+    ],
+)
+def test_weak_governed_conflict_still_upgrades(
+    confidence: float,
+    explicitness: EvidenceExplicitness,
+    evidence: str,
+    requires_inference: bool,
+) -> None:
+    existing = _governed_memory(
+        kind=MemoryKind.RELATIONSHIP_STATE,
+        canonical_predicate="relationship.conflict_status",
+        state_dimension="relationship.conflict_status",
+        state_value="active",
+    )
+    extraction = AtomicExtraction(
+        claims=[
+            _governed_claim(
+                kind=MemoryKind.RELATIONSHIP_STATE,
+                canonical_predicate="relationship.conflict_status",
+                state_dimension="relationship.conflict_status",
+                state_value="resolved",
+                evidence=evidence,
+                confidence=confidence,
+                explicitness=explicitness,
+                requires_inference=requires_inference,
+            )
+        ]
+    )
+
+    decision = assess_memory_upgrade(
+        "昨天已经说开了，现在和好了。",
+        existing_memories=[existing],
+        conversation_history=[],
+        extraction=extraction,
+    )
+
+    assert decision.should_upgrade is True
+    assert decision.reason == "existing_memory_conflict"
+    assert "governed_conflict_local_resolution" not in decision.signals
+
+
+def test_subject_case_does_not_hide_weak_governed_conflict() -> None:
+    existing = _governed_memory(
+        kind=MemoryKind.RELATIONSHIP_STATE,
+        canonical_predicate="relationship.conflict_status",
+        state_dimension="relationship.conflict_status",
+        state_value="active",
+        subject="Relationship",
+    )
+    extraction = AtomicExtraction(
+        claims=[
+            _governed_claim(
+                kind=MemoryKind.RELATIONSHIP_STATE,
+                canonical_predicate="relationship.conflict_status",
+                state_dimension="relationship.conflict_status",
+                state_value="resolved",
+                evidence="现在和好了",
+                explicitness=EvidenceExplicitness.STRONGLY_IMPLIED,
+            )
+        ]
+    )
+
+    decision = assess_memory_upgrade(
+        "昨天已经说开了，现在和好了。",
+        existing_memories=[existing],
+        conversation_history=[],
+        extraction=extraction,
+    )
+
+    assert decision.should_upgrade is True
+    assert decision.reason == "existing_memory_conflict"
+
+
+def test_interaction_subject_alias_conflict_still_upgrades() -> None:
+    existing = _governed_memory(
+        kind=MemoryKind.INTERACTION_PATTERN,
+        canonical_predicate="interaction.response_engagement",
+        state_dimension="interaction.response_engagement",
+        state_value="unresponsive",
+        subject="partner",
+    )
+    extraction = AtomicExtraction(
+        claims=[
+            _governed_claim(
+                kind=MemoryKind.INTERACTION_PATTERN,
+                canonical_predicate="interaction.response_engagement",
+                state_dimension="interaction.response_engagement",
+                state_value="normal",
+                evidence="回复已经恢复正常了",
+            )
+        ]
+    )
+
+    decision = assess_memory_upgrade(
+        "她现在回复已经恢复正常了。",
+        existing_memories=[existing],
+        conversation_history=[],
+        extraction=extraction,
+    )
+
+    assert decision.should_upgrade is True
+    assert decision.reason == "existing_memory_conflict"
+    assert "governed_conflict_local_resolution" not in decision.signals
+
+
+def test_conflict_upgrade_bypasses_general_importance_threshold() -> None:
+    existing = _governed_memory(
+        kind=MemoryKind.INTERACTION_PATTERN,
+        canonical_predicate="interaction.response_engagement",
+        state_dimension="interaction.response_engagement",
+        state_value="unresponsive",
+    )
+    extraction = AtomicExtraction(
+        claims=[
+            _governed_claim(
+                kind=MemoryKind.INTERACTION_PATTERN,
+                canonical_predicate="interaction.response_engagement",
+                state_dimension="interaction.response_engagement",
+                state_value="normal",
+                evidence="回复已经恢复正常了",
+                explicitness=EvidenceExplicitness.STRONGLY_IMPLIED,
+            )
+        ]
+    )
+
+    decision = assess_memory_upgrade(
+        "她现在回复已经恢复正常了。",
+        existing_memories=[existing],
+        conversation_history=[],
+        extraction=extraction,
+        min_importance=5,
+    )
+
+    assert decision.importance == 4
+    assert decision.should_upgrade is True
+    assert decision.reason == "existing_memory_conflict"
+
+
+def test_generic_evidence_cannot_authorize_local_conflict_resolution() -> None:
+    existing = _governed_memory(
+        kind=MemoryKind.RELATIONSHIP_STATE,
+        canonical_predicate="relationship.conflict_status",
+        state_dimension="relationship.conflict_status",
+        state_value="active",
+    )
+    extraction = AtomicExtraction(
+        claims=[
+            _governed_claim(
+                kind=MemoryKind.RELATIONSHIP_STATE,
+                canonical_predicate="relationship.conflict_status",
+                state_dimension="relationship.conflict_status",
+                state_value="resolved",
+                evidence="现在",
+            )
+        ]
+    )
+
+    decision = assess_memory_upgrade(
+        "现在。",
+        existing_memories=[existing],
+        conversation_history=[],
+        extraction=extraction,
+    )
+
+    assert decision.should_upgrade is True
+    assert decision.reason == "existing_memory_conflict"
+    assert "governed_conflict_local_resolution" not in decision.signals
+
+
+def test_custom_predicate_with_governed_state_fields_still_upgrades() -> None:
+    existing = _governed_memory(
+        kind=MemoryKind.RELATIONSHIP_STATE,
+        canonical_predicate="relationship.conflict_status",
+        state_dimension="relationship.conflict_status",
+        state_value="active",
+    )
+    extraction = AtomicExtraction(
+        claims=[
+            _governed_claim(
+                kind=MemoryKind.RELATIONSHIP_STATE,
+                canonical_predicate="relationship.conflict_status",
+                state_dimension="relationship.conflict_status",
+                state_value="resolved",
+                evidence="现在和好了",
+                predicate_type=PredicateType.CUSTOM,
+            )
+        ]
+    )
+
+    decision = assess_memory_upgrade(
+        "昨天已经说开了，现在和好了。",
+        existing_memories=[existing],
+        conversation_history=[],
+        extraction=extraction,
+    )
+
+    assert decision.should_upgrade is True
+    assert decision.reason == "existing_memory_conflict"
+
+
+def test_invalid_governed_state_value_still_upgrades() -> None:
+    existing = _governed_memory(
+        kind=MemoryKind.INTERACTION_PATTERN,
+        canonical_predicate="interaction.response_engagement",
+        state_dimension="interaction.response_engagement",
+        state_value="unresponsive",
+    )
+    extraction = AtomicExtraction(
+        claims=[
+            _governed_claim(
+                kind=MemoryKind.INTERACTION_PATTERN,
+                canonical_predicate="interaction.response_engagement",
+                state_dimension="interaction.response_engagement",
+                state_value="unclear",
+                evidence="回复状态还不明确",
+            )
+        ]
+    )
+
+    decision = assess_memory_upgrade(
+        "她现在回复状态还不明确。",
+        existing_memories=[existing],
+        conversation_history=[],
+        extraction=extraction,
+    )
+
+    assert decision.should_upgrade is True
+    assert decision.reason == "existing_memory_conflict"
+    assert "governed_conflict_local_resolution" not in decision.signals
+
+
+def test_ambiguous_governed_conflict_still_upgrades() -> None:
+    existing = _governed_memory(
+        kind=MemoryKind.INTERACTION_PATTERN,
+        canonical_predicate="interaction.response_engagement",
+        state_dimension="interaction.response_engagement",
+        state_value="unresponsive",
+    )
+    text = "那个现在回复正常了。"
+    extraction = AtomicExtraction(
+        claims=[
+            _governed_claim(
+                kind=MemoryKind.INTERACTION_PATTERN,
+                canonical_predicate="interaction.response_engagement",
+                state_dimension="interaction.response_engagement",
+                state_value="normal",
+                evidence="那个现在回复正常了",
+            )
+        ]
+    )
+    history = [
+        _history_message("ambiguous-1", "她最近不怎么回复我"),
+        _history_message("ambiguous-2", "那个男生倒是经常找她聊天"),
+    ]
+
+    decision = assess_memory_upgrade(
+        text,
+        existing_memories=[existing],
+        conversation_history=history,
+        extraction=extraction,
+    )
+
+    assert decision.should_upgrade is True
+    assert decision.reason == "existing_memory_conflict"
+    assert "ambiguous_reference" in decision.signals
+    assert "governed_conflict_local_resolution" not in decision.signals
+
+
+def test_partial_governed_conflict_still_upgrades() -> None:
+    existing = _governed_memory(
+        kind=MemoryKind.RELATIONSHIP_STATE,
+        canonical_predicate="relationship.conflict_status",
+        state_dimension="relationship.conflict_status",
+        state_value="active",
+    )
+    extraction = AtomicExtraction(
+        claims=[
+            _governed_claim(
+                kind=MemoryKind.RELATIONSHIP_STATE,
+                canonical_predicate="relationship.conflict_status",
+                state_dimension="relationship.conflict_status",
+                state_value="resolved",
+                evidence="现在和好了",
+            )
+        ]
+    )
+
+    decision = assess_memory_upgrade(
+        "昨天已经说开了，现在和好了。",
+        existing_memories=[existing],
+        conversation_history=[],
+        extraction=extraction,
+        partial=True,
+    )
+
+    assert decision.should_upgrade is True
+    assert decision.reason == "existing_memory_conflict"
+
+
+@pytest.mark.parametrize(
+    "perspective",
+    [MemoryPerspective.USER_BELIEF, MemoryPerspective.MODEL_INFERRED],
+)
+def test_non_reported_governed_conflict_still_upgrades(
+    perspective: MemoryPerspective,
+) -> None:
+    existing = _governed_memory(
+        kind=MemoryKind.RELATIONSHIP_STATE,
+        canonical_predicate="relationship.conflict_status",
+        state_dimension="relationship.conflict_status",
+        state_value="active",
+    )
+    extraction = AtomicExtraction(
+        claims=[
+            _governed_claim(
+                kind=MemoryKind.RELATIONSHIP_STATE,
+                canonical_predicate="relationship.conflict_status",
+                state_dimension="relationship.conflict_status",
+                state_value="resolved",
+                evidence="现在和好了",
+                perspective=perspective,
+            )
+        ]
+    )
+
+    decision = assess_memory_upgrade(
+        "昨天已经说开了，现在和好了。",
+        existing_memories=[existing],
+        conversation_history=[],
+        extraction=extraction,
+    )
+
+    assert decision.should_upgrade is True
+    assert decision.reason == "existing_memory_conflict"
+
+
+def test_mixed_governed_conflicts_fail_closed_when_one_claim_is_weak() -> None:
+    existing_conflict = _governed_memory(
+        kind=MemoryKind.RELATIONSHIP_STATE,
+        canonical_predicate="relationship.conflict_status",
+        state_dimension="relationship.conflict_status",
+        state_value="active",
+    )
+    existing_response = _governed_memory(
+        kind=MemoryKind.INTERACTION_PATTERN,
+        canonical_predicate="interaction.response_engagement",
+        state_dimension="interaction.response_engagement",
+        state_value="unresponsive",
+        memory_id="existing-response",
+    )
+    extraction = AtomicExtraction(
+        claims=[
+            _governed_claim(
+                kind=MemoryKind.RELATIONSHIP_STATE,
+                canonical_predicate="relationship.conflict_status",
+                state_dimension="relationship.conflict_status",
+                state_value="resolved",
+                evidence="现在和好了",
+            ),
+            _governed_claim(
+                kind=MemoryKind.INTERACTION_PATTERN,
+                canonical_predicate="interaction.response_engagement",
+                state_dimension="interaction.response_engagement",
+                state_value="normal",
+                evidence="回复也正常了",
+                explicitness=EvidenceExplicitness.STRONGLY_IMPLIED,
+            ),
+        ]
+    )
+
+    decision = assess_memory_upgrade(
+        "现在和好了，回复也正常了。",
+        existing_memories=[existing_conflict, existing_response],
+        conversation_history=[],
+        extraction=extraction,
+    )
+
+    assert decision.should_upgrade is True
+    assert decision.reason == "existing_memory_conflict"
+    assert "governed_conflict_local_resolution" not in decision.signals
 
 
 def test_correction_without_old_context_does_not_force_upgrade() -> None:
@@ -448,14 +912,19 @@ def _memory_item(
     predicate: str,
     summary: str,
     payload: dict[str, str],
+    memory_id: str = "existing-trend",
+    predicate_type: PredicateType = PredicateType.CUSTOM,
+    canonical_predicate: str | None = None,
+    state_dimension: str | None = None,
+    state_value: str | None = None,
 ) -> MemoryItem:
     now = datetime(2026, 7, 18, tzinfo=UTC)
     return MemoryItem(
-        id="existing-trend",
+        id=memory_id,
         user_id="upgrade-test-user",
         relationship_id="partner-1",
         status=MemoryStatus.PROPOSED,
-        dedupe_key="existing-key",
+        dedupe_key=f"existing-key-{memory_id}",
         kind=kind,
         subject=subject,
         summary=summary,
@@ -467,6 +936,105 @@ def _memory_item(
         perspective=MemoryPerspective.USER_REPORTED,
         confidence=0.9,
         payload={"predicate": predicate, **payload},
+        raw_predicate=predicate,
+        predicate_type=predicate_type,
+        canonical_predicate=canonical_predicate,
+        state_dimension=state_dimension,
+        state_value=state_value,
         created_at=now,
         updated_at=now,
+    )
+
+
+def _governed_memory(
+    *,
+    kind: MemoryKind,
+    canonical_predicate: str,
+    state_dimension: str,
+    state_value: str,
+    memory_id: str = "existing-governed-state",
+    subject: str = "relationship",
+) -> MemoryItem:
+    payload = {
+        "state_dimension": state_dimension,
+        "state_value": state_value,
+    }
+    if kind == MemoryKind.INTERACTION_PATTERN:
+        payload.update(
+            {
+                "metric": state_dimension.removeprefix("interaction."),
+                "current": state_value,
+            }
+        )
+    return _memory_item(
+        kind=kind,
+        subject=subject,
+        predicate=canonical_predicate,
+        summary=f"当前状态为 {state_value}",
+        payload=payload,
+        memory_id=memory_id,
+        predicate_type=PredicateType.CANONICAL,
+        canonical_predicate=canonical_predicate,
+        state_dimension=state_dimension,
+        state_value=state_value,
+    )
+
+
+def _governed_claim(
+    *,
+    kind: MemoryKind,
+    canonical_predicate: str,
+    state_dimension: str,
+    state_value: str,
+    evidence: str,
+    confidence: float = 0.95,
+    explicitness: EvidenceExplicitness = EvidenceExplicitness.EXPLICIT,
+    predicate_type: PredicateType = PredicateType.CANONICAL,
+    perspective: MemoryPerspective = MemoryPerspective.USER_REPORTED,
+    requires_inference: bool = False,
+) -> AtomicClaim:
+    payload = {
+        "state_dimension": state_dimension,
+        "state_value": state_value,
+    }
+    if kind == MemoryKind.INTERACTION_PATTERN:
+        payload.update(
+            {
+                "metric": state_dimension.removeprefix("interaction."),
+                "current": state_value,
+            }
+        )
+    return AtomicClaim(
+        claim_id=f"incoming-{state_dimension}-{state_value}",
+        kind=kind,
+        subject="relationship",
+        predicate=canonical_predicate,
+        summary=f"当前状态为 {state_value}",
+        evidence_spans=[evidence],
+        confidence=confidence,
+        perspective=perspective,
+        raw_predicate=canonical_predicate,
+        predicate_type=predicate_type,
+        canonical_predicate=(
+            canonical_predicate if predicate_type == PredicateType.CANONICAL else None
+        ),
+        custom_predicate=(
+            canonical_predicate if predicate_type == PredicateType.CUSTOM else None
+        ),
+        state_dimension=state_dimension,
+        state_value=state_value,
+        explicitness=explicitness,
+        requires_inference=requires_inference,
+        payload=payload,
+    )
+
+
+def _history_message(message_id: str, content: str) -> StoredMessage:
+    return StoredMessage(
+        id=message_id,
+        conversation_id="upgrade-conversation",
+        user_id="upgrade-test-user",
+        relationship_id="partner-1",
+        role=MessageRole.USER,
+        content=content,
     )

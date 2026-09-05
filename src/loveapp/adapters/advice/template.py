@@ -10,7 +10,7 @@ from loveapp.domain.enums import AdviceScenario, RiskLevel
 from loveapp.domain.knowledge import RetrievedDocument
 from loveapp.domain.memory import StoredMessage
 from loveapp.domain.policy import ResolvedScenarioPolicy
-from loveapp.ports.advice import AdviceStreamCallback
+from loveapp.ports.advice import AdviceAttemptCallback, AdviceStreamCallback
 
 
 class TemplateAdviceComposer:
@@ -25,8 +25,10 @@ class TemplateAdviceComposer:
         conversation_history: list[StoredMessage],
         policy: ResolvedScenarioPolicy,
         stream_callback: AdviceStreamCallback | None = None,
+        attempt_callback: AdviceAttemptCallback | None = None,
+        trace: object | None = None,
     ) -> AdviceResponse:
-        del context, conversation_history  # Reserved for the model-backed composer.
+        del context, conversation_history, stream_callback, attempt_callback, trace
 
         if not documents:
             response = AdviceResponse(
@@ -44,7 +46,6 @@ class TemplateAdviceComposer:
                 recommended_actions=["先补充事实、双方反应和你的目标，不急于采取激进行动。"],
                 avoid_actions=["仅凭猜测给对方下结论。"],
             )
-            _emit_response(response, stream_callback)
             return response
 
         top_documents = documents[: policy.total_document_limit]
@@ -90,7 +91,6 @@ class TemplateAdviceComposer:
                 for match in top_documents
             ],
         )
-        _emit_response(response, stream_callback)
         return response
 
 
@@ -126,25 +126,3 @@ def _scenario_document_risk(
         key=_risk_order,
         default=RiskLevel.NORMAL,
     )
-
-
-def _emit_response(
-    response: AdviceResponse,
-    callback: AdviceStreamCallback | None,
-) -> None:
-    if callback is None:
-        return
-    from loveapp.domain.advice import AdviceStreamEvent
-
-    callback(AdviceStreamEvent(field="problem_summary", text=response.problem_summary))
-    callback(AdviceStreamEvent(field="assessment", text=response.assessment))
-    for field in (
-        "clarifying_questions",
-        "recommended_actions",
-        "sample_phrases",
-        "alternatives",
-        "avoid_actions",
-        "risk_notes",
-    ):
-        for index, value in enumerate(getattr(response, field)):
-            callback(AdviceStreamEvent(field=field, text=value, index=index))

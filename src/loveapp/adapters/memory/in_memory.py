@@ -2,7 +2,15 @@ from collections.abc import Callable
 from datetime import datetime
 from uuid import uuid4
 
-from loveapp.domain.advice import RelationshipContext
+from loveapp.domain.advice import (
+    MAX_ADVICE_GENERATIONS,
+    AdviceGenerationAttempt,
+    AdviceGenerationAttemptRecord,
+    AdviceLogicalTurn,
+    AdviceLogicalTurnStatus,
+    AdviceTurnClaimError,
+    RelationshipContext,
+)
 from loveapp.domain.contextual_memory import apply_contextual_memory_update
 from loveapp.domain.memory import (
     AdmissionDecision,
@@ -45,6 +53,8 @@ class InMemoryMemoryStore:
         self._extraction_runs: dict[str, MemoryExtractionRun] = {}
         self._transition_audits: dict[str, MemoryTransitionAudit] = {}
         self._relationship_plans: dict[str, RelationshipPlan] = {}
+        self._advice_logical_turns: dict[str, AdviceLogicalTurn] = {}
+        self._advice_generation_attempts: dict[str, AdviceGenerationAttemptRecord] = {}
 
     def set_clock(self, clock: Callable[[], datetime]) -> None:
         self._clock = clock
@@ -57,9 +67,29 @@ class InMemoryMemoryStore:
         role: MessageRole,
         content: str,
         conversation_id: str | None = None,
+        message_id: str | None = None,
     ) -> StoredMessage:
+        if message_id is not None and message_id in self._messages:
+            existing = self._messages[message_id]
+            expected = (
+                user_id,
+                relationship_id,
+                conversation_id or existing.conversation_id,
+                role,
+                content,
+            )
+            actual = (
+                existing.user_id,
+                existing.relationship_id,
+                existing.conversation_id,
+                existing.role,
+                existing.content,
+            )
+            if actual != expected:
+                raise ValueError("message_id belongs to different message content or scope")
+            return existing.model_copy(deep=True)
         message = StoredMessage(
-            id=str(uuid4()),
+            id=message_id or str(uuid4()),
             conversation_id=conversation_id or str(uuid4()),
             user_id=user_id,
             relationship_id=relationship_id,
@@ -69,6 +99,307 @@ class InMemoryMemoryStore:
         )
         self._messages[message.id] = message
         return message.model_copy(deep=True)
+
+    async def create_advice_logical_turn(
+        self,
+        turn: AdviceLogicalTurn,
+        *,
+        reject_existing: bool = False,
+    ) -> AdviceLogicalTurn:
+        turn.assert_initial_state()
+        message = self._messages.get(turn.user_message_id)
+        if message is None:
+            raise ValueError("logical turn user message does not exist")
+        if (
+            message.user_id,
+            message.relationship_id,
+            message.conversation_id,
+            message.role,
+            message.content,
+        ) != (
+            turn.user_id,
+            turn.relationship_id,
+            turn.conversation_id,
+            MessageRole.USER,
+            turn.query,
+        ):
+            raise ValueError("logical turn user message content or scope mismatch")
+        existing = self._advice_logical_turns.get(turn.id)
+        if existing is not None:
+            if (
+                existing.user_id,
+                existing.relationship_id,
+                existing.conversation_id,
+                existing.user_message_id,
+                existing.query,
+                existing.request_payload,
+            ) != (
+                turn.user_id,
+                turn.relationship_id,
+                turn.conversation_id,
+                turn.user_message_id,
+                turn.query,
+                turn.request_payload,
+            ):
+                raise ValueError("logical_turn_id belongs to different content or scope")
+            if reject_existing:
+                raise AdviceTurnClaimError(
+                    "logical turn is already owned by another generation"
+                )
+            return existing.model_copy(deep=True)
+        if any(
+            item.user_message_id == turn.user_message_id
+            for item in self._advice_logical_turns.values()
+        ):
+            raise ValueError("user_message_id already belongs to another logical turn")
+        self._advice_logical_turns[turn.id] = turn.model_copy(deep=True)
+        return turn.model_copy(deep=True)
+
+    async def get_advice_logical_turn(
+        self,
+        logical_turn_id: str,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+    ) -> AdviceLogicalTurn | None:
+        turn = self._advice_logical_turns.get(logical_turn_id)
+        if turn is not None and not turn.is_in_scope(
+            user_id=user_id,
+            relationship_id=relationship_id,
+            conversation_id=conversation_id,
+        ):
+            return None
+        return turn.model_copy(deep=True) if turn is not None else None
+
+    async def latest_retryable_advice_turn(
+        self,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+    ) -> AdviceLogicalTurn | None:
+        candidates = [
+            turn
+            for turn in self._advice_logical_turns.values()
+            if turn.user_id == user_id
+            and turn.relationship_id == relationship_id
+            and turn.conversation_id == conversation_id
+            and turn.status == AdviceLogicalTurnStatus.GENERATION_FAILED
+            and turn.generation_count < MAX_ADVICE_GENERATIONS
+        ]
+        turn = max(candidates, key=lambda item: item.updated_at, default=None)
+        return turn.model_copy(deep=True) if turn is not None else None
+
+    async def begin_advice_generation(
+        self,
+        logical_turn_id: str,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+        retry: bool,
+    ) -> AdviceLogicalTurn:
+        turn = self._advice_logical_turns.get(logical_turn_id)
+        if turn is None:
+            raise ValueError("logical turn does not exist")
+        _require_advice_turn_scope(
+            turn,
+            user_id=user_id,
+            relationship_id=relationship_id,
+            conversation_id=conversation_id,
+        )
+        expected = (
+            AdviceLogicalTurnStatus.GENERATION_FAILED
+            if retry
+            else AdviceLogicalTurnStatus.MEMORY_STARTED
+        )
+        if turn.status != expected:
+            raise AdviceTurnClaimError("logical turn is not eligible for generation")
+        if turn.generation_count >= MAX_ADVICE_GENERATIONS:
+            raise AdviceTurnClaimError("logical turn generation limit reached")
+        updated = turn.transition(
+            status=AdviceLogicalTurnStatus.GENERATION_IN_PROGRESS,
+            generation_count=turn.generation_count + 1,
+            updated_at=self._clock(),
+            last_error_type=None,
+            fallback_used=False,
+        )
+        self._advice_logical_turns[turn.id] = updated
+        return updated.model_copy(deep=True)
+
+    async def save_advice_generation_attempts(
+        self,
+        logical_turn_id: str,
+        generation_no: int,
+        attempts: list[AdviceGenerationAttempt],
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+    ) -> list[AdviceGenerationAttemptRecord]:
+        turn = self._advice_logical_turns.get(logical_turn_id)
+        if turn is None:
+            raise ValueError("logical turn does not exist")
+        _require_advice_turn_scope(
+            turn,
+            user_id=user_id,
+            relationship_id=relationship_id,
+            conversation_id=conversation_id,
+        )
+        if (
+            turn.status != AdviceLogicalTurnStatus.GENERATION_IN_PROGRESS
+            or generation_no != turn.generation_count
+        ):
+            raise ValueError("generation attempts do not belong to active generation")
+        saved: list[AdviceGenerationAttemptRecord] = []
+        for attempt in attempts:
+            existing = next(
+                (
+                    item
+                    for item in self._advice_generation_attempts.values()
+                    if item.logical_turn_id == logical_turn_id
+                    and item.generation_no == generation_no
+                    and item.attempt.attempt == attempt.attempt
+                ),
+                None,
+            )
+            if existing is not None:
+                if existing.attempt != attempt:
+                    raise ValueError("generation attempt identity collision")
+                saved.append(existing.model_copy(deep=True))
+                continue
+            record = AdviceGenerationAttemptRecord(
+                id=str(uuid4()),
+                logical_turn_id=logical_turn_id,
+                generation_no=generation_no,
+                attempt=attempt,
+                created_at=self._clock(),
+            )
+            self._advice_generation_attempts[record.id] = record
+            saved.append(record.model_copy(deep=True))
+        return saved
+
+    async def fail_advice_logical_turn(
+        self,
+        logical_turn_id: str,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+        last_error_type: str | None = None,
+        fallback_used: bool = False,
+    ) -> AdviceLogicalTurn | None:
+        turn = self._advice_logical_turns.get(logical_turn_id)
+        if turn is None:
+            return None
+        _require_advice_turn_scope(
+            turn,
+            user_id=user_id,
+            relationship_id=relationship_id,
+            conversation_id=conversation_id,
+        )
+        if turn.status not in {
+            AdviceLogicalTurnStatus.MEMORY_STARTED,
+            AdviceLogicalTurnStatus.GENERATION_IN_PROGRESS,
+        }:
+            raise ValueError("logical turn cannot fail from its current state")
+        if not last_error_type:
+            raise ValueError("failed logical turn requires last_error_type")
+        now = self._clock()
+        updated = turn.transition(
+            status=AdviceLogicalTurnStatus.GENERATION_FAILED,
+            last_error_type=last_error_type,
+            fallback_used=fallback_used,
+            updated_at=now,
+            completed_at=None,
+        )
+        self._advice_logical_turns[turn.id] = updated
+        return updated.model_copy(deep=True)
+
+    async def complete_advice_logical_turn(
+        self,
+        logical_turn_id: str,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+        message_id: str,
+        content: str,
+    ) -> tuple[AdviceLogicalTurn, StoredMessage]:
+        turn = self._advice_logical_turns.get(logical_turn_id)
+        if turn is None:
+            raise ValueError("logical turn does not exist")
+        _require_advice_turn_scope(
+            turn,
+            user_id=user_id,
+            relationship_id=relationship_id,
+            conversation_id=conversation_id,
+        )
+        if turn.status == AdviceLogicalTurnStatus.COMPLETED:
+            if turn.assistant_message_id != message_id:
+                raise ValueError("logical turn already completed with another message")
+            existing = self._messages.get(message_id)
+            if existing is None or (
+                existing.user_id,
+                existing.relationship_id,
+                existing.conversation_id,
+                existing.role,
+                existing.content,
+            ) != (
+                turn.user_id,
+                turn.relationship_id,
+                turn.conversation_id,
+                MessageRole.ASSISTANT,
+                content,
+            ):
+                raise ValueError("assistant message identity collision")
+            return turn.model_copy(deep=True), existing.model_copy(deep=True)
+        if turn.status != AdviceLogicalTurnStatus.GENERATION_IN_PROGRESS:
+            raise ValueError("logical turn is not eligible for completion")
+        message = await self.add_message(
+            user_id=turn.user_id,
+            relationship_id=turn.relationship_id,
+            conversation_id=turn.conversation_id,
+            role=MessageRole.ASSISTANT,
+            content=content,
+            message_id=message_id,
+        )
+        now = self._clock()
+        completed = turn.transition(
+            status=AdviceLogicalTurnStatus.COMPLETED,
+            assistant_message_id=message.id,
+            last_error_type=None,
+            fallback_used=False,
+            updated_at=now,
+            completed_at=now,
+        )
+        self._advice_logical_turns[turn.id] = completed
+        return completed.model_copy(deep=True), message
+
+    async def list_advice_generation_attempts(
+        self,
+        logical_turn_id: str,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+    ) -> list[AdviceGenerationAttemptRecord]:
+        turn = self._advice_logical_turns.get(logical_turn_id)
+        if turn is not None:
+            _require_advice_turn_scope(
+                turn,
+                user_id=user_id,
+                relationship_id=relationship_id,
+                conversation_id=conversation_id,
+            )
+        attempts = [
+            item
+            for item in self._advice_generation_attempts.values()
+            if item.logical_turn_id == logical_turn_id
+        ]
+        attempts.sort(key=lambda item: (item.generation_no, item.attempt.attempt))
+        return [item.model_copy(deep=True) for item in attempts]
 
     async def list_messages(
         self,
@@ -589,6 +920,21 @@ class InMemoryMemoryStore:
         ]
         for run_id in run_ids:
             del self._extraction_runs[run_id]
+        turn_ids = [
+            turn.id
+            for turn in self._advice_logical_turns.values()
+            if turn.user_id == user_id
+            and (relationship_id is None or turn.relationship_id == relationship_id)
+        ]
+        for turn_id in turn_ids:
+            del self._advice_logical_turns[turn_id]
+        attempt_ids = [
+            attempt_id
+            for attempt_id, attempt in self._advice_generation_attempts.items()
+            if attempt.logical_turn_id in set(turn_ids)
+        ]
+        for attempt_id in attempt_ids:
+            del self._advice_generation_attempts[attempt_id]
         return len(ids)
 
     async def reset_relationship_scope(
@@ -605,6 +951,7 @@ class InMemoryMemoryStore:
             self._extraction_runs,
             self._transition_audits,
             self._relationship_plans,
+            self._advice_logical_turns,
         ):
             scoped_ids = [
                 item_id
@@ -613,6 +960,13 @@ class InMemoryMemoryStore:
             ]
             for item_id in scoped_ids:
                 del collection[item_id]
+        attempt_ids = [
+            attempt_id
+            for attempt_id, attempt in self._advice_generation_attempts.items()
+            if attempt.logical_turn_id not in self._advice_logical_turns
+        ]
+        for attempt_id in attempt_ids:
+            del self._advice_generation_attempts[attempt_id]
 
     async def get_relationship_context(
         self,
@@ -1021,6 +1375,21 @@ def _memory_keeper_rank(item: MemoryItem) -> tuple[int, int, float, object]:
         item.confidence,
         item.updated_at,
     )
+
+
+def _require_advice_turn_scope(
+    turn: AdviceLogicalTurn,
+    *,
+    user_id: str,
+    relationship_id: str,
+    conversation_id: str,
+) -> None:
+    if not turn.is_in_scope(
+        user_id=user_id,
+        relationship_id=relationship_id,
+        conversation_id=conversation_id,
+    ):
+        raise ValueError("logical turn belongs to different scope")
 
 
 def _explicitness_rank(value) -> int:

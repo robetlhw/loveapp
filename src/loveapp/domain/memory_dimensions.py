@@ -520,7 +520,11 @@ def normalize_interaction_pattern_payload(
         ),
         None,
     )
-    if state is None:
+    # A canonical interaction declaration is allowed to preserve an omitted
+    # state value.  Do not manufacture a current state from evidence on that
+    # surface; aliases and model hints still use the bounded inference path.
+    canonical_surface = _is_canonical_interaction_surface(predicate, metric)
+    if state is None and not canonical_surface:
         state = infer_initiation_balance(evidence_text)
     if state is not None:
         normalized["current"] = state
@@ -531,6 +535,12 @@ def normalize_interaction_pattern_payload(
     if raw_key in _CADENCE_VALUES:
         normalized.setdefault("frequency", raw_key)
     return normalized
+
+
+def _is_canonical_interaction_surface(predicate: object, metric: str) -> bool:
+    if not isinstance(predicate, str):
+        return False
+    return _normalize_identifier(predicate) == f"interaction.{metric}"
 
 
 def normalize_interaction_state_value(
@@ -589,7 +599,7 @@ def interaction_pattern_state(
 ) -> str | None:
     canonical_metric = normalize_interaction_metric(metric)
     if canonical_metric == "initiation_balance":
-        for key in ("current", "direction"):
+        for key in ("current", "direction", "state_value"):
             value = normalize_interaction_state_value(
                 canonical_metric,
                 payload.get(key),
@@ -597,7 +607,7 @@ def interaction_pattern_state(
             if value is not None:
                 return value
         return None
-    for key in ("current", "direction", "frequency"):
+    for key in ("current", "direction", "frequency", "state_value"):
         value = normalize_interaction_state_value(canonical_metric, payload.get(key))
         if value is not None:
             return value

@@ -22,6 +22,7 @@ from loveapp.application.conversation_flow import (
 )
 from loveapp.application.date_planning.clause_parsing import split_date_clauses
 from loveapp.application.date_planning.plan_diff import diff_date_plans
+from loveapp.application.memory_gate import build_pending_memory_context
 from loveapp.application.routing import extract_date_plan_slots
 from loveapp.application.runtime_context import RuntimeContextBuilder
 from loveapp.core.timing import ExecutionTrace
@@ -43,13 +44,14 @@ from loveapp.domain.enums import (
     DatePlanningStatus,
     DateTaskIntent,
     PlaceCategory,
+    RelationshipStage,
     RiskLevel,
     TaskType,
     TransportMode,
 )
 from loveapp.domain.memory import MessageRole, RememberResult, StoredMessage, utc_now
 from loveapp.domain.routing import DatePlanSlots, RouteInput, RouteResult
-from loveapp.domain.runtime_context import RuntimeContext
+from loveapp.domain.runtime_context import PendingMemoryContext, RuntimeContext
 from loveapp.ports.advice import AdviceStreamCallback
 from loveapp.ports.conversation_states import ConversationFlowStateStore
 from loveapp.ports.date_tasks import DatePlanningTaskStore
@@ -106,6 +108,8 @@ class ConversationAgent:
         trace: ExecutionTrace | None = None,
         stream_callback: AdviceStreamCallback | None = None,
     ) -> ConversationTurnResult:
+        if request.retry_advice and request.advice_logical_turn_id is None:
+            raise ValueError("重试建议时必须指定 logical turn。")
         if request.conversation_id is None:
             request = request.model_copy(update={"conversation_id": str(uuid4())})
         trace = trace or ExecutionTrace()
@@ -144,6 +148,44 @@ class ConversationAgent:
             date_task_state=state.get("date_task_state"),
             memory_result=memory_result,
             timings=trace.snapshot(),
+            advice_logical_turn_id=(
+                advice_turn.logical_turn_id if advice_turn is not None else None
+            ),
+        )
+
+    async def retry_last_failed_advice(
+        self,
+        *,
+        user_id: str,
+        relationship_id: str,
+        conversation_id: str,
+        trace: ExecutionTrace | None = None,
+        stream_callback: AdviceStreamCallback | None = None,
+    ) -> ConversationTurnResult:
+        turn = await self._memory_service.latest_retryable_advice_turn(
+            user_id=user_id,
+            relationship_id=relationship_id,
+            conversation_id=conversation_id,
+        )
+        if turn is None:
+            raise ValueError("当前会话没有可重试的建议回答。")
+        relationship_stage = turn.request_payload.get(
+            "relationship_stage",
+            RelationshipStage.UNKNOWN.value,
+        )
+        return await self.chat(
+            ConversationRequest(
+                user_id=user_id,
+                relationship_id=relationship_id,
+                conversation_id=conversation_id,
+                query=turn.query,
+                relationship_stage=relationship_stage,
+                active_task=TaskType.RELATIONSHIP_ADVICE,
+                advice_logical_turn_id=turn.id,
+                retry_advice=True,
+            ),
+            trace=trace,
+            stream_callback=stream_callback,
         )
 
     def _build_graph(self):
@@ -186,6 +228,24 @@ class ConversationAgent:
     async def _load_history(self, state: ConversationState) -> dict:
         with state["trace"].measure("history_load"):
             request = state["request"]
+            retry_turn = None
+            if request.retry_advice:
+                retry_turn = await self._memory_service.get_advice_logical_turn(
+                    request.advice_logical_turn_id or "",
+                    user_id=request.user_id,
+                    relationship_id=request.relationship_id,
+                    conversation_id=request.conversation_id,
+                )
+                if retry_turn is None or (
+                    retry_turn.user_id,
+                    retry_turn.relationship_id,
+                    retry_turn.conversation_id,
+                ) != (
+                    request.user_id,
+                    request.relationship_id,
+                    request.conversation_id,
+                ):
+                    raise ValueError("建议轮次与当前用户、关系或会话不匹配。")
             with state["trace"].measure("memory_sidecar_sync") as details:
                 details["pending_after_wait"] = await self._memory_service.wait_for_scope(
                     user_id=request.user_id,
@@ -200,6 +260,9 @@ class ConversationAgent:
                 request.user_id,
                 request.relationship_id,
                 request.conversation_id,
+                exclude_message_id=(
+                    retry_turn.user_message_id if retry_turn is not None else None
+                ),
             )
             date_task_state = await self._date_task_store.get(
                 user_id=request.user_id,
@@ -298,6 +361,7 @@ class ConversationAgent:
                 request,
                 active_task=request.active_task or flow_state.active_task,
                 date_task_state=date_task_state,
+                pending_memory_context=flow_state.pending_memory_context,
                 trace=state["trace"],
             )
             return {
@@ -313,9 +377,13 @@ class ConversationAgent:
             flow_state = state["flow_state"]
             active_task = request.active_task or flow_state.active_task
             forced_task = (
-                flow_state.pending_task
-                if is_pending_continuation(request.query, flow_state.pending_task)
-                else None
+                TaskType.RELATIONSHIP_ADVICE
+                if request.retry_advice
+                else (
+                    flow_state.pending_task
+                    if is_pending_continuation(request.query, flow_state.pending_task)
+                    else None
+                )
             )
             route = await self._router.route(
                 RouteInput(
@@ -471,24 +539,45 @@ class ConversationAgent:
     async def _relationship_advice(self, state: ConversationState) -> dict:
         request = state["request"]
         route = state["route"]
-        advice_turn = await self._advice_agent.advise_turn(
-            AdviceRequest(
+        advice_request = AdviceRequest(
+            user_id=request.user_id,
+            relationship_id=request.relationship_id,
+            conversation_id=request.conversation_id,
+            query=request.query,
+            relationship_stage=request.relationship_stage,
+            goal=route.primary_goal,
+            secondary_goals=route.secondary_goals,
+            scenario=route.primary_scenario or AdviceScenario.RELATIONSHIP_MAINTENANCE,
+            secondary_scenarios=route.secondary_scenarios,
+            forced_risk_level=(
+                route.risk_level
+                if route.risk_level in {RiskLevel.HIGH, RiskLevel.SENSITIVE}
+                else None
+            ),
+            forced_risk_reasons=route.risk_reasons,
+            logical_turn_id=request.advice_logical_turn_id,
+            retry_generation=request.retry_advice,
+            pending_memory_context=state["runtime_context"].pending_memory_context,
+        )
+        if request.retry_advice:
+            turn = await self._memory_service.get_advice_logical_turn(
+                request.advice_logical_turn_id or "",
                 user_id=request.user_id,
                 relationship_id=request.relationship_id,
                 conversation_id=request.conversation_id,
-                query=request.query,
-                relationship_stage=request.relationship_stage,
-                goal=route.primary_goal,
-                secondary_goals=route.secondary_goals,
-                scenario=route.primary_scenario or AdviceScenario.RELATIONSHIP_MAINTENANCE,
-                secondary_scenarios=route.secondary_scenarios,
-                forced_risk_level=(
-                    route.risk_level
-                    if route.risk_level in {RiskLevel.HIGH, RiskLevel.SENSITIVE}
-                    else None
-                ),
-                forced_risk_reasons=route.risk_reasons,
-            ),
+            )
+            if turn is None:
+                raise ValueError("没有找到可重试的建议轮次。")
+            advice_request = AdviceRequest.model_validate(turn.request_payload).model_copy(
+                update={
+                    "forced_risk_level": advice_request.forced_risk_level,
+                    "forced_risk_reasons": advice_request.forced_risk_reasons,
+                    "logical_turn_id": turn.id,
+                    "retry_generation": True,
+                }
+            )
+        advice_turn = await self._advice_agent.advise_turn(
+            advice_request,
             trace=state["trace"],
             stream_callback=state.get("stream_callback"),
             wait_for_memory=False,
@@ -728,7 +817,40 @@ class ConversationAgent:
 
     async def _finalize_flow(self, state: ConversationState) -> dict:
         request = state["request"]
+        advice_turn = state.get("advice_turn")
+        if advice_turn is not None and any(
+            attempt.fallback_used for attempt in advice_turn.generation_attempts
+        ):
+            pending = _age_pending_memory_context(
+                state["flow_state"].pending_memory_context
+            )
+            flow = state["flow_state"].model_copy(
+                update={"pending_memory_context": pending, "updated_at": utc_now()}
+            )
+            saved = await self._save_conversation_flow_state(flow, state["trace"])
+            return {"flow_state": saved, "follow_up_prompt": None}
         flow = advance_conversation_flow(state["flow_state"], state["route"])
+        pending_memory_context = None
+        if (
+            advice_turn is not None
+            and state["route"].risk_level == RiskLevel.NORMAL
+            and state["route"].task_type == TaskType.RELATIONSHIP_ADVICE
+        ):
+            pending_memory_context = build_pending_memory_context(
+                advice_turn.response.clarifying_questions,
+                created_turn=(
+                    advice_turn.logical_turn_id
+                    or request.advice_logical_turn_id
+                    or f"conversation:{request.conversation_id}"
+                ),
+                previous_context=state["flow_state"].pending_memory_context,
+            )
+        flow = flow.model_copy(
+            update={
+                "pending_memory_context": pending_memory_context,
+                "updated_at": utc_now(),
+            }
+        )
         saved = await self._save_conversation_flow_state(flow, state["trace"])
         follow_up_prompt = None
         if (
@@ -758,6 +880,7 @@ class ConversationAgent:
             active_task=(
                 state["route"].task_type if state.get("route") is not None else request.active_task
             ),
+            pending_memory_context=state["runtime_context"].pending_memory_context,
         )
         return {"current_message": message, "memory_task": memory_task}
 
@@ -1313,6 +1436,16 @@ def _memory_result_from_state(state: ConversationState) -> RememberResult | None
         return task.result()
     except BaseException as exc:
         return RememberResult(message=message, extraction_error=str(exc))
+
+
+def _age_pending_memory_context(
+    pending: PendingMemoryContext | None,
+) -> PendingMemoryContext | None:
+    if pending is None or pending.expires_after_turns <= 1:
+        return None
+    return pending.model_copy(
+        update={"expires_after_turns": pending.expires_after_turns - 1}
+    )
 
 
 def _next_active_task(

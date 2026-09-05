@@ -184,7 +184,7 @@ async def test_active_resolved_active_conflict_again_preserves_history() -> None
     current_conflict_ids = {
         item.id
         for item in context.remembered_items
-        if item.state_dimension == "relationship.conflict_status"
+        if item.state_dimension == "conflict_status"
     }
 
     assert first_active is not None

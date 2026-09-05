@@ -3,10 +3,26 @@
 import re
 from dataclasses import dataclass
 
-from loveapp.domain.memory import AtomicExtraction, MemoryItem, MemoryKind, StoredMessage
+from loveapp.domain.memory import (
+    AtomicClaim,
+    AtomicExtraction,
+    EvidenceExplicitness,
+    MemoryCandidate,
+    MemoryItem,
+    MemoryKind,
+    MemoryPerspective,
+    PredicateType,
+    StoredMessage,
+    normalize_candidate_predicate,
+)
 from loveapp.domain.memory_dimensions import (
     covered_claim_dimensions,
     detect_evidence_dimensions,
+    is_relationship_interaction_subject,
+)
+from loveapp.domain.memory_lifecycle import (
+    governed_state_identity,
+    governed_state_value,
 )
 
 from .memory_repair import MemoryResponseError
@@ -18,6 +34,37 @@ class MemoryUpgradeDecision:
     reason: str | None = None
     importance: int = 1
     signals: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _ExistingConflict:
+    claim: AtomicClaim
+    governed: bool
+    local_subject_match: bool
+
+
+_LOCAL_GOVERNED_CONFLICT_MIN_CONFIDENCE = 0.9
+_GENERIC_STATE_EVIDENCE = frozenset(
+    {
+        "现在",
+        "目前",
+        "最近",
+        "这次",
+        "这样",
+        "这种情况",
+        "已经",
+        "还是",
+        "仍然",
+        "又",
+        "再次",
+        "我",
+        "我们",
+        "她",
+        "他",
+        "对方",
+        "双方",
+    }
+)
 
 
 # These are durable relationship facts where a wrong extraction is more costly
@@ -94,28 +141,44 @@ def assess_memory_upgrade(
     ) > 1:
         signals.append("multi_dimension_atomicity_failure")
 
-    if _has_ambiguous_reference(text, conversation_history):
+    ambiguous_reference = _has_ambiguous_reference(text, conversation_history)
+    if ambiguous_reference:
         signals.append("ambiguous_reference")
         importance = max(importance, 4)
 
     explicit_correction = "explicit_correction" in signals
     existing_conflict = explicit_correction and bool(existing_memories)
+    governed_conflict_local_resolution = False
     coverage_gap = False
     if extraction is not None and _has_claim_coverage_gap(text, extraction):
         coverage_gap = True
         signals.append("claim_coverage_gap")
     if partial:
         signals.append("partial_claim_validation")
-    if extraction is not None and _has_existing_conflict(extraction, existing_memories):
-        existing_conflict = True
-        importance = max(importance, 4)
-        if "existing_memory_conflict" not in signals:
-            signals.append("existing_memory_conflict")
+    if extraction is not None:
+        conflicts = _existing_conflicts(extraction, existing_memories)
+        if conflicts:
+            existing_conflict = True
+            importance = max(importance, 4)
+            governed_conflict_local_resolution = (
+                _can_resolve_governed_conflicts_locally(
+                    conflicts,
+                    source_text=text,
+                    partial=partial,
+                    ambiguous_reference=ambiguous_reference,
+                )
+            )
     if existing_conflict:
         signals.append("existing_memory_conflict")
+    if governed_conflict_local_resolution:
+        signals.append("governed_conflict_local_resolution")
+
+    conflict_requires_upgrade = (
+        existing_conflict and not governed_conflict_local_resolution
+    )
 
     if failure is not None:
-        if importance < min_importance:
+        if importance < min_importance and not conflict_requires_upgrade:
             return MemoryUpgradeDecision(
                 should_upgrade=False,
                 reason=None,
@@ -132,6 +195,7 @@ def assess_memory_upgrade(
             "json_syntax",
             "root_shape",
             "schema_validation",
+            "semantic_gate_contract",
             "unsupported_enum",
             "missing_temporal_anchor",
         }:
@@ -141,7 +205,11 @@ def assess_memory_upgrade(
                 importance=importance,
                 signals=tuple(dict.fromkeys(signals)),
             )
-        reason = "existing_memory_conflict" if existing_conflict else "semantic_uncertainty"
+        reason = (
+            "existing_memory_conflict"
+            if conflict_requires_upgrade
+            else "semantic_uncertainty"
+        )
         return MemoryUpgradeDecision(
             should_upgrade=True,
             reason=reason,
@@ -149,7 +217,9 @@ def assess_memory_upgrade(
             signals=tuple(dict.fromkeys(signals)),
         )
 
-    if extraction is None or importance < min_importance:
+    if extraction is None or (
+        importance < min_importance and not conflict_requires_upgrade
+    ):
         return MemoryUpgradeDecision(
             should_upgrade=False,
             importance=importance,
@@ -167,7 +237,7 @@ def assess_memory_upgrade(
     recoverable_coverage_gap = coverage_gap and any(
         signal in _COVERAGE_RECOVERY_SIGNALS for signal in signals
     )
-    if existing_conflict:
+    if conflict_requires_upgrade:
         reason = "existing_memory_conflict"
     elif "ambiguous_reference" in signals and uncertain_extraction:
         reason = "ambiguous_reference"
@@ -268,44 +338,130 @@ def _has_claim_coverage_gap(
     return len(matched_claim_indexes) != len(set(matched_claim_indexes))
 
 
-def _has_existing_conflict(
+def _existing_conflicts(
     extraction: AtomicExtraction,
     existing_memories: list[MemoryItem],
-) -> bool:
+) -> tuple[_ExistingConflict, ...]:
+    conflicts: list[_ExistingConflict] = []
+    normalized_existing = [
+        (item, normalize_candidate_predicate(item)) for item in existing_memories
+    ]
     for claim in extraction.claims:
-        for item in existing_memories:
-            if claim.subject != item.subject:
+        normalized_claim = normalize_candidate_predicate(claim.to_candidate())
+        for item, normalized_item in normalized_existing:
+            local_subject_match = claim.subject.casefold() == item.subject.casefold()
+            interaction_alias_match = (
+                claim.kind == MemoryKind.INTERACTION_PATTERN
+                and item.kind == claim.kind
+                and is_relationship_interaction_subject(claim.subject)
+                and is_relationship_interaction_subject(item.subject)
+            )
+            if not local_subject_match and not interaction_alias_match:
                 continue
-            existing_predicate = item.payload.get("predicate")
-            if not isinstance(existing_predicate, str) or existing_predicate != claim.predicate:
+            if _is_governed_state_conflict(normalized_claim, normalized_item):
+                conflicts.append(
+                    _ExistingConflict(
+                        claim=claim,
+                        governed=True,
+                        local_subject_match=local_subject_match,
+                    )
+                )
                 continue
-            if claim.kind == MemoryKind.INTERACTION_PATTERN and item.kind == claim.kind:
-                claim_metric = claim.payload.get("metric")
-                item_metric = item.payload.get("metric")
-                if claim_metric != item_metric:
-                    continue
-                claim_state = _pattern_state(claim.payload)
-                item_state = _pattern_state(item.payload)
-                if claim_state and item_state and claim_state != item_state:
-                    return True
-            elif claim.kind == MemoryKind.STABLE_FACT and item.kind == claim.kind:
-                claim_object = claim.object or claim.payload.get("object")
-                item_object = item.payload.get("object")
-                if claim_object and item_object and claim_object != item_object:
-                    return True
-            elif claim.kind == MemoryKind.PREFERENCE and item.kind == claim.kind:
-                claim_preference = claim.payload.get("preference")
-                item_preference = item.payload.get("preference")
-                claim_type = claim.payload.get("preference_type")
-                item_type = item.payload.get("preference_type")
-                if (
-                    claim_preference == item_preference
-                    and claim_type
-                    and item_type
-                    and claim_type != item_type
-                ):
-                    return True
+            if _is_legacy_conflict(claim, item):
+                conflicts.append(
+                    _ExistingConflict(
+                        claim=claim,
+                        governed=False,
+                        local_subject_match=local_subject_match,
+                    )
+                )
+    return tuple(conflicts)
+
+
+def _is_governed_state_conflict(
+    claim: MemoryCandidate,
+    existing: MemoryCandidate,
+) -> bool:
+    claim_identity = governed_state_identity(claim)
+    existing_identity = governed_state_identity(existing)
+    if claim_identity is None or claim_identity != existing_identity:
+        return False
+    claim_value = governed_state_value(claim)
+    existing_value = governed_state_value(existing)
+    return (
+        claim_value is not None
+        and existing_value is not None
+        and claim_value != existing_value
+    )
+
+
+def _is_legacy_conflict(claim: AtomicClaim, item: MemoryItem) -> bool:
+    existing_predicate = item.payload.get("predicate")
+    if not isinstance(existing_predicate, str) or existing_predicate != claim.predicate:
+        return False
+    if claim.kind == MemoryKind.INTERACTION_PATTERN and item.kind == claim.kind:
+        claim_metric = claim.payload.get("metric")
+        item_metric = item.payload.get("metric")
+        if claim_metric != item_metric:
+            return False
+        claim_state = _pattern_state(claim.payload)
+        item_state = _pattern_state(item.payload)
+        return bool(claim_state and item_state and claim_state != item_state)
+    if claim.kind == MemoryKind.STABLE_FACT and item.kind == claim.kind:
+        claim_object = claim.object or claim.payload.get("object")
+        item_object = item.payload.get("object")
+        return bool(claim_object and item_object and claim_object != item_object)
+    if claim.kind == MemoryKind.PREFERENCE and item.kind == claim.kind:
+        claim_preference = claim.payload.get("preference")
+        item_preference = item.payload.get("preference")
+        claim_type = claim.payload.get("preference_type")
+        item_type = item.payload.get("preference_type")
+        return bool(
+            claim_preference == item_preference
+            and claim_type
+            and item_type
+            and claim_type != item_type
+        )
     return False
+
+
+def _can_resolve_governed_conflicts_locally(
+    conflicts: tuple[_ExistingConflict, ...],
+    *,
+    source_text: str,
+    partial: bool,
+    ambiguous_reference: bool,
+) -> bool:
+    if not conflicts or partial or ambiguous_reference:
+        return False
+    return all(
+        conflict.governed
+        and conflict.local_subject_match
+        and _is_high_integrity_governed_claim(conflict.claim, source_text)
+        for conflict in conflicts
+    )
+
+
+def _is_high_integrity_governed_claim(claim: AtomicClaim, source_text: str) -> bool:
+    if claim.predicate_type != PredicateType.CANONICAL:
+        return False
+    if claim.explicitness != EvidenceExplicitness.EXPLICIT:
+        return False
+    if claim.confidence < _LOCAL_GOVERNED_CONFLICT_MIN_CONFIDENCE:
+        return False
+    if claim.perspective != MemoryPerspective.USER_REPORTED or claim.requires_inference:
+        return False
+    return all(
+        _is_specific_exact_evidence(span, source_text)
+        for span in claim.evidence_spans
+    )
+
+
+def _is_specific_exact_evidence(span: str, source_text: str) -> bool:
+    if not span.strip() or span not in source_text:
+        return False
+    normalized = re.sub(r"[^\w\u4e00-\u9fff]+", "", span).casefold()
+    return len(normalized) >= 2 and normalized not in _GENERIC_STATE_EVIDENCE
 
 
 def _pattern_state(payload: dict[str, object]) -> str:

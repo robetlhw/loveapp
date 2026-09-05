@@ -1,14 +1,18 @@
 import re
 from dataclasses import dataclass, replace
+from datetime import datetime
 
 from loveapp.domain.memory import (
     AdmissionDecision,
     EvidenceExplicitness,
     MemoryCandidate,
+    MemoryItem,
     MemoryKind,
     MemoryPerspective,
+    MemoryStatus,
     PredicateType,
 )
+from loveapp.domain.memory_lifecycle import governed_state_identity, governed_state_value
 from loveapp.domain.memory_predicates import is_high_risk_predicate
 
 
@@ -29,6 +33,27 @@ class AdmissionAssessment:
     score: float
     score_breakdown: dict[str, float | bool | str]
     reason: str
+
+
+@dataclass(frozen=True)
+class GovernedTransitionEligibility:
+    eligible: bool
+    reason: str
+    target_memory_id: str | None = None
+    state_dimension: str | None = None
+
+
+_GOVERNED_TRANSITION_MIN_CONFIDENCE = 0.9
+_CURRENT_TRANSITION_EVIDENCE_PATTERN = re.compile(
+    r"(?:现在|当前|如今|最近|近来|这(?:几|些|段)(?:天|周|星期|个月|月|年|时间)|"
+    r"currently|now|recently|over\s+the\s+past)",
+    re.IGNORECASE,
+)
+_HISTORICAL_TRANSITION_EVIDENCE_PATTERN = re.compile(
+    r"(?:曾经|以前|之前|去年|前年|当时|过去|上(?:个|一)(?:月|周|星期|年)|"
+    r"previously|formerly|last\s+(?:month|week|year)|in\s+the\s+past)",
+    re.IGNORECASE,
+)
 
 
 DEFAULT_ADMISSION_POLICIES: dict[MemoryKind, MemoryAdmissionPolicy] = {
@@ -108,6 +133,7 @@ def assess_memory_admission(
     conflict: bool = False,
     corroborating_evidence_count: int = 0,
     policies: dict[MemoryKind, MemoryAdmissionPolicy] | None = None,
+    governed_transition_eligibility: GovernedTransitionEligibility | None = None,
 ) -> AdmissionAssessment:
     policy = (policies or DEFAULT_ADMISSION_POLICIES)[candidate.kind]
     evidence_valid = bool(candidate.evidence_spans) and all(
@@ -169,8 +195,24 @@ def assess_memory_admission(
         "pattern_has_frequency": pattern_has_frequency,
         "pattern_has_multiple_evidence": pattern_has_multiple,
         "pattern_adjustment": pattern_adjustment,
+        "governed_transition_candidate": bool(
+            governed_transition_eligibility is not None
+            and governed_transition_eligibility.eligible
+        ),
+        "governed_transition_reason": (
+            governed_transition_eligibility.reason
+            if governed_transition_eligibility is not None
+            else "not_evaluated"
+        ),
         "score": round(score, 4),
     }
+    if (
+        governed_transition_eligibility is not None
+        and governed_transition_eligibility.target_memory_id is not None
+    ):
+        breakdown["governed_transition_target_memory_id"] = (
+            governed_transition_eligibility.target_memory_id
+        )
 
     if not evidence_valid:
         return AdmissionAssessment(
@@ -201,6 +243,16 @@ def assess_memory_admission(
     multi_evidence_requirement_met = (
         not policy.require_multi_evidence or pattern_has_frequency or pattern_has_multiple
     )
+    if (
+        governed_transition_eligibility is not None
+        and governed_transition_eligibility.eligible
+    ):
+        return AdmissionAssessment(
+            AdmissionDecision.CONFIRM,
+            score,
+            breakdown,
+            "confirmed_governed_transition",
+        )
     direct_requirements_met = (
         explicit_requirement_met
         and multi_evidence_requirement_met
@@ -251,6 +303,74 @@ def assess_memory_admission(
     )
 
 
+def assess_governed_transition_eligibility(
+    candidate: MemoryCandidate,
+    source_text: str,
+    active_memories: list[MemoryItem],
+    *,
+    min_confidence: float = _GOVERNED_TRANSITION_MIN_CONFIDENCE,
+) -> GovernedTransitionEligibility:
+    """Authorize only an explicit, unique, forward canonical state transition."""
+
+    if candidate.predicate_type != PredicateType.CANONICAL:
+        return GovernedTransitionEligibility(False, "noncanonical_candidate")
+    identity = governed_state_identity(candidate)
+    value = governed_state_value(candidate)
+    if identity is None or value is None:
+        return GovernedTransitionEligibility(False, "ungoverned_or_invalid_state")
+
+    targets = [
+        item
+        for item in active_memories
+        if item.status in {MemoryStatus.CONFIRMED, MemoryStatus.PROPOSED}
+        and item.subject.casefold() == candidate.subject.casefold()
+        and governed_state_identity(item) == identity
+        and governed_state_value(item) not in {None, value}
+    ]
+    if not targets:
+        return GovernedTransitionEligibility(
+            False,
+            "no_unique_governed_target",
+            state_dimension=identity[1],
+        )
+    if len(targets) != 1:
+        return GovernedTransitionEligibility(
+            False,
+            "ambiguous_governed_targets",
+            state_dimension=identity[1],
+        )
+
+    target = targets[0]
+    common = {
+        "target_memory_id": target.id,
+        "state_dimension": identity[1],
+    }
+    if candidate.explicitness != EvidenceExplicitness.EXPLICIT:
+        return GovernedTransitionEligibility(False, "nonexplicit_evidence", **common)
+    if candidate.perspective != MemoryPerspective.USER_REPORTED:
+        return GovernedTransitionEligibility(False, "nonreported_perspective", **common)
+    if candidate.requires_inference:
+        return GovernedTransitionEligibility(False, "requires_inference", **common)
+    if candidate.confidence < min_confidence:
+        return GovernedTransitionEligibility(False, "below_transition_confidence", **common)
+    if not candidate.evidence_spans or any(
+        not span or span not in source_text for span in candidate.evidence_spans
+    ):
+        return GovernedTransitionEligibility(False, "evidence_not_in_source", **common)
+    if candidate.period_start and candidate.period_end:
+        start, end = _align_datetimes(candidate.period_start, candidate.period_end)
+        if start > end:
+            return GovernedTransitionEligibility(False, "invalid_temporal_shape", **common)
+    temporal_failure = _transition_temporal_failure(candidate, target)
+    if temporal_failure is not None:
+        return GovernedTransitionEligibility(False, temporal_failure, **common)
+    return GovernedTransitionEligibility(
+        True,
+        "eligible_governed_transition",
+        **common,
+    )
+
+
 def interaction_pattern_has_frequency(candidate: MemoryCandidate) -> bool:
     return bool(_FREQUENCY_PATTERN.search(" ".join(candidate.evidence_spans)))
 
@@ -278,6 +398,35 @@ def _temporal_shape_is_valid(candidate: MemoryCandidate) -> bool:
             candidate.period_start <= candidate.period_end
         )
     return True
+
+
+def _transition_temporal_failure(
+    candidate: MemoryCandidate,
+    target: MemoryItem,
+) -> str | None:
+    evidence = " ".join(candidate.evidence_spans)
+    if _HISTORICAL_TRANSITION_EVIDENCE_PATTERN.search(evidence):
+        return "historical_transition"
+    incoming_time = candidate.period_end or candidate.occurred_at or candidate.period_start
+    target_time = target.period_end or target.occurred_at or target.period_start
+    if incoming_time is None:
+        return "missing_transition_temporal_evidence"
+    if target_time is None:
+        return (
+            None
+            if _CURRENT_TRANSITION_EVIDENCE_PATTERN.search(evidence)
+            else "missing_transition_temporal_evidence"
+        )
+    incoming_time, target_time = _align_datetimes(incoming_time, target_time)
+    return None if incoming_time >= target_time else "historical_transition"
+
+
+def _align_datetimes(left: datetime, right: datetime) -> tuple[datetime, datetime]:
+    if left.tzinfo is None and right.tzinfo is not None:
+        left = left.replace(tzinfo=right.tzinfo)
+    elif left.tzinfo is not None and right.tzinfo is None:
+        right = right.replace(tzinfo=left.tzinfo)
+    return left, right
 
 
 def _clamp(value: float) -> float:

@@ -3,7 +3,11 @@ from loveapp.domain.conversation import ConversationRequest
 from loveapp.domain.date_task import DatePlanningTaskState
 from loveapp.domain.enums import TaskType
 from loveapp.domain.memory import utc_now
-from loveapp.domain.runtime_context import DatePlanRuntimeContext, RuntimeContext
+from loveapp.domain.runtime_context import (
+    DatePlanRuntimeContext,
+    PendingMemoryContext,
+    RuntimeContext,
+)
 from loveapp.ports.date_tasks import DatePlanningTaskStore
 
 
@@ -19,6 +23,7 @@ class RuntimeContextBuilder:
         *,
         active_task: TaskType | None = None,
         date_task_state: DatePlanningTaskState | None = None,
+        pending_memory_context: PendingMemoryContext | None = None,
         trace: ExecutionTrace | None = None,
     ) -> RuntimeContext:
         if request.conversation_id is None:
@@ -41,6 +46,7 @@ class RuntimeContextBuilder:
                 if state is not None and state.is_resumable
                 else None
             ),
+            pending_memory_context=pending_memory_context,
             now=utc_now(),
         )
         if trace is not None:
@@ -58,6 +64,12 @@ class RuntimeContextBuilder:
                             state is not None
                             and state.current_plan is not None
                             and state.current_plan.items
+                        ),
+                        "has_pending_memory_context": pending_memory_context is not None,
+                        "pending_memory_expected_slot": (
+                            pending_memory_context.expected_slot
+                            if pending_memory_context is not None
+                            else None
                         ),
                     }
                 )

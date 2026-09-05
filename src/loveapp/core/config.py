@@ -25,6 +25,14 @@ class Settings(BaseSettings):
     llm_max_retries: int = 2
     llm_max_tokens: int = 4096
 
+    # Final Advice uses a bounded structured-output contract independent from
+    # auxiliary Router and Memory model budgets.
+    advice_model: str = ""
+    advice_max_tokens: int = Field(default=4096, ge=512, le=16384)
+    advice_thinking: Literal["enabled", "disabled"] = "disabled"
+    advice_temperature: float = Field(default=0, ge=0, le=2)
+    advice_structured_retries: int = Field(default=1, ge=0, le=1)
+
     router_provider: Literal["auto", "llm", "disabled"] = "auto"
     router_model: str = ""
     router_max_tokens: int = Field(default=2048, ge=512, le=8192)
@@ -73,8 +81,11 @@ class Settings(BaseSettings):
     memory_extraction_strong_model: str = ""
     memory_extraction_strong_timeout_seconds: float = Field(default=60, ge=1, le=300)
     memory_extraction_strong_max_retries: int = Field(default=1, ge=0, le=3)
-    memory_extraction_strong_max_tokens: int = Field(default=4096, ge=512, le=16384)
-    memory_extraction_strong_thinking: Literal["enabled", "disabled"] = "enabled"
+    # Strong extraction still uses the larger model, but its output is the same
+    # bounded JSON contract. Disabling reasoning avoids consuming the entire
+    # output budget before a parseable response is emitted.
+    memory_extraction_strong_max_tokens: int = Field(default=2048, ge=512, le=16384)
+    memory_extraction_strong_thinking: Literal["enabled", "disabled"] = "disabled"
     memory_extraction_upgrade_min_importance: int = Field(default=4, ge=1, le=5)
     memory_semantic_relation_provider: Literal["disabled", "llm"] = "disabled"
     memory_semantic_relation_model: str = ""
@@ -91,9 +102,7 @@ class Settings(BaseSettings):
     memory_min_confidence: float = Field(default=0.65, ge=0, le=1)
     memory_tentative_min_confidence: float = Field(default=0.5, ge=0, le=1)
     memory_belief_min_confidence: float = Field(default=0.4, ge=0, le=1)
-    memory_admission_policy_overrides: dict[str, dict[str, object]] = Field(
-        default_factory=dict
-    )
+    memory_admission_policy_overrides: dict[str, dict[str, object]] = Field(default_factory=dict)
     memory_context_limit: int = Field(default=20, ge=1, le=100)
     conversation_history_limit: int = Field(default=12, ge=2, le=50)
     memory_context_wait_seconds: float = Field(default=2, ge=0, le=30)

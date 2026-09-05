@@ -9,6 +9,7 @@ from loveapp.domain.enums import RelationshipStage, TaskType
 from loveapp.domain.memory import RememberResult, utc_now
 from loveapp.domain.observability import StepTiming
 from loveapp.domain.routing import RecentRiskState, RouteResult
+from loveapp.domain.runtime_context import PendingMemoryContext
 
 
 class ConversationFlowState(BaseModel):
@@ -25,6 +26,7 @@ class ConversationFlowState(BaseModel):
     last_clarification_reason: str | None = Field(default=None, max_length=300)
     clarification_attempt_count: int = Field(default=0, ge=0, le=3)
     recent_risk_state: RecentRiskState | None = None
+    pending_memory_context: PendingMemoryContext | None = None
     updated_at: datetime = Field(default_factory=utc_now)
 
 
@@ -35,6 +37,8 @@ class ConversationRequest(BaseModel):
     query: str = Field(min_length=1, max_length=4000)
     relationship_stage: RelationshipStage = RelationshipStage.UNKNOWN
     active_task: TaskType | None = None
+    advice_logical_turn_id: str | None = None
+    retry_advice: bool = False
 
 
 class ConversationTurnResult(BaseModel):
@@ -50,3 +54,4 @@ class ConversationTurnResult(BaseModel):
     date_task_state: DatePlanningTaskState | None = None
     memory_result: RememberResult | None = None
     timings: list[StepTiming] = Field(default_factory=list)
+    advice_logical_turn_id: str | None = None

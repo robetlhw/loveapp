@@ -1,9 +1,57 @@
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from enum import StrEnum
 from typing import Any
 
-from loveapp.domain.memory_dimensions import interaction_pattern_state
+from loveapp.domain.memory_dimensions import (
+    interaction_pattern_state,
+    normalize_state_dimension,
+    normalize_state_value,
+)
+
+
+class PredicateCardinality(StrEnum):
+    """How many current values a subject may retain for a predicate.
+
+    This is governance metadata, not a persisted Memory field.  The aliases
+    keep the public vocabulary readable for callers that use either the short
+    or the explicit ``*_VALUE`` spelling.
+    """
+
+    SINGLE = "single"
+    SINGLE_VALUE = "single"
+    MULTI = "multi"
+    MULTI_VALUE = "multi"
+    UNKNOWN = "unknown"
+
+
+class PredicateTemporalBehavior(StrEnum):
+    """Temporal semantics used by relation resolution."""
+
+    TIMELESS = "timeless"
+    STATE = "state"
+    CURRENT = "current"
+    CURRENT_STATE = "current"
+    PATTERN = "pattern"
+    EVENT = "event"
+    PLANNED = "planned"
+    PLANNED_EVENT = "planned"
+    PLAN = "plan"
+    INTENT = "intent"
+    UNKNOWN = "unknown"
+
+
+class PredicateUpdatePolicy(StrEnum):
+    """Safe default action when two values share a predicate."""
+
+    REPLACE = "replace"
+    APPEND = "append"
+    TRANSITION = "transition"
+    MERGE = "merge"
+    NONE = "none"
+    PROTECT = "protect"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)
@@ -16,6 +64,50 @@ class CanonicalPredicateSpec:
     # model from attaching an object from another semantic domain to a valid
     # canonical name.  It is governance metadata, not a new memory field.
     semantic_domain: str | None = None
+    # Relation-governance metadata.  These fields deliberately live in the
+    # predicate registry instead of MemoryCandidate so existing persisted
+    # memory rows and the Store contract remain unchanged.
+    #
+    # ``cardinality`` is either ``single`` (one current value) or ``multi``
+    # (independently coexisting values).  ``temporal_behavior`` describes the
+    # semantic surface, while ``update_policy`` tells the deterministic
+    # relation resolver whether a different value may replace the old one.
+    # Unknown/legacy specs default to a conservative no-op policy.
+    cardinality: PredicateCardinality = PredicateCardinality.UNKNOWN
+    temporal_behavior: PredicateTemporalBehavior = PredicateTemporalBehavior.UNKNOWN
+    update_policy: PredicateUpdatePolicy = PredicateUpdatePolicy.UNKNOWN
+
+    def __post_init__(self) -> None:
+        # ``CanonicalPredicateSpec`` is public and is occasionally constructed
+        # by integrations with plain strings.  Coerce those values once at the
+        # registry boundary while keeping the object immutable afterwards.
+        for field_name, enum_type in (
+            ("cardinality", PredicateCardinality),
+            ("temporal_behavior", PredicateTemporalBehavior),
+            ("update_policy", PredicateUpdatePolicy),
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, enum_type):
+                object.__setattr__(self, field_name, enum_type(value))
+
+
+# Public vocabulary for callers that want to inspect registry metadata without
+# depending on an enum or adding values to the Memory ontology.  Keeping these
+# as strings also makes the frozen JSON/evaluation contracts backwards
+# compatible with older callers that construct ``CanonicalPredicateSpec``
+# directly.
+PREDICATE_CARDINALITY_SINGLE = "single"
+PREDICATE_CARDINALITY_MULTI = "multi"
+PREDICATE_TEMPORAL_STATE = "state"
+PREDICATE_TEMPORAL_PATTERN = "pattern"
+PREDICATE_TEMPORAL_TIMELESS = "timeless"
+PREDICATE_TEMPORAL_EVENT = "event"
+PREDICATE_TEMPORAL_PLAN = "plan"
+PREDICATE_TEMPORAL_INTENT = "intent"
+PREDICATE_UPDATE_REPLACE = "replace"
+PREDICATE_UPDATE_APPEND = "append"
+PREDICATE_UPDATE_MERGE = "merge"
+PREDICATE_UPDATE_NONE = "none"
 
 
 @dataclass(frozen=True)
@@ -47,6 +139,9 @@ CANONICAL_PREDICATES: dict[str, CanonicalPredicateSpec] = {
         state_dimension="relationship.contact_status",
         allowed_values=frozenset({"normal", "reduced", "unavailable", "restored"}),
         high_risk=True,
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_STATE,
+        update_policy=PREDICATE_UPDATE_REPLACE,
     ),
     "relationship.stage": CanonicalPredicateSpec(
         name="relationship.stage",
@@ -63,6 +158,9 @@ CANONICAL_PREDICATES: dict[str, CanonicalPredicateSpec] = {
             }
         ),
         high_risk=True,
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_STATE,
+        update_policy=PREDICATE_UPDATE_REPLACE,
     ),
     "relationship.repair_status": CanonicalPredicateSpec(
         name="relationship.repair_status",
@@ -71,6 +169,9 @@ CANONICAL_PREDICATES: dict[str, CanonicalPredicateSpec] = {
             {"not_started", "intended", "in_progress", "completed", "failed"}
         ),
         high_risk=True,
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_STATE,
+        update_policy=PREDICATE_UPDATE_REPLACE,
     ),
     "confession.status": CanonicalPredicateSpec(
         name="confession.status",
@@ -79,6 +180,9 @@ CANONICAL_PREDICATES: dict[str, CanonicalPredicateSpec] = {
             {"intended", "executed", "accepted", "rejected", "withdrawn"}
         ),
         high_risk=True,
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_STATE,
+        update_policy=PREDICATE_UPDATE_REPLACE,
     ),
     "plan.status": CanonicalPredicateSpec(
         name="plan.status",
@@ -86,82 +190,241 @@ CANONICAL_PREDICATES: dict[str, CanonicalPredicateSpec] = {
         allowed_values=frozenset(
             {"proposed", "confirmed", "completed", "cancelled", "expired"}
         ),
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_PLAN,
+        update_policy=PREDICATE_UPDATE_NONE,
     ),
     "relationship.familiarity": CanonicalPredicateSpec(
         name="relationship.familiarity",
         state_dimension="relationship.familiarity",
         allowed_values=frozenset({"unfamiliar", "low", "moderate", "high"}),
         high_risk=True,
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_STATE,
+        update_policy=PREDICATE_UPDATE_REPLACE,
     ),
     "relationship.contact_opportunity": CanonicalPredicateSpec(
         name="relationship.contact_opportunity",
         state_dimension="relationship.contact_opportunity",
         allowed_values=frozenset({"low", "moderate", "high"}),
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_STATE,
+        update_policy=PREDICATE_UPDATE_REPLACE,
     ),
     "relationship.conflict_status": CanonicalPredicateSpec(
         name="relationship.conflict_status",
         state_dimension="relationship.conflict_status",
         allowed_values=frozenset({"active", "cooling", "repairing", "resolved"}),
         high_risk=True,
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_STATE,
+        update_policy=PREDICATE_UPDATE_REPLACE,
     ),
     "relationship.interaction_reciprocity": CanonicalPredicateSpec(
         name="relationship.interaction_reciprocity",
         state_dimension="relationship.interaction_reciprocity",
         allowed_values=frozenset({"low", "mixed", "high"}),
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_STATE,
+        update_policy=PREDICATE_UPDATE_REPLACE,
     ),
     "partner.relationship_status": CanonicalPredicateSpec(
         name="partner.relationship_status",
         state_dimension="partner.relationship_status",
         allowed_values=frozenset({"unknown", "single", "partnered", "married"}),
         high_risk=True,
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_STATE,
+        update_policy=PREDICATE_UPDATE_REPLACE,
     ),
     "relationship.romantic_interest": CanonicalPredicateSpec(
         name="relationship.romantic_interest",
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
+        update_policy=PREDICATE_UPDATE_NONE,
     ),
     "interaction.contact_frequency": CanonicalPredicateSpec(
         name="interaction.contact_frequency",
         state_dimension="interaction.contact_frequency",
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_PATTERN,
+        update_policy=PREDICATE_UPDATE_REPLACE,
     ),
     "interaction.topic_scope": CanonicalPredicateSpec(
         name="interaction.topic_scope",
         state_dimension="interaction.topic_scope",
+        cardinality=PREDICATE_CARDINALITY_MULTI,
+        temporal_behavior=PREDICATE_TEMPORAL_PATTERN,
+        # Topic scopes can coexist, but the current ontology does not yet
+        # authorize deterministic relation writes for this open dimension.
+        update_policy=PREDICATE_UPDATE_NONE,
     ),
     "interaction.channel": CanonicalPredicateSpec(
         name="interaction.channel",
         state_dimension="interaction.channel",
+        cardinality=PREDICATE_CARDINALITY_MULTI,
+        temporal_behavior=PREDICATE_TEMPORAL_PATTERN,
+        update_policy=PREDICATE_UPDATE_NONE,
     ),
     "interaction.initiation_balance": CanonicalPredicateSpec(
         name="interaction.initiation_balance",
         state_dimension="interaction.initiation_balance",
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_PATTERN,
+        update_policy=PREDICATE_UPDATE_REPLACE,
     ),
     "interaction.response_engagement": CanonicalPredicateSpec(
         name="interaction.response_engagement",
         state_dimension="interaction.response_engagement",
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_PATTERN,
+        update_policy=PREDICATE_UPDATE_REPLACE,
     ),
     "interaction.emotional_disclosure": CanonicalPredicateSpec(
         name="interaction.emotional_disclosure",
         state_dimension="interaction.emotional_disclosure",
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_PATTERN,
+        update_policy=PREDICATE_UPDATE_REPLACE,
     ),
-    "preference.general": CanonicalPredicateSpec(name="preference.general"),
+    "preference.general": CanonicalPredicateSpec(
+        name="preference.general",
+        cardinality=PREDICATE_CARDINALITY_MULTI,
+        temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
+        update_policy=PREDICATE_UPDATE_APPEND,
+    ),
     "preference.food.cuisine": CanonicalPredicateSpec(
         name="preference.food.cuisine",
         semantic_domain="food",
+        cardinality=PREDICATE_CARDINALITY_MULTI,
+        temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
+        update_policy=PREDICATE_UPDATE_APPEND,
     ),
     "preference.food.spiciness": CanonicalPredicateSpec(
         name="preference.food.spiciness",
         semantic_domain="food",
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
+        update_policy=PREDICATE_UPDATE_REPLACE,
     ),
     "preference.environment.noise": CanonicalPredicateSpec(
-        name="preference.environment.noise"
+        name="preference.environment.noise",
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
+        update_policy=PREDICATE_UPDATE_REPLACE,
     ),
     "preference.activity.type": CanonicalPredicateSpec(
         name="preference.activity.type",
         semantic_domain="activity",
+        cardinality=PREDICATE_CARDINALITY_MULTI,
+        temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
+        update_policy=PREDICATE_UPDATE_APPEND,
     ),
     "preference.budget.range": CanonicalPredicateSpec(
         name="preference.budget.range",
         semantic_domain="budget",
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
+        update_policy=PREDICATE_UPDATE_REPLACE,
     ),
+}
+
+
+def _annotate_predicate_schema(
+    spec: CanonicalPredicateSpec,
+) -> CanonicalPredicateSpec:
+    """Fill the reviewed schema metadata for the canonical registry.
+
+    The metadata deliberately lives beside the predicate registry instead of
+    being inferred from an incoming model claim.  Unknown/custom predicates
+    therefore cannot opt themselves into an UPDATE policy by supplying a
+    payload field.
+    """
+
+    name = spec.name
+    cardinality = spec.cardinality
+    temporal_behavior = spec.temporal_behavior
+    update_policy = spec.update_policy
+
+    if cardinality == PredicateCardinality.UNKNOWN:
+        if name in {
+            "preference.food.cuisine",
+            "preference.activity.type",
+            "preference.general",
+            "relationship.romantic_interest",
+            "interaction.channel",
+            "interaction.topic_scope",
+        }:
+            cardinality = PredicateCardinality.MULTI
+        else:
+            cardinality = PredicateCardinality.SINGLE
+
+    if temporal_behavior == PredicateTemporalBehavior.UNKNOWN:
+        if name in {"interaction.channel", "interaction.topic_scope"} or name.startswith(
+            "interaction."
+        ):
+            temporal_behavior = PredicateTemporalBehavior.PATTERN
+        elif (
+            name in {"plan.status"}
+            or name.startswith("relationship.")
+            or name.startswith("contact.")
+        ):
+            temporal_behavior = PredicateTemporalBehavior.CURRENT
+        elif name.startswith("preference.") or name == "relationship.romantic_interest":
+            temporal_behavior = PredicateTemporalBehavior.TIMELESS
+        else:
+            temporal_behavior = PredicateTemporalBehavior.UNKNOWN
+
+    if update_policy == PredicateUpdatePolicy.UNKNOWN:
+        if name in {
+            "contact.status",
+            "relationship.stage",
+            "relationship.repair_status",
+            "confession.status",
+            "plan.status",
+            "relationship.familiarity",
+            "relationship.contact_opportunity",
+            "relationship.conflict_status",
+            "relationship.interaction_reciprocity",
+            "partner.relationship_status",
+            "interaction.contact_frequency",
+            "interaction.initiation_balance",
+            "interaction.response_engagement",
+            "interaction.emotional_disclosure",
+            "preference.food.spiciness",
+            "preference.environment.noise",
+            "preference.budget.range",
+        }:
+            update_policy = (
+                PredicateUpdatePolicy.TRANSITION
+                if spec.high_risk or name in {
+                    "contact.status",
+                    "relationship.stage",
+                    "relationship.repair_status",
+                    "confession.status",
+                    "plan.status",
+                    "relationship.conflict_status",
+                }
+                else PredicateUpdatePolicy.REPLACE
+            )
+        elif cardinality == PredicateCardinality.MULTI:
+            update_policy = PredicateUpdatePolicy.APPEND
+        else:
+            update_policy = PredicateUpdatePolicy.REPLACE
+
+    return replace(
+        spec,
+        cardinality=cardinality,
+        temporal_behavior=temporal_behavior,
+        update_policy=update_policy,
+    )
+
+
+# Keep the registry as the single source of truth while ensuring every
+# canonical predicate exposes a complete, stable schema view.
+CANONICAL_PREDICATES = {
+    name: _annotate_predicate_schema(spec)
+    for name, spec in CANONICAL_PREDICATES.items()
 }
 
 
@@ -480,21 +743,29 @@ def normalize_predicate(
             alias_hit=canonical != requested_canonical and bool(requested_canonical),
         )
 
-    state_dimension = _clean_string(payload.get("state_dimension"))
+    state_dimension = _clean_string(
+        payload.get("state_dimension_hint") or payload.get("state_dimension")
+    )
     if state_dimension:
+        lifecycle_dimension = normalize_state_dimension(state_dimension)
         state_predicate = _STATE_DIMENSION_PREDICATES.get(
-            _normalize_identifier(state_dimension)
+            _normalize_identifier(lifecycle_dimension or state_dimension)
         )
         if state_predicate:
             spec = CANONICAL_PREDICATES[state_predicate]
-            value = _normalize_state_value(state_predicate, payload.get("state_value"))
+            raw_value = payload.get("state_value_hint", payload.get("state_value"))
+            value = (
+                normalize_state_value(lifecycle_dimension, raw_value)
+                if lifecycle_dimension is not None
+                else _normalize_state_value(state_predicate, raw_value)
+            )
             if value is not None and (not spec.allowed_values or value in spec.allowed_values):
                 return PredicateNormalization(
                     raw_predicate=raw or requested_canonical or state_predicate,
                     predicate_type="canonical",
                     canonical_predicate=state_predicate,
                     custom_predicate=None,
-                    state_dimension=spec.state_dimension,
+                    state_dimension=lifecycle_dimension or spec.state_dimension,
                     state_value=value,
                     alias_hit=(
                         _normalize_identifier(raw) != state_predicate
@@ -503,7 +774,7 @@ def normalize_predicate(
                     ),
                 )
 
-    metric = _clean_string(payload.get("metric"))
+    metric = _clean_string(payload.get("metric_hint") or payload.get("metric"))
     if metric:
         metric_predicate = _INTERACTION_METRIC_PREDICATES.get(_normalize_identifier(metric))
         if metric_predicate:
@@ -592,6 +863,22 @@ def canonical_predicate_names() -> tuple[str, ...]:
     return tuple(CANONICAL_PREDICATES)
 
 
+def predicate_spec(value: str | None) -> CanonicalPredicateSpec | None:
+    """Return reviewed governance metadata for a canonical predicate.
+
+    ``None`` is returned for open-world/custom names.  Callers must not infer
+    schema metadata from a custom predicate or from arbitrary model payload.
+    """
+
+    if not isinstance(value, str):
+        return None
+    return CANONICAL_PREDICATES.get(value)
+
+
+# Descriptive alias used by relation/retrieval integrations.
+predicate_schema = predicate_spec
+
+
 def is_high_risk_predicate(value: str | None) -> bool:
     return bool(value and CANONICAL_PREDICATES.get(value, CanonicalPredicateSpec("")).high_risk)
 
@@ -599,7 +886,9 @@ def is_high_risk_predicate(value: str | None) -> bool:
 def _preference_predicate(payload: dict[str, Any], requested: str | None) -> str:
     if requested in CANONICAL_PREDICATES and requested.startswith("preference."):
         return requested
-    preference_type = _normalize_identifier(str(payload.get("preference_type") or ""))
+    preference_type = _normalize_identifier(
+        str(payload.get("preference_type_hint") or payload.get("preference_type") or "")
+    )
     return _PREFERENCE_PREDICATES.get(preference_type, "preference.general")
 
 
@@ -621,6 +910,18 @@ def _enforce_preference_domain(
     spec = CANONICAL_PREDICATES.get(canonical)
     if spec is None:
         return canonical, requested_custom or raw_predicate or canonical
+
+    hint_domain = _preference_hint_domain(payload)
+    if hint_domain is not None:
+        if spec.semantic_domain == hint_domain:
+            return canonical, requested_custom or raw_predicate or canonical
+        hinted_candidates = {
+            name
+            for name, sibling in CANONICAL_PREDICATES.items()
+            if sibling.semantic_domain == hint_domain
+        }
+        if len(hinted_candidates) == 1:
+            return next(iter(hinted_candidates)), requested_custom or raw_predicate or canonical
 
     explicit_domain = _explicit_preference_domain(payload)
     observed_domains = _observed_preference_domains(payload)
@@ -663,8 +964,15 @@ def _enforce_preference_domain(
 
 
 def _explicit_preference_domain(payload: dict[str, Any]) -> str | None:
-    preference_type = _normalize_identifier(str(payload.get("preference_type") or ""))
+    preference_type = _normalize_identifier(
+        str(payload.get("preference_type_hint") or payload.get("preference_type") or "")
+    )
     return _PREFERENCE_DOMAIN_BY_TYPE.get(preference_type)
+
+
+def _preference_hint_domain(payload: dict[str, Any]) -> str | None:
+    hint = _normalize_identifier(str(payload.get("preference_type_hint") or ""))
+    return _PREFERENCE_DOMAIN_BY_TYPE.get(hint)
 
 
 def _observed_preference_domains(payload: dict[str, Any]) -> set[str]:
