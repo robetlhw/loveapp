@@ -2,11 +2,14 @@ import json
 from io import StringIO
 from typing import Any
 
+import pytest
 from rich.console import Console
 from typer.testing import CliRunner
 
 import loveapp.cli as cli_module
+import loveapp.cli_memory_inspector as memory_cli_module
 from loveapp.cli_memory_inspector import render_inspection_report, run_inspector_session
+from loveapp.core.config import Settings
 from loveapp.domain.memory import MemoryStatus
 
 
@@ -69,6 +72,16 @@ class FakeInspector:
         }
 
 
+class FakeMemoryContainer:
+    def __init__(self) -> None:
+        self.memory_service = object()
+        self.memory_store = object()
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
 def test_memory_test_command_passes_fixed_defaults_and_json_turns(monkeypatch) -> None:
     captured: dict[str, Any] = {}
 
@@ -110,6 +123,42 @@ def test_memory_test_command_accepts_v2_memory_version(monkeypatch) -> None:
     assert result.exit_code == 0, result.output
     assert captured["memory_version"] == "v2"
     assert captured["include_routing"] is False
+
+
+@pytest.mark.parametrize(
+    ("memory_version", "expected_provider"),
+    [("v1", "disabled"), ("v2", "llm")],
+)
+async def test_memory_version_selects_relation_provider(
+    monkeypatch,
+    memory_version: str,
+    expected_provider: str,
+) -> None:
+    settings = Settings(_env_file=None)
+    captured_settings = []
+    container = FakeMemoryContainer()
+
+    def fake_build_memory_container(selected_settings):
+        captured_settings.append(selected_settings)
+        return container
+
+    monkeypatch.setattr(memory_cli_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        memory_cli_module,
+        "build_memory_container",
+        fake_build_memory_container,
+    )
+
+    reports = await memory_cli_module.run_memory_inspector_cli(
+        memory_version=memory_version,
+        include_routing=False,
+        input_fn=lambda _: "/exit",
+        output_console=Console(file=StringIO(), force_terminal=False, color_system=None),
+    )
+
+    assert reports == []
+    assert captured_settings[0].memory_semantic_relation_provider == expected_provider
+    assert container.closed is True
 
 
 async def test_noninteractive_json_is_one_stable_document() -> None:
