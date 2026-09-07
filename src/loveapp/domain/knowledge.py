@@ -1,3 +1,5 @@
+from enum import StrEnum
+
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 from loveapp.domain.enums import (
@@ -7,6 +9,13 @@ from loveapp.domain.enums import (
     RiskLevel,
     SourceType,
 )
+
+
+class RetrievalTextMode(StrEnum):
+    QUESTION = "question"
+    QUESTION_VARIANTS = "question_variants"
+    QUESTION_VARIANTS_ANSWER = "question_variants_answer"
+    FULL = "full"
 
 
 class KnowledgeDocument(BaseModel):
@@ -37,18 +46,30 @@ class KnowledgeDocument(BaseModel):
     @computed_field
     @property
     def retrieval_text(self) -> str:
-        sections = [
-            self.title,
-            self.question,
-            *self.query_variants,
-            self.answer,
-            self.context,
-            *self.tags,
-            *self.principles,
-            *self.recommended_actions,
-        ]
-        return "\n".join(section for section in sections if section)
+        return self.render_retrieval_text()
 
+    def render_retrieval_text(
+        self,
+        mode: RetrievalTextMode = RetrievalTextMode.FULL,
+    ) -> str:
+        if mode == RetrievalTextMode.QUESTION:
+            sections = [self.question]
+        elif mode == RetrievalTextMode.QUESTION_VARIANTS:
+            sections = [self.question, *self.query_variants]
+        elif mode == RetrievalTextMode.QUESTION_VARIANTS_ANSWER:
+            sections = [self.question, *self.query_variants, self.answer]
+        else:
+            sections = [
+                self.title,
+                self.question,
+                *self.query_variants,
+                self.answer,
+                self.context,
+                *self.tags,
+                *self.principles,
+                *self.recommended_actions,
+            ]
+        return "\n".join(section for section in sections if section)
 
 class KnowledgeFilters(BaseModel):
     scenario: AdviceScenario | None = None
@@ -65,3 +86,12 @@ class RetrievedDocument(BaseModel):
     score: float = Field(ge=0)
     base_score: float | None = Field(default=None, ge=0)
     score_components: dict[str, float] = Field(default_factory=dict)
+
+
+class KnowledgeSearchResult(BaseModel):
+    """Ranked results plus the full dense and reranked candidate pools."""
+
+    returned: list[RetrievedDocument] = Field(default_factory=list)
+    nearest_candidates: list[RetrievedDocument] = Field(default_factory=list)
+    candidates: list[RetrievedDocument] = Field(default_factory=list)
+    reranked_candidates: list[RetrievedDocument] = Field(default_factory=list)

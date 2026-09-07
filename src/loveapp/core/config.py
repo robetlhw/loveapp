@@ -46,6 +46,42 @@ class Settings(BaseSettings):
     router_context_risk_turns: int = Field(default=4, ge=2, le=4)
     router_live_eval_enabled: bool = False
     router_prompt_version: str = "routing-v3.0"
+    # Phase 3.1 semantic-router controls.  ``legacy`` preserves the existing
+    # task/date correction policy; the dedicated evaluation arms explicitly
+    # select ``off`` (R0), ``always`` (R1), or ``conditional`` (R2).
+    router_semantic_mode: Literal["legacy", "off", "always", "conditional"] = "legacy"
+    router_llm_correction_enabled: bool = False
+    router_llm_always_on_for_relationship: bool = False
+    router_llm_low_confidence_threshold: float = Field(default=0.72, ge=0, le=1)
+    router_llm_margin_threshold: float = Field(default=0.16, ge=0, le=1)
+    # Phase 3.2.1 policy selected on Dev. Scores are semantic relevance,
+    # rather than calibrated probabilities.
+    router_goal_secondary_threshold: float = Field(default=0.3, ge=0, le=1)
+    router_goal_max_count: int = Field(default=3, ge=1, le=3)
+    router_conditional_trigger_profile: Literal["c0", "c1", "c2"] = "c2"
+
+    # Phase 3.2 names these controls explicitly as Router-LLM settings.  The
+    # older ``router_*`` fields above remain supported for existing deployments;
+    # bootstrap uses these values first when they are provided.
+    # Provider identifier (for example ``deepseek`` or ``openai_compatible``)
+    # or the compatibility controls ``auto``/``llm``/``disabled``.
+    router_llm_provider: str | None = None
+    router_llm_model: str | None = None
+    router_llm_temperature: float = Field(default=0, ge=0, le=2)
+    router_llm_max_tokens: int | None = Field(default=None, ge=1, le=16384)
+    router_llm_timeout_seconds: float | None = Field(default=None, ge=0.1, le=300)
+    router_llm_max_retries: int | None = Field(default=None, ge=0, le=8)
+    router_llm_structured_output: Literal["json_schema", "json_object"] = "json_schema"
+    router_llm_prompt_version: str | None = None
+
+    # Phase 3–5 query-planning switches.  All default to the historical
+    # behavior (disabled) so deployments can opt in explicitly and compare
+    # each stage independently.
+    router_v2_enabled: bool = False
+    contextual_query_rewrite_enabled: bool = False
+    query_decomposition_enabled: bool = False
+    max_subqueries: int = Field(default=3, ge=1, le=3)
+    contextual_rewrite_history_window: int = Field(default=4, ge=0, le=20)
 
     date_semantic_provider: Literal["auto", "llm", "disabled"] = "auto"
     date_semantic_model: str = ""
@@ -57,6 +93,18 @@ class Settings(BaseSettings):
 
     rag_backend: Literal["memory", "qdrant"] = "qdrant"
     rag_min_score: float = 0.45
+    # Number of dense candidates fetched before soft reranking.  Keep the
+    # historical default (15) while making benchmark sweeps configurable.
+    rag_candidate_limit: int = Field(default=15, ge=1, le=1000)
+    rag_reranker_mode: Literal[
+        "vector_only", "vector_lexical", "vector_metadata", "full"
+    ] = "full"
+    rag_lexical_weight: float = Field(default=1.0, ge=0, le=10)
+    rag_metadata_weight: float = Field(default=1.0, ge=0, le=10)
+    rag_retrieval_text_mode: Literal[
+        "question", "question_variants", "question_variants_answer", "full"
+    ] = "full"
+    rag_hard_filter: bool = False
     qdrant_url: str = "http://localhost:6333"
     qdrant_collection: str = "love_knowledge"
     qdrant_timeout_seconds: float = 20

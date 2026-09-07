@@ -69,6 +69,20 @@ class SentenceTransformerEmbeddingProvider:
         vectors = await asyncio.to_thread(self._encode, [f"{self._query_prefix}{text}"])
         return vectors[0]
 
+    async def embed_queries(self, texts: list[str]) -> list[list[float]]:
+        """Embed a batch of standalone queries using the model's query prefix.
+
+        This is intentionally an additive optimization for offline evaluation;
+        the single-query ``EmbeddingProvider`` contract remains unchanged.
+        """
+        if not texts:
+            return []
+        await self.warmup()
+        return await asyncio.to_thread(
+            self._encode,
+            [f"{self._query_prefix}{text}" for text in texts],
+        )
+
     async def aclose(self) -> None:
         task = self._warmup_task
         if task is not None and not task.done():

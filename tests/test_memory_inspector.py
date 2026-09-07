@@ -9,6 +9,7 @@ from loveapp.application.memory_inspector import (
     _model_outputs,
 )
 from loveapp.core.timing import ExecutionTrace
+from loveapp.domain.enums import TaskType
 from loveapp.domain.memory import (
     AtomicClaim,
     AtomicExtraction,
@@ -16,6 +17,7 @@ from loveapp.domain.memory import (
     MemoryKind,
     TimeKind,
 )
+from loveapp.domain.routing import RouteResult
 
 NOW = datetime(2026, 8, 29, 12, tzinfo=UTC)
 SCOPE = {
@@ -42,11 +44,28 @@ class FailingExtractor:
         raise ValueError("invalid extraction response")
 
 
+class RecordingRouter:
+    def __init__(self) -> None:
+        self.inputs = []
+
+    async def route(self, route_input):
+        self.inputs.append(route_input)
+        return RouteResult(
+            normalized_query=route_input.latest_query,
+            task_type=TaskType.RELATIONSHIP_ADVICE,
+            task_confidence=0.92,
+        )
+
+
+class FailingRouter:
+    async def route(self, route_input):
+        del route_input
+        raise RuntimeError("router unavailable")
+
+
 async def test_inspector_runs_real_service_and_reports_persisted_add() -> None:
     text = "\u8bb0\u4e00\u4e0b: sushi is her favorite cuisine."
-    extractor = SequenceExtractor(
-        AtomicExtraction(claims=[_sushi_claim("first", text)])
-    )
+    extractor = SequenceExtractor(AtomicExtraction(claims=[_sushi_claim("first", text)]))
     store = InMemoryMemoryStore(clock=lambda: NOW)
     service = MemoryService(store, extractor, clock=lambda: NOW)
     inspector = MemoryInspector(service, store, **SCOPE)
@@ -64,7 +83,75 @@ async def test_inspector_runs_real_service_and_reports_persisted_add() -> None:
     assert report["extraction_run"]["status"] == "completed"
     assert report["audits"][0]["incoming_memory_id"] == report["after"][0]["id"]
     assert report["extraction_error"] is None
+    assert report["routing"]["executed"] is False
+    assert report["memory_pipeline"] == {
+        "memory_version": "v1",
+        "deterministic_relation_enabled": True,
+        "semantic_judge_enabled": False,
+        "semantic_judge_mode": "disabled",
+        "semantic_judge_called": False,
+    }
+    assert report["summary"] == {
+        "extracted_claim_count": 1,
+        "normalized_candidate_count": 1,
+        "saved_memory_count": 1,
+        "relation_counts": {"unrelated": 1},
+        "planned_actions": ["add"],
+        "update_proposed": False,
+        "update_planned": False,
+        "update_applied": False,
+        "actual_write_effects": ["added"],
+    }
     json.dumps(report)
+
+
+async def test_inspector_routes_with_prior_history_before_memory_write() -> None:
+    first_text = "Remember that she prefers sushi."
+    second_text = "She still prefers sushi."
+    extractor = SequenceExtractor(
+        AtomicExtraction(claims=[_sushi_claim("first", first_text)]),
+        AtomicExtraction(claims=[_sushi_claim("second", second_text)]),
+    )
+    store = InMemoryMemoryStore(clock=lambda: NOW)
+    router = RecordingRouter()
+    inspector = MemoryInspector(
+        MemoryService(store, extractor, clock=lambda: NOW),
+        store,
+        router=router,
+        **SCOPE,
+    )
+
+    first = await inspector.execute_turn(first_text)
+    second = await inspector.execute_turn(second_text)
+
+    assert first["routing"]["executed"] is True
+    assert first["routing"]["task_type"] == "relationship_advice"
+    assert first["routing"]["task_confidence"] == 0.92
+    assert router.inputs[0].recent_messages == []
+    assert [message.content for message in router.inputs[1].recent_messages] == [first_text]
+    assert second["summary"]["normalized_candidate_count"] == 1
+
+
+async def test_inspector_records_router_failure_and_continues_memory_pipeline() -> None:
+    text = "Remember that she prefers sushi."
+    extractor = SequenceExtractor(AtomicExtraction(claims=[_sushi_claim("first", text)]))
+    store = InMemoryMemoryStore(clock=lambda: NOW)
+    inspector = MemoryInspector(
+        MemoryService(store, extractor, clock=lambda: NOW),
+        store,
+        router=FailingRouter(),
+        **SCOPE,
+    )
+
+    report = await inspector.execute_turn(text)
+
+    assert report["routing"] == {
+        "executed": True,
+        "error": "router unavailable",
+        "reason": "router_failed",
+    }
+    assert report["summary"]["saved_memory_count"] == 1
+    assert report["diff"]["added"]
 
 
 async def test_inspector_diff_reports_lifecycle_supersession() -> None:
@@ -89,6 +176,9 @@ async def test_inspector_diff_reports_lifecycle_supersession() -> None:
     assert second["diff"]["superseded"][0]["to_status"] == "superseded"
     assert second["diff"]["added"][0]["supersedes_id"] == old_id
     assert second["audits"][0]["rule_name"] == "resolve_active_conflict"
+    assert second["summary"]["update_proposed"] is True
+    assert second["summary"]["update_planned"] is True
+    assert second["summary"]["update_applied"] is True
 
     active = await inspector.list_memories()
     all_memories = await inspector.list_memories(include_all=True)
@@ -212,9 +302,7 @@ def test_inspector_groups_long_tail_shadow_traces_without_lifecycle_effect() -> 
     output = _long_tail_relation_traces(trace.snapshot())
 
     assert output[0]["candidate_index"] == 1
-    assert output[0]["retrieval"]["retrieved_candidates"][0]["memory_id"] == (
-        "memory-old"
-    )
+    assert output[0]["retrieval"]["retrieved_candidates"][0]["memory_id"] == ("memory-old")
     assert output[0]["proposal"]["target_memory_ids"] == ["memory-old"]
     assert output[0]["validator"]["checks"] == {"target_active": True}
     assert output[0]["validator"]["would_supersede_memory_ids"] == ["memory-old"]

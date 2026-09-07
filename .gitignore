@@ -6,6 +6,7 @@ __pycache__/
 .coverage
 htmlcov/
 .cache/
+.tmp/
 .data/
 .env
 dist/

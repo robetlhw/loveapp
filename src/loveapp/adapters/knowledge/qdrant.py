@@ -6,11 +6,17 @@ from contextlib import nullcontext
 from qdrant_client import AsyncQdrantClient, models
 
 from loveapp.domain.enums import RelationshipStage
-from loveapp.domain.knowledge import KnowledgeDocument, KnowledgeFilters, RetrievedDocument
+from loveapp.domain.knowledge import (
+    KnowledgeDocument,
+    KnowledgeFilters,
+    KnowledgeSearchResult,
+    RetrievalTextMode,
+    RetrievedDocument,
+)
 from loveapp.ports.embeddings import EmbeddingProvider
 from loveapp.ports.observability import TraceRecorder
 
-from .scoring import soft_rerank
+from .scoring import RerankConfig, soft_rerank
 
 _POINT_NAMESPACE = uuid.UUID("32b0377e-0d66-4784-9035-98790f5e1c87")
 
@@ -22,11 +28,19 @@ class QdrantKnowledgeStore:
         collection_name: str,
         embedding_provider: EmbeddingProvider,
         min_score: float | None = None,
+        candidate_limit: int = 15,
+        rerank_config: RerankConfig | None = None,
+        retrieval_text_mode: RetrievalTextMode = RetrievalTextMode.FULL,
+        hard_filter: bool = False,
     ) -> None:
         self._client = client
         self._collection_name = collection_name
         self._embedding_provider = embedding_provider
         self._min_score = min_score
+        self._candidate_limit = max(int(candidate_limit), 1)
+        self._rerank_config = rerank_config or RerankConfig()
+        self._retrieval_text_mode = retrieval_text_mode
+        self._hard_filter = hard_filter
 
     def start_warmup(self):
         return self._embedding_provider.start_warmup()
@@ -67,13 +81,13 @@ class QdrantKnowledgeStore:
     ) -> int:
         await self.ensure_collection(recreate=recreate)
         vectors = await self._embedding_provider.embed_documents(
-            [document.retrieval_text for document in documents]
+            [document.render_retrieval_text(self._retrieval_text_mode) for document in documents]
         )
         points = [
             models.PointStruct(
                 id=_point_id(document.id),
                 vector=vector,
-                payload=_document_payload(document),
+                payload=_document_payload(document, self._retrieval_text_mode),
             )
             for document, vector in zip(documents, vectors, strict=True)
         ]
@@ -92,33 +106,52 @@ class QdrantKnowledgeStore:
         limit: int = 5,
         trace: TraceRecorder | None = None,
     ) -> list[RetrievedDocument]:
-        was_ready = self._embedding_provider.is_ready
-        measure = trace.measure("embedding_warmup_wait") if trace else nullcontext({})
-        with measure as details:
-            details["already_ready"] = was_ready
-            details["model"] = self._embedding_provider.model_name
-            await self._embedding_provider.warmup()
+        result = await self.search_detailed(
+            query,
+            filters=filters,
+            limit=limit,
+            trace=trace,
+        )
+        return result.returned
 
-        measure = trace.measure("rag_query_embedding") if trace else nullcontext({})
-        with measure as details:
-            details["model"] = self._embedding_provider.model_name
-            query_vector = await self._embedding_provider.embed_query(query)
+    async def search_detailed(
+        self,
+        query: str,
+        filters: KnowledgeFilters | None = None,
+        limit: int = 5,
+        trace: TraceRecorder | None = None,
+        query_vector: list[float] | None = None,
+    ) -> KnowledgeSearchResult:
+        effective_filters = filters
+        if self._hard_filter and filters is not None and not filters.hard:
+            effective_filters = filters.model_copy(update={"hard": True})
+        if query_vector is None:
+            was_ready = self._embedding_provider.is_ready
+            measure = trace.measure("embedding_warmup_wait") if trace else nullcontext({})
+            with measure as details:
+                details["already_ready"] = was_ready
+                details["model"] = self._embedding_provider.model_name
+                await self._embedding_provider.warmup()
 
-        candidate_limit = limit if filters and filters.hard else max(limit, 15)
+            measure = trace.measure("rag_query_embedding") if trace else nullcontext({})
+            with measure as details:
+                details["model"] = self._embedding_provider.model_name
+                query_vector = await self._embedding_provider.embed_query(query)
+
+        candidate_limit = max(limit, self._candidate_limit)
         measure = trace.measure("rag_vector_search") if trace else nullcontext({})
         with measure as details:
             details["candidate_limit"] = candidate_limit
-            details["hard_filter"] = bool(filters and filters.hard)
+            details["hard_filter"] = bool(effective_filters and effective_filters.hard)
             response = await self._client.query_points(
                 collection_name=self._collection_name,
                 query=query_vector,
-                query_filter=_build_filter(filters),
+                query_filter=_build_filter(effective_filters),
                 limit=candidate_limit,
-                score_threshold=self._min_score,
                 with_payload=True,
             )
-            details["candidate_count"] = len(response.points)
-        matches = [
+            details["nearest_candidate_count"] = len(response.points)
+        nearest = [
             RetrievedDocument(
                 document=KnowledgeDocument.model_validate(point.payload or {}),
                 score=max(float(point.score), 0.0),
@@ -126,11 +159,23 @@ class QdrantKnowledgeStore:
             )
             for point in response.points
         ]
+        matches = [
+            match
+            for match in nearest
+            if self._min_score is None or match.score >= self._min_score
+        ]
         measure = trace.measure("rag_soft_rerank") if trace else nullcontext({})
         with measure as details:
-            reranked = soft_rerank(query, matches, filters)[:limit]
-            details["returned_count"] = len(reranked)
-            return reranked
+            reranked = soft_rerank(query, matches, effective_filters, self._rerank_config)
+            returned = reranked[:limit]
+            details["candidate_count"] = len(matches)
+            details["returned_count"] = len(returned)
+        return KnowledgeSearchResult(
+            returned=returned,
+            nearest_candidates=nearest,
+            candidates=matches,
+            reranked_candidates=reranked,
+        )
 
     async def count(self) -> int:
         result = await self._client.count(
@@ -182,13 +227,18 @@ def _match_values(values: list[str]) -> models.Match:
     return models.MatchAny(any=values)
 
 
-def _document_payload(document: KnowledgeDocument) -> dict:
+def _document_payload(
+    document: KnowledgeDocument,
+    retrieval_text_mode: RetrievalTextMode = RetrievalTextMode.FULL,
+) -> dict:
     payload = document.model_dump(
         mode="json",
         exclude_none=True,
         exclude_computed_fields=True,
     )
-    payload["content_hash"] = hashlib.sha256(document.retrieval_text.encode("utf-8")).hexdigest()
+    retrieval_text = document.render_retrieval_text(retrieval_text_mode)
+    payload["content_hash"] = hashlib.sha256(retrieval_text.encode("utf-8")).hexdigest()
+    payload["retrieval_text_mode"] = retrieval_text_mode.value
     return payload
 
 

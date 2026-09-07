@@ -90,6 +90,26 @@ def test_memory_test_command_passes_fixed_defaults_and_json_turns(monkeypatch) -
     assert captured["texts"] == ["hello"]
     assert captured["json_output"] is True
     assert captured["isolated"] is True
+    assert captured["include_routing"] is True
+    assert captured["memory_version"] == "v1"
+
+
+def test_memory_test_command_accepts_v2_memory_version(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_runner(**kwargs: Any) -> list[dict[str, Any]]:
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(cli_module, "run_memory_inspector_cli", fake_runner)
+    result = CliRunner().invoke(
+        cli_module.app,
+        ["memory-test", "--memory-version", "v2", "--no-route", "--text", "hello"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["memory_version"] == "v2"
+    assert captured["include_routing"] is False
 
 
 async def test_noninteractive_json_is_one_stable_document() -> None:
@@ -155,6 +175,9 @@ def test_skipped_and_failed_turn_render_without_losing_error() -> None:
     )
 
     rendered = output.getvalue()
+    assert "APPLICATION ROUTER" in rendered
+    assert "TURN SUMMARY" in rendered
+    assert "update_applied" in rendered
     assert "SKIPPED - no durable memory extraction" in rendered
     assert "invalid extraction response" in rendered
     assert "memory-1" in rendered
@@ -218,6 +241,20 @@ def _report(text: str) -> dict[str, Any]:
     return {
         "turn": 1,
         "input": text,
+        "routing": {
+            "executed": True,
+            "task_type": "relationship_advice",
+            "task_confidence": 0.91,
+            "source": "rules",
+            "error": None,
+        },
+        "memory_pipeline": {
+            "memory_version": "v1",
+            "deterministic_relation_enabled": True,
+            "semantic_judge_enabled": False,
+            "semantic_judge_mode": "disabled",
+            "semantic_judge_called": False,
+        },
         "gate": {"should_extract": True, "reason": "durable_signal"},
         "before": [_memory("confirmed")],
         "model_outputs": [],
@@ -247,6 +284,17 @@ def _report(text: str) -> dict[str, Any]:
         "audits": [],
         "after": [_memory("confirmed")],
         "extraction_error": None,
+        "summary": {
+            "extracted_claim_count": 1,
+            "normalized_candidate_count": 1,
+            "saved_memory_count": 1,
+            "relation_counts": {"same": 1},
+            "planned_actions": ["merge"],
+            "update_proposed": False,
+            "update_planned": False,
+            "update_applied": False,
+            "actual_write_effects": ["merged"],
+        },
     }
 
 

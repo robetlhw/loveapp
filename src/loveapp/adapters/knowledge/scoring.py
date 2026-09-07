@@ -1,29 +1,74 @@
 import re
+from enum import StrEnum
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from loveapp.domain.enums import RelationshipStage
 from loveapp.domain.knowledge import KnowledgeDocument, KnowledgeFilters, RetrievedDocument
+
+
+class RerankerMode(StrEnum):
+    VECTOR_ONLY = "vector_only"
+    VECTOR_LEXICAL = "vector_lexical"
+    VECTOR_METADATA = "vector_metadata"
+    FULL = "full"
+
+
+class RerankConfig(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    mode: RerankerMode = RerankerMode.FULL
+    lexical_weight: float = Field(default=1.0, ge=0, le=10)
+    metadata_weight: float = Field(default=1.0, ge=0, le=10)
 
 
 def soft_rerank(
     query: str,
     matches: list[RetrievedDocument],
     preferences: KnowledgeFilters | None,
+    config: RerankConfig | None = None,
 ) -> list[RetrievedDocument]:
+    config = config or RerankConfig()
     reranked: list[RetrievedDocument] = []
     for match in matches:
-        components = lexical_components(query, match.document)
-        components.update(_metadata_components(match.document, preferences))
+        components: dict[str, float] = {}
+        if config.mode in {RerankerMode.VECTOR_LEXICAL, RerankerMode.FULL}:
+            components.update(
+                _scale_components(
+                    lexical_components(query, match.document),
+                    config.lexical_weight,
+                )
+            )
+        if config.mode in {RerankerMode.VECTOR_METADATA, RerankerMode.FULL}:
+            components.update(
+                _scale_components(
+                    _metadata_components(match.document, preferences),
+                    config.metadata_weight,
+                )
+            )
         score = match.score + sum(components.values())
         reranked.append(
             match.model_copy(
                 update={
                     "score": round(score, 6),
-                    "base_score": match.base_score or match.score,
+                    "base_score": (
+                        match.base_score
+                        if match.base_score is not None
+                        else match.score
+                    ),
                     "score_components": components,
                 }
             )
         )
     return sorted(reranked, key=lambda item: item.score, reverse=True)
+
+
+def _scale_components(components: dict[str, float], weight: float) -> dict[str, float]:
+    return {
+        name: scaled
+        for name, value in components.items()
+        if (scaled := round(value * weight, 6))
+    }
 
 
 def lexical_components(query: str, document: KnowledgeDocument) -> dict[str, float]:

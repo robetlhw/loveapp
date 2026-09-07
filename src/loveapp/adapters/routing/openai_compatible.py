@@ -1,4 +1,7 @@
+import asyncio
+import hashlib
 import json
+import math
 from time import perf_counter
 from typing import Any, Literal
 
@@ -7,7 +10,37 @@ from pydantic import SecretStr, ValidationError
 
 from loveapp.domain.date_operations import DatePlanOperation
 from loveapp.domain.date_patch import DatePlanPatch
-from loveapp.domain.routing import DatePlanSlots, RouteCorrection, RouteInput, RouteResult
+from loveapp.domain.enums import AdviceGoal, AdviceScenario
+from loveapp.domain.routing import (
+    DatePlanSlots,
+    RouteCorrection,
+    RouteInput,
+    RouteResult,
+    SemanticRouteDecision,
+)
+
+StructuredOutputMode = Literal["json_schema", "json_object"]
+
+
+def semantic_route_response_format(
+    mode: StructuredOutputMode = "json_schema",
+) -> dict[str, Any]:
+    """Return the bounded structured-output contract for the semantic router."""
+
+    if mode == "json_object":
+        return {"type": "json_object"}
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "semantic_route_decision",
+            # Dynamic score maps use enum property names, which several
+            # OpenAI-compatible endpoints reject under their stricter
+            # ``additionalProperties=false`` dialect.  Pydantic validation
+            # remains the authoritative post-response schema check.
+            "strict": False,
+            "schema": SemanticRouteDecision.model_json_schema(),
+        },
+    }
 
 
 class OpenAICompatibleRouteCorrector:
@@ -21,19 +54,76 @@ class OpenAICompatibleRouteCorrector:
         max_retries: int = 2,
         max_tokens: int = 2048,
         thinking: Literal["enabled", "disabled"] | None = None,
+        temperature: float = 0,
+        structured_output: StructuredOutputMode = "json_schema",
+        provider_name: str = "openai_compatible",
         prompt_version: str = "routing-v3.0",
+        semantic_only: bool = False,
     ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        if max_retries < 0:
+            raise ValueError("max_retries must be non-negative")
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+        if not 0 <= temperature <= 2:
+            raise ValueError("temperature must be between 0 and 2")
+        if structured_output not in {"json_schema", "json_object"}:
+            raise ValueError("structured_output must be json_schema or json_object")
         self._model = model
         self._max_tokens = max_tokens
         self._thinking = thinking
+        self._temperature = temperature
+        self._timeout_seconds = timeout_seconds
+        self._max_retries = max_retries
+        self._structured_output = structured_output
+        self._provider_name = provider_name
+        self._provider_prefers_json_object = (
+            provider_name.casefold() == "deepseek" and structured_output == "json_schema"
+        )
         self._prompt_version = prompt_version
+        self._semantic_only = semantic_only
+        self._system_prompt = (
+            _SEMANTIC_SYSTEM_PROMPT
+            if semantic_only
+            else _SYSTEM_PROMPT + "\n" + _DATE_SLOT_INSTRUCTIONS
+        )
+        self._prompt_sha256 = hashlib.sha256(
+            self._system_prompt.encode("utf-8")
+        ).hexdigest()
         self.last_telemetry: dict[str, Any] = {}
         self._client = AsyncOpenAI(
             api_key=api_key.get_secret_value(),
             base_url=base_url,
             timeout=timeout_seconds,
-            max_retries=max_retries,
+            # Keep retry accounting in this adapter.  The SDK's hidden retry
+            # loop cannot be represented accurately in evaluation telemetry.
+            max_retries=0,
         )
+
+    @property
+    def provider(self) -> str:
+        return self._provider_name
+
+    @property
+    def live_llm(self) -> bool:
+        return True
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    @property
+    def prompt_version(self) -> str:
+        return self._prompt_version
+
+    @property
+    def prompt_sha256(self) -> str:
+        return self._prompt_sha256
+
+    @property
+    def semantic_only(self) -> bool:
+        return self._semantic_only
 
     async def correct(
         self,
@@ -42,75 +132,169 @@ class OpenAICompatibleRouteCorrector:
     ) -> RouteCorrection:
         started = perf_counter()
         self.last_telemetry = {
+            "provider": self._provider_name,
+            "live_llm": True,
             "model": self._model,
             "prompt_version": self._prompt_version,
+            "prompt_sha256": self._prompt_sha256,
+            "temperature": self._temperature,
+            "max_tokens": self._max_tokens,
+            "timeout_seconds": self._timeout_seconds,
+            "max_retries": self._max_retries,
             "input_tokens": None,
             "output_tokens": None,
+            "total_tokens": None,
             "duration_ms": None,
             "attempt_count": 0,
+            "retry_count": 0,
+            "timeout_count": 0,
+            "parse_error_count": 0,
+            "provider_error_count": 0,
+            "fallback_count": 0,
+            "semantic_sanitization_count": 0,
+            "semantic_sanitization_reasons": [],
+            "llm_raw_decision": None,
+            "llm_sanitized_decision": None,
+            "schema_fallback_count": 0,
+            "structured_output": self._structured_output,
+            "effective_structured_output": (
+                "json_object"
+                if self._provider_prefers_json_object
+                else self._structured_output
+            ),
         }
         messages = [
-            {"role": "system", "content": _SYSTEM_PROMPT + "\n" + _DATE_SLOT_INSTRUCTIONS},
+            {"role": "system", "content": self._system_prompt},
             {
                 "role": "user",
-                "content": _build_prompt(route_input, rule_result),
+                "content": _build_prompt(
+                    route_input,
+                    rule_result,
+                    semantic_only=self._semantic_only,
+                ),
             },
         ]
         last_error: ValueError | None = None
-        for attempt in range(2):
+        parse_repair_used = False
+        transport_retries = 0
+        request_mode: StructuredOutputMode = (
+            "json_object" if self._provider_prefers_json_object else self._structured_output
+        )
+        while True:
             # Count a request before sending it so a transport failure is still
             # observable in the fallback trace.
-            self.last_telemetry["attempt_count"] = attempt + 1
+            self.last_telemetry["attempt_count"] += 1
             request_kwargs = {
                 "model": self._model,
                 "messages": messages,
-                "response_format": {"type": "json_object"},
-                "temperature": 0,
+                "response_format": semantic_route_response_format(request_mode),
+                "temperature": self._temperature,
                 "max_tokens": self._max_tokens,
             }
             if self._thinking is not None:
                 request_kwargs["extra_body"] = {"thinking": {"type": self._thinking}}
-            completion = await self._client.chat.completions.create(**request_kwargs)
+            try:
+                completion = await asyncio.wait_for(
+                    self._client.chat.completions.create(**request_kwargs),
+                    timeout=self._timeout_seconds,
+                )
+            except Exception as exc:
+                self.last_telemetry["provider_error_count"] += 1
+                self.last_telemetry["last_provider_error"] = _safe_error_message(exc)
+                if _is_timeout_error(exc):
+                    self.last_telemetry["timeout_count"] += 1
+                if request_mode == "json_schema" and _is_schema_format_error(exc):
+                    request_mode = "json_object"
+                    self.last_telemetry["schema_fallback_count"] += 1
+                    self.last_telemetry["retry_count"] += 1
+                    continue
+                if transport_retries < self._max_retries:
+                    transport_retries += 1
+                    self.last_telemetry["retry_count"] += 1
+                    await asyncio.sleep(min(0.25 * transport_retries, 1.0))
+                    continue
+                self.last_telemetry["duration_ms"] = round(
+                    (perf_counter() - started) * 1000,
+                    3,
+                )
+                self.last_telemetry["fallback_count"] = 1
+                raise
             usage = getattr(completion, "usage", None)
             self.last_telemetry.update(
                 {
                     "input_tokens": _accumulate_token_count(
                         self.last_telemetry.get("input_tokens"),
-                        getattr(usage, "prompt_tokens", None),
+                        _usage_value(usage, "prompt_tokens", "input_tokens"),
                     ),
                     "output_tokens": _accumulate_token_count(
                         self.last_telemetry.get("output_tokens"),
-                        getattr(usage, "completion_tokens", None),
+                        _usage_value(usage, "completion_tokens", "output_tokens"),
                     ),
                     "duration_ms": round((perf_counter() - started) * 1000, 3),
                 }
             )
-            choice = completion.choices[0]
+            self.last_telemetry["total_tokens"] = _sum_known_tokens(
+                self.last_telemetry.get("input_tokens"),
+                self.last_telemetry.get("output_tokens"),
+            )
+            try:
+                choice = completion.choices[0]
+            except (AttributeError, IndexError, TypeError) as exc:
+                self.last_telemetry["provider_error_count"] += 1
+                self.last_telemetry["last_provider_error"] = _safe_error_message(exc)
+                if transport_retries < self._max_retries:
+                    transport_retries += 1
+                    self.last_telemetry["retry_count"] += 1
+                    await asyncio.sleep(min(0.25 * transport_retries, 1.0))
+                    continue
+                self.last_telemetry["fallback_count"] = 1
+                self.last_telemetry["duration_ms"] = round(
+                    (perf_counter() - started) * 1000,
+                    3,
+                )
+                raise ValueError("router provider returned no choices") from exc
             content = choice.message.content
+            if isinstance(content, str):
+                # Keep a bounded in-memory preview for diagnosing provider
+                # shape drift. It is intentionally not copied to RouteResult
+                # or persisted in evaluation reports.
+                self.last_telemetry["last_response_preview"] = content[:1000]
             try:
                 correction, slot_parse_rejections = _parse_response_with_slot_rejections(
                     content,
                     choice.finish_reason,
+                    semantic_only=self._semantic_only,
                 )
                 self.last_telemetry["slot_parse_rejections"] = slot_parse_rejections
+                if self._semantic_only:
+                    self.last_telemetry["llm_raw_decision"] = _raw_semantic_decision_trace(
+                        content
+                    )
+                    self.last_telemetry["llm_sanitized_decision"] = (
+                        _sanitized_semantic_decision_trace(correction)
+                    )
+                    reasons = list(dict.fromkeys(slot_parse_rejections.values()))
+                    self.last_telemetry["semantic_sanitization_reasons"] = reasons
+                    self.last_telemetry["semantic_sanitization_count"] = int(bool(reasons))
                 _validate_evidence(correction, route_input)
                 return correction
             except ValueError as exc:
                 last_error = exc
-                if attempt == 1:
+                self.last_telemetry["parse_error_count"] += 1
+                self.last_telemetry["last_parse_error"] = _safe_error_message(exc)
+                if parse_repair_used:
                     break
+                parse_repair_used = True
+                self.last_telemetry["retry_count"] += 1
                 messages.extend(
                     [
                         {"role": "assistant", "content": content or ""},
-                        {
-                            "role": "user",
-                            "content": (
-                                f"上一次输出未通过结构校验。请修正并只输出 JSON。校验错误：{exc}"
-                            ),
-                        },
+                        {"role": "user", "content": _repair_prompt(self._semantic_only, exc)},
                     ]
                 )
-        raise last_error or ValueError("路由校正结果无法解析。")
+        self.last_telemetry["duration_ms"] = round((perf_counter() - started) * 1000, 3)
+        self.last_telemetry["fallback_count"] = 1
+        raise last_error or ValueError("router response could not be parsed")
 
     async def aclose(self) -> None:
         await self._client.close()
@@ -128,48 +312,121 @@ def _accumulate_token_count(
     return (known_total or 0) + observed
 
 
-def _build_prompt(route_input: RouteInput, rule_result: RouteResult) -> str:
+def _usage_value(usage: object, *names: str) -> object:
+    """Read common OpenAI-compatible usage field aliases without guessing."""
+
+    if usage is None:
+        return None
+    for name in names:
+        if isinstance(usage, dict) and name in usage:
+            return usage[name]
+        value = getattr(usage, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _sum_known_tokens(input_tokens: object, output_tokens: object) -> int | None:
+    if all(
+        isinstance(value, int) and not isinstance(value, bool)
+        for value in (input_tokens, output_tokens)
+    ):
+        return int(input_tokens) + int(output_tokens)
+    return None
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    name = type(exc).__name__.casefold()
+    return isinstance(exc, (TimeoutError, asyncio.TimeoutError)) or "timeout" in name
+
+
+def _safe_error_message(exc: BaseException) -> str:
+    """Keep provider diagnostics useful without persisting credentials."""
+
+    message = str(exc).replace("\r", " ").replace("\n", " ").strip()
+    lowered = message.casefold()
+    for marker in ("api_key=", "apikey=", "authorization: bearer "):
+        index = lowered.find(marker)
+        if index >= 0:
+            message = message[: index + len(marker)] + "[redacted]"
+            break
+    return message[:500]
+
+
+def _repair_prompt(semantic_only: bool, error: BaseException) -> str:
+    if semantic_only:
+        return (
+            "The previous response failed local SemanticRouteDecision validation. "
+            "Return one complete JSON object with exactly the eight required fields "
+            "from the system prompt. Use enum strings, arrays for lists, objects "
+            "for score maps, and no markdown or extra keys. Validation error: "
+            f"{_safe_error_message(error)}"
+        )
+    return f"上一次输出未通过结构校验。请修正并只输出 JSON。校验错误：{error}"
+
+
+def _is_schema_format_error(exc: BaseException) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    message = str(exc).casefold()
+    return (
+        str(status_code) == "400"
+        and (
+            "response_format" in message
+            or "json_schema" in message
+            or "structured output" in message
+        )
+        and (
+            "schema" in message
+            or "json" in message
+            or "structured" in message
+            or "unavailable" in message
+            or "unsupported" in message
+        )
+    )
+
+
+def _build_prompt(
+    route_input: RouteInput,
+    rule_result: RouteResult,
+    *,
+    semantic_only: bool = False,
+) -> str:
+    if semantic_only:
+        # Phase 3.2 has a deliberately narrow contract.  Date-task fields and
+        # legacy task labels are omitted so an OpenAI-compatible model cannot
+        # confuse the semantic decision with the older RouteCorrection shape.
+        payload = {
+            "current_query": route_input.latest_query,
+            "recent_messages": [
+                {"role": message.role.value, "content": message.content}
+                for message in route_input.recent_messages[-4:]
+            ],
+        }
+        return json.dumps(payload, ensure_ascii=False)
     payload = {
         "latest_query": route_input.latest_query,
         "recent_messages": [
             {"role": message.role.value, "content": message.content}
-            for message in route_input.recent_messages[-6:]
+            for message in route_input.recent_messages[-4:]
         ],
-        "active_task": route_input.active_task.value if route_input.active_task else None,
-        "forced_task": route_input.forced_task.value if route_input.forced_task else None,
-        "pending_task": route_input.pending_task.value if route_input.pending_task else None,
-        "pending_task_reason": route_input.pending_task_reason,
-        "last_clarification_reason": route_input.last_clarification_reason,
-        "clarification_attempt_count": route_input.clarification_attempt_count,
-        "runtime_context": (
-            route_input.runtime_context.model_dump(mode="json")
-            if route_input.runtime_context
-            else None
-        ),
-        "rule_result": {
+        # Only compact rule hints are sent.  The semantic Router must not
+        # receive the full Agent State, date slots, memory context, or other
+        # unrelated runtime fields.
+        "rule_hints": {
             "task_type": rule_result.task_type.value,
             "task_confidence": rule_result.task_confidence,
             "task_scores": {key.value: value for key, value in rule_result.task_scores.items()},
-            "primary_goal": (rule_result.primary_goal.value if rule_result.primary_goal else None),
-            "goal_scores": {key.value: value for key, value in rule_result.goal_scores.items()},
-            "primary_scenario": (
-                rule_result.primary_scenario.value if rule_result.primary_scenario else None
-            ),
+            "primary_goal": rule_result.primary_goal.value if rule_result.primary_goal else None,
+            "goal_scores": {
+                key.value: value for key, value in rule_result.rule_goal_scores.items()
+            },
+            "primary_scenario": rule_result.primary_scenario.value
+            if rule_result.primary_scenario
+            else None,
             "scenario_scores": {
                 key.value: value for key, value in rule_result.scenario_scores.items()
             },
             "scenario_confidence": rule_result.scenario_confidence,
-            "date_plan": rule_result.date_plan.model_dump(mode="json"),
-            "date_patch": (
-                rule_result.date_patch.model_dump(mode="json") if rule_result.date_patch else None
-            ),
-            "date_request_mode": rule_result.date_request_mode.value,
-            "date_intent": rule_result.date_intent.value,
-            "date_mutation": rule_result.date_mutation.value,
-            "date_operations": [
-                operation.model_dump(mode="json") for operation in rule_result.date_operations
-            ],
-            "date_missing_fields": rule_result.date_missing_fields,
         },
     }
     return json.dumps(payload, ensure_ascii=False)
@@ -183,6 +440,8 @@ def _parse_response(content: str | None, finish_reason: str | None) -> RouteCorr
 def _parse_response_with_slot_rejections(
     content: str | None,
     finish_reason: str | None,
+    *,
+    semantic_only: bool = False,
 ) -> tuple[RouteCorrection, dict[str, str]]:
     if not content:
         raise ValueError(f"路由模型没有返回正文，finish_reason={finish_reason or 'unknown'}。")
@@ -196,11 +455,338 @@ def _parse_response_with_slot_rejections(
         raise ValueError("路由模型返回内容不符合 RouteCorrection 结构。") from exc
     if not isinstance(payload, dict):
         raise ValueError("路由模型返回内容不符合 RouteCorrection 结构。")
+    if semantic_only:
+        return _route_correction_from_semantic_payload(payload)
+    payload = _normalize_semantic_payload(payload)
     sanitized_payload, slot_parse_rejections = _sanitize_date_plan_payload(payload)
     try:
         return RouteCorrection.model_validate(sanitized_payload), slot_parse_rejections
     except ValidationError as exc:
         raise ValueError("路由模型返回内容不符合 RouteCorrection 结构。") from exc
+
+
+def _route_correction_from_semantic_payload(
+    payload: dict[str, Any],
+) -> tuple[RouteCorrection, dict[str, str]]:
+    """Validate and adapt the Phase 3.2-only response contract.
+
+    The application still consumes ``RouteCorrection`` because it owns date
+    and legacy task guards.  Live semantic calls are validated against the
+    smaller, complete ``SemanticRouteDecision`` first, so a partial object or
+    a date-planning-shaped response cannot be accepted accidentally.
+    """
+
+    sanitized, semantic_rejections = _sanitize_semantic_payload(payload)
+    try:
+        decision = SemanticRouteDecision.model_validate(sanitized)
+    except ValidationError as exc:
+        raise ValueError("路由模型返回内容不符合 SemanticRouteDecision 结构。") from exc
+    primary_goal = decision.goals[0] if decision.goals else None
+    primary_score = (
+        decision.scenario_scores.get(decision.primary_scenario)
+        if decision.primary_scenario is not None
+        else None
+    )
+    return RouteCorrection(
+        task_type=(
+            "relationship_advice" if decision.branch == "rag" else "out_of_scope"
+        ),
+        branch=decision.branch,
+        task_confidence=decision.confidence,
+        primary_goal=primary_goal,
+        secondary_goals=decision.goals[1:3],
+        primary_scenario=decision.primary_scenario,
+        secondary_scenarios=decision.secondary_scenarios,
+        scenario_confidence=primary_score,
+        scenario_scores=decision.scenario_scores,
+        goals=decision.goals,
+        goal_scores=decision.goal_scores,
+        confidence=decision.confidence,
+        reasoning_summary=decision.reasoning_summary,
+    ), semantic_rejections
+
+
+def _sanitize_semantic_payload(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Apply only lossless bounds/enum cleanup before strict validation.
+
+    DeepSeek occasionally emits a valid semantic object with three secondary
+    labels, a goal label in the scenario list, or a reasoning summary over the
+    storage bound.  Those are provider shape errors, but dropping the invalid
+    extras is deterministic and does not invent a classification. Unknown
+    top-level keys are deliberately retained so ``extra=forbid`` still rejects
+    legacy/date-shaped responses.
+    """
+
+    sanitized = dict(payload)
+    rejected: dict[str, str] = {}
+    scenario_values = {item.value for item in AdviceScenario}
+    goal_values = {item.value for item in AdviceGoal}
+
+    primary_scenario = sanitized.get("primary_scenario")
+    if primary_scenario is not None and primary_scenario not in scenario_values:
+        sanitized["primary_scenario"] = None
+        rejected["primary_scenario"] = "unknown_enum_removed"
+
+    secondary = sanitized.get("secondary_scenarios")
+    if isinstance(secondary, list):
+        valid_secondary: list[str] = []
+        for index, item in enumerate(secondary):
+            if not isinstance(item, str) or item not in scenario_values:
+                rejected[f"secondary_scenarios.{index}"] = "unknown_enum_removed"
+                continue
+            if item == sanitized.get("primary_scenario"):
+                rejected[f"secondary_scenarios.{index}"] = (
+                    "invalid_primary_secondary_relationship"
+                )
+                continue
+            if item in valid_secondary:
+                rejected[f"secondary_scenarios.{index}"] = "duplicate_label_removed"
+                continue
+            valid_secondary.append(item)
+        bounded_secondary = valid_secondary[:2]
+        if bounded_secondary != secondary:
+            sanitized["secondary_scenarios"] = bounded_secondary
+        if len(valid_secondary) > 2:
+            rejected["secondary_scenarios.limit"] = "label_count_bounded"
+
+    scenario_scores = sanitized.get("scenario_scores")
+    if isinstance(scenario_scores, dict):
+        valid_scores: dict[str, float] = {}
+        for key, value in scenario_scores.items():
+            if not isinstance(key, str) or key not in scenario_values:
+                rejected[f"scenario_scores.{key}"] = "unknown_enum_removed"
+                continue
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                rejected[f"scenario_scores.{key}"] = "invalid_score_removed"
+                continue
+            bounded = min(max(float(value), 0.0), 1.0)
+            if bounded != value:
+                rejected[f"scenario_scores.{key}"] = "score_clamped"
+            valid_scores[key] = bounded
+        if valid_scores != scenario_scores:
+            sanitized["scenario_scores"] = valid_scores
+
+        primary = sanitized.get("primary_scenario")
+        if primary is None and sanitized.get("branch") == "rag" and valid_scores:
+            primary = max(valid_scores, key=valid_scores.get)
+            sanitized["primary_scenario"] = primary
+            rejected["primary_scenario.repair"] = "primary_missing_repaired"
+        selected_scenarios = [
+            item
+            for item in [primary, *(sanitized.get("secondary_scenarios") or [])]
+            if isinstance(item, str) and item in scenario_values
+        ]
+        confidence = _bounded_semantic_confidence(sanitized.get("confidence"))
+        for index, scenario in enumerate(selected_scenarios):
+            if scenario in valid_scores:
+                continue
+            valid_scores[scenario] = confidence if index == 0 else min(confidence, 0.79)
+            rejected[f"scenario_scores.{scenario}"] = (
+                "score_missing_filled" if index == 0 else "secondary_missing_score"
+            )
+        sanitized["scenario_scores"] = valid_scores
+
+    goals = sanitized.get("goals")
+    if isinstance(goals, list):
+        valid_goals: list[str] = []
+        for index, item in enumerate(goals):
+            if not isinstance(item, str) or item not in goal_values:
+                rejected[f"goals.{index}"] = "unknown_enum_removed"
+                continue
+            if item in valid_goals:
+                rejected[f"goals.{index}"] = "duplicate_label_removed"
+                continue
+            valid_goals.append(item)
+        bounded_goals = valid_goals[:3]
+        if bounded_goals != goals:
+            sanitized["goals"] = bounded_goals
+        if len(valid_goals) > 3:
+            rejected["goals.limit"] = "label_count_bounded"
+
+    goal_scores = sanitized.get("goal_scores")
+    if isinstance(goal_scores, dict):
+        valid_goal_scores: dict[str, float] = {}
+        for key, value in goal_scores.items():
+            if not isinstance(key, str) or key not in goal_values:
+                rejected[f"goal_scores.{key}"] = "unknown_enum_removed"
+                continue
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                rejected[f"goal_scores.{key}"] = "invalid_score_removed"
+                continue
+            bounded = min(max(float(value), 0.0), 1.0)
+            if bounded != value:
+                rejected[f"goal_scores.{key}"] = "score_clamped"
+            valid_goal_scores[key] = bounded
+        if valid_goal_scores != goal_scores:
+            sanitized["goal_scores"] = valid_goal_scores
+        if not sanitized.get("goals") and sanitized.get("branch") == "rag" and valid_goal_scores:
+            sanitized["goals"] = sorted(
+                valid_goal_scores,
+                key=lambda goal: (-valid_goal_scores[goal], goal),
+            )[:3]
+            rejected["goals"] = "goal_order_normalized"
+        confidence = _bounded_semantic_confidence(sanitized.get("confidence"))
+        for index, goal in enumerate(sanitized.get("goals") or []):
+            if goal in valid_goal_scores:
+                continue
+            valid_goal_scores[goal] = confidence if index == 0 else min(confidence, 0.79)
+            rejected[f"goal_scores.{goal}"] = (
+                "score_missing_filled" if index == 0 else "secondary_missing_score"
+            )
+        sanitized["goal_scores"] = valid_goal_scores
+
+    reasoning = sanitized.get("reasoning_summary")
+    if isinstance(reasoning, str) and len(reasoning) > 300:
+        sanitized["reasoning_summary"] = reasoning[:300]
+        rejected["reasoning_summary"] = "max_length"
+    return sanitized, rejected
+
+
+def _bounded_semantic_confidence(value: object) -> float:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return min(max(float(value), 0.0), 1.0)
+    return 0.5
+
+
+_SEMANTIC_DECISION_FIELDS = (
+    "branch",
+    "primary_scenario",
+    "secondary_scenarios",
+    "scenario_scores",
+    "goals",
+    "goal_scores",
+    "confidence",
+    "reasoning_summary",
+)
+
+
+def _raw_semantic_decision_trace(content: str | None) -> dict[str, object] | None:
+    """Keep only the bounded classification payload, never hidden reasoning."""
+
+    if not content:
+        return None
+    cleaned = content.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        cleaned = "\n".join(lines[1:-1])
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return {
+        field: _bounded_trace_value(payload[field])
+        for field in _SEMANTIC_DECISION_FIELDS
+        if field in payload
+    }
+
+
+def _bounded_trace_value(value: object) -> object:
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value[:300]
+    if isinstance(value, (int, float)):
+        return float(value) if math.isfinite(float(value)) else 0.0
+    if isinstance(value, list):
+        return [_bounded_trace_value(item) for item in value[:10]]
+    if isinstance(value, dict):
+        return {
+            str(key)[:80]: _bounded_trace_value(item)
+            for key, item in list(value.items())[:20]
+        }
+    return str(value)[:300]
+
+
+def _sanitized_semantic_decision_trace(
+    correction: RouteCorrection,
+) -> dict[str, object]:
+    goals = list(dict.fromkeys([*correction.goals, *correction.secondary_goals]))[:3]
+    if correction.primary_goal is not None:
+        secondary = [goal for goal in goals if goal != correction.primary_goal]
+        goals = [correction.primary_goal, *secondary][:3]
+    return {
+        "branch": correction.branch,
+        "primary_scenario": (
+            correction.primary_scenario.value if correction.primary_scenario else None
+        ),
+        "secondary_scenarios": [item.value for item in correction.secondary_scenarios],
+        "scenario_scores": {
+            key.value: float(value) for key, value in correction.scenario_scores.items()
+        },
+        "goals": [item.value for item in goals],
+        "goal_scores": {
+            key.value: float(value) for key, value in correction.goal_scores.items()
+        },
+        "confidence": correction.confidence,
+        "reasoning_summary": correction.reasoning_summary,
+    }
+
+
+def _normalize_semantic_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the Phase 3.1 semantic contract into RouteCorrection fields."""
+
+    normalized = dict(payload)
+    branch = normalized.get("branch")
+    if "task_type" not in normalized and branch in {"rag", "out_of_scope"}:
+        normalized["task_type"] = "relationship_advice" if branch == "rag" else "out_of_scope"
+    if "task_confidence" not in normalized and normalized.get("confidence") is not None:
+        normalized["task_confidence"] = normalized["confidence"]
+
+    raw_goals = normalized.get("goals")
+    if isinstance(raw_goals, list):
+        labels: list[str] = []
+        scores = dict(normalized.get("goal_scores") or {})
+        for item in raw_goals:
+            if isinstance(item, str):
+                label = item
+                confidence = None
+            elif isinstance(item, dict):
+                label = item.get("label") or item.get("goal")
+                confidence = item.get("confidence")
+            else:
+                continue
+            if not isinstance(label, str) or not label:
+                continue
+            labels.append(label)
+            if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
+                scores[label] = float(confidence)
+        if labels:
+            normalized["goals"] = labels[:3]
+            normalized.setdefault("primary_goal", labels[0])
+            normalized.setdefault("secondary_goals", labels[1:3])
+        normalized["goal_scores"] = scores
+
+    raw_scenarios = normalized.get("scenarios")
+    if isinstance(raw_scenarios, list):
+        labels = []
+        scores = dict(normalized.get("scenario_scores") or {})
+        for item in raw_scenarios:
+            if isinstance(item, str):
+                label = item
+                confidence = None
+            elif isinstance(item, dict):
+                label = item.get("label") or item.get("scenario")
+                confidence = item.get("confidence")
+            else:
+                continue
+            if not isinstance(label, str) or not label:
+                continue
+            labels.append(label)
+            if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
+                scores[label] = float(confidence)
+        if labels:
+            normalized.setdefault("primary_scenario", labels[0])
+            normalized.setdefault("secondary_scenarios", labels[1:3])
+        normalized["scenario_scores"] = scores
+        normalized.pop("scenarios", None)
+
+    if normalized.get("scenario_confidence") is None and normalized.get("confidence") is not None:
+        normalized["scenario_confidence"] = normalized["confidence"]
+    return normalized
 
 
 def _sanitize_date_plan_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
@@ -271,6 +857,47 @@ def _validate_evidence(correction: RouteCorrection, route_input: RouteInput) -> 
         raise ValueError(f"路由证据不在对话原文中：{invalid[0]}")
 
 
+_SEMANTIC_SYSTEM_PROMPT = """
+You are LoveApp's semantic router. Classify the user's current request only;
+do not answer it and do not produce date-planning fields.
+
+Return exactly one JSON object with exactly these fields:
+branch, primary_scenario, secondary_scenarios, scenario_scores, goals,
+goal_scores, confidence, reasoning_summary.
+
+Allowed branch values: rag, out_of_scope.
+Allowed scenario values: pursuit, conflict, chat_analysis,
+relationship_maintenance, boundary, breakup.
+Allowed goal values: initiate, understand, progress, repair, communicate,
+set_boundary, end_relationship.
+
+Use branch=rag for relationship advice and branch=out_of_scope for requests
+outside relationship advice. For rag, choose the main scenario and up to two
+secondary scenarios. Choose up to three goals in priority order. Keep every
+score and confidence between 0 and 1. The score maps may contain only the
+selected labels. For out_of_scope, use null, [], {}, [], {}, and a short
+reasoning_summary in the corresponding fields.
+
+Scenario rules:
+- pursuit: starting or advancing an early relationship, contact, or an invite.
+- chat_analysis: interpreting replies, tone, frequency, or interaction signals.
+- conflict: an explicit quarrel, cold war, blame dispute, or escalation.
+- relationship_maintenance: ongoing relationship habits and long-term upkeep.
+- boundary: privacy, consent, autonomy, or social/financial/body/digital limits.
+- breakup: ending, separation, reconciliation after ending, or post-breakup contact.
+
+Goal rules:
+- initiate starts contact or an early invite; understand interprets meaning/signals.
+- progress decides or takes the next step; repair fixes an existing conflict.
+- communicate is explicit discussion or negotiation; set_boundary states limits.
+- end_relationship ends the relationship or manages post-breakup matters.
+
+Use the latest query as the primary evidence. Recent messages only resolve
+pronouns or omitted context. Do not include markdown, explanations, or any
+keys outside the contract.
+""".strip()
+
+
 _SYSTEM_PROMPT = """
 你是 LoveApp 的语义路由校正器，只分类，不回答用户问题。只输出一个合法 JSON 对象。
 
@@ -286,6 +913,30 @@ DateRequestMode：none、evaluate、category_recommendation、place_search、iti
 
 AdviceScenario：pursuit、conflict、chat_analysis、relationship_maintenance、boundary、breakup。
 AdviceGoal：initiate、understand、progress、repair、communicate、set_boundary、end_relationship。
+
+Phase 3.1 语义边界（先判断用户真正要解决的核心问题）：
+- pursuit：从陌生、认识或暧昧走向进一步关系；主动接触、邀约、建立连接、推进早期关系。
+- chat_analysis：主要理解对方聊天行为、回复变化或互动信号的含义；如果重点是下一步采取行动，
+  应同时考虑 progress 或 communicate，而不是只标 chat_analysis。
+- conflict：已经发生明确争执、反复矛盾、冷战、反击或责任争议，核心是修复冲突模式。
+- relationship_maintenance：关系已经存在且没有单次冲突作为中心，关注长期相处、亲密感、联系频率、
+  生活协调或未来发展。
+- boundary：私人空间、自主权、同意、隐私、社交/财务/身体/数字边界或公开关系边界。若“查手机”
+  的核心是未经同意查看隐私，primary 应为 boundary，conflict 最多作为 secondary。
+- breakup：考虑结束、明确分手，或分手后的边界、恢复、共同事务和持续联系。
+
+Goal 语义边界（允许多个，不要只因“怎么办/怎么处理”默认 communicate）：
+- initiate：首次或早期开启联系、聊天、发起邀约。
+- understand：判断含义、理解行为、评估现状和关系信号；“回复越来越慢是什么意思”必须保留 understand。
+- progress：决定是否推进下一步、继续邀约、确认关系或推进关系状态。
+- repair：修复已经发生的冲突，降低升级，打破冷战/反击/翻旧账循环。
+- communicate：用户明确需要表达、讨论、协商或对话方式；不是所有建议请求的默认标签。
+- set_boundary：明确允许/不允许的隐私、空间、同意、身体、数字、财务或社交边界。
+- end_relationship：结束关系、明确分手，或处理分手后的持续联系与共同事务。
+
+普通关系分支的 branch 只能是 rag 或 out_of_scope。高风险/敏感请求由上游安全规则处理，
+不得通过语义输出绕过 Safety。可返回 scenario_scores/goal_scores（0 到 1）以及简短
+reasoning_summary；不要输出长篇推理过程。
 
 规则：
 1. latest_query 是当前意图的主要依据；recent_messages 只用于理解指代和省略。
@@ -354,9 +1005,9 @@ AdviceGoal：initiate、understand、progress、repair、communicate、set_bound
      relationship_advice，真正的行程安排或参数补充则应保留 date_planning。只有真实的寒暄、
      感谢、告别或没有任务意图的短句才能使用 general_chat。
 
-必须输出字段：task_type、secondary_tasks、task_confidence、primary_goal、secondary_goals、
+必须输出字段：task_type、branch、secondary_tasks、task_confidence、primary_goal、secondary_goals、
 primary_scenario、secondary_scenarios、scenario_confidence、needs_clarification、
-evidence_spans、date_patch、date_operations、date_request_mode、date_intent、date_mutation。为兼容旧调用方可以同时输出
+scenario_scores、goals、goal_scores、confidence、reasoning_summary、evidence_spans、date_patch、date_operations、date_request_mode、date_intent、date_mutation。为兼容旧调用方可以同时输出
 date_plan，但 date_patch 是当前轮增量；数组无内容时输出 []，
 可空标量输出 null。
 """.strip()

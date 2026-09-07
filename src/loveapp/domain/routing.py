@@ -1,5 +1,6 @@
 from datetime import date as Date
 from datetime import datetime
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -22,6 +23,8 @@ from loveapp.domain.enums import (
 )
 from loveapp.domain.memory import StoredMessage
 from loveapp.domain.runtime_context import RuntimeContext
+
+SemanticScore = Annotated[float, Field(ge=0, le=1)]
 
 
 class DatePlanSlots(BaseModel):
@@ -74,10 +77,36 @@ class RouteInput(BaseModel):
     previous_risk_state: RecentRiskState | None = None
 
 
+class SemanticRouteDecision(BaseModel):
+    """Bounded semantic routing decision returned by a Router model.
+
+    This is deliberately a classification contract rather than a reasoning
+    trace.  ``reasoning_summary`` is optional, short evidence-oriented text;
+    chain-of-thought is neither requested nor persisted.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # The Live Router contract is deliberately complete: a provider must
+    # return an explicit branch and bounded semantic fields rather than an
+    # empty/partial object that would be indistinguishable from a parse error.
+    branch: Literal["rag", "out_of_scope"]
+    primary_scenario: AdviceScenario | None
+    secondary_scenarios: list[AdviceScenario] = Field(..., max_length=2)
+    scenario_scores: dict[AdviceScenario, SemanticScore]
+    goals: list[AdviceGoal] = Field(..., max_length=3)
+    goal_scores: dict[AdviceGoal, SemanticScore]
+    confidence: float = Field(..., ge=0, le=1)
+    reasoning_summary: str | None = Field(..., max_length=300)
+
+
 class RouteCorrection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     task_type: TaskType
+    # Phase 3.1 semantic fields are optional so old correction fixtures and
+    # date-planning providers remain source-compatible.
+    branch: Literal["rag", "out_of_scope"] | None = None
     secondary_tasks: list[TaskType] = Field(default_factory=list, max_length=2)
     task_confidence: float = Field(ge=0, le=1)
     primary_goal: AdviceGoal | None = None
@@ -85,6 +114,11 @@ class RouteCorrection(BaseModel):
     primary_scenario: AdviceScenario | None = None
     secondary_scenarios: list[AdviceScenario] = Field(default_factory=list, max_length=2)
     scenario_confidence: float | None = Field(default=None, ge=0, le=1)
+    scenario_scores: dict[AdviceScenario, SemanticScore] = Field(default_factory=dict)
+    goals: list[AdviceGoal] = Field(default_factory=list, max_length=3)
+    goal_scores: dict[AdviceGoal, SemanticScore] = Field(default_factory=dict)
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    reasoning_summary: str | None = Field(default=None, max_length=300)
     needs_clarification: bool = False
     evidence_spans: list[str] = Field(default_factory=list, max_length=8)
     date_plan: DatePlanSlots = Field(default_factory=DatePlanSlots)
@@ -97,10 +131,15 @@ class RouteCorrection(BaseModel):
 
 class RouteResult(BaseModel):
     normalized_query: str
+    router_raw_query: str | None = None
+    router_recent_context: list[dict[str, str]] = Field(default_factory=list, max_length=20)
     task_type: TaskType
     secondary_tasks: list[TaskType] = Field(default_factory=list, max_length=2)
     task_confidence: float = Field(ge=0, le=1)
     task_scores: dict[TaskType, float] = Field(default_factory=dict)
+    rule_branch_scores: dict[str, float] = Field(default_factory=dict)
+    rule_scenario_scores: dict[AdviceScenario, float] = Field(default_factory=dict)
+    rule_goal_scores: dict[AdviceGoal, float] = Field(default_factory=dict)
     # Diagnostic fields distinguish rule routing from LLM correction.
     rule_task_type: TaskType | None = None
     llm_task_type: TaskType | None = None
@@ -116,6 +155,14 @@ class RouteResult(BaseModel):
     secondary_scenarios: list[AdviceScenario] = Field(default_factory=list, max_length=2)
     scenario_confidence: float | None = Field(default=None, ge=0, le=1)
     scenario_scores: dict[AdviceScenario, float] = Field(default_factory=dict)
+    llm_scenario_scores: dict[AdviceScenario, float] = Field(default_factory=dict)
+    llm_goal_scores: dict[AdviceGoal, float] = Field(default_factory=dict)
+    # Raw rule evidence and LLM relevance use different scales.  Only these
+    # normalized 0..1 maps are suitable for downstream soft metadata.
+    final_scenario_weights: dict[AdviceScenario, SemanticScore] = Field(
+        default_factory=dict
+    )
+    final_goal_weights: dict[AdviceGoal, SemanticScore] = Field(default_factory=dict)
 
     date_plan: DatePlanSlots = Field(default_factory=DatePlanSlots)
     date_patch: DatePlanPatch | None = None
@@ -148,6 +195,20 @@ class RouteResult(BaseModel):
     source: RouteSource = RouteSource.RULES
     llm_used: bool = False
     router_llm_used: bool = False
+    router_llm_called: bool = False
+    router_llm_call_count: int = Field(default=0, ge=0)
+    router_llm_attempt_count: int = Field(default=0, ge=0)
+    router_llm_retry_count: int = Field(default=0, ge=0)
+    router_llm_timeout_count: int = Field(default=0, ge=0)
+    router_llm_parse_error_count: int = Field(default=0, ge=0)
+    router_llm_provider_error_count: int = Field(default=0, ge=0)
+    router_semantic_mode: str | None = None
+    semantic_bypass_reason: str | None = Field(default=None, max_length=80)
+    router_llm_fallback_reason: str | None = None
+    router_llm_route_decision: dict[str, object] | None = None
+    router_llm_raw_decision: dict[str, object] | None = None
+    router_llm_sanitized_decision: dict[str, object] | None = None
+    router_reasoning_summary: str | None = None
     llm_error: str | None = None
     needs_clarification: bool = False
     evidence_spans: list[str] = Field(default_factory=list, max_length=12)
@@ -167,8 +228,29 @@ class RouteResult(BaseModel):
     recent_risk_inherited: bool = False
     recent_risk_deescalated: bool = False
     router_prompt_version: str | None = None
+    router_prompt_sha256: str | None = None
+    router_provider: str | None = None
+    router_live_llm: bool = False
+    router_temperature: float | None = Field(default=None, ge=0, le=2)
+    router_max_tokens: int | None = Field(default=None, ge=0)
+    router_timeout_seconds: float | None = Field(default=None, ge=0)
+    router_max_retries: int | None = Field(default=None, ge=0)
     router_model: str | None = None
     router_input_tokens: int | None = Field(default=None, ge=0)
     router_output_tokens: int | None = Field(default=None, ge=0)
+    router_total_tokens: int | None = Field(default=None, ge=0)
     router_duration_ms: float | None = Field(default=None, ge=0)
+    router_retry_count: int = Field(default=0, ge=0)
+    router_timeout_count: int = Field(default=0, ge=0)
+    router_parse_error_count: int = Field(default=0, ge=0)
+    router_provider_error_count: int = Field(default=0, ge=0)
+    router_fallback_count: int = Field(default=0, ge=0)
+    router_schema_fallback_count: int = Field(default=0, ge=0)
+    router_semantic_sanitization_count: int = Field(default=0, ge=0)
+    router_semantic_sanitization_reasons: list[str] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+    router_last_provider_error: str | None = None
+    router_last_parse_error: str | None = None
     fallback_reason: str | None = None

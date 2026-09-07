@@ -9,7 +9,7 @@ The production call may persist Memory; this module does not make write decision
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Literal
 
 from loveapp.application.memory import MemoryService
 from loveapp.core.timing import ExecutionTrace
@@ -21,7 +21,9 @@ from loveapp.domain.memory import (
     StoredMessage,
 )
 from loveapp.domain.memory_write import MemoryTransitionAudit
+from loveapp.domain.routing import RouteInput
 from loveapp.ports.memory import MemoryStore
+from loveapp.ports.routing import Router
 
 _ACTIVE_STATUSES = {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}
 _GOVERNANCE_TRACE = "memory_candidate_governance"
@@ -36,6 +38,8 @@ class MemoryInspector:
         memory_service: MemoryService,
         memory_store: MemoryStore,
         *,
+        router: Router | None = None,
+        memory_version: Literal["v1", "v2"] = "v1",
         user_id: str,
         relationship_id: str,
         conversation_id: str,
@@ -53,6 +57,10 @@ class MemoryInspector:
 
         self.memory_service = memory_service
         self.memory_store = memory_store
+        self.router = router
+        if memory_version not in {"v1", "v2"}:
+            raise ValueError("memory_version must be v1 or v2")
+        self.memory_version = memory_version
         self.user_id = user_id
         self.relationship_id = relationship_id
         self.conversation_id = conversation_id
@@ -72,6 +80,7 @@ class MemoryInspector:
             raise ValueError("text must not be empty")
 
         before_items = await self._snapshot_items()
+        routing = await self._route_turn(text)
         trace = ExecutionTrace()
         result = await self.memory_service.remember_text(
             user_id=self.user_id,
@@ -81,9 +90,7 @@ class MemoryInspector:
             status=requested_status or self.requested_status,
             trace=trace,
         )
-        long_tail_shadow_pending_count = (
-            await self.memory_service.wait_for_long_tail_shadow()
-        )
+        long_tail_shadow_pending_count = await self.memory_service.wait_for_long_tail_shadow()
         after_items = await self._snapshot_items()
         audits = await self.memory_store.list_transition_audits(
             user_id=self.user_id,
@@ -94,6 +101,7 @@ class MemoryInspector:
         extraction_run = await self._extraction_run(result.extraction_run_id)
         records = trace.snapshot()
         candidates = _governance_candidates(records)
+        model_outputs = _model_outputs(records)
         memory_index = {item.id: item for item in [*before_items, *after_items]}
         _attach_candidate_memories(candidates, memory_index)
         contextual_update = _trace_payload(records, "memory_contextual_update")
@@ -110,21 +118,16 @@ class MemoryInspector:
                     "candidate_index": None,
                     "action": "contextual_update",
                     "update_type": contextual_update["contextual_update_type"],
-                    "target_memory_ids": [
-                        contextual_update["selected_target_memory_id"]
-                    ],
+                    "target_memory_ids": [contextual_update["selected_target_memory_id"]],
                     "rule": "contextual_memory_update",
                     "reason": contextual_update.get("reason"),
                 }
             )
-        before = [
-            _memory_record(item) for item in before_items if item.status in _ACTIVE_STATUSES
-        ]
-        after = [
-            _memory_record(item) for item in after_items if item.status in _ACTIVE_STATUSES
-        ]
+        before = [_memory_record(item) for item in before_items if item.status in _ACTIVE_STATUSES]
+        after = [_memory_record(item) for item in after_items if item.status in _ACTIVE_STATUSES]
 
         self._turn += 1
+        diff = _memory_diff(before_items, after_items, result, candidates)
         return {
             "turn": self._turn,
             "input": text,
@@ -135,6 +138,20 @@ class MemoryInspector:
                 "source_message_id": result.message.id,
                 "extraction_run_id": result.extraction_run_id,
             },
+            "routing": routing,
+            "memory_pipeline": {
+                "memory_version": self.memory_version,
+                "deterministic_relation_enabled": True,
+                "semantic_judge_enabled": self.memory_version == "v2",
+                "semantic_judge_mode": (
+                    "shadow" if self.memory_version == "v2" else "disabled"
+                ),
+                "semantic_judge_called": any(
+                    (evaluation.get("proposal") or {}).get("judge_status")
+                    in {"completed", "failed"}
+                    for evaluation in long_tail_relations
+                ),
+            },
             "gate": (
                 result.gate_decision.model_dump(mode="json")
                 if result.gate_decision is not None
@@ -144,12 +161,12 @@ class MemoryInspector:
             "explicit_correction": explicit_correction,
             "long_tail_relations": long_tail_relations,
             "long_tail_shadow_pending_count": long_tail_shadow_pending_count,
-            "model_outputs": _model_outputs(records),
+            "model_outputs": model_outputs,
             "before": before,
             "candidates": candidates,
             "operations": operations,
             "after": after,
-            "diff": _memory_diff(before_items, after_items, result, candidates),
+            "diff": diff,
             "extraction_run": (
                 _extraction_run_record(extraction_run) if extraction_run is not None else {}
             ),
@@ -164,6 +181,13 @@ class MemoryInspector:
                 ],
                 "pending": result.pending,
             },
+            "summary": _turn_summary(
+                model_outputs=model_outputs,
+                candidates=candidates,
+                operations=operations,
+                diff=diff,
+                result=result,
+            ),
         }
 
     async def observe_turn(
@@ -262,6 +286,34 @@ class MemoryInspector:
             limit=limit or self.limit,
             read_only=True,
         )
+
+    async def _route_turn(self, text: str) -> dict[str, Any]:
+        if self.router is None:
+            return {
+                "executed": False,
+                "error": None,
+                "reason": "router_not_configured",
+            }
+        try:
+            history = await self.memory_service.get_conversation_history(
+                self.user_id,
+                self.relationship_id,
+                self.conversation_id,
+            )
+            result = await self.router.route(
+                RouteInput(latest_query=text, recent_messages=history[-20:])
+            )
+        except Exception as exc:
+            return {
+                "executed": True,
+                "error": str(exc),
+                "reason": "router_failed",
+            }
+        return {
+            "executed": True,
+            "error": None,
+            **result.model_dump(mode="json"),
+        }
 
     async def _extraction_run(self, run_id: str | None) -> MemoryExtractionRun | None:
         if run_id is None:
@@ -414,9 +466,7 @@ def _long_tail_relation_traces(records: list[Any]) -> list[dict[str, Any]]:
             details[target] = _load_json(details.pop(source, None), fallback)
         details["trace_status"] = record.status.value
         details["trace_duration_ms"] = round(record.duration_ms, 4)
-        grouped.setdefault(candidate_index, {"candidate_index": candidate_index})[
-            section
-        ] = details
+        grouped.setdefault(candidate_index, {"candidate_index": candidate_index})[section] = details
     return [grouped[index] for index in sorted(grouped)]
 
 
@@ -523,6 +573,53 @@ def _memory_diff(
         "expired": expired,
         "status_changed": status_changed,
         "rejected": rejected,
+    }
+
+
+def _turn_summary(
+    *,
+    model_outputs: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    operations: list[dict[str, Any]],
+    diff: dict[str, list[dict[str, Any]]],
+    result: RememberResult,
+) -> dict[str, Any]:
+    extracted_claim_count = len(candidates)
+    for output in reversed(model_outputs):
+        raw_claims = output.get("raw_claims")
+        if isinstance(raw_claims, list):
+            extracted_claim_count = len(raw_claims)
+            break
+
+    relation_counts: dict[str, int] = {}
+    for candidate in candidates:
+        relation = str(candidate.get("claim_relation") or "none")
+        relation_counts[relation] = relation_counts.get(relation, 0) + 1
+
+    planned_actions = [
+        str(operation.get("action") or operation.get("planned_action"))
+        for operation in operations
+        if operation.get("action") or operation.get("planned_action")
+    ]
+    update_actions = {"update", "replace", "contextual_update"}
+    update_proposed = any(candidate.get("claim_relation") == "update" for candidate in candidates)
+    update_planned = any(action in update_actions for action in planned_actions)
+    update_applied = bool(diff.get("updated") or diff.get("superseded"))
+    actual_write_effects = [
+        effect
+        for effect in ("added", "merged", "updated", "superseded", "expired", "rejected")
+        if diff.get(effect)
+    ]
+    return {
+        "extracted_claim_count": extracted_claim_count,
+        "normalized_candidate_count": len(candidates),
+        "saved_memory_count": len(result.saved),
+        "relation_counts": relation_counts,
+        "planned_actions": planned_actions,
+        "update_proposed": update_proposed,
+        "update_planned": update_planned,
+        "update_applied": update_applied,
+        "actual_write_effects": actual_write_effects,
     }
 
 

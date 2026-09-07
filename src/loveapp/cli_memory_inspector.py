@@ -5,14 +5,14 @@ from __future__ import annotations
 import json
 import shlex
 from collections.abc import Callable, Iterable
-from typing import Any
+from typing import Any, Literal
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
 from loveapp.application.memory_inspector import MemoryInspector
-from loveapp.bootstrap import build_memory_container
+from loveapp.bootstrap import build_memory_container, build_routing_container
 from loveapp.core.config import get_settings
 from loveapp.domain.memory import MemoryStatus
 
@@ -43,27 +43,41 @@ async def run_memory_inspector_cli(
     texts: Iterable[str] = (),
     json_output: bool = False,
     isolated: bool = False,
+    include_routing: bool = True,
+    memory_version: Literal["v1", "v2"] = "v1",
     limit: int = 200,
     input_fn: InputFunction = input,
     output_console: Console | None = None,
 ) -> list[dict[str, Any]]:
     """Build the configured Memory pipeline and run an Inspector session."""
 
+    if memory_version not in {"v1", "v2"}:
+        raise ValueError("memory_version must be v1 or v2")
     settings = get_settings()
-    if isolated:
-        settings = settings.model_copy(update={"memory_backend": "memory"})
-    container = build_memory_container(settings)
-    inspector = MemoryInspector(
-        container.memory_service,
-        container.memory_store,
-        user_id=user_id,
-        relationship_id=relationship_id,
-        conversation_id=conversation_id,
-        requested_status=requested_status,
-        limit=limit,
+    settings = settings.model_copy(
+        update={
+            "memory_backend": "memory" if isolated else settings.memory_backend,
+            "memory_semantic_relation_provider": (
+                "llm" if memory_version == "v2" else "disabled"
+            ),
+        }
     )
+    container = build_memory_container(settings)
+    routing_container = None
     console = output_console or Console()
     try:
+        routing_container = build_routing_container(settings) if include_routing else None
+        inspector = MemoryInspector(
+            container.memory_service,
+            container.memory_store,
+            router=(routing_container.router if routing_container is not None else None),
+            memory_version=memory_version,
+            user_id=user_id,
+            relationship_id=relationship_id,
+            conversation_id=conversation_id,
+            requested_status=requested_status,
+            limit=limit,
+        )
         return await run_inspector_session(
             inspector,
             texts=list(texts),
@@ -72,7 +86,11 @@ async def run_memory_inspector_cli(
             console=console,
         )
     finally:
-        await container.aclose()
+        try:
+            if routing_container is not None:
+                await routing_container.aclose()
+        finally:
+            await container.aclose()
 
 
 async def run_inspector_session(
@@ -219,7 +237,10 @@ async def _handle_command(
 def render_inspection_report(console: Console, report: dict[str, Any]) -> None:
     console.rule(f"Turn {report.get('turn', '-')}: Memory inspection")
     console.print(Panel(str(report.get("input", "")), title="INPUT", expand=False))
+    _render_routing(console, report.get("routing") or {})
+    _render_memory_pipeline(console, report.get("memory_pipeline") or {})
     _render_gate(console, report.get("gate") or {})
+    _render_turn_summary(console, report.get("summary") or {})
     _render_memories(console, report.get("before") or [], title="BEFORE (active)")
     _render_model_outputs(console, report.get("model_outputs") or [])
     _render_long_tail_relations(console, report.get("long_tail_relations") or [])
@@ -238,6 +259,76 @@ def render_inspection_report(console: Console, report: dict[str, Any]) -> None:
     if error:
         console.print(Panel(str(error), title="EXTRACTION ERROR", border_style="red"))
     _render_memories(console, report.get("after") or [], title="AFTER")
+
+
+def _render_routing(console: Console, routing: dict[str, Any]) -> None:
+    table = Table(title="APPLICATION ROUTER", show_header=False)
+    table.add_column(style="cyan", no_wrap=True)
+    table.add_column()
+    for key in (
+        "executed",
+        "task_type",
+        "secondary_tasks",
+        "task_confidence",
+        "source",
+        "primary_scenario",
+        "secondary_scenarios",
+        "primary_goal",
+        "secondary_goals",
+        "risk_level",
+        "needs_clarification",
+        "router_llm_called",
+        "router_llm_used",
+        "router_model",
+        "router_llm_fallback_reason",
+        "reason",
+        "error",
+    ):
+        if key in routing:
+            table.add_row(key, _display(routing.get(key)))
+    console.print(table)
+    if routing.get("error"):
+        console.print(
+            Panel(
+                str(routing["error"]),
+                title="ROUTER ERROR (Memory inspection continued)",
+                border_style="yellow",
+            )
+        )
+
+
+def _render_memory_pipeline(console: Console, pipeline: dict[str, Any]) -> None:
+    table = Table(title="MEMORY PIPELINE VERSION", show_header=False)
+    table.add_column(style="cyan", no_wrap=True)
+    table.add_column()
+    for key in (
+        "memory_version",
+        "deterministic_relation_enabled",
+        "semantic_judge_enabled",
+        "semantic_judge_mode",
+        "semantic_judge_called",
+    ):
+        table.add_row(key, _display(pipeline.get(key)))
+    console.print(table)
+
+
+def _render_turn_summary(console: Console, summary: dict[str, Any]) -> None:
+    table = Table(title="TURN SUMMARY", show_header=False)
+    table.add_column(style="cyan", no_wrap=True)
+    table.add_column()
+    for key in (
+        "extracted_claim_count",
+        "normalized_candidate_count",
+        "saved_memory_count",
+        "relation_counts",
+        "planned_actions",
+        "update_proposed",
+        "update_planned",
+        "update_applied",
+        "actual_write_effects",
+    ):
+        table.add_row(key, _display(summary.get(key)))
+    console.print(table)
 
 
 def _render_banner(console: Console, inspector: MemoryInspector) -> None:
@@ -490,8 +581,7 @@ def _render_candidates(console: Console, candidates: list[dict[str, Any]]) -> No
         if candidate.get("planned_action") == "merge" and not planned_target_ids:
             planned_target_ids = candidate.get("relation_target_memory_ids") or []
         planned = (
-            f"{candidate.get('planned_action') or '-'}\n"
-            f"targets={_display(planned_target_ids)}"
+            f"{candidate.get('planned_action') or '-'}\ntargets={_display(planned_target_ids)}"
         )
         table.add_row(
             str(candidate.get("candidate_index", "-")),
@@ -666,11 +756,7 @@ def _render_runs(console: Console, runs: list[dict[str, Any]]) -> None:
             )
             claim_count = attempt.get("claim_count")
             table.add_row(
-                (
-                    f"{run.get('id') or '-'}\n{run.get('status') or '-'}"
-                    if index == 0
-                    else ""
-                ),
+                (f"{run.get('id') or '-'}\n{run.get('status') or '-'}" if index == 0 else ""),
                 str(run.get("gate_reason") or run.get("gate_decision", {}).get("reason") or "-")
                 if index == 0
                 else "",

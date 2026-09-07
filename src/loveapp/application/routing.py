@@ -3,6 +3,7 @@ import unicodedata
 from collections.abc import Iterable, Mapping
 from datetime import timedelta
 from time import perf_counter
+from typing import Literal
 
 from loveapp.application.conversation_flow import is_pending_cancellation
 from loveapp.application.date_planning.clause_parsing import split_date_clauses
@@ -68,6 +69,15 @@ class HybridRouter:
         clarification_threshold: float = 0.68,
         prompt_version: str = "routing-v3.0",
         date_semantic_parser: DateSemanticParser | None = None,
+        router_v2_enabled: bool = False,
+        semantic_mode: Literal["legacy", "off", "always", "conditional"] = "legacy",
+        router_llm_correction_enabled: bool = False,
+        router_llm_always_on_for_relationship: bool = False,
+        router_llm_low_confidence_threshold: float | None = None,
+        router_llm_margin_threshold: float | None = None,
+        router_goal_secondary_threshold: float = 0.3,
+        router_goal_max_count: int = 3,
+        router_conditional_trigger_profile: Literal["c0", "c1", "c2"] = "c2",
     ) -> None:
         self._safety_policy = safety_policy
         self._corrector = corrector
@@ -75,6 +85,32 @@ class HybridRouter:
         self._ambiguity_margin = ambiguity_margin
         self._clarification_threshold = clarification_threshold
         self._prompt_version = prompt_version
+        # Phase 3 Router/Safety enhancements are opt-in.  Keeping the
+        # historical default disabled is important for callers that rely on
+        # the pre-Phase-3 rule tables (and for controlled A/B arms).
+        self._router_v2_enabled = router_v2_enabled
+        if semantic_mode not in {"legacy", "off", "always", "conditional"}:
+            raise ValueError(f"Unsupported semantic router mode: {semantic_mode}")
+        if not 0 <= router_goal_secondary_threshold <= 1:
+            raise ValueError("router_goal_secondary_threshold must be between 0 and 1")
+        if not 1 <= router_goal_max_count <= 3:
+            raise ValueError("router_goal_max_count must be between 1 and 3")
+        if router_conditional_trigger_profile not in {"c0", "c1", "c2"}:
+            raise ValueError("router_conditional_trigger_profile must be c0, c1, or c2")
+        self._semantic_mode = semantic_mode
+        self._router_llm_correction_enabled = router_llm_correction_enabled
+        self._router_llm_always_on_for_relationship = router_llm_always_on_for_relationship
+        self._router_llm_low_confidence_threshold = (
+            confidence_threshold
+            if router_llm_low_confidence_threshold is None
+            else router_llm_low_confidence_threshold
+        )
+        self._router_llm_margin_threshold = (
+            ambiguity_margin if router_llm_margin_threshold is None else router_llm_margin_threshold
+        )
+        self._router_goal_secondary_threshold = router_goal_secondary_threshold
+        self._router_goal_max_count = router_goal_max_count
+        self._router_conditional_trigger_profile = router_conditional_trigger_profile
         self._date_semantic_parser = date_semantic_parser or (
             corrector if hasattr(corrector, "parse_date_operations") else None
         )
@@ -86,28 +122,69 @@ class HybridRouter:
             recent_messages=route_input.recent_messages,
             previous_risk_state=route_input.previous_risk_state,
         )
-        result = route_by_rules(route_input, normalized)
+        result = route_by_rules(
+            route_input,
+            normalized,
+            router_v2_enabled=self._router_v2_enabled,
+        )
         result = result.model_copy(
             update={
                 "risk_level": safety.risk_level,
                 "risk_reasons": safety.reasons,
                 "recent_risk_inherited": safety.inherited,
                 "recent_risk_deescalated": safety.deescalated,
+                "router_raw_query": route_input.latest_query,
+                "router_recent_context": [
+                    {"role": message.role.value, "content": message.content}
+                    for message in route_input.recent_messages[-20:]
+                ],
                 "router_prompt_version": self._prompt_version,
+                "router_semantic_mode": self._semantic_mode,
             }
         )
-        if safety.risk_level != RiskLevel.NORMAL or self._corrector is None:
-            return await self._finalize_route(route_input, result)
-        # Exact casual messages are a deterministic fast path.  This guard is
-        # intentionally after the safety scan so a safety rule always wins.
-        if _is_exact_casual_chat(normalized):
-            return await self._finalize_route(route_input, result)
-        if _is_clear_out_of_scope(result):
-            return await self._finalize_route(route_input, result)
+        if safety.risk_level != RiskLevel.NORMAL:
+            return await self._finalize_route(
+                route_input,
+                result.model_copy(update={"semantic_bypass_reason": "safety_guard"}),
+            )
+        deterministic_bypass = _semantic_deterministic_bypass_reason(route_input, result)
+        if (
+            deterministic_bypass == "date_workflow"
+            and self._semantic_mode not in {"always", "conditional"}
+        ):
+            # Date routing predates the Phase 3 semantic arms. Preserve the
+            # legacy corrector path while keeping date workflows deterministic
+            # in the explicit Always and Conditional evaluation modes.
+            deterministic_bypass = None
+        if deterministic_bypass is not None:
+            return await self._finalize_route(
+                route_input,
+                result.model_copy(update={"semantic_bypass_reason": deterministic_bypass}),
+            )
+        if self._corrector is None:
+            bypass_reason = (
+                "corrector_unavailable"
+                if self._semantic_mode in {"always", "conditional"}
+                else None
+            )
+            return await self._finalize_route(
+                route_input,
+                result.model_copy(update={"semantic_bypass_reason": bypass_reason}),
+            )
         if not self._needs_llm_correction(route_input, result):
-            return await self._finalize_route(route_input, result)
+            bypass_reason = {
+                "always": "semantic_router_disabled",
+                "conditional": "conditional_not_triggered",
+                "off": "semantic_mode_off",
+                "legacy": "rule_confident",
+            }[self._semantic_mode]
+            return await self._finalize_route(
+                route_input,
+                result.model_copy(update={"semantic_bypass_reason": bypass_reason}),
+            )
 
         started = perf_counter()
+        result = result.model_copy(update={"router_llm_called": True, "router_llm_call_count": 1})
         try:
             correction = await self._corrector.correct(route_input, result)
         except Exception as exc:
@@ -124,7 +201,12 @@ class HybridRouter:
                         "router_model": telemetry.get("model"),
                         "router_input_tokens": telemetry.get("input_tokens"),
                         "router_output_tokens": telemetry.get("output_tokens"),
+                        "router_total_tokens": _total_tokens(telemetry),
+                        "router_llm_attempt_count": _attempt_count(telemetry),
                         "router_duration_ms": duration_ms,
+                        "router_llm_fallback_reason": "llm_correction_failed",
+                        "router_llm_route_decision": None,
+                        **_router_telemetry_route_fields(telemetry),
                     }
                 ),
             )
@@ -164,6 +246,16 @@ class HybridRouter:
             task_date_plan=task_slots,
             current_turn_date_plan=current_turn_date_plan,
             current_turn_field_sources=current_turn_field_sources,
+            goal_secondary_threshold=(
+                self._router_goal_secondary_threshold
+                if self._semantic_mode in {"always", "conditional"}
+                else 0.0
+            ),
+            goal_max_count=(
+                self._router_goal_max_count
+                if self._semantic_mode in {"always", "conditional"}
+                else 3
+            ),
         )
         structural_slot_rejections = telemetry.get("slot_parse_rejections", {})
         if not isinstance(structural_slot_rejections, dict):
@@ -185,9 +277,15 @@ class HybridRouter:
                 "router_model": telemetry.get("model"),
                 "router_input_tokens": telemetry.get("input_tokens"),
                 "router_output_tokens": telemetry.get("output_tokens"),
+                "router_total_tokens": _total_tokens(telemetry),
+                "router_llm_attempt_count": _attempt_count(telemetry),
                 "router_duration_ms": telemetry.get(
                     "duration_ms", round((perf_counter() - started) * 1000, 3)
                 ),
+                "router_llm_fallback_reason": None,
+                "router_llm_route_decision": _semantic_decision_trace(correction),
+                "router_reasoning_summary": correction.reasoning_summary,
+                **_router_telemetry_route_fields(telemetry),
             }
         )
         return await self._finalize_route(route_input, merged)
@@ -268,9 +366,7 @@ class HybridRouter:
             "date_semantic_parse_required": required,
             "date_semantic_parse_reason": "+".join(parse_reasons) or None,
             "date_semantic_trigger_reasons": list(parse_reasons),
-            **_date_semantic_route_telemetry(
-                profile if isinstance(profile, Mapping) else {}
-            ),
+            **_date_semantic_route_telemetry(profile if isinstance(profile, Mapping) else {}),
             "date_unresolved_references": list(deterministic.unresolved_references),
             "date_patch": semantic_base_patch,
             "date_operations": list(deterministic.operations),
@@ -312,10 +408,10 @@ class HybridRouter:
             return result.model_copy(
                 update=_date_semantic_failure_update(
                     {
-                    **base_update,
-                    "date_semantic_llm_used": True,
-                    "date_semantic_error": str(exc)[:300],
-                    **_date_semantic_route_telemetry(telemetry),
+                        **base_update,
+                        "date_semantic_llm_used": True,
+                        "date_semantic_error": str(exc)[:300],
+                        **_date_semantic_route_telemetry(telemetry),
                     },
                     deterministic_complete=deterministic_complete,
                     fallback_reason="semantic_parse_failed",
@@ -334,9 +430,7 @@ class HybridRouter:
                         **base_update,
                         "date_semantic_llm_used": True,
                         **_date_semantic_route_telemetry(telemetry),
-                        "date_unresolved_references": list(
-                            resolution.unresolved_references
-                        ),
+                        "date_unresolved_references": list(resolution.unresolved_references),
                     },
                     deterministic_complete=False,
                     fallback_reason="semantic_result_incomplete",
@@ -481,9 +575,21 @@ class HybridRouter:
         route_input: RouteInput,
         result: RouteResult,
     ) -> bool:
+        # Phase 3.1 evaluation arms are explicit.  ``off`` is a true
+        # rule-only arm; it must not accidentally invoke the legacy corrector
+        # for a weak task or date candidate.
+        if self._semantic_mode == "off":
+            return False
+        # The explicit enable flag gates the new evaluation arms.  ``legacy``
+        # intentionally ignores it so existing deployments that already use
+        # the historical date/task corrector keep their behaviour unchanged.
+        if self._semantic_mode in {"always", "conditional"} and not (
+            self._router_llm_correction_enabled
+        ):
+            return False
         if _is_exact_casual_chat(result.normalized_query):
             return False
-        if _is_clear_out_of_scope(result):
+        if _is_clear_out_of_scope(result) and self._semantic_mode != "always":
             return False
         if (
             route_input.date_task_state is None
@@ -499,6 +605,19 @@ class HybridRouter:
             # existing workflow as either a supplement or a task switch. A
             # structured slot-only answer remains a deterministic fast path.
             return not _is_obvious_date_supplement(result.normalized_query)
+        if self._semantic_mode == "always":
+            # Deterministic bypasses are resolved before this method.  The
+            # Always arm must not pass through any rule-confidence gate.
+            return True
+        if self._semantic_mode == "conditional":
+            return _needs_conditional_semantic_router_call(
+                route_input,
+                result,
+                low_confidence_threshold=self._router_llm_low_confidence_threshold,
+                margin_threshold=self._router_llm_margin_threshold,
+                always_on_for_relationship=self._router_llm_always_on_for_relationship,
+                trigger_profile=self._router_conditional_trigger_profile,
+            )
         if _looks_like_date_candidate(result.normalized_query, result):
             return True
         if self._needs_task_correction(route_input, result):
@@ -531,6 +650,17 @@ class HybridRouter:
                 TaskType.GENERAL_CHAT,
                 TaskType.OUT_OF_SCOPE,
             } and not _has_explicit_business_request(rules.normalized_query)
+        if (
+            self._semantic_mode in {"always", "conditional"}
+            and correction.task_type == TaskType.RELATIONSHIP_ADVICE
+            and rules.task_type in {TaskType.GENERAL_CHAT, TaskType.OUT_OF_SCOPE}
+            and not _is_clear_out_of_scope(rules)
+            and not _has_verified_date_task_signal(route_input, rules)
+        ):
+            # Semantic correction is specifically allowed to recover short,
+            # colloquial relationship queries that the rule layer labelled as
+            # general chat.  Explicit OOD/date guards above still win.
+            return True
         if correction.task_type == TaskType.DATE_PLANNING:
             correction_mode = _resolved_correction_date_mode(
                 route_input,
@@ -586,9 +716,11 @@ def _apply_date_plan_focus_guard(
     )
     if not date_plan_is_focused:
         return result
-    has_explicit_operation = bool(result.date_operations) or _looks_like_date_edit_request(
-        result.normalized_query
-    ) or _is_executable_date_mode(result.date_request_mode)
+    has_explicit_operation = (
+        bool(result.date_operations)
+        or _looks_like_date_edit_request(result.normalized_query)
+        or _is_executable_date_mode(result.date_request_mode)
+    )
     if (
         not has_explicit_operation
         or _looks_like_explicit_advice_request(result.normalized_query)
@@ -636,6 +768,66 @@ def normalize_route_text(text: str) -> str:
 def _corrector_telemetry(corrector: RouteCorrector | None) -> Mapping[str, object]:
     telemetry = getattr(corrector, "last_telemetry", {})
     return telemetry if isinstance(telemetry, Mapping) else {}
+
+
+def _router_telemetry_route_fields(telemetry: Mapping[str, object]) -> dict[str, object]:
+    """Map provider diagnostics onto the route trace without exposing secrets."""
+
+    fields: dict[str, object] = {}
+    mapping = {
+        "router_prompt_sha256": "prompt_sha256",
+        "router_provider": "provider",
+        "router_temperature": "temperature",
+        "router_max_tokens": "max_tokens",
+        "router_timeout_seconds": "timeout_seconds",
+        "router_max_retries": "max_retries",
+        "router_retry_count": "retry_count",
+        "router_timeout_count": "timeout_count",
+        "router_parse_error_count": "parse_error_count",
+        "router_provider_error_count": "provider_error_count",
+        "router_fallback_count": "fallback_count",
+        "router_schema_fallback_count": "schema_fallback_count",
+        "router_semantic_sanitization_count": "semantic_sanitization_count",
+        "router_semantic_sanitization_reasons": "semantic_sanitization_reasons",
+        "router_llm_raw_decision": "llm_raw_decision",
+        "router_llm_sanitized_decision": "llm_sanitized_decision",
+        "router_last_provider_error": "last_provider_error",
+        "router_last_parse_error": "last_parse_error",
+        "router_llm_retry_count": "retry_count",
+        "router_llm_timeout_count": "timeout_count",
+        "router_llm_parse_error_count": "parse_error_count",
+        "router_llm_provider_error_count": "provider_error_count",
+    }
+    for field, key in mapping.items():
+        value = telemetry.get(key)
+        if value is not None:
+            fields[field] = value
+    alias_map = {
+        "router_llm_retry_count": "retry_count",
+        "router_llm_timeout_count": "timeout_count",
+        "router_llm_parse_error_count": "parse_error_count",
+        "router_llm_provider_error_count": "provider_error_count",
+    }
+    for field, key in alias_map.items():
+        value = telemetry.get(key)
+        if value is not None:
+            fields[field] = value
+    live_llm = telemetry.get("live_llm")
+    if isinstance(live_llm, bool):
+        fields["router_live_llm"] = live_llm
+    return fields
+
+
+def _attempt_count(telemetry: Mapping[str, object]) -> int:
+    value = telemetry.get("attempt_count")
+    return value if isinstance(value, int) and value >= 0 else 1
+
+
+def _total_tokens(telemetry: Mapping[str, object]) -> int | None:
+    input_tokens = telemetry.get("input_tokens")
+    output_tokens = telemetry.get("output_tokens")
+    values = [value for value in (input_tokens, output_tokens) if isinstance(value, int)]
+    return sum(values) if len(values) == 2 else None
 
 
 def _date_semantic_telemetry(parser: DateSemanticParser | None) -> Mapping[str, object]:
@@ -737,12 +929,15 @@ def _remove_unverified_stop_local_area(
     area = patch.area
     if area is None or "stop_local_constraints" not in parse_reasons:
         return patch
-    if re.search(
-        rf"(?:(?:整个|全程|所有|全部).{{0,12}}(?:约会|行程|安排).{{0,12}}"
-        rf"{re.escape(area)}|{re.escape(area)}.{{0,12}}(?:安排|覆盖).{{0,8}}"
-        r"(?:整个|全程|所有|全部).{0,8}(?:约会|行程))",
-        text,
-    ) is not None:
+    if (
+        re.search(
+            rf"(?:(?:整个|全程|所有|全部).{{0,12}}(?:约会|行程|安排).{{0,12}}"
+            rf"{re.escape(area)}|{re.escape(area)}.{{0,12}}(?:安排|覆盖).{{0,8}}"
+            r"(?:整个|全程|所有|全部).{0,8}(?:约会|行程))",
+            text,
+        )
+        is not None
+    ):
         return patch
     if re.search(rf"{re.escape(area)}\s*(?:附近|周边|一带|商圈)", text) is None:
         return patch
@@ -759,7 +954,12 @@ def _same_area_value(first: str, second: str) -> bool:
     return left == right or left in right or right in left
 
 
-def route_by_rules(route_input: RouteInput, normalized_query: str | None = None) -> RouteResult:
+def route_by_rules(
+    route_input: RouteInput,
+    normalized_query: str | None = None,
+    *,
+    router_v2_enabled: bool = False,
+) -> RouteResult:
     text = normalized_query or normalize_route_text(route_input.latest_query)
     latest_date_slots = extract_date_plan_slots(RouteInput(latest_query=route_input.latest_query))
     date_slots = (
@@ -778,6 +978,16 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
             4,
         )
         task_evidence.setdefault(TaskType.RELATIONSHIP_ADVICE, []).append("明确关系咨询请求")
+    # Phase 3 branch routing: many real relationship questions omit an
+    # explicit relationship noun (for example, "回复越来越慢怎么办").
+    # Scenario cues below are still relationship-domain evidence and should
+    # default to RAG rather than falling through to general_chat.
+    if router_v2_enabled and _has_relationship_domain_signal(text):
+        task_scores[TaskType.RELATIONSHIP_ADVICE] = max(
+            task_scores.get(TaskType.RELATIONSHIP_ADVICE, 0),
+            3.5,
+        )
+        task_evidence.setdefault(TaskType.RELATIONSHIP_ADVICE, []).append("关系领域语义线索")
     if (
         _has_relationship_semantic_request(text)
         and task_scores.get(TaskType.RELATIONSHIP_ADVICE, 0) >= 4
@@ -786,14 +996,32 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
         # let "代码" alone outrank an explicit conflict or communication request.
         task_scores.pop(TaskType.OUT_OF_SCOPE, None)
         task_evidence.pop(TaskType.OUT_OF_SCOPE, None)
-    date_request_mode = _infer_date_request_mode(route_input, text, latest_date_slots)
+    if (
+        router_v2_enabled
+        and _has_non_product_domain_signal(text)
+        and not _has_relationship_semantic_request(text)
+    ):
+        task_scores[TaskType.OUT_OF_SCOPE] = max(
+            task_scores.get(TaskType.OUT_OF_SCOPE, 0),
+            5,
+        )
+        task_evidence.setdefault(TaskType.OUT_OF_SCOPE, []).append("明确非恋爱领域线索")
+    # Mentioning a date as the relationship action is not, by itself, a
+    # request for the agent to build an itinerary.  For example, "想安排一次
+    # 小约会，让感情升温，怎么做" is pursuit/progress advice.  Keep explicit
+    # agent-directed planning/search commands on the date-planning path.
+    relationship_date_action = router_v2_enabled and _looks_like_relationship_date_action(text)
+    date_request_mode = (
+        DateRequestMode.EVALUATE
+        if relationship_date_action
+        else _infer_date_request_mode(route_input, text, latest_date_slots)
+    )
     implicit_date_bundle = _looks_like_implicit_date_plan_bundle(text, latest_date_slots)
     executable_date_request = _is_executable_date_mode(date_request_mode)
     if (
         executable_date_request
         and not (
-            route_input.date_task_state is not None
-            and route_input.date_task_state.is_resumable
+            route_input.date_task_state is not None and route_input.date_task_state.is_resumable
         )
         and route_input.recent_messages
     ):
@@ -858,9 +1086,7 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
             task_evidence.setdefault(TaskType.DATE_PLANNING, []).append("复合请求中的后续约会规划")
         else:
             bonus = 5 if implicit_date_bundle else 4
-            task_scores[TaskType.DATE_PLANNING] = (
-                task_scores.get(TaskType.DATE_PLANNING, 0) + bonus
-            )
+            task_scores[TaskType.DATE_PLANNING] = task_scores.get(TaskType.DATE_PLANNING, 0) + bonus
             task_evidence.setdefault(TaskType.DATE_PLANNING, []).append(
                 "结构化约会条件组合" if implicit_date_bundle else "明确约会规划请求"
             )
@@ -928,9 +1154,19 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
     if task_type == TaskType.RELATIONSHIP_ADVICE or (
         TaskType.RELATIONSHIP_ADVICE in secondary_tasks
     ):
+        scenario_patterns = _phase3_pattern_view(
+            _SCENARIO_PATTERNS,
+            _PHASE3_SCENARIO_PATTERN_ENTRIES,
+            enabled=router_v2_enabled,
+        )
+        goal_patterns = _phase3_pattern_view(
+            _GOAL_PATTERNS,
+            _PHASE3_GOAL_PATTERN_ENTRIES,
+            enabled=router_v2_enabled,
+        )
         scenario_scores, scenario_evidence = _score_labels(
             text,
-            _SCENARIO_PATTERNS,
+            scenario_patterns,
             suppress_negated=True,
         )
         _apply_regex_scores(
@@ -944,6 +1180,7 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
             text,
             scenario_scores,
             scenario_evidence,
+            scenario_patterns=scenario_patterns,
         )
         if date_request_mode == DateRequestMode.EVALUATE:
             scenario_scores[AdviceScenario.PURSUIT] = (
@@ -961,7 +1198,7 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
 
         goal_scores, goal_evidence = _score_labels(
             text,
-            _GOAL_PATTERNS,
+            goal_patterns,
             suppress_negated=True,
         )
         _apply_regex_scores(
@@ -1031,14 +1268,29 @@ def route_by_rules(route_input: RouteInput, normalized_query: str | None = None)
         secondary_tasks=secondary_tasks,
         task_confidence=task_confidence,
         task_scores=_rounded_scores(task_scores),
+        rule_branch_scores={
+            "rag": round(task_scores.get(TaskType.RELATIONSHIP_ADVICE, 0), 3),
+            "out_of_scope": round(task_scores.get(TaskType.OUT_OF_SCOPE, 0), 3),
+            "general_chat": round(task_scores.get(TaskType.GENERAL_CHAT, 0), 3),
+        },
+        rule_scenario_scores=_rounded_scores(scenario_scores),
+        rule_goal_scores=_rounded_scores(goal_scores),
         rule_task_type=task_type,
         primary_goal=primary_goal,
         secondary_goals=secondary_goals,
         goal_scores=_rounded_scores(goal_scores),
+        final_goal_weights=_normalize_selected_weights(
+            goal_scores,
+            [primary_goal, *secondary_goals],
+        ),
         primary_scenario=primary_scenario,
         secondary_scenarios=secondary_scenarios,
         scenario_confidence=scenario_confidence,
         scenario_scores=_rounded_scores(scenario_scores),
+        final_scenario_weights=_normalize_selected_weights(
+            scenario_scores,
+            [primary_scenario, *secondary_scenarios],
+        ),
         date_plan=date_plan,
         date_patch=date_patch,
         date_request_mode=date_request_mode,
@@ -1147,6 +1399,8 @@ def merge_route_correction(
     task_date_plan: DatePlanSlots | None = None,
     current_turn_date_plan: DatePlanSlots | None = None,
     current_turn_field_sources: dict[str, str] | None = None,
+    goal_secondary_threshold: float = 0.0,
+    goal_max_count: int = 3,
 ) -> RouteResult:
     date_request_mode = _resolved_correction_date_mode(
         route_input,
@@ -1257,26 +1511,79 @@ def merge_route_correction(
     ):
         date_mutation = DatePlanMutation.ADD
 
+    llm_scenario_scores = _semantic_scenario_scores(correction)
+    llm_goal_scores = _semantic_goal_scores(correction)
     if task_type == TaskType.RELATIONSHIP_ADVICE:
-        primary_scenario = correction.primary_scenario or rules.primary_scenario
-        secondary_scenarios = _without_primary(
-            [*correction.secondary_scenarios, *rules.secondary_scenarios],
-            primary_scenario,
-        )[:2]
+        has_semantic_scenarios = bool(
+            correction.primary_scenario is not None
+            or correction.secondary_scenarios
+            or correction.scenario_scores
+        )
+        semantic_primary_scenario, semantic_secondary_scenarios = _semantic_scenario_fields(
+            correction
+        )
+        primary_scenario = semantic_primary_scenario or rules.primary_scenario
+        if correction.primary_scenario is not None or correction.scenario_scores:
+            secondary_scenarios = _without_primary(
+                semantic_secondary_scenarios,
+                primary_scenario,
+            )[:2]
+        else:
+            secondary_scenarios = _without_primary(
+                [*semantic_secondary_scenarios, *rules.secondary_scenarios],
+                primary_scenario,
+            )[:2]
         if primary_scenario is None:
             primary_scenario = AdviceScenario.RELATIONSHIP_MAINTENANCE
-        primary_goal = correction.primary_goal or rules.primary_goal
-        secondary_goals = _without_primary(
-            [*correction.secondary_goals, *rules.secondary_goals],
-            primary_goal,
-        )[:2]
-        scenario_confidence = correction.scenario_confidence or rules.scenario_confidence
+        has_semantic_goals = bool(
+            correction.primary_goal is not None
+            or correction.secondary_goals
+            or correction.goals
+            or correction.goal_scores
+        )
+        semantic_primary_goal, semantic_secondary_goals = select_semantic_goals(
+            correction,
+            secondary_threshold=goal_secondary_threshold,
+            max_goals=goal_max_count,
+        )
+        primary_goal = semantic_primary_goal or rules.primary_goal
+        if correction.goals or correction.goal_scores or correction.primary_goal is not None:
+            secondary_goals = _without_primary(semantic_secondary_goals, primary_goal)[:2]
+        else:
+            secondary_goals = _without_primary(
+                [*semantic_secondary_goals, *rules.secondary_goals],
+                primary_goal,
+            )[:2]
+        scenario_confidence = (
+            correction.scenario_confidence
+            if correction.scenario_confidence is not None
+            else rules.scenario_confidence
+        )
+        # ``scenario_scores`` / ``goal_scores`` remain compatibility aliases
+        # for the active source.  They never combine unbounded rule evidence
+        # with 0..1 semantic relevance.
+        scenario_scores = (
+            llm_scenario_scores if has_semantic_scenarios else dict(rules.rule_scenario_scores)
+        )
+        goal_scores = llm_goal_scores if has_semantic_goals else dict(rules.rule_goal_scores)
+        final_scenario_weights = _normalize_selected_weights(
+            scenario_scores,
+            [primary_scenario, *secondary_scenarios],
+        )
+        final_goal_weights = _normalize_selected_weights(
+            goal_scores,
+            [primary_goal, *secondary_goals],
+        )
     else:
         primary_scenario = None
         secondary_scenarios = []
         primary_goal = None
         secondary_goals = []
         scenario_confidence = None
+        scenario_scores = {}
+        goal_scores = {}
+        final_scenario_weights = {}
+        final_goal_weights = {}
 
     return rules.model_copy(
         update={
@@ -1291,9 +1598,16 @@ def merge_route_correction(
             ),
             "primary_goal": primary_goal,
             "secondary_goals": secondary_goals,
+            "goal_scores": goal_scores,
+            "final_goal_weights": final_goal_weights,
             "primary_scenario": primary_scenario,
             "secondary_scenarios": secondary_scenarios,
             "scenario_confidence": scenario_confidence,
+            "scenario_scores": scenario_scores,
+            "final_scenario_weights": final_scenario_weights,
+            "llm_scenario_scores": llm_scenario_scores,
+            "llm_goal_scores": llm_goal_scores,
+            "router_reasoning_summary": correction.reasoning_summary,
             "date_plan": date_plan,
             "date_patch": date_patch,
             "date_request_mode": date_request_mode,
@@ -1416,8 +1730,7 @@ def _recover_date_activation_history_slots(route_input: RouteInput) -> DatePlanS
     relevant_messages = [
         message
         for message in route_input.recent_messages
-        if message.role == MessageRole.USER
-        and _looks_like_date_activation_context(message.content)
+        if message.role == MessageRole.USER and _looks_like_date_activation_context(message.content)
     ][-6:]
     return extract_date_plan_slots(
         route_input.model_copy(update={"recent_messages": relevant_messages})
@@ -1759,6 +2072,47 @@ def _is_clear_out_of_scope(result: RouteResult) -> bool:
     return result.task_scores.get(TaskType.OUT_OF_SCOPE, 0) >= 4
 
 
+def _semantic_deterministic_bypass_reason(
+    route_input: RouteInput,
+    result: RouteResult,
+) -> str | None:
+    """Name the small set of local branches that precede semantic routing."""
+
+    if _is_exact_casual_chat(result.normalized_query):
+        return "deterministic_ood"
+    if _is_clear_out_of_scope(result):
+        if _is_explicit_system_command(result.normalized_query):
+            return "explicit_system_command"
+        return "deterministic_ood"
+    if route_input.forced_task == TaskType.DATE_PLANNING:
+        return "date_workflow"
+    if result.task_type == TaskType.DATE_PLANNING:
+        return "date_workflow"
+    if (
+        route_input.active_task == TaskType.DATE_PLANNING
+        and (
+            _is_obvious_date_supplement(result.normalized_query)
+            or _looks_like_date_edit_request(result.normalized_query)
+        )
+    ):
+        return "date_workflow"
+    if (
+        route_input.date_task_state is not None
+        and route_input.date_task_state.is_resumable
+        and _is_obvious_date_supplement(result.normalized_query)
+    ):
+        return "date_workflow"
+    return None
+
+
+def _is_explicit_system_command(text: str) -> bool:
+    return re.search(
+        r"(?:登录|退出|重启|关闭|打开|运行|执行|修复).{0,12}(?:系统|服务|接口|程序|进程)|"
+        r"(?:systemctl|docker\s+compose|登录系统|重启服务)",
+        text,
+    ) is not None
+
+
 def _has_explicit_business_request(text: str) -> bool:
     if (
         _has_explicit_date_planning_request(text)
@@ -1815,6 +2169,114 @@ def _has_relationship_semantic_request(text: str) -> bool:
             "怎么做",
         )
     )
+
+
+def _has_relationship_domain_signal(text: str) -> bool:
+    """Detect relationship-domain language without requiring an advice verb."""
+
+    markers = (
+        "第一次见面",
+        "第一次约会",
+        "第一次邀约",
+        "约会结束",
+        "兴趣群",
+        "群聊",
+        "私聊",
+        "暧昧",
+        "往前走",
+        "继续聊",
+        "太主动",
+        "联系方式",
+        "约出来",
+        "夸对方",
+        "回复很",
+        "回复越来越",
+        "回复不差",
+        "聊天表情",
+        "聊天语气",
+        "不主动开场",
+        "主动出现",
+        "哈哈哈",
+        "叫名字",
+        "亲近昵称",
+        "吃醋",
+        "吵架",
+        "争吵",
+        "冷战",
+        "旧事",
+        "花费怎么分",
+        "家里人",
+        "家务",
+        "异地",
+        "纪念日",
+        "联系几次",
+        "语音",
+        "被冷落",
+        "越来越麻木",
+        "社交软件密码",
+        "共享位置",
+        "朋友圈",
+        "相册和聊天记录",
+        "公开恋情",
+        "身体亲密",
+        "个人财务",
+        "分手",
+        "分开后",
+        "复合",
+        "放下",
+        "想结束",
+        "宠物",
+        "共同账户",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _has_non_product_domain_signal(text: str) -> bool:
+    """Detect clear non-product requests for the top-level OOD branch."""
+
+    markers = (
+        "下雨",
+        "天气",
+        "气温",
+        "高铁",
+        "车票",
+        "java",
+        "报错",
+        "空指针",
+        "黑屏",
+        "重启",
+        "空气炸锅",
+        "鸡翅",
+        "美元兑人民币",
+        "汇率",
+        "导师请假",
+        "邮件",
+        "降噪耳机",
+        "周末苏州",
+        "pandas",
+        "csv",
+        "transformer",
+        "attention",
+        "excel",
+        "去重",
+        "日语",
+        "零基础",
+        "平方米",
+        "docker compose",
+        "vla 模型",
+        "机械键盘",
+        "进程占端口",
+        "租的房子",
+        "空调漏水",
+        "番茄炒蛋",
+        "蛋白质",
+        "增肌",
+        "周报模板",
+        "答辩 ppt",
+        "音乐节",
+        "大阪玩",
+    )
+    return any(marker in text for marker in markers)
 
 
 def _out_of_scope_reason(text: str) -> str:
@@ -1938,11 +2400,325 @@ def _needs_semantic_scenario_correction(
     )
 
 
+def _needs_conditional_semantic_router_call(
+    route_input: RouteInput,
+    result: RouteResult,
+    *,
+    low_confidence_threshold: float,
+    margin_threshold: float,
+    always_on_for_relationship: bool,
+    trigger_profile: Literal["c0", "c1", "c2"] = "c2",
+) -> bool:
+    """Decide whether a normal-risk turn needs semantic correction.
+
+    The trigger intentionally uses broad signals rather than case-specific
+    keywords.  It is designed to recover short/colloquial relationship turns
+    and close scenario/goal decisions while preserving deterministic fast
+    paths for confident, explicit requests.
+    """
+
+    text = result.normalized_query
+    if always_on_for_relationship and result.task_type == TaskType.RELATIONSHIP_ADVICE:
+        return True
+
+    task_margin = _top_margin(result.task_scores)
+    low_task_confidence = result.task_confidence < low_confidence_threshold
+    ambiguous_task = task_margin < margin_threshold
+    potential_relationship = _has_relationship_domain_signal(
+        text
+    ) or _has_relationship_semantic_request(text)
+    relationship_recovered_as_other = (
+        result.task_type in {TaskType.GENERAL_CHAT, TaskType.OUT_OF_SCOPE}
+        and potential_relationship
+    )
+    sparse_evidence = len(result.evidence_spans) <= 1
+    short_colloquial = len(text) <= 24 and (sparse_evidence or potential_relationship)
+
+    if relationship_recovered_as_other or short_colloquial:
+        return True
+    if low_task_confidence or ambiguous_task:
+        return True
+    if result.task_type == TaskType.RELATIONSHIP_ADVICE:
+        if _needs_semantic_scenario_correction(result, margin_threshold):
+            return True
+        meaningful_scenarios = [score for score in result.scenario_scores.values() if score >= 2]
+        meaningful_goals = [score for score in result.goal_scores.values() if score >= 2]
+        current_trigger = (
+            len(meaningful_scenarios) > 1 and _top_margin(result.scenario_scores) < margin_threshold
+        ) or (len(meaningful_goals) > 1 and _top_margin(result.goal_scores) < margin_threshold)
+        if current_trigger or trigger_profile == "c0":
+            return current_trigger
+        if _has_phase321_scenario_uncertainty(result, margin_threshold):
+            return True
+        if trigger_profile == "c1":
+            return False
+        return _has_phase321_multilabel_uncertainty(result)
+    return False
+
+
+_HARD_SCENARIO_PAIRS = {
+    frozenset((AdviceScenario.PURSUIT, AdviceScenario.CHAT_ANALYSIS)),
+    frozenset((AdviceScenario.CONFLICT, AdviceScenario.RELATIONSHIP_MAINTENANCE)),
+    frozenset((AdviceScenario.BOUNDARY, AdviceScenario.RELATIONSHIP_MAINTENANCE)),
+    frozenset((AdviceScenario.BOUNDARY, AdviceScenario.CONFLICT)),
+    frozenset((AdviceScenario.BREAKUP, AdviceScenario.RELATIONSHIP_MAINTENANCE)),
+    frozenset((AdviceScenario.BREAKUP, AdviceScenario.CONFLICT)),
+}
+
+
+def _has_phase321_scenario_uncertainty(
+    result: RouteResult,
+    margin_threshold: float,
+) -> bool:
+    scores = result.rule_scenario_scores or result.scenario_scores
+    ranked = sorted(
+        ((label, score) for label, score in scores.items() if score > 0),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    if len(ranked) >= 2:
+        top_pair = frozenset((ranked[0][0], ranked[1][0]))
+        normalized_margin = (ranked[0][1] - ranked[1][1]) / max(ranked[0][1], 1.0)
+        if top_pair in _HARD_SCENARIO_PAIRS and normalized_margin <= max(
+            margin_threshold,
+            0.3,
+        ):
+            return True
+    if (
+        result.primary_scenario == AdviceScenario.RELATIONSHIP_MAINTENANCE
+        and not result.secondary_scenarios
+        and any(
+            scores.get(label, 0) > 0
+            for label in (
+                AdviceScenario.PURSUIT,
+                AdviceScenario.CONFLICT,
+                AdviceScenario.BOUNDARY,
+                AdviceScenario.BREAKUP,
+            )
+        )
+    ):
+        return True
+    selected = {
+        scenario
+        for scenario in [result.primary_scenario, *result.secondary_scenarios]
+        if scenario is not None
+    }
+    if _phase321_scenario_cues(result.normalized_query) - selected:
+        return True
+    # A RAG route without meaningful scenario evidence is precisely where a
+    # confident task label cannot stand in for semantic classification.
+    return not scores or max(scores.values(), default=0) < 2
+
+
+def _phase321_scenario_cues(text: str) -> set[AdviceScenario]:
+    """Return narrow counter-evidence cues used only by C1/C2 triggering."""
+
+    patterns: dict[AdviceScenario, str] = {
+        AdviceScenario.PURSUIT: (
+            r"继续.{0,5}(?:试探|接触|联系|推进)|"
+            r"(?:刚认识|约过).{0,12}(?:后来|偶尔|接下来)"
+        ),
+        AdviceScenario.CONFLICT: (
+            r"(?:每次|反复|总是|一直).{0,12}(?:吵|争执|冷战)|"
+            r"(?:吵|争执).{0,12}(?:循环|反复|升级)|"
+            r"(?:修复|重建).{0,5}信任|不升级矛盾"
+        ),
+        AdviceScenario.BOUNDARY: (
+            r"未经.{0,6}同意|隐私|界限|"
+            r"翻.{0,6}(?:聊天记录|手机)|共享定位|社交软件密码"
+        ),
+        AdviceScenario.BREAKUP: (
+            r"(?:关系结束|结束关系|分开|分手)(?:后|以后)|"
+            r"已经.{0,6}(?:结束关系|分开|分手)"
+        ),
+    }
+    return {scenario for scenario, pattern in patterns.items() if re.search(pattern, text)}
+
+
+def _has_phase321_multilabel_uncertainty(result: RouteResult) -> bool:
+    needs = _semantic_information_needs(result.normalized_query)
+    selected_goals = [result.primary_goal, *result.secondary_goals]
+    selected = {goal for goal in selected_goals if goal is not None}
+    if selected == {AdviceGoal.COMMUNICATE} and needs - {AdviceGoal.COMMUNICATE}:
+        return True
+    # Even one explicit information need is meaningful when the rule result
+    # omitted it.  Comparing only label counts misses equal-sized but
+    # semantically different goal sets.
+    if needs - selected:
+        return True
+    if len(needs) < 2:
+        return _scenario_goal_evidence_conflicts(result)
+    return _scenario_goal_evidence_conflicts(result)
+
+
+def _semantic_information_needs(text: str) -> set[AdviceGoal]:
+    patterns: dict[AdviceGoal, str] = {
+        AdviceGoal.UNDERSTAND: (
+            r"分析|判断|怎么看|为什么|什么(?:意思|含义)|意味着|代表什么|"
+            r"不确定|想清楚|看行动|犹豫"
+        ),
+        AdviceGoal.PROGRESS: (
+            r"下一步|进一步|推进|发展|接下来|往前|"
+            r"继续.{0,5}(?:试探|接触|联系|推进)|要不要.{0,8}(?:约|联系|表白)"
+        ),
+        AdviceGoal.REPAIR: (
+            r"修复|缓和|道歉|和好|复合|挽回|停下来|重建.{0,5}信任|"
+            r"解决.{0,6}(?:矛盾|冲突|冷战)"
+        ),
+        AdviceGoal.COMMUNICATE: (
+            r"(?:怎么|如何|怎样).{0,4}(?:说|讲|回复|表达|沟通)|"
+            r"(?:怎么|如何|怎样)(?:回|回复)|"
+            r"说清|讲明|(?:我该|应该|先).{0,4}说(?:什么|清楚)?"
+        ),
+        AdviceGoal.SET_BOUNDARY: (
+            r"边界|界限|底线|拒绝|保持距离|保留自己的|不恢复亲密|"
+            r"未经.{0,6}同意|隐私|明确.{0,5}(?:界限|规则)"
+        ),
+        AdviceGoal.END_RELATIONSHIP: (
+            r"结束.{0,5}(?:关系|恋爱)|关系结束后|结束关系后|分开后|分手后|"
+            r"分手|离开|断联"
+        ),
+    }
+    return {goal for goal, pattern in patterns.items() if re.search(pattern, text)}
+
+
+def _scenario_goal_evidence_conflicts(result: RouteResult) -> bool:
+    goals = {goal for goal in [result.primary_goal, *result.secondary_goals] if goal is not None}
+    if result.primary_scenario == AdviceScenario.BREAKUP:
+        return bool(goals) and goals.isdisjoint(
+            {AdviceGoal.REPAIR, AdviceGoal.END_RELATIONSHIP, AdviceGoal.UNDERSTAND}
+        )
+    if result.primary_scenario == AdviceScenario.BOUNDARY:
+        return bool(goals) and goals.isdisjoint(
+            {AdviceGoal.SET_BOUNDARY, AdviceGoal.COMMUNICATE, AdviceGoal.END_RELATIONSHIP}
+        )
+    if result.primary_scenario == AdviceScenario.CONFLICT:
+        return bool(goals) and goals.isdisjoint(
+            {AdviceGoal.REPAIR, AdviceGoal.COMMUNICATE, AdviceGoal.UNDERSTAND}
+        )
+    return False
+
+
+def _semantic_decision_trace(correction: RouteCorrection) -> dict[str, object]:
+    """Return a bounded, JSON-friendly semantic decision trace."""
+
+    primary_scenario, secondary_scenarios = _semantic_scenario_fields(correction)
+    primary_goal, secondary_goals = _semantic_goal_fields(correction)
+    return {
+        "branch": correction.branch,
+        "task_type": correction.task_type.value,
+        "primary_scenario": primary_scenario.value if primary_scenario else None,
+        "secondary_scenarios": [item.value for item in secondary_scenarios],
+        "scenario_scores": {
+            key.value: value for key, value in _semantic_scenario_scores(correction).items()
+        },
+        "goals": [item.value for item in [primary_goal, *secondary_goals] if item is not None],
+        "primary_goal": primary_goal.value if primary_goal else None,
+        "secondary_goals": [item.value for item in secondary_goals],
+        "goal_scores": {
+            key.value: value for key, value in _semantic_goal_scores(correction).items()
+        },
+        "confidence": correction.confidence,
+        "reasoning_summary": correction.reasoning_summary,
+    }
+
+
+def _semantic_scenario_scores(
+    correction: RouteCorrection,
+) -> dict[AdviceScenario, float]:
+    scores = dict(correction.scenario_scores)
+    confidence = correction.scenario_confidence
+    if correction.primary_scenario is not None and correction.primary_scenario not in scores:
+        scores[correction.primary_scenario] = confidence if confidence is not None else 1.0
+    for scenario in correction.secondary_scenarios:
+        scores.setdefault(scenario, min(confidence or 0.5, 0.79))
+    return {key: float(value) for key, value in scores.items()}
+
+
+def _semantic_goal_scores(correction: RouteCorrection) -> dict[AdviceGoal, float]:
+    scores = dict(correction.goal_scores)
+    confidence = correction.confidence
+    goals = [*correction.goals]
+    if correction.primary_goal is not None:
+        goals.insert(0, correction.primary_goal)
+    goals.extend(correction.secondary_goals)
+    for index, goal in enumerate(goals):
+        if goal not in scores:
+            scores[goal] = confidence if confidence is not None else (1.0 if index == 0 else 0.65)
+    return {key: float(value) for key, value in scores.items()}
+
+
+def _semantic_scenario_fields(
+    correction: RouteCorrection,
+) -> tuple[AdviceScenario | None, list[AdviceScenario]]:
+    scores = _semantic_scenario_scores(correction)
+    primary = correction.primary_scenario
+    if primary is None and scores:
+        primary = max(scores, key=scores.get)
+    secondary = [*correction.secondary_scenarios]
+    if correction.primary_scenario is None and scores:
+        secondary.extend(
+            label
+            for label, _ in sorted(scores.items(), key=lambda item: (-item[1], item[0].value))
+            if label != primary
+        )
+    return primary, _without_primary(secondary, primary)[:2]
+
+
+def _semantic_goal_fields(
+    correction: RouteCorrection,
+) -> tuple[AdviceGoal | None, list[AdviceGoal]]:
+    scores = _semantic_goal_scores(correction)
+    explicit = [*correction.goals]
+    primary = correction.primary_goal or (explicit[0] if explicit else None)
+    if primary is None and scores:
+        primary = max(scores, key=scores.get)
+    secondary = [*correction.secondary_goals]
+    if explicit:
+        secondary.extend(explicit[1:])
+    if correction.primary_goal is None and not explicit and scores:
+        secondary.extend(
+            label
+            for label, _ in sorted(scores.items(), key=lambda item: (-item[1], item[0].value))
+            if label != primary
+        )
+    return primary, _without_primary(secondary, primary)[:2]
+
+
+def select_semantic_goals(
+    correction: RouteCorrection,
+    *,
+    secondary_threshold: float,
+    max_goals: int,
+) -> tuple[AdviceGoal | None, list[AdviceGoal]]:
+    """Apply the fixed goal-selection policy to semantic relevance scores."""
+
+    if not 0 <= secondary_threshold <= 1:
+        raise ValueError("secondary_threshold must be between 0 and 1")
+    if not 1 <= max_goals <= 3:
+        raise ValueError("max_goals must be between 1 and 3")
+    primary, candidates = _semantic_goal_fields(correction)
+    if primary is None:
+        return None, []
+    scores = _semantic_goal_scores(correction)
+    order_index = {goal: index for index, goal in enumerate(candidates)}
+    selected = [
+        goal
+        for goal in candidates
+        if scores.get(goal, 0.0) >= secondary_threshold
+    ]
+    selected.sort(key=lambda goal: (-scores.get(goal, 0.0), order_index[goal]))
+    selected = selected[: max_goals - 1]
+    return primary, selected
+
+
 def _apply_contextual_scenario_scores(
     route_input: RouteInput,
     text: str,
     scores: dict[AdviceScenario, float],
     evidence: dict[AdviceScenario, list[str]],
+    *,
+    scenario_patterns: Mapping[AdviceScenario, tuple[tuple[str, float], ...]] | None = None,
 ) -> None:
     if not route_input.recent_messages:
         return
@@ -1957,6 +2733,7 @@ def _apply_contextual_scenario_scores(
     current_primary = max(scores, key=scores.get) if scores else None
     current_strength = scores.get(current_primary, 0) if current_primary else 0
     contextual: dict[AdviceScenario, float] = {}
+    active_patterns = scenario_patterns or _SCENARIO_PATTERNS
     resolved_scenarios = {
         scenario
         for scenario in _CONTEXT_CONTINUITY_SCENARIOS
@@ -1965,7 +2742,7 @@ def _apply_contextual_scenario_scores(
     for distance, historical_text in enumerate(reversed(user_turns), start=1):
         historical_scores, _ = _score_labels(
             historical_text,
-            _SCENARIO_PATTERNS,
+            active_patterns,
             suppress_negated=True,
         )
         historical_evidence: dict[AdviceScenario, list[str]] = {}
@@ -2104,6 +2881,24 @@ def _looks_like_implicit_date_plan_bundle(
             text,
         )
         is not None
+    )
+
+
+def _looks_like_relationship_date_action(text: str) -> bool:
+    """Recognize a relationship action that merely mentions a date.
+
+    A user may ask whether/how to invite someone, continue a date, or make a
+    relationship warmer.  Those requests should remain relationship advice;
+    only an explicit assistant-directed plan/search request belongs to the
+    date-planning workflow.
+    """
+
+    if not any(marker in text for marker in ("约会", "见面", "邀约", "喝咖啡", "吃饭")):
+        return False
+    if _has_explicit_date_planning_request(text) or _has_direct_date_execution_command(text):
+        return False
+    return _looks_like_advice_request(text) or any(
+        marker in text for marker in ("想", "要不要", "该不该", "怎么做", "合适")
     )
 
 
@@ -3009,18 +3804,14 @@ def _extract_schedule_slots(text: str) -> tuple[dict[str, list[str]], list[str]]
             for position in _all_positions(clause, marker)
         ]
         clause_meal_types = {meal_type for meal_type, _, _ in marker_positions}
-        scoped_meal_type = (
-            next(iter(clause_meal_types)) if len(clause_meal_types) == 1 else None
-        )
+        scoped_meal_type = next(iter(clause_meal_types)) if len(clause_meal_types) == 1 else None
         clock_meal_type = _meal_type_from_clock(clause)
         for keyword, aliases in cuisine_aliases.items():
             for alias in aliases:
                 for position in _all_positions(clause, alias):
                     nearest = _nearest_meal_marker(clause, position, marker_positions)
                     meal_type = (
-                        nearest[0]
-                        if nearest is not None
-                        else scoped_meal_type or clock_meal_type
+                        nearest[0] if nearest is not None else scoped_meal_type or clock_meal_type
                     )
                     if meal_type is None:
                         continue
@@ -3145,22 +3936,25 @@ def _is_operation_only_constraint(text: str, candidate: str) -> bool:
     clause = _containing_clause(text, candidate)
     if _is_turn_control_scope(clause):
         return True
-    has_edit = re.search(
-        r"(?:换(?:一个|个|成|为)?|替换|更换|删掉|删除|移除)",
-        clause,
-    ) is not None
-    has_plan_reference = re.search(
-        r"(?:这个|那个|该|当前|原来|之前)?(?:地方|地点|节点|景点|餐厅)|"
-        r"第\s*[一二三四五六七八九十0-9]+\s*个",
-        clause,
-    ) is not None
+    has_edit = (
+        re.search(
+            r"(?:换(?:一个|个|成|为)?|替换|更换|删掉|删除|移除)",
+            clause,
+        )
+        is not None
+    )
+    has_plan_reference = (
+        re.search(
+            r"(?:这个|那个|该|当前|原来|之前)?(?:地方|地点|节点|景点|餐厅)|"
+            r"第\s*[一二三四五六七八九十0-9]+\s*个",
+            clause,
+        )
+        is not None
+    )
     generic_removal = re.search(r"不想\s*(?:去|要)(?:了|这个|那个)?", candidate) is not None
     return (has_edit and has_plan_reference) or (
         generic_removal
-        and (
-            has_plan_reference
-            or re.search(r"(?:换(?:一个|个)?|替换|更换)", text) is not None
-        )
+        and (has_plan_reference or re.search(r"(?:换(?:一个|个)?|替换|更换)", text) is not None)
     )
 
 
@@ -3184,8 +3978,7 @@ def _is_turn_control_scope(clause: str) -> bool:
 def _date_mutation_policy(text: str) -> DateMutationPolicy:
     return DateMutationPolicy(
         preserve_unmentioned_items=any(
-            _is_turn_control_scope(clause.text)
-            for clause in split_date_clauses(text)
+            _is_turn_control_scope(clause.text) for clause in split_date_clauses(text)
         )
     )
 
@@ -3335,6 +4128,28 @@ def _unique[ValueT](values: Iterable[ValueT]) -> list[ValueT]:
 
 def _rounded_scores[LabelT](scores: dict[LabelT, float]) -> dict[LabelT, float]:
     return {label: round(score, 3) for label, score in scores.items()}
+
+
+def _normalize_selected_weights[LabelT](
+    scores: Mapping[LabelT, float],
+    selected: Iterable[LabelT | None],
+) -> dict[LabelT, float]:
+    """Normalize one score source without mixing rule and LLM scales."""
+
+    labels = _unique(label for label in selected if label is not None)
+    if not labels:
+        return {}
+    non_negative = {
+        label: max(0.0, float(scores.get(label, 0.0)))
+        for label in labels
+    }
+    maximum = max(non_negative.values(), default=0.0)
+    if maximum <= 0:
+        return {label: (1.0 if index == 0 else 0.0) for index, label in enumerate(labels)}
+    return {
+        label: round(min(value / maximum, 1.0), 6)
+        for label, value in non_negative.items()
+    }
 
 
 _DEFAULT_GOAL_BY_SCENARIO = {
@@ -3723,6 +4538,140 @@ _SCENARIO_REGEX_PATTERNS: dict[AdviceScenario, tuple[tuple[str, float], ...]] = 
         (r"(?:谈|聊|沟通).{0,10}(?:分歧|矛盾|冲突|消费观|争执)", 4),
     ),
 }
+
+
+# Phase 3 additions are kept as a separate overlay so the historical rule
+# tables remain unchanged when ``router_v2_enabled`` is false.  The overlay
+# is intentionally data-only: scoring, negation handling, and tie-breaking
+# continue to use the existing deterministic implementation.
+_PHASE3_SCENARIO_PATTERN_ENTRIES: dict[AdviceScenario, tuple[tuple[str, float], ...]] = {
+    AdviceScenario.PURSUIT: (
+        ("第一次见完面", 5),
+        ("第一次约会", 4.5),
+        ("第一次邀约", 4.5),
+        ("兴趣群", 4),
+        ("群聊转私聊", 5),
+        ("联系方式", 4),
+        ("约出来", 4),
+        ("夸对方", 3.5),
+        ("自然继续聊", 4),
+        ("太主动", 3),
+        ("暧昧挺久", 4),
+    ),
+    AdviceScenario.CONFLICT: (
+        ("花费怎么分", 4),
+        ("家里人", 3),
+        ("插手", 3.5),
+        ("优先安排朋友", 3.5),
+        ("纪念日", 3),
+        ("家务", 3.5),
+        ("前任还有联系", 4),
+        ("落差感", 3),
+    ),
+    AdviceScenario.CHAT_ANALYSIS: (
+        ("回复越来越慢", 5),
+        ("回复不差但很少主动", 5),
+        ("不主动开场", 5),
+        ("聊天表情", 4),
+        ("哈哈哈", 4),
+        ("经常说“我们”", 4),
+        ("亲近昵称", 4),
+        ("客气正式", 4),
+        ("主动出现", 4),
+        ("吃醋", 3.5),
+    ),
+    AdviceScenario.RELATIONSHIP_MAINTENANCE: (
+        ("联系几次", 4),
+        ("文字", 2.5),
+        ("语音", 2.5),
+        ("职业发展", 3),
+        ("新兴趣", 3),
+        ("被冷落", 3.5),
+        ("越来越麻木", 4),
+        ("共同经历", 3),
+    ),
+    AdviceScenario.BOUNDARY: (
+        ("密码", 4.5),
+        ("共享位置", 5),
+        ("不重叠的朋友圈", 5),
+        ("私人空间", 4.5),
+        ("未经同意翻", 5),
+        ("相册和聊天记录", 5),
+        ("公开恋情", 4),
+        ("身体亲密", 4),
+        ("个人财务", 4),
+        ("独立的个人", 3.5),
+    ),
+    AdviceScenario.BREAKUP: (
+        ("明确说想结束", 5),
+        ("共同养的宠物", 4),
+        ("共同账户", 4),
+        ("共同朋友", 3.5),
+        ("一直走不出来", 4),
+        ("一直做不到", 3),
+        ("都是我的问题", 3.5),
+        ("考虑结束", 4),
+    ),
+}
+
+
+_PHASE3_GOAL_PATTERN_ENTRIES: dict[AdviceGoal, tuple[tuple[str, float], ...]] = {
+    AdviceGoal.INITIATE: (
+        ("群聊转私聊", 4),
+        ("联系方式", 3.5),
+        ("约出来", 3.5),
+        ("夸对方", 3),
+        ("第一次见完面", 3),
+    ),
+    AdviceGoal.UNDERSTAND: (
+        ("判断不出", 4),
+        ("判断是不是", 4),
+        ("不知道是不是", 3),
+        ("看重", 2),
+    ),
+    AdviceGoal.PROGRESS: (
+        ("往前走", 4),
+        ("继续聊", 3),
+        ("推进", 3),
+    ),
+    AdviceGoal.REPAIR: (("解决", 2.5), ("谈不拢", 3)),
+    AdviceGoal.COMMUNICATE: (
+        ("怎么处理", 2.5),
+        ("联系几次", 3),
+        ("说清楚", 3),
+    ),
+    AdviceGoal.SET_BOUNDARY: (
+        ("私人空间", 4),
+        ("密码", 4),
+        ("共享位置", 4),
+        ("朋友圈", 3),
+        ("独处时间", 4),
+        ("保留", 2.5),
+    ),
+    AdviceGoal.END_RELATIONSHIP: (
+        ("明确说想结束", 5),
+        ("考虑结束", 4),
+        ("分手后", 3),
+    ),
+}
+
+
+def _phase3_pattern_view[LabelT](
+    base: Mapping[LabelT, tuple[tuple[str, float], ...]],
+    overlay: Mapping[LabelT, tuple[tuple[str, float], ...]],
+    *,
+    enabled: bool,
+) -> dict[LabelT, tuple[tuple[str, float], ...]]:
+    """Return a copy of label patterns with the optional Phase 3 overlay."""
+
+    if not enabled:
+        return dict(base)
+    # Preserve declaration order so equal-score labels resolve identically
+    # across Python processes.  Iterating over a set here made Router results
+    # depend on PYTHONHASHSEED and caused frozen evals to drift.
+    labels = list(base)
+    labels.extend(label for label in overlay if label not in base)
+    return {label: (*base.get(label, ()), *overlay.get(label, ())) for label in labels}
 
 
 _CONTEXT_CONTINUITY_SCENARIOS = (

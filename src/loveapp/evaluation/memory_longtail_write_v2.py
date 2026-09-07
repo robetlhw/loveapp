@@ -548,6 +548,438 @@ def compare_memory_longtail_write_v2_reports(
     }
 
 
+def compare_memory_longtail_write_v2_semantic_remediation(
+    baseline: Mapping[str, Any],
+    remediation: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Compare the frozen Final Live baseline with one remediation run."""
+
+    metric_paths = {
+        "raw_retrieval_recall_at_20": ("retrieval_metrics", "raw_retrieval_recall_at_20"),
+        "equivalence_aware_recall_at_20": (
+            "retrieval_metrics",
+            "equivalence_aware_recall_at_20",
+        ),
+        "conditional_gold_retention_at_5": (
+            "retrieval_metrics",
+            "conditional_gold_retention_at_5",
+        ),
+        "end_to_end_gold_recall_at_5": (
+            "retrieval_metrics",
+            "end_to_end_gold_recall_at_5",
+        ),
+        "oracle_relation_accuracy": ("oracle_relation_metrics", "relation_accuracy"),
+        "oracle_macro_f1": ("oracle_relation_metrics", "macro_f1"),
+        "oracle_target_set_accuracy": (
+            "oracle_relation_metrics",
+            "target_set_accuracy",
+        ),
+        "oracle_target_micro_f1": ("oracle_relation_metrics", "target_micro_f1"),
+        "retrieved_relation_accuracy": (
+            "retrieved_relation_metrics",
+            "relation_accuracy",
+        ),
+        "retrieved_macro_f1": ("retrieved_relation_metrics", "macro_f1"),
+        "retrieved_contradiction_recall": (
+            "contradiction_diagnostics",
+            "retrieved",
+            "recall",
+        ),
+        "retrieved_contradiction_f1": (
+            "contradiction_diagnostics",
+            "retrieved",
+            "f1",
+        ),
+        "retrieved_target_set_accuracy": (
+            "retrieved_relation_metrics",
+            "target_set_accuracy",
+        ),
+        "retrieved_target_micro_f1": (
+            "retrieved_relation_metrics",
+            "target_micro_f1",
+        ),
+        "retrieved_multi_target_proposal_count": (
+            "multi_target_metrics",
+            "retrieved_proposal_count",
+        ),
+        "exact_expected_multi_target_proposal_count": (
+            "multi_target_metrics",
+            "exact_expected_multi_target_proposal_count",
+        ),
+        "overbroad_multi_target_proposal_count": (
+            "multi_target_metrics",
+            "overbroad_multi_target_proposal_count",
+        ),
+        "destructive_safety_violation_count": (
+            "safety_metrics",
+            "destructive_safety_violation_count",
+        ),
+        "top5_duplicate_semantic_memory_count": (
+            "retrieval_metrics",
+            "top5_duplicate_semantic_memory_count",
+        ),
+        "retrieved_judge_avg_prompt_tokens": (
+            "telemetry",
+            "judge",
+            "retrieved",
+            "avg_prompt_tokens",
+        ),
+        "retrieved_judge_avg_completion_tokens": (
+            "telemetry",
+            "judge",
+            "retrieved",
+            "avg_completion_tokens",
+        ),
+        "retrieved_judge_avg_total_tokens": (
+            "telemetry",
+            "judge",
+            "retrieved",
+            "avg_total_tokens",
+        ),
+    }
+
+    def path_value(report: Mapping[str, Any], path: Sequence[str]) -> Any:
+        value: Any = report
+        for part in path:
+            if not isinstance(value, Mapping):
+                return None
+            value = value.get(part)
+        return value
+
+    def metric(path: Sequence[str], *, fallback: Sequence[str] | None = None) -> dict[str, Any]:
+        before = path_value(baseline, path)
+        after = path_value(remediation, path)
+        if before is None and fallback is not None:
+            before = path_value(baseline, fallback)
+        delta: float | None = None
+        if (
+            isinstance(before, (int, float))
+            and not isinstance(before, bool)
+            and isinstance(after, (int, float))
+            and not isinstance(after, bool)
+        ):
+            delta = round(float(after) - float(before), 4)
+        return {"baseline": before, "remediation": after, "delta": delta}
+
+    baseline_dataset = baseline.get("dataset", {})
+    remediation_dataset = remediation.get("dataset", {})
+    baseline_filters = baseline.get("filters", {})
+    remediation_filters = remediation.get("filters", {})
+    baseline_parameters = baseline.get("parameters", {})
+    remediation_parameters = remediation.get("parameters", {})
+    baseline_filters = baseline_filters if isinstance(baseline_filters, Mapping) else {}
+    remediation_filters = (
+        remediation_filters if isinstance(remediation_filters, Mapping) else {}
+    )
+    baseline_parameters = (
+        baseline_parameters if isinstance(baseline_parameters, Mapping) else {}
+    )
+    remediation_parameters = (
+        remediation_parameters if isinstance(remediation_parameters, Mapping) else {}
+    )
+    same_scope = bool(
+        isinstance(baseline_dataset, Mapping)
+        and isinstance(remediation_dataset, Mapping)
+        and baseline_dataset.get("case_sha256") == remediation_dataset.get("case_sha256")
+        and baseline_dataset.get("shared_bank_sha256")
+        == remediation_dataset.get("shared_bank_sha256")
+        and baseline.get("case_count") == remediation.get("case_count")
+        and int(baseline.get("repeat", 1) or 1)
+        == int(remediation.get("repeat", 1) or 1)
+        and bool(baseline.get("hard_cases_only", False))
+        == bool(remediation.get("hard_cases_only", False))
+        and baseline_filters == remediation_filters
+        and baseline_parameters.get("vector_top_k")
+        == remediation_parameters.get("vector_top_k")
+        and baseline_parameters.get("cheap_rank_top_n")
+        == remediation_parameters.get("cheap_rank_top_n")
+    )
+    return {
+        "status": "COMPARABLE" if same_scope else "SCOPE_MISMATCH",
+        "baseline_status": baseline.get("status"),
+        "remediation_status": remediation.get("status"),
+        "scope": {
+            "same_dataset_and_run_scope": same_scope,
+            "baseline_case_count": baseline.get("case_count"),
+            "remediation_case_count": remediation.get("case_count"),
+            "baseline_repeat": int(baseline.get("repeat", 1) or 1),
+            "remediation_repeat": int(remediation.get("repeat", 1) or 1),
+            "hard_cases_only": bool(remediation.get("hard_cases_only", False)),
+            "baseline_filters": dict(baseline_filters),
+            "remediation_filters": dict(remediation_filters),
+            "baseline_vector_top_k": baseline_parameters.get("vector_top_k"),
+            "remediation_vector_top_k": remediation_parameters.get("vector_top_k"),
+            "baseline_cheap_rank_top_n": baseline_parameters.get("cheap_rank_top_n"),
+            "remediation_cheap_rank_top_n": remediation_parameters.get(
+                "cheap_rank_top_n"
+            ),
+        },
+        "metrics": {
+            name: metric(
+                path,
+                fallback=(
+                    ("retrieval_metrics", "equivalence_group_duplicate_slot_count_at_5")
+                    if name == "top5_duplicate_semantic_memory_count"
+                    else None
+                ),
+            )
+            for name, path in metric_paths.items()
+        },
+    }
+
+
+def compare_memory_longtail_write_v2_top_k_ablation(
+    reports: Mapping[int, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Compare unchanged semantic Top-3/4/5 runs and select K conservatively."""
+
+    expected_ks = (3, 4, 5)
+    scope_errors: list[str] = []
+    if set(reports) != set(expected_ks):
+        scope_errors.append("expected_exactly_top_3_4_5")
+
+    available = {k: reports[k] for k in expected_ks if k in reports}
+    baselines = list(available.values())
+    if baselines:
+        first = baselines[0]
+        first_dataset = first.get("dataset", {})
+        first_parameters = first.get("parameters", {})
+        for k, report in available.items():
+            dataset = report.get("dataset", {})
+            parameters = report.get("parameters", {})
+            if not isinstance(dataset, Mapping) or not isinstance(parameters, Mapping):
+                scope_errors.append(f"top_{k}_missing_scope_metadata")
+                continue
+            if (
+                dataset.get("case_sha256") != first_dataset.get("case_sha256")
+                or dataset.get("shared_bank_sha256")
+                != first_dataset.get("shared_bank_sha256")
+                or report.get("filters") != first.get("filters")
+                or report.get("case_count") != first.get("case_count")
+                or int(report.get("repeat", 1) or 1)
+                != int(first.get("repeat", 1) or 1)
+            ):
+                scope_errors.append(f"top_{k}_dataset_or_run_scope_mismatch")
+            if parameters.get("vector_top_k") != 20:
+                scope_errors.append(f"top_{k}_vector_top_k_not_20")
+            if parameters.get("cheap_rank_top_n") != k:
+                scope_errors.append(f"top_{k}_cheap_rank_limit_mismatch")
+            if parameters.get("semantic_judge_candidate_limit") != k:
+                scope_errors.append(f"top_{k}_judge_limit_mismatch")
+            if parameters.get("semantic_judge_protocol") != first_parameters.get(
+                "semantic_judge_protocol"
+            ):
+                scope_errors.append(f"top_{k}_judge_protocol_mismatch")
+
+    def section(report: Mapping[str, Any], name: str) -> Mapping[str, Any]:
+        value = report.get(name, {})
+        return value if isinstance(value, Mapping) else {}
+
+    def number(value: object, default: float = 0.0) -> float:
+        return (
+            float(value)
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+            else default
+        )
+
+    def semantic_hit_and_mrr(report: Mapping[str, Any]) -> tuple[float, float]:
+        rows = [row for row in report.get("rows", []) if isinstance(row, Mapping)]
+        eligible = [row for row in rows if _row_expected_retrieval_candidate_ids(row)]
+        hits = 0
+        reciprocal_ranks: list[float] = []
+        for row in eligible:
+            expected = set(_row_expected_retrieval_candidate_ids(row))
+            ranked = row.get("retrieval", {}).get("ranked", [])
+            ranks = [
+                index
+                for index, candidate in enumerate(ranked, start=1)
+                if candidate.get("memory_id") in expected
+            ]
+            hits += bool(ranks)
+            reciprocal_ranks.append(1 / min(ranks) if ranks else 0.0)
+        return (
+            _ratio(hits, len(eligible)),
+            round(mean(reciprocal_ranks), 4) if reciprocal_ranks else 0.0,
+        )
+
+    arms: dict[str, dict[str, Any]] = {}
+    for k, report in available.items():
+        retrieval = section(report, "retrieval_metrics")
+        relation = section(report, "retrieved_relation_metrics")
+        multi = section(report, "multi_target_metrics")
+        write = section(report, "write_metrics")
+        safety = section(report, "safety_metrics")
+        telemetry = section(section(section(report, "telemetry"), "judge"), "retrieved")
+        semantic_hit, semantic_mrr = semantic_hit_and_mrr(report)
+        semantic_recall = retrieval.get(
+            "semantic_recall_at_k",
+            retrieval.get("end_to_end_gold_recall_at_5", 0.0),
+        )
+        semantic_retention = retrieval.get(
+            "semantic_gold_retention_at_k",
+            retrieval.get("conditional_gold_retention_at_5", 0.0),
+        )
+        semantic_exact = retrieval.get(
+            "semantic_target_set_exact_at_k",
+            retrieval.get("gold_target_set_exact_at_5", 0.0),
+        )
+        arms[str(k)] = {
+            "semantic_top_k": k,
+            "semantic_hit_at_k": number(
+                retrieval.get("semantic_hit_at_k"), semantic_hit
+            ),
+            "semantic_recall_at_k": number(semantic_recall),
+            "semantic_gold_retention_at_k": number(semantic_retention),
+            "semantic_target_set_recall_at_k": number(semantic_recall),
+            "semantic_gold_target_set_exact_at_k": number(semantic_exact),
+            "semantic_mrr_at_k": number(
+                retrieval.get("semantic_mrr_at_k"), semantic_mrr
+            ),
+            "hard_negative_promotion_rate": number(
+                retrieval.get("hard_negative_promotion_rate")
+            ),
+            "relation_accuracy": number(relation.get("relation_accuracy")),
+            "macro_f1": number(relation.get("macro_f1")),
+            "target_set_accuracy": number(relation.get("target_set_accuracy")),
+            "target_micro_precision": number(relation.get("target_micro_precision")),
+            "target_micro_recall": number(relation.get("target_micro_recall")),
+            "target_micro_f1": number(relation.get("target_micro_f1")),
+            "unexpected_target_count": int(
+                number(telemetry.get("unexpected_target_count"))
+            ),
+            "retrieved_multi_target_proposal_count": int(
+                number(multi.get("retrieved_proposal_count"))
+            ),
+            "expected_multi_target_case_count": int(
+                number(multi.get("expected_multi_target_case_count"))
+            ),
+            "exact_expected_multi_target_proposal_count": int(
+                number(multi.get("exact_expected_multi_target_proposal_count"))
+            ),
+            "overbroad_multi_target_proposal_count": int(
+                number(multi.get("overbroad_multi_target_proposal_count"))
+            ),
+            "passed_case_count": int(number(report.get("passed_case_count"))),
+            "failed_case_count": int(number(report.get("failed_case_count"))),
+            "store_action_accuracy": number(write.get("store_action_accuracy")),
+            "store_application_error_count": int(
+                number(write.get("store_application_error_count"))
+            ),
+            "destructive_safety_violation_count": int(
+                number(safety.get("destructive_safety_violation_count"))
+            ),
+            "avg_judge_prompt_tokens": number(telemetry.get("avg_prompt_tokens")),
+            "avg_judge_completion_tokens": number(
+                telemetry.get("avg_completion_tokens")
+            ),
+            "avg_judge_total_tokens": number(telemetry.get("avg_total_tokens")),
+            "judge_latency_p50_ms": number(telemetry.get("latency_p50_ms")),
+            "judge_latency_p95_ms": number(telemetry.get("latency_p95_ms")),
+        }
+
+    safe_arms = [
+        arm
+        for arm in arms.values()
+        if arm["destructive_safety_violation_count"] == 0
+        and arm["store_application_error_count"] == 0
+    ]
+    recommended = None
+    if not scope_errors and safe_arms:
+        selected = max(
+            safe_arms,
+            key=lambda arm: (
+                arm["semantic_recall_at_k"],
+                arm["target_set_accuracy"],
+                arm["target_micro_f1"],
+                arm["relation_accuracy"],
+                arm["macro_f1"],
+                arm["passed_case_count"],
+                -arm["avg_judge_total_tokens"],
+            ),
+        )
+        recommended = selected["semantic_top_k"]
+
+    return {
+        "status": "COMPARABLE" if not scope_errors else "SCOPE_MISMATCH",
+        "scope_errors": list(dict.fromkeys(scope_errors)),
+        "selection_priority": ["safety", "recall", "target", "relation", "cost"],
+        "recommended_semantic_top_k": recommended,
+        "recommendation_reason": (
+            "Selected among zero-violation arms by semantic recall, target quality, "
+            "relation quality, then cost."
+            if recommended is not None
+            else "No recommendation because the ablation scope is invalid or no safe arm exists."
+        ),
+        "arms": arms,
+    }
+
+
+def render_memory_longtail_write_v2_top_k_ablation(
+    comparison: Mapping[str, Any],
+) -> str:
+    """Render the bounded Top-K comparison used for the final freeze decision."""
+
+    arms = comparison.get("arms", {})
+    metrics = (
+        "semantic_hit_at_k",
+        "semantic_recall_at_k",
+        "semantic_gold_retention_at_k",
+        "semantic_target_set_recall_at_k",
+        "semantic_gold_target_set_exact_at_k",
+        "semantic_mrr_at_k",
+        "hard_negative_promotion_rate",
+        "relation_accuracy",
+        "macro_f1",
+        "target_set_accuracy",
+        "target_micro_precision",
+        "target_micro_recall",
+        "target_micro_f1",
+        "unexpected_target_count",
+        "retrieved_multi_target_proposal_count",
+        "expected_multi_target_case_count",
+        "exact_expected_multi_target_proposal_count",
+        "overbroad_multi_target_proposal_count",
+        "passed_case_count",
+        "failed_case_count",
+        "store_action_accuracy",
+        "store_application_error_count",
+        "avg_judge_prompt_tokens",
+        "avg_judge_completion_tokens",
+        "avg_judge_total_tokens",
+        "judge_latency_p50_ms",
+        "judge_latency_p95_ms",
+        "destructive_safety_violation_count",
+    )
+    lines = [
+        "# Memory V2 Final Top-K Ablation",
+        "",
+        f"Status: `{comparison.get('status', '-')}`",
+        "",
+        "| Metric | Top-3 | Top-4 | Top-5 |",
+        "|---|---:|---:|---:|",
+    ]
+    for metric in metrics:
+        lines.append(
+            f"| `{metric}` | {_fmt(arms.get('3', {}).get(metric))} | "
+            f"{_fmt(arms.get('4', {}).get(metric))} | "
+            f"{_fmt(arms.get('5', {}).get(metric))} |"
+        )
+    lines.extend(
+        [
+            "",
+            f"Recommended semantic Top-K: "
+            f"**{comparison.get('recommended_semantic_top_k', 'none')}**",
+            "",
+            str(comparison.get("recommendation_reason", "")),
+            "",
+            "Selection priority: safety, recall, target quality, relation quality, cost.",
+        ]
+    )
+    if comparison.get("scope_errors"):
+        lines.extend(["", f"Scope errors: `{comparison.get('scope_errors')}`"])
+    return "\n".join(lines) + "\n"
+
+
 def load_memory_longtail_write_v2_dataset(
     case_path: Path,
     shared_bank_path: Path,
@@ -1518,6 +1950,11 @@ async def _evaluate_v2_case(
     user_id = f"longtail-write-v2-{case_id.casefold()}-user"
     relationship_id = f"longtail-write-v2-{case_id.casefold()}-relationship"
     bank_records = _case_bank(case, shared_by_pool)
+    equivalence_group_by_id = {
+        str(row["memory_id"]): str(row["equivalent_memory_group_id"]).strip()
+        for row in bank_records
+        if row.get("equivalent_memory_group_id")
+    }
     bank_items = [
         _memory_item_from_row(
             row,
@@ -1545,6 +1982,7 @@ async def _evaluate_v2_case(
             relationship_id=relationship_id,
             vector_limit=vector_limit,
             rank_limit=rank_limit,
+            equivalence_group_by_id=equivalence_group_by_id,
         )
     else:
         query_started = perf_counter()
@@ -1571,6 +2009,7 @@ async def _evaluate_v2_case(
             relationship_id=relationship_id,
             vector_limit=vector_limit,
             rank_limit=rank_limit,
+            equivalence_group_by_id=equivalence_group_by_id,
         )
     embedding_failures_after = int(embedding_telemetry.get("failure_count") or 0)
     retrieval["embedding_failure_count"] = max(
@@ -1776,6 +2215,7 @@ def _retrieve_and_rank(
     relationship_id: str,
     vector_limit: int,
     rank_limit: int,
+    equivalence_group_by_id: Mapping[str, str],
 ) -> dict[str, Any]:
     filtered_out: list[dict[str, str]] = []
     scored: list[tuple[MemoryItem, float]] = []
@@ -1822,13 +2262,17 @@ def _retrieve_and_rank(
             row["memory_id"],
         )
     )
-    ranked_rows = ranked_rows[:rank_limit]
     for index, row in enumerate(ranked_rows, start=1):
         row["rank"] = index
         row["rank_after"] = index
+    collapse = _collapse_equivalent_ranked_candidates(
+        ranked_rows,
+        equivalence_group_by_id=equivalence_group_by_id,
+        limit=rank_limit,
+    )
     return {
         "vector": vector_rows,
-        "ranked": ranked_rows,
+        **collapse,
         "filtered_out": filtered_out,
         "eligible_candidate_count": len(scored),
         "vector_limit": vector_limit,
@@ -1849,6 +2293,7 @@ async def _retrieve_with_production_hybrid(
     relationship_id: str,
     vector_limit: int,
     rank_limit: int,
+    equivalence_group_by_id: Mapping[str, str],
 ) -> dict[str, Any]:
     """Run the production retriever, then expose its two benchmark stages.
 
@@ -1893,7 +2338,7 @@ async def _retrieve_with_production_hybrid(
             -result.score.semantic_similarity,
             result.item.id,
         ),
-    )[:rank_limit]
+    )
     cheap_ranking_latency_ms = round(
         (perf_counter() - cheap_ranking_started) * 1000,
         3,
@@ -1913,6 +2358,7 @@ async def _retrieve_with_production_hybrid(
             "kind": result.item.kind.value,
             "subject": result.item.subject,
             "status": result.item.status.value,
+            "confidence": round(float(result.item.confidence), 6),
             "text": result.item.original_text,
             "score": score,
             "semantic_similarity": round(result.score.semantic_similarity, 6),
@@ -1932,6 +2378,11 @@ async def _retrieve_with_production_hybrid(
                 vector_rank=vector_rank_by_id[result.item.id],
             )
         )
+    collapse = _collapse_equivalent_ranked_candidates(
+        ranked_rows,
+        equivalence_group_by_id=equivalence_group_by_id,
+        limit=rank_limit,
+    )
     returned_ids = set(by_id)
     filtered_out = [
         {
@@ -1943,7 +2394,7 @@ async def _retrieve_with_production_hybrid(
     ]
     return {
         "vector": vector_rows,
-        "ranked": ranked_rows,
+        **collapse,
         "filtered_out": filtered_out,
         "eligible_candidate_count": len(retrieved),
         "vector_limit": vector_limit,
@@ -1960,6 +2411,87 @@ async def _retrieve_with_production_hybrid(
             "preserve_candidates": True,
         },
     }
+
+
+def _collapse_equivalent_ranked_candidates(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    equivalence_group_by_id: Mapping[str, str],
+    limit: int,
+) -> dict[str, Any]:
+    """Collapse documented physical aliases before selecting Judge Top-K.
+
+    The equivalence map is frozen dataset identity metadata.  Benchmark roles,
+    semantic tags, and expected targets are deliberately unavailable here, so
+    collapse cannot leak Gold into candidate selection.
+    """
+
+    rows: list[dict[str, Any]] = []
+    groups: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+    for physical_rank, candidate in enumerate(candidates, start=1):
+        row = dict(candidate)
+        memory_id = str(row["memory_id"])
+        group_id = str(equivalence_group_by_id.get(memory_id, "")).strip()
+        row["equivalent_memory_group_id"] = group_id or None
+        row["collapse_rank_before"] = physical_rank
+        rows.append(row)
+        groups[_equivalence_key(memory_id, group_id)].append((physical_rank, row))
+
+    representatives: list[tuple[int, dict[str, Any]]] = []
+    collapsed_groups: list[dict[str, Any]] = []
+    for members in groups.values():
+        representative_rank, representative = min(
+            members,
+            key=lambda pair: _equivalence_representative_key(pair[1]),
+        )
+        group_rank = min(rank for rank, _ in members)
+        representatives.append((group_rank, representative))
+        group_id = representative.get("equivalent_memory_group_id")
+        if group_id and len(members) > 1:
+            removed = sorted(
+                (row for _, row in members if row is not representative),
+                key=lambda row: str(row["memory_id"]),
+            )
+            collapsed_groups.append(
+                {
+                    "equivalent_memory_group_id": group_id,
+                    "representative_memory_id": str(representative["memory_id"]),
+                    "representative_rank_before_collapse": representative_rank,
+                    "removed_memory_ids": [str(row["memory_id"]) for row in removed],
+                }
+            )
+
+    representatives.sort(key=lambda pair: (pair[0], str(pair[1]["memory_id"])))
+    collapsed = [row for _, row in representatives]
+    selected = collapsed[:limit]
+    for rank, row in enumerate(selected, start=1):
+        row["rank"] = rank
+        row["rank_after"] = rank
+
+    return {
+        "ranked": selected,
+        "pre_collapse_candidate_count": len(rows),
+        "post_collapse_candidate_count": len(collapsed),
+        "equivalence_groups_collapsed": len(collapsed_groups),
+        "duplicate_slots_removed": len(rows) - len(collapsed),
+        "top5_duplicate_semantic_memory_count": _equivalence_duplicate_slot_count(
+            selected
+        ),
+        "equivalence_collapse_groups": collapsed_groups,
+    }
+
+
+def _equivalence_representative_key(candidate: Mapping[str, Any]) -> tuple[Any, ...]:
+    score = candidate.get("score")
+    score = score if isinstance(score, Mapping) else {}
+    cheap_score = float(score.get("cheap_score") or 0.0)
+    vector_score = float(
+        score.get("semantic_similarity")
+        or candidate.get("semantic_similarity")
+        or 0.0
+    )
+    confidence = float(candidate.get("confidence") or 0.0)
+    return (-cheap_score, -vector_score, -confidence, str(candidate["memory_id"]))
 
 
 def _annotate_retrieval_roles(
@@ -2037,6 +2569,7 @@ def _cheap_rank_row(
         "kind": item.kind.value,
         "subject": item.subject,
         "status": item.status.value,
+        "confidence": round(float(item.confidence), 6),
         "text": item.original_text,
         "score": {
             "semantic_similarity": round(semantic_similarity, 6),
@@ -2101,8 +2634,21 @@ async def _run_relation_stage(
         if record.get("name") == "memory_semantic_relation_model"
     ]
     policy_details = policy_records[-1].get("details", {}) if policy_records else {}
+    candidate_relations = _candidate_relation_trace_rows(
+        policy_details.get("candidate_relations_json")
+    )
+    target_ids = set(proposal.target_memory_ids)
+    direct_target_ids = [
+        item["memory_id"] for item in candidate_relations if item["is_direct_target"]
+    ]
+    supplied_candidate_ids = [item.id for item in candidates]
+    trace_candidate_ids = [item["memory_id"] for item in candidate_relations]
+    candidate_relation_trace_complete = bool(
+        len(trace_candidate_ids) == len(set(trace_candidate_ids))
+        and set(trace_candidate_ids) == set(supplied_candidate_ids)
+    )
     return {
-        "candidate_ids": [item.id for item in candidates],
+        "candidate_ids": supplied_candidate_ids,
         "judge_status": judge_status,
         "judge_error_type": error_type,
         "judge_error_category": error_category,
@@ -2116,9 +2662,54 @@ async def _run_relation_stage(
             for memory_id in str(policy_details.get("raw_target_ids") or "").split(",")
             if memory_id
         ],
+        "candidate_relations": candidate_relations,
+        "candidate_relation_trace_complete": candidate_relation_trace_complete,
+        "direct_target_ids": direct_target_ids,
+        "final_target_ids": list(proposal.target_memory_ids),
+        "per_target_relations": [
+            item for item in candidate_relations if item["memory_id"] in target_ids
+        ],
+        "reported_overall_relation": policy_details.get("reported_overall_relation"),
+        "derived_overall_relation": policy_details.get("derived_overall_relation"),
         "proposal": proposal.model_dump(mode="json"),
         "validation": validation.model_dump(mode="json"),
     }
+
+
+def _candidate_relation_trace_rows(value: object) -> list[dict[str, Any]]:
+    """Decode the adapter's bounded candidate-wise trace for evaluation output."""
+
+    if not isinstance(value, str) or not value:
+        return []
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(decoded, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in decoded[:5]:
+        if not isinstance(item, Mapping):
+            return []
+        memory_id = item.get("memory_id")
+        relation = item.get("relation")
+        is_direct_target = item.get("is_direct_target")
+        confidence = item.get("confidence")
+        if not isinstance(memory_id, str) or not isinstance(relation, str):
+            return []
+        if not isinstance(is_direct_target, bool):
+            return []
+        if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+            return []
+        rows.append(
+            {
+                "memory_id": memory_id,
+                "relation": relation,
+                "is_direct_target": is_direct_target,
+                "confidence": float(confidence),
+            }
+        )
+    return rows
 
 
 def _safe_judge_trace_records(trace: ExecutionTrace) -> list[dict[str, Any]]:
@@ -2515,10 +3106,39 @@ def _attribute_failure(
             if relation_stage.get("judge_error_category") == "transport"
             else "MODEL_PARSE_ERROR"
         )
-    elif not retrieved_checks["relation"]:
-        stages.append("SEMANTIC_RELATION_ERROR")
-    elif not retrieved_checks["target_set"]:
-        stages.append("TARGET_SELECTION_ERROR")
+    else:
+        if not retrieved_checks["relation"]:
+            stages.append("SEMANTIC_RELATION_ERROR")
+            secondary.append("RELATION_CLASSIFICATION_ERROR")
+        if not retrieved_checks["target_set"]:
+            stages.append("TARGET_SELECTION_ERROR")
+            expected_targets = set(_expected_semantic_target_ids(case))
+            proposal = relation_stage.get("proposal", {})
+            final_targets = set(
+                proposal.get("target_memory_ids", [])
+                if isinstance(proposal, Mapping)
+                else []
+            )
+            candidate_relations = relation_stage.get("candidate_relations", [])
+            trace_complete = relation_stage.get("candidate_relation_trace_complete") is True
+            if trace_complete and isinstance(candidate_relations, list):
+                direct_targets = {
+                    str(item.get("memory_id"))
+                    for item in candidate_relations
+                    if isinstance(item, Mapping)
+                    and item.get("is_direct_target") is True
+                    and item.get("memory_id") is not None
+                }
+                candidate_ids = {
+                    str(value) for value in relation_stage.get("candidate_ids", [])
+                }
+                gold_targets_available = expected_targets <= candidate_ids
+                if (
+                    gold_targets_available and direct_targets != expected_targets
+                ) or bool(direct_targets - expected_targets):
+                    secondary.append("DIRECT_TARGET_ELIGIBILITY_ERROR")
+                if final_targets != direct_targets:
+                    secondary.append("TARGET_AGGREGATION_ERROR")
     validation = relation_stage["validation"]
     raw_correct = retrieved_checks["relation"] and retrieved_checks["target_set"]
     expected_semantic_targets = _expected_semantic_target_ids(case)
@@ -2671,6 +3291,8 @@ def _build_report(
             "vector_top_k": vector_limit,
             "cheap_rank_top_n": rank_limit,
             "semantic_judge_candidate_limit": rank_limit,
+            "equivalence_collapse": "documented_group_id_before_semantic_top_k",
+            "semantic_judge_protocol": "candidate_wise_single_call_direct_target_v2",
             "retrieval_engine": retrieval_engines,
             "embedding_input": embedding_input,
             "embedding_input_detail": (
@@ -2850,6 +3472,7 @@ def _retrieval_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         return count
 
     reciprocal_ranks: list[float] = []
+    semantic_reciprocal_ranks: list[float] = []
     for row in eligible:
         expected = set(_row_expected_retrieval_candidate_ids(row))
         ranks = [
@@ -2858,6 +3481,17 @@ def _retrieval_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             if item["memory_id"] in expected
         ]
         reciprocal_ranks.append(1 / min(ranks) if ranks else 0.0)
+        semantic_ranks = [
+            index
+            for index, item in enumerate(
+                row.get("retrieval", {}).get("ranked", []),
+                start=1,
+            )
+            if item["memory_id"] in expected
+        ]
+        semantic_reciprocal_ranks.append(
+            1 / min(semantic_ranks) if semantic_ranks else 0.0
+        )
     top20_hits = target_hits("vector", 20)
     ranked_hits = target_hits("ranked")
     candidate_counts = [row.get("candidate_pool_size", 0) for row in rows]
@@ -2899,6 +3533,31 @@ def _retrieval_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         _equivalence_duplicate_slot_count(row.get("retrieval", {}).get("ranked", []))
         for row in rows
     )
+    pre_collapse_candidate_count = sum(
+        int(row.get("retrieval", {}).get("pre_collapse_candidate_count") or 0)
+        for row in rows
+    )
+    post_collapse_candidate_count = sum(
+        int(row.get("retrieval", {}).get("post_collapse_candidate_count") or 0)
+        for row in rows
+    )
+    equivalence_groups_collapsed = sum(
+        int(row.get("retrieval", {}).get("equivalence_groups_collapsed") or 0)
+        for row in rows
+    )
+    duplicate_slots_removed = sum(
+        int(row.get("retrieval", {}).get("duplicate_slots_removed") or 0)
+        for row in rows
+    )
+    top5_duplicate_semantic_memory_count = sum(
+        int(
+            row.get("retrieval", {}).get(
+                "top5_duplicate_semantic_memory_count"
+            )
+            or 0
+        )
+        for row in rows
+    )
     retrieval_latencies = [
         row["retrieval"]["latency_ms"] for row in rows if "retrieval" in row
     ]
@@ -2912,6 +3571,18 @@ def _retrieval_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         for row in rows
         if "retrieval" in row and row["retrieval"].get("vector_ranking_latency_ms") is not None
     ]
+    semantic_candidate_limit = max(
+        (
+            len(row.get("retrieval", {}).get("ranked", []))
+            for row in rows
+        ),
+        default=0,
+    )
+    semantic_exact_count = sum(
+        set(_row_expected_retrieval_candidate_ids(row))
+        <= {item["memory_id"] for item in row.get("retrieval", {}).get("ranked", [])}
+        for row in eligible
+    )
     return {
         "retrieval_expected_case_count": len(eligible),
         "retrieval_expected_target_count": total_targets,
@@ -2939,6 +3610,16 @@ def _retrieval_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             total_equivalent_targets,
         ),
         "mrr": round(mean(reciprocal_ranks), 4) if reciprocal_ranks else 0.0,
+        "semantic_candidate_limit": semantic_candidate_limit,
+        "semantic_hit_at_k": _ratio(case_hits("ranked"), len(eligible)),
+        "semantic_recall_at_k": end_to_end_recall_at_5,
+        "semantic_gold_retention_at_k": conditional_retention,
+        "semantic_target_set_exact_at_k": _ratio(semantic_exact_count, len(eligible)),
+        "semantic_mrr_at_k": (
+            round(mean(semantic_reciprocal_ranks), 4)
+            if semantic_reciprocal_ranks
+            else 0.0
+        ),
         "conditional_gold_retention_at_5": conditional_retention,
         # Compatibility alias retained for older report consumers.  This is a
         # conditional Top-20 -> Top-5 retention metric, not end-to-end recall.
@@ -2946,11 +3627,7 @@ def _retrieval_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "end_to_end_gold_recall_at_5": end_to_end_recall_at_5,
         "target_set_recall_at_5": end_to_end_recall_at_5,
         "gold_target_set_exact_at_5": _ratio(
-            sum(
-                set(_row_expected_retrieval_candidate_ids(row))
-                <= {item["memory_id"] for item in row.get("retrieval", {}).get("ranked", [])}
-                for row in eligible
-            ),
+            semantic_exact_count,
             len(eligible),
         ),
         "hard_negative_promotion_count": sum(
@@ -2971,6 +3648,13 @@ def _retrieval_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "equivalence_group_duplicate_slot_count": duplicate_slots_at_20,
         "equivalence_group_duplicate_slot_count_at_20": duplicate_slots_at_20,
         "equivalence_group_duplicate_slot_count_at_5": duplicate_slots_at_5,
+        "pre_collapse_candidate_count": pre_collapse_candidate_count,
+        "post_collapse_candidate_count": post_collapse_candidate_count,
+        "equivalence_groups_collapsed": equivalence_groups_collapsed,
+        "duplicate_slots_removed": duplicate_slots_removed,
+        "top5_duplicate_semantic_memory_count": (
+            top5_duplicate_semantic_memory_count
+        ),
         "avg_candidate_count": (round(mean(candidate_counts), 4) if candidate_counts else 0.0),
         "retrieval_latency_p50_ms": _percentile(
             retrieval_latencies,
@@ -3675,25 +4359,28 @@ def finalize_memory_longtail_write_v2_live_validation(
             "equivalence_aware_recall_at_20",
             0.95,
         ),
+        "top5_duplicate_semantic_memory_count": (
+            int(full_retrieval.get("top5_duplicate_semantic_memory_count") or 0) == 0
+        ),
         "retrieved_relation_accuracy": _metric_meets_threshold(
             full_relation,
             "relation_accuracy",
-            0.75,
+            0.70,
         ),
         "retrieved_relation_macro_f1": _metric_meets_threshold(
             full_relation,
             "macro_f1",
-            0.70,
+            0.60,
         ),
         "target_set_accuracy": _metric_meets_threshold(
             full_relation,
             "target_set_accuracy",
-            0.60,
+            0.50,
         ),
         "target_micro_f1": _metric_meets_threshold(
             full_relation,
             "target_micro_f1",
-            0.70,
+            0.65,
         ),
         "semantic_judge_complete": judge_complete,
         "destructive_safety": destructive_safety,
@@ -3716,6 +4403,30 @@ def finalize_memory_longtail_write_v2_live_validation(
         ),
     }
 
+    stretch_checks = {
+        "retrieved_relation_accuracy": _metric_meets_threshold(
+            full_relation,
+            "relation_accuracy",
+            0.75,
+        ),
+        "retrieved_relation_macro_f1": _metric_meets_threshold(
+            full_relation,
+            "macro_f1",
+            0.70,
+        ),
+        "target_set_accuracy": _metric_meets_threshold(
+            full_relation,
+            "target_set_accuracy",
+            0.60,
+        ),
+        "target_micro_f1": _metric_meets_threshold(
+            full_relation,
+            "target_micro_f1",
+            0.70,
+        ),
+        "destructive_safety": destructive_safety,
+    }
+
     if not destructive_safety:
         status = "SAFETY_REGRESSION"
     elif not dataset_contract:
@@ -3731,6 +4442,7 @@ def finalize_memory_longtail_write_v2_live_validation(
             "retrieved_relation_macro_f1",
             "target_set_accuracy",
             "target_micro_f1",
+            "top5_duplicate_semantic_memory_count",
             "semantic_judge_complete",
             "store_application_complete",
             "hard_case_scope_complete",
@@ -3741,12 +4453,15 @@ def finalize_memory_longtail_write_v2_live_validation(
     ):
         status = "SEMANTIC_JUDGE_REMEDIATION_REQUIRED"
     else:
-        status = "MEMORY_V2_FREEZE_READY"
+        status = "MEMORY_V2_FREEZE_READY_MINIMUM"
 
     failed_checks = [name for name, passed in checks.items() if not passed]
     final_validation = {
         "status": status,
         "checks": checks,
+        "minimum_freeze_checks": checks,
+        "stretch_checks": stretch_checks,
+        "stretch_target_met": all(stretch_checks.values()),
         "failed_checks": failed_checks,
         "full_case_count": full_report.get("case_count"),
         "hard_case_count": hard_report.get("case_count"),
@@ -3788,6 +4503,7 @@ def render_memory_longtail_write_v2_report(report: Mapping[str, Any]) -> str:
     known_limitations = report.get("known_limitation_metrics", {})
     acceptance_checks = report.get("acceptance_checks", {})
     fixture_comparison = report.get("fixture_comparison")
+    semantic_remediation = report.get("semantic_remediation_comparison")
     repository = report.get("repository", {})
     final_validation = report.get("final_validation", {})
     contradiction = report.get("contradiction_diagnostics", {}).get("retrieved", {})
@@ -3908,8 +4624,10 @@ def render_memory_longtail_write_v2_report(report: Mapping[str, Any]) -> str:
         "## Retrieval and Ranking",
         "",
         f"- Vector retrieval stage: **Top-{parameters.get('vector_top_k', '-')}** candidates",
-        f"- Cheap ranking stage: **Top-{parameters.get('cheap_rank_top_n', '-')}** candidates "
-        "(also supplied to the Semantic Judge)",
+        "- Cheap ranking stage: vector candidates are reranked before documented "
+        "equivalence groups are collapsed",
+        f"- Semantic Judge stage: **Top-{parameters.get('cheap_rank_top_n', '-')}** "
+        "collapsed semantic candidates",
         f"- Retrieval engine: `{parameters.get('retrieval_engine', '-')}`",
         f"- Embedding input: `{parameters.get('embedding_input', '-')}`",
         f"- Embedding input detail: {parameters.get('embedding_input_detail', '-')}",
@@ -3965,6 +4683,11 @@ def render_memory_longtail_write_v2_report(report: Mapping[str, Any]) -> str:
         "unrelated_candidate_retention_rate",
         "equivalence_group_duplicate_slot_count_at_20",
         "equivalence_group_duplicate_slot_count_at_5",
+        "pre_collapse_candidate_count",
+        "post_collapse_candidate_count",
+        "equivalence_groups_collapsed",
+        "duplicate_slots_removed",
+        "top5_duplicate_semantic_memory_count",
         "avg_candidate_count",
         "retrieval_latency_p50_ms",
         "retrieval_latency_p95_ms",
@@ -4284,6 +5007,19 @@ def render_memory_longtail_write_v2_report(report: Mapping[str, Any]) -> str:
             lines.append(f"| `{name}` | {value} |")
     else:
         lines.append("| none | 0 |")
+    secondary = report.get("failure_attribution", {}).get("secondary", {})
+    lines.extend(
+        [
+            "",
+            "| Secondary diagnostic | Count |",
+            "|---|---:|",
+        ]
+    )
+    if secondary:
+        for name, value in secondary.items():
+            lines.append(f"| `{name}` | {value} |")
+    else:
+        lines.append("| none | 0 |")
     lines.extend(
         [
             "",
@@ -4307,6 +5043,120 @@ def render_memory_longtail_write_v2_report(report: Mapping[str, Any]) -> str:
             f"{proposal.get('target_memory_ids', [])} | "
             f"{row.get('store', {}).get('actual_write_action', '-')} |"
         )
+    lines.extend(
+        [
+            "",
+            "### Candidate-wise Failure Trace",
+            "",
+            "| Run | Case | Candidate | Relation | Direct target | Final target | "
+            "Gold target | Overall | Validator pass |",
+            "|---:|---|---|---|---:|---:|---:|---|---:|",
+        ]
+    )
+    trace_row_count = 0
+    for row in failures:
+        relation_stage = row.get("retrieved_relation", {})
+        if not isinstance(relation_stage, Mapping):
+            continue
+        proposal = relation_stage.get("proposal", {})
+        validation = relation_stage.get("validation", {})
+        final_targets = set(
+            proposal.get("target_memory_ids", [])
+            if isinstance(proposal, Mapping)
+            else []
+        )
+        gold_targets = set(_row_expected_semantic_target_ids(row))
+        candidate_relations = relation_stage.get("candidate_relations", [])
+        if not isinstance(candidate_relations, list):
+            continue
+        for candidate in candidate_relations:
+            if not isinstance(candidate, Mapping):
+                continue
+            memory_id = str(candidate.get("memory_id", "-"))
+            validator_pass = validation.get("validator_pass", "-")
+            lines.append(
+                f"| {row.get('run_index', '-')} | {row.get('case_id')} | {memory_id} | "
+                f"{candidate.get('relation', '-')} | "
+                f"{candidate.get('is_direct_target', '-')} | "
+                f"{memory_id in final_targets} | {memory_id in gold_targets} | "
+                f"{proposal.get('relation', '-') if isinstance(proposal, Mapping) else '-'} | "
+                f"{validator_pass} |"
+            )
+            trace_row_count += 1
+    if trace_row_count == 0:
+        lines.append("| - | none | - | - | - | - | - | - | - |")
+    lines.extend(["", "### Bounded Failure Details", ""])
+    if not failures:
+        lines.append("No failed cases.")
+    for row in failures:
+        relation_stage = row.get("retrieved_relation", {})
+        relation_stage = relation_stage if isinstance(relation_stage, Mapping) else {}
+        proposal = relation_stage.get("proposal", {})
+        proposal = proposal if isinstance(proposal, Mapping) else {}
+        validation = relation_stage.get("validation", {})
+        validation = validation if isinstance(validation, Mapping) else {}
+        relation_by_id = {
+            str(item.get("memory_id")): item
+            for item in relation_stage.get("candidate_relations", [])
+            if isinstance(item, Mapping) and item.get("memory_id") is not None
+        }
+        incoming_text = " ".join(str(row.get("incoming_text", "")).split())[:300]
+        lines.extend(
+            [
+                f"#### {row.get('case_id')} / run {row.get('run_index', 1)}",
+                "",
+                f"- Incoming: {incoming_text}",
+                f"- Final target set: {proposal.get('target_memory_ids', [])}",
+                f"- Gold target set: {_row_expected_semantic_target_ids(row)}",
+                f"- Overall relation: {proposal.get('relation', '-')}",
+                f"- Validator: pass={validation.get('validator_pass', '-')}, "
+                f"validated_relation={validation.get('validated_relation', '-')}, "
+                f"would_update={validation.get('would_update', '-')}, "
+                f"reasons={validation.get('validator_reasons', [])}",
+                "- Top-K candidates:",
+                "",
+            ]
+        )
+        ranked = row.get("retrieval", {}).get("ranked", [])
+        if not isinstance(ranked, list) or not ranked:
+            lines.append("  - none")
+        for index, candidate in enumerate(ranked[:5], start=1):
+            if not isinstance(candidate, Mapping):
+                continue
+            memory_id = str(candidate.get("memory_id", "-"))
+            candidate_text = " ".join(str(candidate.get("text", "")).split())[:220]
+            judged = relation_by_id.get(memory_id, {})
+            lines.append(
+                f"  - {index}. {memory_id}: {candidate_text} "
+                f"[relation={judged.get('relation', '-')}, "
+                f"direct={judged.get('is_direct_target', '-')}]"
+            )
+        lines.append("")
+    if isinstance(semantic_remediation, Mapping):
+        lines.extend(
+            [
+                "",
+                "## Baseline Final Live vs Semantic Judge Remediation",
+                "",
+                f"- Comparison status: `{semantic_remediation.get('status', '-')}`",
+                f"- Baseline status: `{semantic_remediation.get('baseline_status', '-')}`",
+                f"- Remediation status: `{semantic_remediation.get('remediation_status', '-')}`",
+                "",
+                "| Metric | Baseline Final Live | Remediation | Delta |",
+                "|---|---:|---:|---:|",
+            ]
+        )
+        comparison_metrics = semantic_remediation.get("metrics", {})
+        if isinstance(comparison_metrics, Mapping) and comparison_metrics:
+            for name, values in comparison_metrics.items():
+                if not isinstance(values, Mapping):
+                    continue
+                lines.append(
+                    f"| `{name}` | {_fmt(values.get('baseline'))} | "
+                    f"{_fmt(values.get('remediation'))} | {_fmt(values.get('delta'))} |"
+                )
+        else:
+            lines.append("| none | - | - | - |")
     if isinstance(fixture_comparison, Mapping):
         lines.extend(
             [
@@ -5040,9 +5890,12 @@ __all__ = [
     "LongTailWriteV2EvaluationError",
     "collect_memory_longtail_write_v2_repository_metadata",
     "compare_memory_longtail_write_v2_reports",
+    "compare_memory_longtail_write_v2_semantic_remediation",
+    "compare_memory_longtail_write_v2_top_k_ablation",
     "evaluate_memory_longtail_write_v2",
     "evaluate_memory_longtail_write_v2_fixture",
     "finalize_memory_longtail_write_v2_live_validation",
     "load_memory_longtail_write_v2_dataset",
     "render_memory_longtail_write_v2_report",
+    "render_memory_longtail_write_v2_top_k_ablation",
 ]

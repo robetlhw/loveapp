@@ -1,5 +1,6 @@
 import asyncio
 import json
+from collections.abc import Mapping, Sequence
 from datetime import date as Date
 from datetime import datetime
 from pathlib import Path
@@ -7,6 +8,7 @@ from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 import typer
+from qdrant_client import AsyncQdrantClient
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
@@ -15,6 +17,8 @@ from rich.table import Table
 from rich.text import Text
 
 from loveapp.adapters.knowledge.loader import load_knowledge_path, merge_knowledge_documents
+from loveapp.adapters.knowledge.qdrant import QdrantKnowledgeStore
+from loveapp.adapters.knowledge.scoring import RerankConfig, RerankerMode
 from loveapp.adapters.memory import OpenAICompatibleSemanticRelationJudge
 from loveapp.application.advice_presentation import (
     AdvicePresentationMode,
@@ -23,12 +27,15 @@ from loveapp.application.advice_presentation import (
 )
 from loveapp.application.memory import NoOpMemoryExtractor
 from loveapp.application.memory_retrieval import HybridMemoryRetriever
+from loveapp.application.retrieval_query_planner import RetrievalQueryPlanner
+from loveapp.application.routing import HybridRouter
 from loveapp.bootstrap import (
     _build_memory_extractor,
     build_container,
     build_embedding_provider,
     build_memory_container,
     build_qdrant_store,
+    build_routing_container,
     load_seed_documents,
 )
 from loveapp.cli_memory_inspector import (
@@ -51,6 +58,7 @@ from loveapp.domain.enums import (
     TaskType,
     TransportMode,
 )
+from loveapp.domain.knowledge import RetrievalTextMode
 from loveapp.domain.memory import (
     MemoryCompactionResult,
     MemoryExtractionRun,
@@ -66,6 +74,8 @@ from loveapp.domain.relationship_plan import PlanStatus, RelationshipPlan
 from loveapp.domain.routing import RouteResult
 from loveapp.evaluation import (
     FixtureSemanticRelationJudge,
+    build_phase31_router,
+    evaluate_contextual_rewrite,
     evaluate_dateplan,
     evaluate_live_routing_conversations,
     evaluate_memory_admission_integration,
@@ -80,7 +90,21 @@ from loveapp.evaluation import (
     evaluate_memory_longtail_write_v1,
     evaluate_memory_normalization_boundary,
     evaluate_memory_normalization_v1,
+    evaluate_multiquery,
+    evaluate_phase31_dataset,
+    evaluate_phase32_dataset,
+    evaluate_phase32_experiment,
+    evaluate_phase32_repeatability,
+    evaluate_phase32_smoke,
+    evaluate_phase321_experiment,
+    evaluate_router_safety,
     evaluate_routing_conversations,
+    load_contextual_rewrite_eval_markdown,
+    load_multiquery_eval_markdown,
+    load_router_challenge_cases,
+    load_router_safety_cases,
+    phase32_dry_run,
+    phase321_call_budget,
     render_dateplan_report,
     render_longtail_baseline_report,
     render_longtail_realistic_report,
@@ -96,7 +120,19 @@ from loveapp.evaluation import (
     render_memory_normalization_boundary_report,
     render_memory_normalization_v1_report,
     render_routing_report,
+    resolve_phase32_provider,
     run_baseline,
+    validate_contextual_rewrite_dataset,
+    validate_multiquery_dataset,
+    validate_router_challenge_dataset,
+    validate_router_safety_dataset,
+    write_phase31_findings,
+    write_phase31_report,
+    write_phase32_findings,
+    write_phase32_report,
+    write_phase45_report,
+    write_phase321_reports,
+    write_router_safety_report,
 )
 from loveapp.evaluation.memory_extraction_alignment import (
     OpenAICompatibleExtractionAlignmentJudge,
@@ -113,11 +149,32 @@ from loveapp.evaluation.memory_longtail_realistic import HARD_CASE_IDS
 from loveapp.evaluation.memory_longtail_write_v2 import (
     collect_memory_longtail_write_v2_repository_metadata,
     compare_memory_longtail_write_v2_reports,
+    compare_memory_longtail_write_v2_semantic_remediation,
     evaluate_memory_longtail_write_v2,
     evaluate_memory_longtail_write_v2_fixture,
     finalize_memory_longtail_write_v2_live_validation,
     render_memory_longtail_write_v2_report,
 )
+from loveapp.evaluation.rag_v2 import (
+    build_e2e_executor,
+    compare_oracle_and_e2e,
+    evaluate_rag_targets,
+    evaluate_rag_v2,
+    load_rag_eval_markdown,
+    validate_rag_v2_dataset,
+    write_rag_report,
+)
+from loveapp.evaluation.rag_v2_metadata import (
+    MetadataFilterExperimentConfig,
+    build_metadata_filter_e2e_executors,
+    evaluate_metadata_filter_comparison,
+    write_metadata_filter_comparison,
+)
+from loveapp.evaluation.rag_v2_sweep import (
+    run_rag_v2_dev_sweep,
+    write_sweep_report,
+)
+from loveapp.safety import SafetyPolicy
 
 app = typer.Typer(
     name="loveapp",
@@ -355,6 +412,2231 @@ def _split_eval_filters(values: list[str] | None) -> list[str]:
     if not values:
         return []
     return [item.strip() for value in values for item in value.split(",") if item.strip()]
+
+
+# ---------------------------------------------------------------------------
+# LoveApp Phase 3--5 specialised evaluations
+#
+# These commands intentionally operate on the specialised fixtures directly.
+# They never add the fixtures to the knowledge base or to an embedding
+# corpus.  The feature switches are exposed here (rather than inferred from
+# environment variables) so that Dev and frozen Test runs are reproducible.
+
+_PHASE35_EVAL_ROOT = Path("evals/rag/phase3_5")
+_PHASE31_EVAL_ROOT = Path("evals/rag/phase3_1")
+_PHASE321_DEV_FILENAME = "loveapp_router_safety_eval_dev_v1.md"
+_PHASE321_CHALLENGE_FILENAME = "loveapp_router_challenge_dev_v1.md"
+_PHASE321_FORBIDDEN_TEST_FILENAME = "loveapp_router_safety_eval_test_v1.md"
+_PHASE321_BEFORE_FILENAMES = {
+    "always_before_dev": "router_phase3_2_live_always_dev.json",
+    "conditional_before_dev": "router_phase3_2_live_conditional_dev.json",
+    "always_before_challenge_dev": "router_phase3_2_live_always_challenge_dev.json",
+    "conditional_before_challenge_dev": (
+        "router_phase3_2_live_conditional_challenge_dev.json"
+    ),
+}
+
+
+def _phase35_json_path(output: Path) -> Path:
+    """Return the JSON destination while accepting a convenient ``.md`` path."""
+
+    return output if output.suffix.casefold() == ".json" else output.with_suffix(".json")
+
+
+def _phase35_write_router_report(report: dict[str, Any], output: Path) -> tuple[Path, Path]:
+    json_path = _phase35_json_path(output)
+    markdown_path = json_path.with_suffix(".md")
+    write_router_safety_report(report, json_path, markdown_output=markdown_path)
+    return json_path, markdown_path
+
+
+def _phase35_live_router_configured(settings: Any) -> bool:
+    """Return whether an explicitly requested live Router can be constructed.
+
+    A missing key/base URL/model, demo provider, or disabled live-eval switch is
+    treated as *not configured*.  Callers emit a skipped artifact in that case
+    instead of invoking an external model or inventing metrics.
+    """
+
+    configured_router_provider = getattr(settings, "router_llm_provider", None)
+    provider = str(
+        configured_router_provider
+        or getattr(settings, "router_provider", "auto")
+    ).casefold()
+    llm_provider = str(getattr(settings, "llm_provider", "demo")).casefold()
+    model = (
+        getattr(settings, "router_llm_model", None)
+        or getattr(settings, "router_model", "")
+        or getattr(settings, "llm_model", "")
+    )
+    provider_is_concrete = provider not in {"auto", "llm", "disabled", "none", "demo"}
+    return bool(
+        getattr(settings, "router_live_eval_enabled", False)
+        and provider not in {"disabled", "none", "demo"}
+        and (provider_is_concrete or llm_provider != "demo")
+        and getattr(settings, "llm_api_key", None)
+        and getattr(settings, "llm_base_url", None)
+        and model
+    )
+
+
+def _phase35_skipped_report(
+    *, phase: int, dataset: Path, reason: str, router_mode: str | None = None
+) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "phase": phase,
+        "status": "skipped",
+        "dataset": str(dataset),
+        "reason": reason,
+    }
+    if router_mode is not None:
+        report["router_mode"] = router_mode
+    return report
+
+
+def _phase35_load_path(path: Path, *, phase: int) -> Path:
+    if path.exists():
+        return path
+    # Keep defaults useful when the command is run from a different working
+    # directory (for example through an installed console script).
+    name = path.name
+    candidate = _PHASE35_EVAL_ROOT / name
+    if candidate.exists():
+        return candidate
+    raise FileNotFoundError(f"Phase {phase} evaluation dataset not found: {path}")
+
+
+def _phase35_load_knowledge_path(path: Path) -> Path:
+    """Resolve a knowledge path from the repository root when needed.
+
+    The specialised eval commands are often invoked through an installed
+    console script, where the process working directory is not the repository
+    root.  Keep path resolution deterministic without changing the configured
+    knowledge file or indexing any specialised fixture.
+    """
+
+    if path.exists():
+        return path
+    repository_root = Path(__file__).resolve().parents[2]
+    candidate = repository_root / path
+    if candidate.exists():
+        return candidate
+    raise FileNotFoundError(f"Knowledge file not found: {path}")
+
+
+def _phase35_phase45_lint(
+    *,
+    rewrite_cases: Sequence[Any] | None = None,
+    multiquery_cases: Sequence[Any] | None = None,
+    knowledge: Path | None = None,
+) -> dict[str, Any]:
+    """Run non-mutating Phase 4/5 fixture lint for report diagnostics.
+
+    Lint findings are recorded in the report but do not silently alter Gold or
+    block a deterministic rule evaluation.  In particular, the supplied
+    contextual fixture deliberately reuses generic ellipsis text across
+    different histories; that is surfaced as a dataset issue rather than
+    hidden by the evaluator.
+    """
+
+    documents = []
+    knowledge_ref: str | None = None
+    if knowledge is not None:
+        resolved = _phase35_load_knowledge_path(knowledge)
+        documents = load_knowledge_path(resolved)
+        knowledge_ref = str(resolved)
+    known_ids = [document.id for document in documents] if knowledge is not None else None
+    result: dict[str, Any] = {"knowledge": knowledge_ref}
+    if rewrite_cases is not None:
+        result["phase4"] = validate_contextual_rewrite_dataset(
+            rewrite_cases,
+            knowledge_ids=known_ids,
+            source_ref="phase4",
+        )
+    if multiquery_cases is not None:
+        result["phase5"] = validate_multiquery_dataset(
+            multiquery_cases,
+            knowledge_ids=known_ids,
+            source_ref="phase5",
+        )
+    return result
+
+
+async def _run_phase35_router_eval(
+    dataset: Path,
+    *,
+    settings: Any,
+    router_mode: Literal["rules", "configured", "live"],
+    router_v2: bool,
+) -> dict[str, Any]:
+    """Evaluate Router/Safety and close configured Router resources safely."""
+
+    eval_settings = settings.model_copy(update={"router_v2_enabled": router_v2})
+    routing_container = None
+    try:
+        if router_mode == "rules":
+            router = HybridRouter(
+                SafetyPolicy(context_turns=eval_settings.router_context_risk_turns),
+                confidence_threshold=eval_settings.router_confidence_threshold,
+                ambiguity_margin=eval_settings.router_ambiguity_margin,
+                clarification_threshold=eval_settings.router_clarification_threshold,
+                prompt_version=eval_settings.router_prompt_version,
+                router_v2_enabled=router_v2,
+            )
+        else:
+            routing_container = build_routing_container(eval_settings)
+            router = routing_container.router
+        return await evaluate_router_safety(
+            dataset,
+            router=router,
+            router_mode=("router_v2" if router_v2 else "current")
+            if router_mode != "live"
+            else "live",
+        )
+    finally:
+        if routing_container is not None:
+            await routing_container.aclose()
+
+
+@eval_app.command("router-safety")
+def router_safety_eval(
+    dataset: Annotated[
+        Path,
+        typer.Option("--dataset", help="Phase 3 Router/Safety Markdown dataset."),
+    ] = _PHASE35_EVAL_ROOT / "loveapp_router_safety_eval_dev_v1.md",
+    output: Annotated[
+        Path,
+        typer.Option("--output", help="JSON report path; Markdown is written beside it."),
+    ] = Path(".data/evals/router_safety_dev.json"),
+    router_mode: Annotated[
+        Literal["rules", "configured", "live"],
+        typer.Option(
+            "--router-mode",
+            help="rules is deterministic; configured uses Settings; live is explicitly gated.",
+        ),
+    ] = "rules",
+    live: Annotated[
+        bool,
+        typer.Option(
+            "--live/--no-live",
+            help="Shortcut for --router-mode live; an unconfigured live run is skipped.",
+        ),
+    ] = False,
+    router_v2: Annotated[
+        bool,
+        typer.Option("--router-v2/--current-router", help="Select the Phase 3 Router arm."),
+    ] = True,
+    fail_on_targets: Annotated[
+        bool,
+        typer.Option("--fail-on-targets/--no-fail-on-targets"),
+    ] = False,
+) -> None:
+    """Evaluate the Phase 3 branch, scenario, goals, and safety contract."""
+
+    dataset = _phase35_load_path(dataset, phase=3)
+    if live:
+        router_mode = "live"
+    settings = get_settings()
+    if router_mode == "live" and not _phase35_live_router_configured(settings):
+        report = _phase35_skipped_report(
+            phase=3,
+            dataset=dataset,
+            router_mode="live",
+            reason=(
+                "Live Router is not configured (enable router_live_eval_enabled and "
+                "provide a non-demo provider, API key, base URL, and model)."
+            ),
+        )
+        json_path, markdown_path = _phase35_write_router_report(report, output)
+        console.print(
+            f"[yellow]Phase 3 Live Router skipped:[/yellow] {json_path} and {markdown_path}"
+        )
+        return
+
+    try:
+        report = asyncio.run(
+            _run_phase35_router_eval(
+                dataset,
+                settings=settings,
+                router_mode=router_mode,
+                router_v2=router_v2,
+            )
+        )
+        report["inputs"] = {
+            "dataset": str(dataset),
+            "router_mode": router_mode,
+            "router_v2_enabled": router_v2,
+        }
+        json_path, markdown_path = _phase35_write_router_report(report, output)
+    except Exception as exc:
+        # ``skipped`` is reserved for the explicit, pre-flight configuration
+        # gate above.  Once a live Router is configured, an initialization or
+        # evaluation failure must remain visible to CI rather than being
+        # misreported as an unavailable experiment.
+        console.print(f"[red]Phase 3 Router/Safety evaluation failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[green]Phase 3 reports saved:[/green] {json_path} and {markdown_path}")
+    console.print(
+        f"Branch accuracy={report.get('branch_accuracy', 0)}; "
+        f"Safety bypass={report.get('safety_to_rag_bypass_rate', 0)}"
+    )
+    if fail_on_targets and not report.get("acceptance_passed", False):
+        raise typer.Exit(code=2)
+
+
+async def _run_phase31_arm(
+    dataset: Path,
+    *,
+    arm: Literal["rule", "llm", "conditional"],
+    settings: Any,
+    live: bool,
+    input_cost_per_million: float | None,
+    output_cost_per_million: float | None,
+) -> dict[str, Any]:
+    if not live or arm == "rule":
+        router = build_phase31_router(arm)
+        return await evaluate_phase31_dataset(
+            dataset,
+            arm=arm,
+            router=router,
+            provider="fixture_semantic" if arm != "rule" else "none",
+            live_llm=False,
+            input_cost_per_million=input_cost_per_million,
+            output_cost_per_million=output_cost_per_million,
+        )
+    eval_settings = settings.model_copy(
+        update={
+            "router_v2_enabled": True,
+            "router_semantic_mode": "always" if arm == "llm" else "conditional",
+            "router_llm_correction_enabled": True,
+        }
+    )
+    routing_container = build_routing_container(eval_settings)
+    try:
+        return await evaluate_phase31_dataset(
+            dataset,
+            arm=arm,
+            router=routing_container.router,
+            provider="live_llm",
+            live_llm=True,
+            input_cost_per_million=input_cost_per_million,
+            output_cost_per_million=output_cost_per_million,
+        )
+    finally:
+        await routing_container.aclose()
+
+
+@eval_app.command("router-phase3-1")
+def router_phase31_eval(
+    dev_dataset: Annotated[
+        Path,
+        typer.Option("--dev-dataset", help="Frozen Phase 3 Router Dev Markdown dataset."),
+    ] = _PHASE35_EVAL_ROOT / "loveapp_router_safety_eval_dev_v1.md",
+    challenge_dataset: Annotated[
+        Path,
+        typer.Option("--challenge-dataset", help="Phase 3.1 Challenge Dev Markdown dataset."),
+    ] = _PHASE31_EVAL_ROOT / "loveapp_router_challenge_dev_v1.md",
+    arm: Annotated[
+        Literal["all", "rule", "llm", "conditional"],
+        typer.Option("--arm", help="Evaluation arm(s) to run."),
+    ] = "all",
+    live: Annotated[
+        bool,
+        typer.Option("--live/--no-live", help="Use a configured live Router provider."),
+    ] = False,
+    output_dir: Annotated[
+        Path,
+        typer.Option("--output-dir", help="Directory for JSON/Markdown reports."),
+    ] = Path(".data/evals"),
+    input_cost_per_million: Annotated[
+        float | None,
+        typer.Option("--input-cost-per-million"),
+    ] = None,
+    output_cost_per_million: Annotated[
+        float | None,
+        typer.Option("--output-cost-per-million"),
+    ] = None,
+) -> None:
+    """Compare Rule-only, LLM always-on, and Conditional Router arms on Dev only."""
+
+    dev_dataset = dev_dataset.resolve()
+    challenge_dataset = challenge_dataset.resolve()
+    if not dev_dataset.exists() or not challenge_dataset.exists():
+        raise typer.BadParameter("Phase 3.1 dataset path does not exist")
+    try:
+        challenge_cases = load_router_safety_cases(challenge_dataset)
+        lint = validate_router_challenge_dataset(
+            challenge_dataset,
+            reference_paths=(
+                dev_dataset,
+                _PHASE35_EVAL_ROOT / "loveapp_router_safety_eval_test_v1.md",
+            ),
+        )
+        if not lint.get("passed"):
+            raise ValueError(f"Challenge Dev lint failed: {lint}")
+        # The compatibility loader validates ChallengeSlices as well; keep the
+        # generic parser call above to guarantee the evaluator sees the same
+        # 120 cases and never silently drops a block.
+        if len(challenge_cases) != 120:
+            raise ValueError("Challenge Dev must contain exactly 120 cases")
+    except Exception as exc:
+        console.print(f"[red]Phase 3.1 fixture validation failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    arms = ("rule", "llm", "conditional") if arm == "all" else (arm,)
+    datasets = (("dev", dev_dataset), ("challenge_dev", challenge_dataset))
+    settings = get_settings()
+    if live and not _phase35_live_router_configured(settings):
+        raise typer.BadParameter(
+            "--live requires router_live_eval_enabled, a non-demo provider, API key, "
+            "base URL, and model"
+        )
+    reports: dict[str, dict[str, Any]] = {}
+    try:
+        for dataset_name, dataset_path in datasets:
+            for active_arm in arms:
+                report = asyncio.run(
+                    _run_phase31_arm(
+                        dataset_path,
+                        arm=active_arm,
+                        settings=settings,
+                        live=live,
+                        input_cost_per_million=input_cost_per_million,
+                        output_cost_per_million=output_cost_per_million,
+                    )
+                )
+                report["challenge_lint"] = lint if dataset_name == "challenge_dev" else None
+                output = output_dir / f"router_phase3_1_{active_arm}_{dataset_name}.json"
+                write_phase31_report(report, output)
+                reports[f"{active_arm}_{dataset_name}"] = report
+                console.print(
+                    f"[green]Phase 3.1 report saved:[/green] {output} "
+                    f"(RAG recall={report.get('rag_recall', 0):.4f}, "
+                    f"LLM rate={report.get('llm_call_rate', 0):.4f})"
+                )
+        # Findings are a three-arm comparison.  A single-arm run must not
+        # overwrite an existing comparison with synthetic zero rows for the
+        # two arms that were not requested.
+        if arm == "all":
+            findings = (
+                output_dir.parent.parent / "docs" / "rag" / "PHASE3_1_SEMANTIC_ROUTER_FINDINGS.md"
+            )
+            # output_dir defaults to .data/evals; for custom dirs keep findings at
+            # the repository documentation location only when it is unambiguous.
+            if output_dir == Path(".data/evals"):
+                findings = Path("docs/rag/PHASE3_1_SEMANTIC_ROUTER_FINDINGS.md")
+            write_phase31_findings(reports, findings)
+            console.print(f"[green]Phase 3.1 findings saved:[/green] {findings}")
+        else:
+            console.print(
+                "[yellow]Single-arm run: existing Phase 3.1 findings were not overwritten; "
+                "run with --arm all to regenerate the comparison.[/yellow]"
+            )
+    except Exception as exc:
+        console.print(f"[red]Phase 3.1 evaluation failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
+def _phase321_validate_datasets(
+    dev_dataset: Path,
+    challenge_dataset: Path,
+) -> tuple[Path, Path, dict[str, Any]]:
+    """Resolve and lint only the frozen Dev and Challenge Dev datasets."""
+
+    supplied = {
+        "dev": (dev_dataset, _PHASE321_DEV_FILENAME),
+        "challenge_dev": (challenge_dataset, _PHASE321_CHALLENGE_FILENAME),
+    }
+    for label, (path, required_name) in supplied.items():
+        if path.name.casefold() == _PHASE321_FORBIDDEN_TEST_FILENAME.casefold():
+            raise ValueError(
+                "Phase 3.2.1 must never read the exposed Router Test V1 dataset"
+            )
+        if path.name.casefold() != required_name.casefold():
+            raise ValueError(
+                f"Phase 3.2.1 {label} must use the frozen {required_name} dataset"
+            )
+
+    resolved_dev = dev_dataset.resolve()
+    resolved_challenge = challenge_dataset.resolve()
+    forbidden = (
+        _PHASE35_EVAL_ROOT / _PHASE321_FORBIDDEN_TEST_FILENAME
+    ).resolve()
+    if resolved_dev == forbidden or resolved_challenge == forbidden:
+        raise ValueError(
+            "Phase 3.2.1 must never read the exposed Router Test V1 dataset"
+        )
+    if resolved_dev == resolved_challenge:
+        raise ValueError("Phase 3.2.1 Dev and Challenge Dev must be distinct datasets")
+    if not resolved_dev.is_file() or not resolved_challenge.is_file():
+        raise ValueError("Phase 3.2.1 dataset path does not exist")
+
+    dev_lint = validate_router_safety_dataset(resolved_dev)
+    challenge_lint = validate_router_challenge_dataset(
+        resolved_challenge,
+        reference_paths=(resolved_dev,),
+    )
+    if not dev_lint.get("passed") or int(dev_lint.get("case_count", 0)) != 120:
+        raise ValueError(f"Phase 3.2.1 Dev lint failed: {dev_lint}")
+    if (
+        not challenge_lint.get("passed")
+        or int(challenge_lint.get("case_count", 0)) != 120
+    ):
+        raise ValueError(f"Phase 3.2.1 Challenge Dev lint failed: {challenge_lint}")
+    return resolved_dev, resolved_challenge, {
+        "dev": dev_lint,
+        "challenge_dev": challenge_lint,
+        "loaded_datasets": [str(resolved_dev), str(resolved_challenge)],
+        "old_router_test_loaded": False,
+    }
+
+
+def _phase321_load_before_references(before_dir: Path) -> dict[str, Any]:
+    """Reuse prior Live reports as read-only before references, never as new results."""
+
+    resolved_dir = before_dir.resolve()
+    paths = {
+        name: resolved_dir / filename
+        for name, filename in _PHASE321_BEFORE_FILENAMES.items()
+    }
+    existing = {name for name, path in paths.items() if path.is_file()}
+    if not existing:
+        return {
+            "status": "not_available",
+            "directory": str(resolved_dir),
+            "reports": {},
+            "new_live_calls_for_before_references": 0,
+            "historical_llm_case_calls_represented": 0,
+        }
+    missing = sorted(set(paths) - existing)
+    if missing:
+        raise ValueError(
+            "Phase 3.2 before-reference bundle is partial; missing: "
+            + ", ".join(missing)
+        )
+
+    summaries: dict[str, Any] = {}
+    for name, path in paths.items():
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid Phase 3.2 before report {path}: {exc}") from exc
+        if not isinstance(report, Mapping):
+            raise ValueError(f"Phase 3.2 before report must be an object: {path}")
+        provider = str(report.get("provider") or "").casefold()
+        if not report.get("live_llm") or provider in {
+            "",
+            "none",
+            "fixture",
+            "fixture_semantic",
+            "demo",
+            "disabled",
+            "off",
+        }:
+            raise ValueError(f"Phase 3.2 before report is not a real Live report: {path}")
+        if int(report.get("case_count") or 0) != 120:
+            raise ValueError(f"Phase 3.2 before report must contain 120 cases: {path}")
+        expected_arm = "conditional" if name.startswith("conditional") else "always"
+        expected_dataset = (
+            _PHASE321_CHALLENGE_FILENAME
+            if name.endswith("challenge_dev")
+            else _PHASE321_DEV_FILENAME
+        )
+        dataset_value = report.get("dataset")
+        if str(report.get("arm") or "").casefold() != expected_arm:
+            raise ValueError(
+                f"Phase 3.2 before report arm mismatch for {name}: {path}"
+            )
+        if not dataset_value or Path(str(dataset_value)).name.casefold() != (
+            expected_dataset.casefold()
+        ):
+            raise ValueError(
+                f"Phase 3.2 before report dataset mismatch for {name}: {path}"
+            )
+        if int(report.get("llm_success_count") or 0) <= 0:
+            raise ValueError(
+                f"Phase 3.2 before report contains no successful Live decision: {path}"
+            )
+        summaries[name] = {
+            "path": str(path),
+            "generated_at": report.get("generated_at"),
+            "dataset": report.get("dataset"),
+            "dataset_sha256": report.get("dataset_sha256"),
+            "provider": report.get("provider"),
+            "model": report.get("model"),
+            "prompt_version": report.get("prompt_version"),
+            "prompt_sha256": report.get("prompt_sha256"),
+            "branch_macro_f1": report.get("branch_macro_f1"),
+            "rag_recall": report.get("rag_recall"),
+            "scenario_macro_f1": report.get("scenario_macro_f1"),
+            "scenario_top2_hit": report.get("scenario_top2_hit"),
+            "goal_micro_f1": report.get("goal_micro_f1"),
+            "goal_macro_f1": report.get("goal_macro_f1"),
+            "llm_call_rate": report.get("llm_call_rate"),
+            "llm_called_count": report.get("llm_called_count"),
+            "total_tokens": report.get("total_tokens"),
+            "router_mean_latency_ms": report.get("router_mean_latency_ms"),
+            "router_p95_latency_ms": report.get("router_p95_latency_ms"),
+        }
+    return {
+        "status": "reused_as_read_only_before_reference",
+        "directory": str(resolved_dir),
+        "reports": summaries,
+        "new_live_calls_for_before_references": 0,
+        "historical_llm_case_calls_represented": sum(
+            int(item.get("llm_called_count") or 0) for item in summaries.values()
+        ),
+        "note": (
+            "Prior reports are comparison references only and are never relabeled "
+            "as Phase 3.2.1 results."
+        ),
+    }
+
+
+def _phase321_load_goal_policy_source(before_dir: Path) -> dict[str, Any]:
+    """Load only the old Always-Dev trace used by the offline Goal sweep."""
+
+    path = before_dir.resolve() / _PHASE321_BEFORE_FILENAMES["always_before_dev"]
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"Phase 3.2 Always-Dev before report not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Phase 3.2 Always-Dev before report is invalid JSON: {path}") from exc
+    if not isinstance(report, dict):
+        raise ValueError("Phase 3.2 Always-Dev before report must be a JSON object")
+    provider = str(report.get("provider") or "").casefold()
+    dataset = report.get("dataset")
+    if (
+        report.get("arm") != "always"
+        or report.get("live_llm") is not True
+        or provider
+        in {"", "demo", "fixture", "fixture_semantic", "none", "disabled", "off"}
+        or not dataset
+        or Path(str(dataset)).name.casefold() != _PHASE321_DEV_FILENAME.casefold()
+    ):
+        raise ValueError(
+            "Phase 3.2 Goal Policy source must be a real Live Always-Dev report"
+        )
+    cases = report.get("cases")
+    if not isinstance(cases, list) or len(cases) != 120:
+        raise ValueError(
+            "Phase 3.2 Goal Policy source must contain all 120 recorded Dev traces"
+        )
+    if int(report.get("llm_success_count") or 0) <= 0:
+        raise ValueError(
+            "Phase 3.2 Goal Policy source contains no successful Live decisions"
+        )
+    return report
+
+
+@eval_app.command("router-phase3-2")
+def router_phase32_eval(
+    dev_dataset: Annotated[Path, typer.Option("--dev-dataset")] = _PHASE35_EVAL_ROOT
+    / "loveapp_router_safety_eval_dev_v1.md",
+    challenge_dataset: Annotated[Path, typer.Option("--challenge-dataset")] = _PHASE31_EVAL_ROOT
+    / "loveapp_router_challenge_dev_v1.md",
+    semantic_mode: Annotated[
+        Literal["all", "off", "always", "conditional"],
+        typer.Option("--semantic-mode", help="all, off, always, or conditional"),
+    ] = "all",
+    provider: Annotated[str | None, typer.Option("--provider")] = None,
+    model: Annotated[str | None, typer.Option("--model")] = None,
+    prompt_version: Annotated[str | None, typer.Option("--prompt-version")] = None,
+    output_dir: Annotated[Path, typer.Option("--output-dir")] = Path(".data/evals"),
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    smoke: Annotated[bool, typer.Option("--smoke/--no-smoke")] = True,
+    repeatability: Annotated[bool, typer.Option("--repeatability/--no-repeatability")] = True,
+    repeatability_runs: Annotated[int, typer.Option("--repeatability-runs", min=2, max=5)] = 3,
+    repeatability_sample_size: Annotated[
+        int, typer.Option("--repeatability-sample-size", min=20, max=30)
+    ] = 24,
+    input_cost_per_million: Annotated[
+        float | None, typer.Option("--input-cost-per-million")
+    ] = None,
+    output_cost_per_million: Annotated[
+        float | None, typer.Option("--output-cost-per-million")
+    ] = None,
+) -> None:
+    """Run the Phase 3.2 Rule/Live Semantic Router experiment."""
+
+    dev_dataset = dev_dataset.resolve()
+    challenge_dataset = challenge_dataset.resolve()
+    if not dev_dataset.exists() or not challenge_dataset.exists():
+        raise typer.BadParameter("Phase 3.2 dataset path does not exist")
+    try:
+        challenge_lint = validate_router_challenge_dataset(
+            challenge_dataset,
+            reference_paths=(
+                dev_dataset,
+                _PHASE35_EVAL_ROOT / "loveapp_router_safety_eval_test_v1.md",
+            ),
+        )
+        if (
+            not challenge_lint.get("passed")
+            or len(load_router_challenge_cases(challenge_dataset)) != 120
+        ):
+            raise ValueError(f"Challenge Dev lint failed: {challenge_lint}")
+    except Exception as exc:
+        raise typer.BadParameter(f"Phase 3.2 Challenge Dev validation failed: {exc}") from exc
+    settings = get_settings()
+    configured_router_llm_provider = settings.router_llm_provider
+    configured_router_mode = (
+        configured_router_llm_provider.casefold()
+        if configured_router_llm_provider
+        else ""
+    )
+    router_provider_label = None
+    if configured_router_llm_provider and configured_router_mode not in {"auto", "llm"}:
+        router_provider_label = configured_router_llm_provider
+    effective_provider = provider or router_provider_label or settings.llm_provider
+    effective_model = (
+        model or settings.router_llm_model or settings.router_model or settings.llm_model
+    )
+    effective_prompt_version = (
+        prompt_version
+        or settings.router_llm_prompt_version
+        or (
+            "routing-v3.2-v1"
+            if semantic_mode in {"always", "conditional", "all"}
+            else settings.router_prompt_version
+        )
+    )
+    if dry_run:
+        dry = phase32_dry_run(
+            settings=settings.model_copy(
+                update={
+                    "llm_provider": effective_provider,
+                    "router_llm_provider": effective_provider,
+                    "router_model": effective_model,
+                    "router_prompt_version": effective_prompt_version,
+                    "router_semantic_mode": (
+                        "always"
+                        if semantic_mode in {"all", "always"}
+                        else "conditional"
+                        if semantic_mode == "conditional"
+                        else "off"
+                    ),
+                }
+            ),
+            dev_dataset=dev_dataset,
+            challenge_dataset=challenge_dataset,
+            output_path=output_dir,
+        )
+        console.print_json(json.dumps(dry, ensure_ascii=False))
+        if not dry.get("ok", False):
+            raise typer.Exit(code=2)
+        return
+    if semantic_mode == "off":
+        for dataset_name, dataset_path in (
+            ("dev", dev_dataset),
+            ("challenge_dev", challenge_dataset),
+        ):
+            report = asyncio.run(evaluate_phase32_dataset(dataset_path, arm="rule"))
+            output = output_dir / f"router_phase3_2_rule_{dataset_name}.json"
+            write_phase32_report(report, output)
+            console.print(f"[green]Phase 3.2 report saved:[/green] {output}")
+        return
+    if semantic_mode not in {"all", "always", "conditional"}:
+        raise typer.BadParameter(f"Unsupported --semantic-mode: {semantic_mode}")
+    if str(effective_provider).casefold() in {
+        "",
+        "demo",
+        "fixture",
+        "fixture_semantic",
+        "none",
+        "disabled",
+        "off",
+    }:
+        raise typer.BadParameter(
+            "Live LLM evaluation was not executed: fixture/demo provider is forbidden"
+        )
+    # Validate the caller's explicit paid-call gate before constructing a
+    # runtime settings copy that enables the selected live arm.  Setting the
+    # runtime flag first would accidentally turn a disabled `.env` gate into
+    # an implicit opt-in.
+    live_settings_candidate = settings.model_copy(
+        update={
+            "llm_provider": effective_provider,
+            "router_provider": "llm",
+            "router_llm_provider": "llm",
+            "router_model": effective_model,
+            "router_llm_model": effective_model,
+            "router_prompt_version": effective_prompt_version,
+            "router_llm_prompt_version": effective_prompt_version,
+            "router_v2_enabled": True,
+            "router_llm_correction_enabled": True,
+        }
+    )
+    if not _phase35_live_router_configured(live_settings_candidate):
+        raise typer.BadParameter(
+            "Live LLM evaluation was not executed. Configure non-demo provider, model, "
+            "API key, base URL, and LOVEAPP_ROUTER_LIVE_EVAL_ENABLED=true."
+        )
+    live_settings = live_settings_candidate.model_copy(
+        update={"router_live_eval_enabled": True}
+    )
+    containers: list[Any] = []
+
+    def router_factory(arm_name: str) -> Any:
+        container = build_routing_container(
+            live_settings.model_copy(update={"router_semantic_mode": arm_name})
+        )
+        containers.append(container)
+        return container.router
+
+    async def run_experiment() -> tuple[dict[str, dict[str, Any]], dict[str, Any] | None]:
+        smoke_reports: dict[str, Any] | None = None
+        try:
+            if smoke:
+                smoke_reports = {}
+                for arm_name in ("always", "conditional"):
+                    smoke_router = router_factory(arm_name)
+                    smoke_report = await evaluate_phase32_smoke(
+                        challenge_dataset, router=smoke_router, arm=arm_name, sample_size=8
+                    )
+                    smoke_reports[arm_name] = smoke_report
+                    # A smoke run is the final preflight against the real
+                    # provider.  If it produced no successful structured
+                    # decision, stop before the 240-case run; per-case Rule
+                    # fallback must never be serialized as a formal Live arm.
+                    if int(smoke_report.get("llm_success_count") or 0) <= 0:
+                        raise RuntimeError(
+                            "Live LLM evaluation was not executed: smoke test produced "
+                            f"no successful Live decisions for {arm_name} arm"
+                        )
+            reports = await evaluate_phase32_experiment(
+                dev_dataset,
+                challenge_dataset,
+                router_factory=router_factory,
+                live_metadata={
+                    "provider": effective_provider,
+                    "model": effective_model,
+                    "temperature": live_settings.router_llm_temperature,
+                    "max_tokens": live_settings.router_llm_max_tokens
+                    or live_settings.router_max_tokens,
+                    "timeout_seconds": live_settings.router_llm_timeout_seconds
+                    or live_settings.router_timeout_seconds,
+                    "max_retries": live_settings.router_llm_max_retries
+                    if live_settings.router_llm_max_retries is not None
+                    else live_settings.router_max_retries,
+                    "prompt_version": effective_prompt_version,
+                },
+                input_cost_per_million=input_cost_per_million,
+                output_cost_per_million=output_cost_per_million,
+            )
+            return reports, smoke_reports
+        finally:
+            for container in reversed(containers):
+                await container.aclose()
+
+    try:
+        reports, smoke_reports = asyncio.run(run_experiment())
+    except Exception as exc:
+        console.print(
+            "[red]Live LLM evaluation was not executed to completion; "
+            f"no fixture fallback was used:[/red] {exc}"
+        )
+        raise typer.Exit(code=1) from exc
+    if semantic_mode != "all":
+        reports = {
+            key: value
+            for key, value in reports.items()
+            if key.startswith("rule_") or key.startswith(f"{semantic_mode}_")
+        }
+    for key, report in reports.items():
+        output_arm = (
+            "live_always"
+            if key.startswith("always_")
+            else "live_conditional"
+            if key.startswith("conditional_")
+            else "rule"
+        )
+        dataset_name = "challenge_dev" if key.endswith("challenge_dev") else "dev"
+        output = output_dir / f"router_phase3_2_{output_arm}_{dataset_name}.json"
+        write_phase32_report(report, output)
+        console.print(f"[green]Phase 3.2 report saved:[/green] {output}")
+    if smoke_reports is not None:
+        smoke_path = output_dir / "router_phase3_2_smoke.json"
+        smoke_path.parent.mkdir(parents=True, exist_ok=True)
+        smoke_path.write_text(
+            json.dumps(smoke_reports, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        console.print(f"[green]Phase 3.2 smoke report saved:[/green] {smoke_path}")
+    if semantic_mode == "all":
+        findings = Path("docs/rag/PHASE3_2_LIVE_LLM_ROUTER_FINDINGS.md")
+        write_phase32_findings(reports, findings)
+        console.print(f"[green]Phase 3.2 Findings saved:[/green] {findings}")
+        if repeatability:
+
+            async def run_repeatability() -> dict[str, Any]:
+                repeat_containers: list[Any] = []
+
+                def repeat_factory(arm_name: str, _run_index: int) -> Any:
+                    container = build_routing_container(
+                        live_settings.model_copy(update={"router_semantic_mode": arm_name})
+                    )
+                    repeat_containers.append(container)
+                    return container.router
+
+                try:
+                    return await evaluate_phase32_repeatability(
+                        challenge_dataset,
+                        router_factory=repeat_factory,
+                        arm="always",
+                        runs=repeatability_runs,
+                        sample_size=repeatability_sample_size,
+                    )
+                finally:
+                    for container in reversed(repeat_containers):
+                        await container.aclose()
+
+            try:
+                repeat_report = asyncio.run(run_repeatability())
+                repeat_path = output_dir / "router_phase3_2_repeatability.json"
+                repeat_path.parent.mkdir(parents=True, exist_ok=True)
+                repeat_path.write_text(
+                    json.dumps(repeat_report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                )
+                console.print(f"[green]Phase 3.2 repeatability saved:[/green] {repeat_path}")
+            except Exception as exc:
+                console.print(f"[red]Phase 3.2 repeatability failed:[/red] {exc}")
+                raise typer.Exit(code=1) from exc
+
+
+@eval_app.command("router-phase3-2-1")
+def router_phase321_eval(
+    dev_dataset: Annotated[Path, typer.Option("--dev-dataset")] = _PHASE35_EVAL_ROOT
+    / _PHASE321_DEV_FILENAME,
+    challenge_dataset: Annotated[Path, typer.Option("--challenge-dataset")] = _PHASE31_EVAL_ROOT
+    / _PHASE321_CHALLENGE_FILENAME,
+    before_dir: Annotated[
+        Path,
+        typer.Option(
+            "--before-dir",
+            help="Directory containing the four read-only Phase 3.2 before reports.",
+        ),
+    ] = Path(".data/evals"),
+    provider: Annotated[str | None, typer.Option("--provider")] = None,
+    model: Annotated[str | None, typer.Option("--model")] = None,
+    prompt_version: Annotated[str | None, typer.Option("--prompt-version")] = None,
+    max_retries: Annotated[
+        int | None,
+        typer.Option("--max-retries", min=0, max=3, help="Optional Live provider retry override."),
+    ] = None,
+    output_dir: Annotated[Path, typer.Option("--output-dir")] = Path(".data/evals"),
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    input_cost_per_million: Annotated[
+        float | None, typer.Option("--input-cost-per-million")
+    ] = None,
+    output_cost_per_million: Annotated[
+        float | None, typer.Option("--output-cost-per-million")
+    ] = None,
+) -> None:
+    """Run the fixed Phase 3.2.1 Router stabilization experiment."""
+
+    try:
+        dev_dataset, challenge_dataset, dataset_validation = (
+            _phase321_validate_datasets(
+                dev_dataset,
+                challenge_dataset,
+            )
+        )
+        before_references = _phase321_load_before_references(before_dir)
+        goal_policy_source_report = _phase321_load_goal_policy_source(before_dir)
+    except Exception as exc:
+        raise typer.BadParameter(f"Phase 3.2.1 preflight failed: {exc}") from exc
+
+    settings = get_settings()
+    effective_provider = resolve_phase32_provider(settings, provider)
+    effective_model = (
+        model or settings.router_llm_model or settings.router_model or settings.llm_model
+    )
+    effective_prompt_version = (
+        prompt_version
+        or settings.router_llm_prompt_version
+        or "routing-v3.2.1-v1"
+    )
+    live_updates: dict[str, Any] = {
+        "llm_provider": effective_provider,
+        "router_provider": "llm",
+        "router_llm_provider": effective_provider,
+        "router_model": effective_model,
+        "router_llm_model": effective_model,
+        "router_prompt_version": effective_prompt_version,
+        "router_llm_prompt_version": effective_prompt_version,
+        "router_v2_enabled": True,
+        "router_llm_correction_enabled": True,
+        "router_llm_temperature": 0,
+        "router_goal_secondary_threshold": 0.0,
+        "router_goal_max_count": 3,
+        "router_conditional_trigger_profile": "c2",
+    }
+    if max_retries is not None:
+        live_updates["router_llm_max_retries"] = max_retries
+    live_candidate = settings.model_copy(update=live_updates)
+    effective_max_retries = (
+        live_candidate.router_llm_max_retries
+        if live_candidate.router_llm_max_retries is not None
+        else live_candidate.router_max_retries
+    )
+
+    if dry_run:
+        call_budget = phase321_call_budget(
+            dev_case_count=int(dataset_validation["dev"]["case_count"]),
+            challenge_case_count=int(
+                dataset_validation["challenge_dev"]["case_count"]
+            ),
+            max_retries=effective_max_retries,
+        )
+        dry = phase32_dry_run(
+            settings=live_candidate.model_copy(update={"router_semantic_mode": "always"}),
+            dev_dataset=dev_dataset,
+            challenge_dataset=challenge_dataset,
+            output_path=output_dir,
+        )
+        dry["phase"] = "3.2.1"
+        dry["dataset_validation"] = dataset_validation
+        dry["before_references"] = before_references
+        dry["goal_policy_selection"] = "read-only Phase 3.2 Always Dev trace replay"
+        dry["conditional_profiles"] = ["c0", "c1", "c2"]
+        dry["challenge_profiles"] = ["selected_on_dev"]
+        dry["repeatability"] = {"runs": 3, "sample_size": 24}
+        dry["call_budget"] = call_budget
+        dry["old_router_test_loaded"] = False
+        console.print_json(json.dumps(dry, ensure_ascii=False))
+        if not dry.get("ok", False):
+            raise typer.Exit(code=2)
+        return
+
+    if str(effective_provider).casefold() in {
+        "",
+        "demo",
+        "fixture",
+        "fixture_semantic",
+        "none",
+        "disabled",
+        "off",
+    }:
+        raise typer.BadParameter(
+            "Live LLM evaluation was not executed: fixture/demo provider is forbidden"
+        )
+    if not _phase35_live_router_configured(live_candidate):
+        raise typer.BadParameter(
+            "Live LLM evaluation was not executed. Configure non-demo provider, model, "
+            "API key, base URL, and LOVEAPP_ROUTER_LIVE_EVAL_ENABLED=true."
+        )
+    live_settings = live_candidate.model_copy(update={"router_live_eval_enabled": True})
+    call_budget = phase321_call_budget(
+        dev_case_count=int(dataset_validation["dev"]["case_count"]),
+        challenge_case_count=int(dataset_validation["challenge_dev"]["case_count"]),
+        max_retries=effective_max_retries,
+    )
+    console.print(
+        "[yellow]Phase 3.2.1 Live budget:[/yellow] "
+        f"up to {call_budget['llm_case_call_upper_bound']} LLM-routed cases / "
+        f"{call_budget['provider_attempt_upper_bound']} provider attempts "
+        "(Goal Policy replay adds zero calls)."
+    )
+    if before_references.get("status") == "reused_as_read_only_before_reference":
+        console.print(
+            "[dim]Four Phase 3.2 reports will be reused only as before references; "
+            "they are not rerun or relabeled.[/dim]"
+        )
+
+    containers: list[Any] = []
+
+    def router_factory(
+        arm: str,
+        trigger_profile: str,
+        goal_threshold: float,
+        goal_max_count: int,
+    ) -> Any:
+        container = build_routing_container(
+            live_settings.model_copy(
+                update={
+                    "router_semantic_mode": arm,
+                    "router_conditional_trigger_profile": trigger_profile,
+                    "router_goal_secondary_threshold": goal_threshold,
+                    "router_goal_max_count": goal_max_count,
+                }
+            )
+        )
+        containers.append(container)
+        return container.router
+
+    async def run_experiment() -> dict[str, dict[str, Any]]:
+        try:
+            return await evaluate_phase321_experiment(
+                dev_dataset,
+                challenge_dataset,
+                router_factory=router_factory,
+                live_metadata={
+                    "provider": effective_provider,
+                    "model": effective_model,
+                    "temperature": live_settings.router_llm_temperature,
+                    "max_tokens": live_settings.router_llm_max_tokens
+                    or live_settings.router_max_tokens,
+                    "timeout_seconds": live_settings.router_llm_timeout_seconds
+                    or live_settings.router_timeout_seconds,
+                    "max_retries": live_settings.router_llm_max_retries
+                    if live_settings.router_llm_max_retries is not None
+                    else live_settings.router_max_retries,
+                    "prompt_version": effective_prompt_version,
+                },
+                goal_policy_source_report=goal_policy_source_report,
+                before_references={
+                    **before_references,
+                },
+                repeatability_runs=3,
+                repeatability_sample_size=24,
+                input_cost_per_million=input_cost_per_million,
+                output_cost_per_million=output_cost_per_million,
+            )
+        finally:
+            for container in reversed(containers):
+                await container.aclose()
+
+    try:
+        reports = asyncio.run(run_experiment())
+    except Exception as exc:
+        console.print(
+            "[red]Phase 3.2.1 Live evaluation was not executed to completion; "
+            "no formal report bundle was written and no fixture fallback was used:[/red] "
+            f"{type(exc).__name__}: {exc}"
+        )
+        raise typer.Exit(code=1) from exc
+
+    for report in reports.values():
+        report["dataset_validation"] = dataset_validation
+    try:
+        written = write_phase321_reports(
+            reports,
+            output_dir,
+            require_complete=True,
+        )
+    except Exception as exc:
+        console.print(f"[red]Phase 3.2.1 report write failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    for report_name, path in written.items():
+        console.print(f"[green]Phase 3.2.1 report saved ({report_name}):[/green] {path}")
+    protocol = reports["always_dev"].get("phase321_protocol", {})
+    console.print(
+        "[green]Phase 3.2.1 selection:[/green] "
+        f"goal={protocol.get('goal_policy')}, "
+        f"conditional={protocol.get('conditional_profile')}"
+    )
+
+
+def _phase35_planner(
+    settings: Any,
+    *,
+    rewrite: bool,
+    decomposition: bool,
+) -> RetrievalQueryPlanner:
+    return RetrievalQueryPlanner(
+        contextual_query_rewrite_enabled=rewrite,
+        query_decomposition_enabled=decomposition,
+        max_subqueries=getattr(settings, "max_subqueries", 3),
+        history_window=getattr(settings, "contextual_rewrite_history_window", 4),
+    )
+
+
+@eval_app.command("contextual-rewrite")
+def contextual_rewrite_eval(
+    dataset: Annotated[
+        Path,
+        typer.Option("--dataset", help="Phase 4 contextual-rewrite Markdown dataset."),
+    ] = _PHASE35_EVAL_ROOT / "loveapp_contextual_rewrite_eval_dev_v1.md",
+    output: Annotated[
+        Path,
+        typer.Option("--output", help="JSON report path; Markdown is written beside it."),
+    ] = Path(".data/evals/contextual_rewrite_dev.json"),
+    rewrite: Annotated[
+        bool,
+        typer.Option("--rewrite/--no-rewrite", help="Enable the conditional rewrite stage."),
+    ] = True,
+    with_retrieval: Annotated[
+        bool,
+        typer.Option("--with-retrieval/--without-retrieval", help="Also run paired retrieval."),
+    ] = False,
+    knowledge: Annotated[
+        Path,
+        typer.Option(
+            "--knowledge",
+            help="V2 knowledge base used for RelevantIDs lint and optional retrieval.",
+        ),
+    ] = Path("knowledge/loveapp_rag_knowledge_base_v2.md"),
+    ephemeral_qdrant: Annotated[
+        bool,
+        typer.Option("--ephemeral-qdrant/--configured-qdrant"),
+    ] = False,
+    fail_on_targets: Annotated[
+        bool,
+        typer.Option("--fail-on-targets/--no-fail-on-targets"),
+    ] = False,
+) -> None:
+    """Evaluate conditional contextual Query Rewrite (Phase 4)."""
+
+    dataset = _phase35_load_path(dataset, phase=4)
+    settings = get_settings()
+    planner = _phase35_planner(settings, rewrite=rewrite, decomposition=False)
+    try:
+        cases = load_contextual_rewrite_eval_markdown(dataset)
+        # Read the frozen 500-document KB for RelevantIDs lint on every run.
+        # This is deliberately read-only; indexing remains gated by
+        # ``with_retrieval`` and the specialised fixtures never enter it.
+        knowledge_path = _phase35_load_knowledge_path(knowledge)
+        report_lint = _phase35_phase45_lint(
+            rewrite_cases=cases,
+            knowledge=knowledge_path,
+        )
+        if with_retrieval:
+            report = asyncio.run(
+                _run_phase35_retrieval_eval(
+                    knowledge=knowledge_path,
+                    settings=settings,
+                    ephemeral_qdrant=ephemeral_qdrant,
+                    evaluate=evaluate_contextual_rewrite,
+                    cases=cases,
+                    planner=planner,
+                )
+            )
+        else:
+            report = asyncio.run(evaluate_contextual_rewrite(cases, planner=planner))
+        # The evaluator can be used standalone without a KB, but the CLI has
+        # already loaded the frozen KB for lint.  Publish that authoritative
+        # phase lint at the conventional top-level key as well as retaining
+        # the wrapped ``dataset_lint`` diagnostics for provenance.
+        if "phase4" in report_lint:
+            report["lint"] = report_lint["phase4"]
+        report["dataset_lint"] = report_lint
+        report["inputs"] = {
+            "dataset": str(dataset),
+            "rewrite_enabled": rewrite,
+            "with_retrieval": with_retrieval,
+            "knowledge": str(knowledge_path),
+        }
+        json_path, markdown_path = write_phase45_report(report, output, phase=4)
+    except Exception as exc:
+        console.print(f"[red]Phase 4 contextual-rewrite evaluation failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Phase 4 reports saved:[/green] {json_path} and {markdown_path}")
+    if fail_on_targets:
+        trigger = report.get("trigger", {})
+        if float(trigger.get("f1", 0)) < 0.90 or float(report.get("query_drift_rate", 0)) > 0.05:
+            raise typer.Exit(code=2)
+
+
+@eval_app.command("multiquery")
+def multiquery_eval(
+    dataset: Annotated[
+        Path,
+        typer.Option("--dataset", help="Phase 5 multi-query Markdown dataset."),
+    ] = _PHASE35_EVAL_ROOT / "loveapp_multiquery_eval_dev_v1.md",
+    output: Annotated[
+        Path,
+        typer.Option("--output", help="JSON report path; Markdown is written beside it."),
+    ] = Path(".data/evals/multiquery_dev.json"),
+    decomposition: Annotated[
+        bool,
+        typer.Option("--decomposition/--no-decomposition", help="Enable bounded decomposition."),
+    ] = True,
+    rewrite: Annotated[
+        bool,
+        typer.Option("--rewrite/--no-rewrite", help="Enable rewrite before decomposition."),
+    ] = False,
+    with_retrieval: Annotated[
+        bool,
+        typer.Option(
+            "--with-retrieval/--without-retrieval",
+            help="Also run multi-query retrieval.",
+        ),
+    ] = False,
+    knowledge: Annotated[
+        Path,
+        typer.Option(
+            "--knowledge",
+            help="V2 knowledge base used for RelevantIDs lint and optional retrieval.",
+        ),
+    ] = Path("knowledge/loveapp_rag_knowledge_base_v2.md"),
+    ephemeral_qdrant: Annotated[
+        bool,
+        typer.Option("--ephemeral-qdrant/--configured-qdrant"),
+    ] = False,
+    fail_on_targets: Annotated[
+        bool,
+        typer.Option("--fail-on-targets/--no-fail-on-targets"),
+    ] = False,
+) -> None:
+    """Evaluate bounded Multi-query Decomposition (Phase 5)."""
+
+    dataset = _phase35_load_path(dataset, phase=5)
+    settings = get_settings()
+    planner = _phase35_planner(settings, rewrite=rewrite, decomposition=decomposition)
+    try:
+        cases = load_multiquery_eval_markdown(dataset)
+        # Read the frozen 500-document KB for RelevantIDs lint on every run.
+        # This is deliberately read-only; indexing remains gated by
+        # ``with_retrieval`` and the specialised fixtures never enter it.
+        knowledge_path = _phase35_load_knowledge_path(knowledge)
+        report_lint = _phase35_phase45_lint(
+            multiquery_cases=cases,
+            knowledge=knowledge_path,
+        )
+        if with_retrieval:
+            report = asyncio.run(
+                _run_phase35_retrieval_eval(
+                    knowledge=knowledge_path,
+                    settings=settings,
+                    ephemeral_qdrant=ephemeral_qdrant,
+                    evaluate=evaluate_multiquery,
+                    cases=cases,
+                    planner=planner,
+                )
+            )
+        else:
+            report = asyncio.run(evaluate_multiquery(cases, planner=planner))
+        if "phase5" in report_lint:
+            report["lint"] = report_lint["phase5"]
+        report["dataset_lint"] = report_lint
+        report["inputs"] = {
+            "dataset": str(dataset),
+            "rewrite_enabled": rewrite,
+            "decomposition_enabled": decomposition,
+            "with_retrieval": with_retrieval,
+            "knowledge": str(knowledge_path),
+        }
+        json_path, markdown_path = write_phase45_report(report, output, phase=5)
+    except Exception as exc:
+        console.print(f"[red]Phase 5 multiquery evaluation failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Phase 5 reports saved:[/green] {json_path} and {markdown_path}")
+    if fail_on_targets:
+        trigger = report.get("trigger", {})
+        if float(trigger.get("f1", 0)) < 0.90:
+            raise typer.Exit(code=2)
+
+
+async def _run_phase35_retrieval_eval(
+    *,
+    knowledge: Path,
+    settings: Any,
+    ephemeral_qdrant: bool,
+    evaluate,
+    cases,
+    planner: RetrievalQueryPlanner,
+) -> dict[str, Any]:
+    """Run an optional retrieval arm in one event loop and close its resources."""
+
+    knowledge = _phase35_load_knowledge_path(knowledge)
+    documents = load_knowledge_path(knowledge)
+    updates = {"qdrant_url": ":memory:"} if ephemeral_qdrant else {}
+    eval_settings = settings.model_copy(update=updates) if updates else settings
+    retriever = build_qdrant_store(eval_settings)
+    try:
+        if ephemeral_qdrant:
+            await retriever.index_documents(list(documents), recreate=True)
+        return await evaluate(cases, planner=planner, retriever=retriever)
+    finally:
+        await retriever.aclose()
+
+
+@eval_app.command("phase3-5-ablation")
+def phase35_ablation_eval(
+    dataset: Annotated[
+        Path | None,
+        typer.Option(
+            "--dataset",
+            help="Optional fixture directory shorthand; when supplied it selects all phase paths.",
+        ),
+    ] = None,
+    router_dataset: Annotated[
+        Path,
+        typer.Option("--router-dataset", help="Phase 3 dataset."),
+    ] = _PHASE35_EVAL_ROOT / "loveapp_router_safety_eval_dev_v1.md",
+    rewrite_dataset: Annotated[
+        Path,
+        typer.Option("--rewrite-dataset", help="Phase 4 dataset."),
+    ] = _PHASE35_EVAL_ROOT / "loveapp_contextual_rewrite_eval_dev_v1.md",
+    multiquery_dataset: Annotated[
+        Path,
+        typer.Option("--multiquery-dataset", help="Phase 5 dataset."),
+    ] = _PHASE35_EVAL_ROOT / "loveapp_multiquery_eval_dev_v1.md",
+    output: Annotated[
+        Path,
+        typer.Option("--output", help="Combined A/B/C/D JSON report."),
+    ] = Path(".data/evals/phase3_5_ablation.json"),
+    router_v2: Annotated[
+        bool,
+        typer.Option(
+            "--router-v2/--current-router",
+            help="Keep the canonical B/C/D Router V2 arm enabled (A remains current).",
+        ),
+    ] = True,
+    rewrite: Annotated[
+        bool,
+        typer.Option(
+            "--rewrite/--no-rewrite",
+            help="Keep the canonical C/D rewrite arm enabled.",
+        ),
+    ] = True,
+    decomposition: Annotated[
+        bool,
+        typer.Option(
+            "--decomposition/--no-decomposition",
+            help="Keep the canonical D decomposition arm enabled.",
+        ),
+    ] = True,
+) -> None:
+    """Run the controlled Phase 3--5 A/B/C/D ablation without retrieval."""
+
+    # The combined experiment is a protocol, not a free-form feature sweep:
+    # A/B/C/D must remain current/off/off, V2/off/off, V2/on/off and
+    # V2/on/on.  Keep the legacy switches in the CLI for discoverability and
+    # backwards-compatible help output, but reject attempts to alter the
+    # canonical arms instead of silently producing a different experiment.
+    if not router_v2 or not rewrite or not decomposition:
+        raise typer.BadParameter(
+            "phase3-5-ablation uses the fixed canonical A/B/C/D protocol; "
+            "do not disable --router-v2, --rewrite, or --decomposition"
+        )
+
+    if dataset is not None:
+        if dataset.is_dir():
+            # The combined ablation defaults to the Dev split.  A Test run can
+            # still be requested by supplying the three explicit Test paths.
+            split = "dev"
+            router_dataset = dataset / f"loveapp_router_safety_eval_{split}_v1.md"
+            rewrite_dataset = dataset / f"loveapp_contextual_rewrite_eval_{split}_v1.md"
+            multiquery_dataset = dataset / f"loveapp_multiquery_eval_{split}_v1.md"
+        elif "router_safety" in dataset.name.casefold():
+            split = "test" if "_test_" in dataset.name.casefold() else "dev"
+            router_dataset = dataset
+            rewrite_dataset = dataset.with_name(f"loveapp_contextual_rewrite_eval_{split}_v1.md")
+            multiquery_dataset = dataset.with_name(f"loveapp_multiquery_eval_{split}_v1.md")
+        else:
+            raise ValueError(
+                "--dataset for phase3-5-ablation must be the phase3_5 fixture directory "
+                "or the Router/Safety dataset"
+            )
+    router_dataset = _phase35_load_path(router_dataset, phase=3)
+    rewrite_dataset = _phase35_load_path(rewrite_dataset, phase=4)
+    multiquery_dataset = _phase35_load_path(multiquery_dataset, phase=5)
+    if not (router_v2 and rewrite and decomposition):
+        raise typer.BadParameter(
+            "phase3-5-ablation is a frozen protocol: use the canonical "
+            "A=current/off/off/off, B=V2/off/off, C=V2/on/off, D=V2/on/on arms; "
+            "override flags cannot disable a canonical feature."
+        )
+    settings = get_settings()
+
+    def _make_ablation_router(enabled: bool) -> HybridRouter:
+        return HybridRouter(
+            SafetyPolicy(context_turns=settings.router_context_risk_turns),
+            confidence_threshold=settings.router_confidence_threshold,
+            ambiguity_margin=settings.router_ambiguity_margin,
+            clarification_threshold=settings.router_clarification_threshold,
+            prompt_version=settings.router_prompt_version,
+            router_v2_enabled=enabled,
+        )
+
+    current_router = _make_ablation_router(False)
+    router_v2_instance = _make_ablation_router(True)
+
+    def _run_ablation_arm(
+        *,
+        router_enabled: bool,
+        rewrite_enabled: bool,
+        decomposition_enabled: bool,
+    ) -> dict[str, Any]:
+        planner = _phase35_planner(
+            settings,
+            rewrite=rewrite_enabled,
+            decomposition=decomposition_enabled,
+        )
+        return {
+            "router_v2": router_enabled,
+            "rewrite": rewrite_enabled,
+            "decomposition": decomposition_enabled,
+            "router": asyncio.run(
+                evaluate_router_safety(
+                    router_dataset,
+                    router=router_v2_instance if router_enabled else current_router,
+                    router_mode="router_v2" if router_enabled else "current",
+                )
+            ),
+            "contextual_rewrite": asyncio.run(
+                evaluate_contextual_rewrite(rewrite_cases, planner=planner)
+            ),
+            "multiquery": asyncio.run(evaluate_multiquery(multi_cases, planner=planner)),
+        }
+
+    try:
+        load_router_safety_cases(router_dataset)
+        rewrite_cases = load_contextual_rewrite_eval_markdown(rewrite_dataset)
+        multi_cases = load_multiquery_eval_markdown(multiquery_dataset)
+        try:
+            phase35_knowledge = _phase35_load_knowledge_path(
+                Path("knowledge/loveapp_rag_knowledge_base_v2.md")
+            )
+            phase35_knowledge_ids = [
+                document.id for document in load_knowledge_path(phase35_knowledge)
+            ]
+        except FileNotFoundError:
+            phase35_knowledge = None
+            phase35_knowledge_ids = None
+        dataset_lint = {
+            "knowledge": str(phase35_knowledge) if phase35_knowledge else None,
+            "phase4": validate_contextual_rewrite_dataset(
+                rewrite_cases,
+                knowledge_ids=phase35_knowledge_ids,
+                source_ref="phase4",
+            ),
+            "phase5": validate_multiquery_dataset(
+                multi_cases,
+                knowledge_ids=phase35_knowledge_ids,
+                source_ref="phase5",
+            ),
+        }
+        # Keep arms explicit even though Phase 4/5 use their own specialised
+        # gold sets; this makes the causal comparisons auditable.
+        arms: dict[str, Any] = {}
+        # Canonical controlled arms required by the Phase 3--5 protocol:
+        # A=current/off/off, B=V2/off/off, C=V2/on/off, D=V2/on/on.
+        arms["A"] = _run_ablation_arm(
+            router_enabled=False,
+            rewrite_enabled=False,
+            decomposition_enabled=False,
+        )
+        arms["B"] = _run_ablation_arm(
+            router_enabled=router_v2,
+            rewrite_enabled=False,
+            decomposition_enabled=False,
+        )
+        arms["C"] = _run_ablation_arm(
+            router_enabled=router_v2,
+            rewrite_enabled=rewrite,
+            decomposition_enabled=False,
+        )
+        arms["D"] = _run_ablation_arm(
+            router_enabled=router_v2,
+            rewrite_enabled=rewrite,
+            decomposition_enabled=decomposition,
+        )
+        # Do not claim a single cross-phase score.  Each arm keeps the exact
+        # evaluator report and only exposes safe scalar deltas where available.
+        report = {
+            "schema_version": 1,
+            "status": "completed",
+            "experiment": "phase3_5_ablation",
+            "arms": arms,
+            "inputs": {
+                "router_dataset": str(router_dataset),
+                "rewrite_dataset": str(rewrite_dataset),
+                "multiquery_dataset": str(multiquery_dataset),
+                "router_v2_requested": router_v2,
+                "rewrite_requested": rewrite,
+                "decomposition_requested": decomposition,
+            },
+            "comparisons": _phase35_ablation_comparisons(arms),
+            "dataset_lint": dataset_lint,
+            "notes": [
+                "Specialized Phase 3--5 fixtures are never indexed or embedded.",
+                "Relationship stage is not scored because RouteResult does not predict it.",
+            ],
+        }
+        output.parent.mkdir(parents=True, exist_ok=True)
+        json_path = _phase35_json_path(output)
+        markdown_path = json_path.with_suffix(".md")
+        json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        markdown_path.write_text(_render_phase35_ablation_report(report), encoding="utf-8")
+    except Exception as exc:
+        console.print(f"[red]Phase 3--5 ablation failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Phase 3--5 ablation saved:[/green] {json_path} and {markdown_path}")
+
+
+def _phase35_ablation_comparisons(arms: Mapping[str, Any]) -> dict[str, Any]:
+    """Return explicit, per-phase deltas for the frozen A/B/C/D arms."""
+
+    definitions = {
+        "A_to_B": (
+            "A",
+            "B",
+            "Router/Safety gain",
+            {
+                "branch_macro_f1": ("router", "branch_macro_f1"),
+                "scenario_primary_accuracy": ("router", "scenario_primary_accuracy"),
+                "goal_micro_f1": ("router", "goal_micro_f1"),
+                "high_risk_recall": ("router", "high_risk_recall"),
+                "safety_bypass_rate": ("router", "safety_to_rag_bypass_rate"),
+            },
+        ),
+        "B_to_C": (
+            "B",
+            "C",
+            "Contextual Rewrite gain",
+            {
+                "trigger_f1": ("contextual_rewrite", "trigger.f1"),
+                "query_drift_rate": ("contextual_rewrite", "query_drift_rate"),
+            },
+        ),
+        "C_to_D": (
+            "C",
+            "D",
+            "Multi-query gain",
+            {
+                "trigger_f1": ("multiquery", "trigger.f1"),
+                "subquery_count_exact_accuracy": (
+                    "multiquery",
+                    "subquery_count_exact_accuracy",
+                ),
+                "need_recall_at_5": ("multiquery", "retrieval.need_recall_at_5"),
+                "all_needs_covered_at_5": (
+                    "multiquery",
+                    "retrieval.all_needs_covered_at_5",
+                ),
+            },
+        ),
+        "A_to_D": (
+            "A",
+            "D",
+            "Overall combined change (cross-phase reports; no pooled score)",
+            {
+                "branch_macro_f1": ("router", "branch_macro_f1"),
+                "goal_micro_f1": ("router", "goal_micro_f1"),
+                "rewrite_trigger_f1": ("contextual_rewrite", "trigger.f1"),
+                "decomposition_trigger_f1": ("multiquery", "trigger.f1"),
+            },
+        ),
+    }
+
+    def read(arm: Mapping[str, Any], report: str, path: str) -> float | None:
+        payload = arm.get(report, {})
+        if not isinstance(payload, Mapping):
+            return None
+        if path.startswith("retrieval.") and payload.get("retrieval_executed") is False:
+            return None
+        value: Any = payload
+        for part in path.split("."):
+            if not isinstance(value, Mapping):
+                return None
+            value = value.get(part)
+        return float(value) if isinstance(value, (int, float)) else None
+
+    output: dict[str, Any] = {}
+    for name, (left_name, right_name, description, metrics) in definitions.items():
+        left = arms.get(left_name, {})
+        right = arms.get(right_name, {})
+        deltas: dict[str, float | None] = {}
+        values: dict[str, dict[str, float | None]] = {}
+        for metric, (report, path) in metrics.items():
+            before = read(left, report, path)
+            after = read(right, report, path)
+            values[metric] = {"from": before, "to": after}
+            deltas[metric] = (
+                round(after - before, 4) if before is not None and after is not None else None
+            )
+        output[name] = {
+            "from": left_name,
+            "to": right_name,
+            "description": description,
+            "values": values,
+            "delta": deltas,
+        }
+    return output
+
+
+def _render_phase35_ablation_report(report: Mapping[str, Any]) -> str:
+    lines = [
+        "# LoveApp Phase 3--5 A/B/C/D Ablation",
+        "",
+        "| Arm | Router V2 | Rewrite | Decomposition | Available reports |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for name in ("A", "B", "C", "D"):
+        arm = report.get("arms", {}).get(name, {})
+        reports = ", ".join(
+            key for key in ("router", "contextual_rewrite", "multiquery") if key in arm
+        )
+        lines.append(
+            f"| {name} | {arm.get('router_v2', False)} | {arm.get('rewrite', False)} | "
+            f"{arm.get('decomposition', False)} | {reports or '-'} |"
+        )
+    lines.extend(
+        [
+            "",
+            "Comparisons are reported as per-metric deltas in the JSON artifact: "
+            "A→B Router/Safety; B→C Contextual Rewrite; C→D Multi-query; A→D overall.",
+            "",
+        ]
+    )
+    lint = report.get("dataset_lint", {})
+    if lint:
+        lines.extend(["Dataset lint:", ""])
+        for phase in ("phase4", "phase5"):
+            item = lint.get(phase, {})
+            lines.append(
+                f"- {phase}: passed={item.get('passed', False)}; "
+                f"errors={len(item.get('errors', []))}; warnings={len(item.get('warnings', []))}"
+            )
+        lines.append("")
+    return "\n".join(lines)
+
+
+@eval_app.command("rag")
+def rag_eval(
+    dataset: Annotated[
+        Path,
+        typer.Option("--dataset", help="RAG V2 Dev/Test Markdown dataset path."),
+    ] = Path("evals/rag/cases_v2_dev.md"),
+    knowledge: Annotated[
+        Path,
+        typer.Option("--knowledge", help="RAG V2 knowledge-base path."),
+    ] = Path("knowledge/loveapp_rag_knowledge_base_v2.md"),
+    mode: Annotated[
+        Literal["retriever", "e2e"],
+        typer.Option("--mode", help="Evaluate retrieval alone or the routing-to-RAG path."),
+    ] = "retriever",
+    output: Annotated[
+        Path,
+        typer.Option("--output", help="JSON report path; Markdown is written beside it."),
+    ] = Path(".data/evals/rag_v2_dev.json"),
+    case: Annotated[
+        list[str] | None,
+        typer.Option("--case", help="Case id filter; repeat or use comma-separated values."),
+    ] = None,
+    query_type: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--query-type",
+            help="QueryType filter; repeat or use comma-separated values.",
+        ),
+    ] = None,
+    scenario: Annotated[
+        list[str] | None,
+        typer.Option("--scenario", help="Primary scenario filter; repeat or use commas."),
+    ] = None,
+    fail_on_targets: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-targets/--no-fail-on-targets",
+            help="Exit with code 2 when the selected evaluation misses a target.",
+        ),
+    ] = False,
+    ephemeral_qdrant: Annotated[
+        bool,
+        typer.Option(
+            "--ephemeral-qdrant/--configured-qdrant",
+            help="在隔离的内存 Qdrant 中先索引指定 V2 KB；适用于本地复现评测。",
+        ),
+    ] = False,
+    hard_filter: Annotated[
+        bool | None,
+        typer.Option(
+            "--hard-filter/--soft-filter",
+            help="显式覆盖本次评测的 metadata hard-filter；省略时沿用配置。",
+        ),
+    ] = None,
+) -> None:
+    """Run the RAG V2 integrity checks and retrieval evaluation."""
+
+    try:
+        documents = load_knowledge_path(knowledge)
+        cases = load_rag_eval_markdown(dataset)
+        integrity = _validate_rag_cli_dataset(dataset, documents, cases)
+        if not integrity["passed"]:
+            raise ValueError("; ".join(integrity["errors"]))
+
+        case_ids = _split_eval_filters(case)
+        query_types = _split_eval_filters(query_type)
+        scenarios = _split_eval_filters(scenario)
+        selected_cases = _filter_rag_eval_cases(
+            cases,
+            case_ids=case_ids,
+            query_types=query_types,
+            scenarios=scenarios,
+        )
+        if not selected_cases:
+            raise ValueError("RAG V2 filters matched no cases")
+
+        eval_kwargs: dict[str, Any] = {
+            "mode": mode,
+            "settings": get_settings(),
+        }
+        if ephemeral_qdrant:
+            eval_kwargs.update(
+                documents=documents,
+                ephemeral_qdrant=True,
+            )
+        if hard_filter is not None:
+            eval_kwargs["hard_filter"] = hard_filter
+        report = asyncio.run(_run_rag_v2_cli_eval(selected_cases, **eval_kwargs))
+        report["inputs"] = {
+            "dataset": str(dataset),
+            "knowledge": str(knowledge),
+            "hard_filter": report.get("hard_filter", hard_filter),
+            "filters": {
+                "case": case_ids,
+                "query_type": query_types,
+                "scenario": scenarios,
+            },
+        }
+        report["integrity"] = integrity
+        json_path, markdown_path = write_rag_report(report, output)
+    except Exception as exc:
+        console.print(f"[red]RAG V2 evaluation failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[green]RAG V2 reports saved:[/green] {json_path} and {markdown_path}")
+    table = Table(title=f"RAG V2 {mode} summary")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    for key in ("case_count", "hit_at_1", "hit_at_3", "hit_at_5", "mrr", "ndcg_at_5"):
+        table.add_row(key, str(report.get(key, 0)))
+    table.add_row("targets_passed", str(report.get("targets", {}).get("passed", False)))
+    console.print(table)
+
+    if fail_on_targets and not report.get("targets", {}).get("passed", False):
+        console.print("[red]RAG V2 acceptance targets were not met.[/red]")
+        raise typer.Exit(code=2)
+
+
+@eval_app.command("rag-sweep")
+def rag_sweep_eval(
+    dataset: Annotated[
+        Path,
+        typer.Option("--dataset", help="RAG V2 Dev Markdown dataset path."),
+    ] = Path("evals/rag/cases_v2_dev.md"),
+    knowledge: Annotated[
+        Path,
+        typer.Option("--knowledge", help="RAG V2 knowledge-base path."),
+    ] = Path("knowledge/loveapp_rag_knowledge_base_v2.md"),
+    output: Annotated[
+        Path,
+        typer.Option("--output", help="JSON report path; Markdown is written beside it."),
+    ] = Path(".data/evals/rag_v2_dev_sweep.json"),
+) -> None:
+    """Tune RAG V2 retrieval on the Dev split and freeze the selected config."""
+
+    try:
+        documents = load_knowledge_path(knowledge)
+        cases = load_rag_eval_markdown(dataset)
+        if not cases or any(not case.id.startswith("rag_v2_dev_") for case in cases):
+            raise ValueError("RAG V2 sweep accepts the Dev split only; Test is evaluation-only")
+
+        integrity = _validate_rag_cli_dataset(dataset, documents, cases)
+        if not integrity["passed"]:
+            raise ValueError("; ".join(integrity["errors"]))
+
+        report = asyncio.run(
+            _run_rag_v2_cli_sweep(
+                documents,
+                cases,
+                settings=get_settings(),
+                progress=lambda message: console.print(f"[dim]{message}[/dim]"),
+            )
+        )
+        report["inputs"] = {
+            "dataset": str(dataset),
+            "knowledge": str(knowledge),
+        }
+        report["integrity"] = integrity
+        json_path, markdown_path = write_sweep_report(report, output)
+    except Exception as exc:
+        console.print(f"[red]RAG V2 Dev sweep failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[green]RAG V2 Dev sweep reports saved:[/green] {json_path} and {markdown_path}")
+    table = Table(title="RAG V2 frozen retrieval config")
+    table.add_column("Setting")
+    table.add_column("Value", justify="right")
+    for key, value in report["frozen_config"].items():
+        table.add_row(key, str(value))
+    console.print(table)
+
+
+async def _run_rag_v2_cli_sweep(documents, cases, *, settings, progress=None):
+    embedding_provider = build_embedding_provider(settings)
+    try:
+        return await run_rag_v2_dev_sweep(
+            documents,
+            cases,
+            embedding_provider=embedding_provider,
+            progress=progress,
+        )
+    finally:
+        await embedding_provider.aclose()
+
+
+def _validate_rag_cli_dataset(dataset: Path, documents, cases) -> dict[str, Any]:
+    """Validate one requested split together with its sibling when available."""
+
+    splits = {
+        "dev"
+        if case.id.startswith("rag_v2_dev_")
+        else "test"
+        if case.id.startswith("rag_v2_test_")
+        else "unknown"
+        for case in cases
+    }
+    if len(splits) != 1 or "unknown" in splits:
+        raise ValueError("RAG V2 dataset must contain exactly one recognized Dev/Test split")
+    split = next(iter(splits))
+    counterpart_name = "cases_v2_test.md" if split == "dev" else "cases_v2_dev.md"
+    counterpart_path = dataset.with_name(counterpart_name)
+    if not counterpart_path.exists():
+        repository_counterpart = Path("evals/rag") / counterpart_name
+        counterpart_path = repository_counterpart if repository_counterpart.exists() else None
+
+    counterpart_cases = (
+        load_rag_eval_markdown(counterpart_path) if counterpart_path is not None else []
+    )
+    dev_cases = cases if split == "dev" else counterpart_cases
+    test_cases = counterpart_cases if split == "dev" else cases
+    integrity = validate_rag_v2_dataset(
+        documents,
+        dev_cases,
+        test_cases,
+        require_exact_counts=counterpart_path is not None,
+    )
+    if counterpart_path is None and len(documents) != 500:
+        integrity["errors"].append(
+            f"V2 knowledge base must contain exactly 500 documents; found {len(documents)}"
+        )
+        integrity["passed"] = False
+    integrity["validated_splits"] = [split]
+    if counterpart_path is not None:
+        integrity["validated_splits"].append("test" if split == "dev" else "dev")
+        integrity["counterpart_dataset"] = str(counterpart_path)
+    return integrity
+
+
+def _filter_rag_eval_cases(
+    cases,
+    *,
+    case_ids: list[str],
+    query_types: list[str],
+    scenarios: list[str],
+):
+    case_filter = set(case_ids)
+    query_type_filter = set(query_types)
+    scenario_filter = set(scenarios)
+    return [
+        case
+        for case in cases
+        if (not case_filter or case.id in case_filter)
+        and (not query_type_filter or case.query_type in query_type_filter)
+        and (
+            not scenario_filter
+            or (
+                case.expected_primary_scenario is not None
+                and case.expected_primary_scenario.value in scenario_filter
+            )
+        )
+    ]
+
+
+async def _run_rag_v2_cli_eval(
+    cases,
+    *,
+    mode: Literal["retriever", "e2e"],
+    settings,
+    documents=None,
+    ephemeral_qdrant: bool = False,
+    hard_filter: bool | None = None,
+):
+    updates: dict[str, Any] = {}
+    if ephemeral_qdrant:
+        updates["qdrant_url"] = ":memory:"
+    if hard_filter is not None:
+        updates["rag_hard_filter"] = hard_filter
+    eval_settings = settings.model_copy(update=updates) if updates else settings
+    retriever = build_qdrant_store(eval_settings)
+    routing_container = None
+    try:
+        if ephemeral_qdrant:
+            if documents is None:
+                raise ValueError("ephemeral Qdrant evaluation requires the V2 knowledge documents")
+            indexed = await retriever.index_documents(list(documents), recreate=True)
+        else:
+            indexed = None
+        if mode == "e2e":
+            routing_container = build_routing_container(eval_settings)
+            report = await evaluate_rag_v2(
+                cases,
+                mode=mode,
+                executor=build_e2e_executor(routing_container.router, retriever),
+            )
+            oracle_report = await evaluate_rag_v2(
+                cases,
+                mode="retriever",
+                retriever=retriever,
+            )
+            report["oracle_gap"] = compare_oracle_and_e2e(oracle_report, report)
+            report["targets"] = evaluate_rag_targets(report)
+            report["retriever_backend"] = (
+                "qdrant_memory" if ephemeral_qdrant else "qdrant_configured"
+            )
+            report["hard_filter"] = bool(getattr(eval_settings, "rag_hard_filter", False))
+            if indexed is not None:
+                report["indexed_document_count"] = indexed
+            return report
+        report = await evaluate_rag_v2(cases, mode=mode, retriever=retriever)
+        report["retriever_backend"] = "qdrant_memory" if ephemeral_qdrant else "qdrant_configured"
+        report["hard_filter"] = bool(getattr(eval_settings, "rag_hard_filter", False))
+        if indexed is not None:
+            report["indexed_document_count"] = indexed
+        return report
+    finally:
+        try:
+            if routing_container is not None:
+                await routing_container.aclose()
+        finally:
+            await retriever.aclose()
+
+
+@eval_app.command("rag-metadata-filter")
+def rag_metadata_filter_eval(
+    dataset: Annotated[
+        Path,
+        typer.Option("--dataset", help="RAG V2 Dev/Test Markdown dataset path."),
+    ] = Path("evals/rag/cases_v2_dev.md"),
+    knowledge: Annotated[
+        Path,
+        typer.Option("--knowledge", help="RAG V2 knowledge-base path."),
+    ] = Path("knowledge/loveapp_rag_knowledge_base_v2.md"),
+    output: Annotated[
+        Path,
+        typer.Option("--output", help="Comparison JSON path; Markdown is written beside it."),
+    ] = Path(".data/evals/rag_v2_metadata_filter_dev.json"),
+    ephemeral_qdrant: Annotated[
+        bool,
+        typer.Option(
+            "--ephemeral-qdrant/--configured-qdrant",
+            help="在隔离的内存 Qdrant 中索引 V2 KB，或使用已配置的 collection。",
+        ),
+    ] = False,
+    router_mode: Annotated[
+        Literal["rules", "configured", "live"],
+        typer.Option(
+            "--router-mode",
+            help="Router 模式：rules（可复现）、configured（按配置）、live（默认跳过）。",
+        ),
+    ] = "rules",
+) -> None:
+    """Compare frozen Hard and Soft metadata-filter E2E arms."""
+
+    # Live Router is intentionally opt-in and is not part of the controlled
+    # Hard-vs-Soft comparison.  Emit an explicit skipped artifact instead of
+    # making an unbounded external-model call or fabricating metrics.
+    if router_mode == "live":
+        report = {
+            "schema_version": 1,
+            "status": "skipped",
+            "experiment": "rag_v2_metadata_filter_hard_vs_soft",
+            "dataset": str(dataset),
+            "knowledge": str(knowledge),
+            "router_mode": "live",
+            "reason": (
+                "Live Router validation was explicitly skipped; set up a controlled live "
+                "environment before running this optional experiment."
+            ),
+        }
+        json_path, markdown_path = _write_metadata_filter_skipped_report(report, output)
+        console.print(
+            f"[yellow]Live Router comparison skipped:[/yellow] {json_path} and {markdown_path}"
+        )
+        return
+
+    try:
+        documents = load_knowledge_path(knowledge)
+        cases = load_rag_eval_markdown(dataset)
+        integrity = _validate_rag_cli_dataset(dataset, documents, cases)
+        if not integrity["passed"]:
+            raise ValueError("; ".join(integrity["errors"]))
+        split = "dev" if cases[0].id.startswith("rag_v2_dev_") else "test"
+        settings = get_settings()
+        report = asyncio.run(
+            _run_metadata_filter_cli_comparison(
+                cases,
+                documents=documents,
+                settings=settings,
+                dataset=split,
+                ephemeral_qdrant=ephemeral_qdrant,
+                router_mode=router_mode,
+            )
+        )
+        report["inputs"] = {
+            "dataset": str(dataset),
+            "knowledge": str(knowledge),
+            "ephemeral_qdrant": ephemeral_qdrant,
+            "router_mode": router_mode,
+            "frozen_hard_filter": True,
+            "frozen_soft_filter": False,
+        }
+        report["integrity"] = integrity
+        json_path, markdown_path = write_metadata_filter_comparison(report, output)
+    except Exception as exc:
+        console.print(f"[red]RAG metadata-filter comparison failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(
+        f"[green]RAG metadata-filter reports saved:[/green] {json_path} and {markdown_path}"
+    )
+    table = Table(title=f"RAG V2 metadata filter ({router_mode}) summary")
+    table.add_column("Metric")
+    table.add_column("Hard", justify="right")
+    table.add_column("Soft", justify="right")
+    table.add_column("Delta", justify="right")
+    overall = report.get("overall", {})
+    for key in ("hit_at_3", "mrr", "candidate_recall", "coverage", "no_answer_f1"):
+        values = overall.get(key, {})
+        table.add_row(
+            key,
+            str(values.get("hard")),
+            str(values.get("soft")),
+            str(values.get("delta")),
+        )
+    amplification = report.get("hard_filter_amplification", {})
+    table.add_row(
+        "hard_filter_amplification_count",
+        str(amplification.get("hard_filter_amplification_count", 0)),
+        "-",
+        "-",
+    )
+    console.print(table)
+
+
+async def _run_metadata_filter_cli_comparison(
+    cases,
+    *,
+    documents,
+    settings,
+    dataset: str,
+    ephemeral_qdrant: bool,
+    router_mode: Literal["rules", "configured"],
+):
+    """Run paired frozen Qdrant arms while sharing client, embeddings and Router output."""
+
+    hard_config = MetadataFilterExperimentConfig.frozen(hard_filter=True)
+    soft_config = MetadataFilterExperimentConfig.frozen(hard_filter=False)
+    updates = {
+        "rag_min_score": hard_config.min_score,
+        "rag_candidate_limit": hard_config.candidate_limit,
+        "rag_reranker_mode": hard_config.reranker_mode.value,
+        "rag_lexical_weight": hard_config.lexical_weight,
+        "rag_metadata_weight": hard_config.metadata_weight,
+        "rag_retrieval_text_mode": hard_config.retrieval_text_mode.value,
+    }
+    if ephemeral_qdrant:
+        updates["qdrant_url"] = ":memory:"
+    eval_settings = settings.model_copy(update=updates)
+
+    embedding_provider = build_embedding_provider(eval_settings)
+    if ephemeral_qdrant or eval_settings.qdrant_url == ":memory:":
+        client = AsyncQdrantClient(location=":memory:")
+        backend = "qdrant_memory"
+    else:
+        client = AsyncQdrantClient(
+            url=eval_settings.qdrant_url,
+            timeout=eval_settings.qdrant_timeout_seconds,
+        )
+        backend = "qdrant_configured"
+
+    common_kwargs = {
+        "client": client,
+        "collection_name": eval_settings.qdrant_collection,
+        "embedding_provider": embedding_provider,
+        "min_score": hard_config.min_score,
+        "candidate_limit": hard_config.candidate_limit,
+        "rerank_config": RerankConfig(
+            mode=RerankerMode.FULL,
+            lexical_weight=hard_config.lexical_weight,
+            metadata_weight=hard_config.metadata_weight,
+        ),
+        "retrieval_text_mode": RetrievalTextMode.QUESTION_VARIANTS,
+    }
+    hard_retriever = QdrantKnowledgeStore(**common_kwargs, hard_filter=True)
+    soft_retriever = QdrantKnowledgeStore(**common_kwargs, hard_filter=False)
+    routing_container = None
+    try:
+        if ephemeral_qdrant:
+            indexed = await hard_retriever.index_documents(list(documents), recreate=True)
+        else:
+            indexed = None
+
+        if router_mode == "rules":
+            router = HybridRouter(
+                SafetyPolicy(context_turns=eval_settings.router_context_risk_turns),
+                corrector=None,
+                confidence_threshold=eval_settings.router_confidence_threshold,
+                ambiguity_margin=eval_settings.router_ambiguity_margin,
+                clarification_threshold=eval_settings.router_clarification_threshold,
+                prompt_version=eval_settings.router_prompt_version,
+            )
+        else:
+            routing_container = build_routing_container(eval_settings)
+            router = routing_container.router
+
+        hard_executor, soft_executor = build_metadata_filter_e2e_executors(
+            router,
+            hard_retriever,
+            soft_retriever,
+            top_k=hard_config.top_k,
+        )
+        report = await evaluate_metadata_filter_comparison(
+            cases,
+            hard_executor=hard_executor,
+            soft_executor=soft_executor,
+            mode="e2e",
+            top_k=hard_config.top_k,
+            dataset=dataset,
+            hard_config=hard_config,
+            soft_config=soft_config,
+        )
+        report["retriever_backend"] = backend
+        report["router_mode"] = router_mode
+        if indexed is not None:
+            report["indexed_document_count"] = indexed
+        return report
+    finally:
+        try:
+            if routing_container is not None:
+                await routing_container.aclose()
+        finally:
+            # The two stores deliberately share both objects; close each
+            # resource exactly once rather than calling store.aclose() twice.
+            try:
+                await embedding_provider.aclose()
+            finally:
+                await client.close()
+
+
+def _write_metadata_filter_skipped_report(
+    report: dict[str, Any],
+    output_path: Path,
+) -> tuple[Path, Path]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path = (
+        output_path
+        if output_path.suffix.casefold() == ".json"
+        else output_path.with_suffix(".json")
+    )
+    markdown_path = json_path.with_suffix(".md")
+    json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    markdown_path.write_text(
+        "# LoveApp RAG V2 Metadata Filter Comparison\n\n"
+        f"- Status: `{report.get('status', 'skipped')}`\n"
+        f"- Router mode: `{report.get('router_mode', '-')}`\n"
+        f"- Reason: {report.get('reason', '')}\n",
+        encoding="utf-8",
+    )
+    return json_path, markdown_path
 
 
 @eval_app.command("dateplan")
@@ -1309,6 +3591,30 @@ def memory_longtail_write_v2_eval(
             help="Run the fixed 40x1 Live evaluation and 8x3 hard-case validation.",
         ),
     ] = False,
+    semantic_remediation_validation: Annotated[
+        bool,
+        typer.Option(
+            "--semantic-remediation-validation",
+            help=(
+                "Run the fixed 40x1 and hard 8x3 Semantic Judge remediation "
+                "validation with frozen-baseline comparisons."
+            ),
+        ),
+    ] = False,
+    baseline_report: Annotated[
+        Path,
+        typer.Option(
+            "--baseline-report",
+            help="Frozen full Final Live JSON used for the remediation comparison.",
+        ),
+    ] = Path(".data/evals/memory_longtail_write_v2_final_live.json"),
+    hard_baseline_report: Annotated[
+        Path,
+        typer.Option(
+            "--hard-baseline-report",
+            help="Frozen hard-case Final Live JSON used for the remediation comparison.",
+        ),
+    ] = Path(".data/evals/memory_longtail_write_v2_final_live_hard.json"),
 ) -> None:
     """Run the retrieval-aware V2 benchmark in shadow-only mode."""
 
@@ -1326,9 +3632,33 @@ def memory_longtail_write_v2_eval(
         )
     if final_live_validation and repeat != 1:
         raise typer.BadParameter("--final-live-validation manages its own 1x and 3x repeats")
+    if semantic_remediation_validation and final_live_validation:
+        raise typer.BadParameter(
+            "--semantic-remediation-validation cannot be combined with --final-live-validation"
+        )
+    if semantic_remediation_validation and mode != "live":
+        raise typer.BadParameter("--semantic-remediation-validation requires --mode live")
+    if semantic_remediation_validation and (
+        case is not None or slice_name is not None or hard_cases
+    ):
+        raise typer.BadParameter(
+            "--semantic-remediation-validation cannot be combined with "
+            "--case, --slice, or --hard-cases"
+        )
+    if semantic_remediation_validation and repeat != 1:
+        raise typer.BadParameter(
+            "--semantic-remediation-validation manages its own 1x and 3x repeats"
+        )
+    if semantic_remediation_validation and output is not None:
+        raise typer.BadParameter(
+            "--semantic-remediation-validation writes fixed artifact names; "
+            "--output is not supported"
+        )
     effective_repeat = 3 if hard_cases and repeat == 1 else repeat
     output_path = output or (
-        Path(".data/evals/memory_longtail_write_v2_final_live.json")
+        Path(".data/evals/memory_longtail_write_v2_semantic_remediation_live.json")
+        if semantic_remediation_validation
+        else Path(".data/evals/memory_longtail_write_v2_final_live.json")
         if final_live_validation
         else _default_memory_longtail_write_v2_output_path()
     )
@@ -1336,6 +3666,32 @@ def memory_longtail_write_v2_eval(
         raise typer.BadParameter("--output must be a JSON path; Markdown is written beside it")
 
     try:
+        if semantic_remediation_validation:
+            full_report, hard_report = asyncio.run(
+                _run_semantic_remediation_memory_longtail_write_v2_eval(
+                    dataset,
+                    shared_bank,
+                    settings=get_settings(),
+                    vector_limit=vector_limit,
+                    rank_limit=rank_limit,
+                    fail_on_error=fail_on_error,
+                    compare_fixture=compare_fixture,
+                    baseline_report=baseline_report,
+                    hard_baseline_report=hard_baseline_report,
+                )
+            )
+            hard_output_path = Path(
+                ".data/evals/memory_longtail_write_v2_semantic_remediation_hard.json"
+            )
+            _write_memory_longtail_write_v2_artifact(full_report, output_path)
+            _write_memory_longtail_write_v2_artifact(hard_report, hard_output_path)
+            console.print(
+                f"[green]Semantic remediation Live JSON saved:[/green] {output_path}\n"
+                f"[green]Semantic remediation hard-case JSON saved:[/green] "
+                f"{hard_output_path}\n"
+                f"status={full_report['status']}"
+            )
+            return
         if final_live_validation:
             full_report, hard_report = asyncio.run(
                 _run_final_live_memory_longtail_write_v2_eval(
@@ -1847,6 +4203,60 @@ async def _run_final_live_memory_longtail_write_v2_eval(
     )
 
 
+def _load_memory_longtail_write_v2_report(path: Path) -> dict[str, Any]:
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"Memory Long-tail Write V2 baseline not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Memory Long-tail Write V2 baseline is invalid JSON: {path}") from exc
+    if not isinstance(report, dict):
+        raise ValueError(f"Memory Long-tail Write V2 baseline must be a JSON object: {path}")
+    return report
+
+
+async def _run_semantic_remediation_memory_longtail_write_v2_eval(
+    dataset: Path,
+    shared_bank: Path,
+    *,
+    settings: Any,
+    vector_limit: int,
+    rank_limit: int,
+    fail_on_error: bool,
+    compare_fixture: bool,
+    baseline_report: Path,
+    hard_baseline_report: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run the fixed remediation validation and compare it to frozen Live artifacts."""
+
+    baseline = _load_memory_longtail_write_v2_report(baseline_report)
+    hard_baseline = _load_memory_longtail_write_v2_report(hard_baseline_report)
+    full_report, hard_report = await _run_final_live_memory_longtail_write_v2_eval(
+        dataset,
+        shared_bank,
+        settings=settings,
+        vector_limit=vector_limit,
+        rank_limit=rank_limit,
+        fail_on_error=fail_on_error,
+        compare_fixture=compare_fixture,
+    )
+    full_report["semantic_remediation_comparison"] = (
+        compare_memory_longtail_write_v2_semantic_remediation(baseline, full_report)
+    )
+    hard_report["semantic_remediation_comparison"] = (
+        compare_memory_longtail_write_v2_semantic_remediation(hard_baseline, hard_report)
+    )
+    full_report["semantic_remediation_baseline"] = {
+        "artifact": str(baseline_report),
+        "status": baseline.get("status"),
+    }
+    hard_report["semantic_remediation_baseline"] = {
+        "artifact": str(hard_baseline_report),
+        "status": hard_baseline.get("status"),
+    }
+    return full_report, hard_report
+
+
 async def _run_memory_longtail_relation_eval(
     dataset: Path,
     *,
@@ -2015,11 +4425,22 @@ def ingest_knowledge(
         bool,
         typer.Option("--recreate/--no-recreate", help="是否重建 collection。"),
     ] = True,
+    include_seed: Annotated[
+        bool,
+        typer.Option(
+            "--include-seed/--no-seed",
+            help="是否合并内置 seed 文档；V2 正式知识库通常使用 --no-seed。",
+        ),
+    ] = True,
 ) -> None:
     """按问答块生成向量并写入本地 Qdrant。"""
     try:
         external_documents = load_knowledge_path(path)
-        documents = merge_knowledge_documents(load_seed_documents(), external_documents)
+        documents = (
+            merge_knowledge_documents(load_seed_documents(), external_documents)
+            if include_seed
+            else external_documents
+        )
         if not documents:
             raise ValueError("没有找到可入库的知识文档。")
         with console.status("正在生成本地向量并写入 Qdrant..."):
@@ -2027,8 +4448,9 @@ def ingest_knowledge(
     except Exception as exc:
         console.print(f"[red]知识入库失败：[/red]{exc}")
         raise typer.Exit(code=1) from exc
+    source_description = "Seed 与正式文档统一去重后" if include_seed else "正式文档"
     console.print(
-        f"[green]入库完成：[/green]Seed 与正式文档统一去重后写入 {indexed} 个问答 chunk，"
+        f"[green]入库完成：[/green]{source_description}写入 {indexed} 个问答 chunk，"
         f"collection 共 {total} 条。"
     )
 
@@ -2126,6 +4548,24 @@ def memory_test(
             help="Use a process-local store while retaining the configured extractor.",
         ),
     ] = False,
+    route: Annotated[
+        bool,
+        typer.Option(
+            "--route/--no-route",
+            help="Run the configured application Router before Memory inspection.",
+        ),
+    ] = True,
+    memory_version: Annotated[
+        Literal["v1", "v2"],
+        typer.Option(
+            "--memory-version",
+            case_sensitive=False,
+            help=(
+                "Memory relation mode: v1 deterministic resolver, or v2 Semantic "
+                "Judge shadow evaluation with deterministic fallback."
+            ),
+        ),
+    ] = "v1",
     limit: Annotated[int, typer.Option("--limit", min=1, max=1000)] = 200,
 ) -> None:
     """Inspect the real Memory pipeline in an isolated test identity."""
@@ -2140,6 +4580,8 @@ def memory_test(
                 texts=text or (),
                 json_output=json_output,
                 isolated=isolated,
+                include_routing=route,
+                memory_version=memory_version,
                 limit=limit,
             )
         )

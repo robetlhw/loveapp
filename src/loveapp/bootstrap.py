@@ -26,6 +26,7 @@ from loveapp.adapters.knowledge.loader import (
     merge_knowledge_documents,
     parse_documents,
 )
+from loveapp.adapters.knowledge.scoring import RerankConfig, RerankerMode
 from loveapp.adapters.maps import AmapMapProvider, DemoMapProvider
 from loveapp.adapters.memory import (
     InMemoryMemoryStore,
@@ -54,9 +55,10 @@ from loveapp.application.memory_semantic_relations import (
     LongTailRelationShadowEvaluator,
     LongTailSemanticRelationValidator,
 )
+from loveapp.application.retrieval_query_planner import RetrievalQueryPlanner
 from loveapp.application.routing import HybridRouter
 from loveapp.core.config import Settings, get_settings
-from loveapp.domain.knowledge import KnowledgeDocument
+from loveapp.domain.knowledge import KnowledgeDocument, RetrievalTextMode
 from loveapp.ports.conversation_states import ConversationFlowStateStore
 from loveapp.ports.date_tasks import DatePlanningTaskStore
 from loveapp.ports.embeddings import EmbeddingProvider
@@ -108,6 +110,19 @@ class MemoryContainer:
                 await close()
 
 
+@dataclass(frozen=True)
+class RoutingContainer:
+    router: Router
+    safety_policy: SafetyPolicy
+    resources: tuple[Any, ...] = ()
+
+    async def aclose(self) -> None:
+        for resource in reversed(self.resources):
+            close = getattr(resource, "aclose", None)
+            if close is not None:
+                await close()
+
+
 def build_container(settings: Settings | None = None) -> AppContainer:
     settings = settings or get_settings()
     resources: list[Any] = []
@@ -124,7 +139,16 @@ def build_container(settings: Settings | None = None) -> AppContainer:
             load_seed_documents(),
             load_knowledge_path(settings.knowledge_path),
         )
-        retriever = InMemoryKnowledgeRetriever(documents)
+        retriever = InMemoryKnowledgeRetriever(
+            documents,
+            rerank_config=RerankConfig(
+                mode=RerankerMode(settings.rag_reranker_mode),
+                lexical_weight=settings.rag_lexical_weight,
+                metadata_weight=settings.rag_metadata_weight,
+            ),
+            retrieval_text_mode=RetrievalTextMode(settings.rag_retrieval_text_mode),
+            hard_filter=settings.rag_hard_filter,
+        )
 
     composer = _build_advice_composer(settings)
     if hasattr(composer, "aclose"):
@@ -146,28 +170,22 @@ def build_container(settings: Settings | None = None) -> AppContainer:
     weather_provider = _build_weather_provider(settings)
     if hasattr(weather_provider, "aclose"):
         resources.append(weather_provider)
-    safety_policy = SafetyPolicy(context_turns=settings.router_context_risk_turns)
-    route_corrector = _build_route_corrector(settings)
-    if route_corrector is not None:
-        resources.append(route_corrector)
-    date_semantic_parser = _build_date_semantic_parser(settings)
-    if date_semantic_parser is not None:
-        resources.append(date_semantic_parser)
-    router = HybridRouter(
-        safety_policy,
-        route_corrector,
-        confidence_threshold=settings.router_confidence_threshold,
-        ambiguity_margin=settings.router_ambiguity_margin,
-        clarification_threshold=settings.router_clarification_threshold,
-        prompt_version=settings.router_prompt_version,
-        date_semantic_parser=date_semantic_parser,
-    )
+    routing_container = build_routing_container(settings)
+    safety_policy = routing_container.safety_policy
+    router = routing_container.router
+    resources.extend(routing_container.resources)
     advice_agent = AdviceAgent(
         retriever,
         memory_service,
         safety_policy,
         composer,
         router,
+        query_planner=RetrievalQueryPlanner(
+            contextual_query_rewrite_enabled=settings.contextual_query_rewrite_enabled,
+            query_decomposition_enabled=settings.query_decomposition_enabled,
+            max_subqueries=settings.max_subqueries,
+            history_window=settings.contextual_rewrite_history_window,
+        ),
     )
     date_planning_agent = DatePlanningAgent(map_provider, memory_service, weather_provider)
     date_plan_validator = DatePlanValidator()
@@ -196,6 +214,41 @@ def build_container(settings: Settings | None = None) -> AppContainer:
         memory_store=memory_store,
         date_task_store=date_task_store,
         conversation_flow_state_store=conversation_flow_state_store,
+        resources=tuple(resources),
+    )
+
+
+def build_routing_container(settings: Settings | None = None) -> RoutingContainer:
+    settings = settings or get_settings()
+    resources: list[Any] = []
+    safety_policy = SafetyPolicy(context_turns=settings.router_context_risk_turns)
+    route_corrector = _build_route_corrector(settings)
+    if route_corrector is not None:
+        resources.append(route_corrector)
+    date_semantic_parser = _build_date_semantic_parser(settings)
+    if date_semantic_parser is not None and date_semantic_parser is not route_corrector:
+        resources.append(date_semantic_parser)
+    router = HybridRouter(
+        safety_policy,
+        route_corrector,
+        confidence_threshold=settings.router_confidence_threshold,
+        ambiguity_margin=settings.router_ambiguity_margin,
+        clarification_threshold=settings.router_clarification_threshold,
+        prompt_version=_router_prompt_version(settings),
+        date_semantic_parser=date_semantic_parser,
+        router_v2_enabled=settings.router_v2_enabled,
+        semantic_mode=settings.router_semantic_mode,
+        router_llm_correction_enabled=settings.router_llm_correction_enabled,
+        router_llm_always_on_for_relationship=settings.router_llm_always_on_for_relationship,
+        router_llm_low_confidence_threshold=settings.router_llm_low_confidence_threshold,
+        router_llm_margin_threshold=settings.router_llm_margin_threshold,
+        router_goal_secondary_threshold=settings.router_goal_secondary_threshold,
+        router_goal_max_count=settings.router_goal_max_count,
+        router_conditional_trigger_profile=settings.router_conditional_trigger_profile,
+    )
+    return RoutingContainer(
+        router=router,
+        safety_policy=safety_policy,
         resources=tuple(resources),
     )
 
@@ -270,15 +323,26 @@ def build_qdrant_store(
     *,
     embedding_provider: EmbeddingProvider | None = None,
 ) -> QdrantKnowledgeStore:
-    client = AsyncQdrantClient(
-        url=settings.qdrant_url,
-        timeout=settings.qdrant_timeout_seconds,
-    )
+    if settings.qdrant_url == ":memory:":
+        client = AsyncQdrantClient(location=":memory:")
+    else:
+        client = AsyncQdrantClient(
+            url=settings.qdrant_url,
+            timeout=settings.qdrant_timeout_seconds,
+        )
     return QdrantKnowledgeStore(
         client=client,
         collection_name=settings.qdrant_collection,
         embedding_provider=embedding_provider or build_embedding_provider(settings),
         min_score=settings.rag_min_score,
+        candidate_limit=settings.rag_candidate_limit,
+        rerank_config=RerankConfig(
+            mode=RerankerMode(settings.rag_reranker_mode),
+            lexical_weight=settings.rag_lexical_weight,
+            metadata_weight=settings.rag_metadata_weight,
+        ),
+        retrieval_text_mode=RetrievalTextMode(settings.rag_retrieval_text_mode),
+        hard_filter=settings.rag_hard_filter,
     )
 
 
@@ -336,9 +400,7 @@ def _build_advice_composer(settings: Settings):
         max_retries=settings.llm_max_retries,
         max_tokens=settings.advice_max_tokens,
         thinking=(
-            settings.advice_thinking
-            if settings.llm_provider.casefold() == "deepseek"
-            else None
+            settings.advice_thinking if settings.llm_provider.casefold() == "deepseek" else None
         ),
         temperature=settings.advice_temperature,
         structured_retries=settings.advice_structured_retries,
@@ -424,9 +486,7 @@ def _build_semantic_relation_judge(
         or settings.llm_model
     )
     if not model:
-        raise ValueError(
-            "LOVEAPP_MEMORY_SEMANTIC_RELATION_MODEL 或 LOVEAPP_LLM_MODEL 未配置。"
-        )
+        raise ValueError("LOVEAPP_MEMORY_SEMANTIC_RELATION_MODEL 或 LOVEAPP_LLM_MODEL 未配置。")
     return OpenAICompatibleSemanticRelationJudge(
         api_key=settings.llm_api_key,
         base_url=settings.llm_base_url,
@@ -439,28 +499,51 @@ def _build_semantic_relation_judge(
 
 
 def _build_route_corrector(settings: Settings):
-    use_llm = settings.router_provider == "llm" or (
-        settings.router_provider == "auto" and settings.llm_provider != "demo"
-    )
+    provider = (settings.router_llm_provider or settings.router_provider).casefold()
+    if provider in {"disabled", "off", "none"}:
+        return None
+    use_llm = provider not in {"auto", "llm"} or settings.llm_provider != "demo"
     if not use_llm:
         return None
     if not settings.llm_api_key:
         raise ValueError("LOVEAPP_LLM_API_KEY 未配置。")
     if not settings.llm_base_url:
         raise ValueError("LOVEAPP_LLM_BASE_URL 未配置。")
-    model = settings.router_model or settings.llm_model
+    model = settings.router_llm_model or settings.router_model or settings.llm_model
     if not model:
         raise ValueError("LOVEAPP_ROUTER_MODEL 或 LOVEAPP_LLM_MODEL 未配置。")
     return OpenAICompatibleRouteCorrector(
         api_key=settings.llm_api_key,
         base_url=settings.llm_base_url,
         model=model,
-        timeout_seconds=settings.router_timeout_seconds,
-        max_retries=settings.router_max_retries,
-        max_tokens=settings.router_max_tokens,
+        timeout_seconds=settings.router_llm_timeout_seconds or settings.router_timeout_seconds,
+        max_retries=(
+            settings.router_llm_max_retries
+            if settings.router_llm_max_retries is not None
+            else settings.router_max_retries
+        ),
+        max_tokens=settings.router_llm_max_tokens or settings.router_max_tokens,
         thinking=settings.router_thinking,
-        prompt_version=settings.router_prompt_version,
+        temperature=settings.router_llm_temperature,
+        structured_output=settings.router_llm_structured_output,
+        provider_name=(
+            settings.router_llm_provider
+            if settings.router_llm_provider
+            and settings.router_llm_provider.casefold() not in {"auto", "llm", "disabled"}
+            else settings.llm_provider
+        ),
+        prompt_version=_router_prompt_version(settings),
+        semantic_only=settings.router_semantic_mode in {"always", "conditional"},
     )
+
+
+def _router_prompt_version(settings: Settings) -> str:
+    configured = settings.router_llm_prompt_version
+    if configured:
+        return configured
+    if settings.router_semantic_mode in {"always", "conditional"}:
+        return "routing-v3.2-v1"
+    return settings.router_prompt_version
 
 
 def _build_date_semantic_parser(settings: Settings):
@@ -476,8 +559,7 @@ def _build_date_semantic_parser(settings: Settings):
     model = settings.date_semantic_model or settings.router_model or settings.llm_model
     if not model:
         raise ValueError(
-            "LOVEAPP_DATE_SEMANTIC_MODEL、LOVEAPP_ROUTER_MODEL 或 "
-            "LOVEAPP_LLM_MODEL 未配置。"
+            "LOVEAPP_DATE_SEMANTIC_MODEL、LOVEAPP_ROUTER_MODEL 或 LOVEAPP_LLM_MODEL 未配置。"
         )
     return OpenAICompatibleDateSemanticParser(
         api_key=settings.llm_api_key,

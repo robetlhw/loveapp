@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import json
 from dataclasses import dataclass
 from typing import TypedDict
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -11,6 +12,7 @@ from loveapp.application.contextual_memory_updates import (
     may_contain_contextual_memory_update,
 )
 from loveapp.application.memory_gate import MemoryGate
+from loveapp.application.retrieval_query_planner import RetrievalQueryPlanner
 from loveapp.application.routing import route_by_rules
 from loveapp.application.scenario_policy import (
     ScenarioPolicyRegistry,
@@ -78,6 +80,7 @@ class AdviceAgent:
         composer: AdviceComposer,
         router: Router | None = None,
         policy_registry: ScenarioPolicyRegistry | None = None,
+        query_planner: RetrievalQueryPlanner | None = None,
     ) -> None:
         self._retriever = retriever
         self._memory_service = memory_service
@@ -85,6 +88,7 @@ class AdviceAgent:
         self._composer = composer
         self._router = router
         self._policy_registry = policy_registry or default_scenario_policy_registry()
+        self._query_planner = query_planner
         self._graph = self._build_graph()
 
     async def advise(self, request: AdviceRequest) -> AdviceResponse:
@@ -117,9 +121,7 @@ class AdviceAgent:
                 }
             )
         except asyncio.CancelledError as exc:
-            await asyncio.shield(
-                self._fail_recorded_turn(request, exc, trace, execution)
-            )
+            await asyncio.shield(self._fail_recorded_turn(request, exc, trace, execution))
             raise
         except AdviceTurnClaimError:
             raise
@@ -188,9 +190,7 @@ class AdviceAgent:
         if existing_turn is not None:
             _validate_logical_turn_request(existing_turn, request)
             if not request.retry_generation:
-                raise AdviceTurnClaimError(
-                    "该建议逻辑轮次已经提交，不能并发或重复生成。"
-                )
+                raise AdviceTurnClaimError("该建议逻辑轮次已经提交，不能并发或重复生成。")
         if request.retry_generation:
             if existing_turn is None:
                 raise ValueError("没有找到可重试的建议轮次。")
@@ -373,26 +373,75 @@ class AdviceAgent:
             }
 
     async def _retrieve(self, state: AdviceState) -> dict:
-        with state["trace"].measure("rag_retrieval"):
+        with state["trace"].measure("rag_retrieval") as details:
             request = state["request"]
             policy = state["policy"]
             scenario_weights = {
                 scenario: limit / policy.total_document_limit
                 for scenario, limit in policy.retrieval_limits.items()
             }
-            documents = await self._retriever.search(
-                query=request.query,
-                filters=KnowledgeFilters(
-                    scenario=state["scenario"],
-                    scenarios=request.secondary_scenarios,
-                    relationship_stage=request.relationship_stage,
-                    goal=request.goal,
-                    goals=request.secondary_goals,
-                    scenario_weights=scenario_weights,
-                ),
-                limit=policy.total_document_limit,
-                trace=state["trace"],
+            filters = KnowledgeFilters(
+                scenario=state["scenario"],
+                scenarios=request.secondary_scenarios,
+                relationship_stage=request.relationship_stage,
+                goal=request.goal,
+                goals=request.secondary_goals,
+                scenario_weights=scenario_weights,
             )
+            planner = self._query_planner
+            if planner is not None and (
+                planner.contextual_query_rewrite_enabled or planner.query_decomposition_enabled
+            ):
+                history = state.get("conversation_history")
+                if history is None:
+                    current_message = state.get("current_message")
+                    history = await self._memory_service.get_conversation_history(
+                        request.user_id,
+                        request.relationship_id,
+                        current_message.conversation_id
+                        if current_message
+                        else request.conversation_id,
+                        exclude_message_id=current_message.id if current_message else None,
+                    )
+                planned = await planner.retrieve(
+                    self._retriever,
+                    request.query,
+                    history=history,
+                    filters=filters,
+                    limit=policy.total_document_limit,
+                    trace=state["trace"],
+                )
+                documents = planned.returned
+                # ``ExecutionTrace`` deliberately stores scalar detail values
+                # for compatibility with the existing observability schema.
+                # Keep the complete multi-query retrieval diagnostics on the
+                # outer AdviceAgent retrieval step as JSON strings so callers
+                # do not have to inspect the planner's private result object.
+                details["per_subquery_candidate_ids"] = json.dumps(
+                    planned.per_subquery_candidate_ids,
+                    ensure_ascii=False,
+                )
+                details["per_subquery_scores"] = json.dumps(
+                    planned.per_subquery_scores,
+                    ensure_ascii=False,
+                )
+                details["merged_candidate_ids"] = json.dumps(
+                    planned.merged_candidate_ids,
+                    ensure_ascii=False,
+                )
+                details["final_top_k"] = json.dumps(
+                    planned.final_top_k,
+                    ensure_ascii=False,
+                )
+                details["duplicate_candidate_ratio"] = planned.duplicate_candidate_ratio
+                details["subquery_count"] = len(planned.plan.subqueries)
+            else:
+                documents = await self._retriever.search(
+                    query=request.query,
+                    filters=filters,
+                    limit=policy.total_document_limit,
+                    trace=state["trace"],
+                )
             return {"documents": documents}
 
     async def _compose(self, state: AdviceState) -> dict:
@@ -475,11 +524,7 @@ class AdviceAgent:
     async def _save_response(self, state: AdviceState) -> dict:
         memory_task = state.get("memory_task")
         memory_result: RememberResult | None = state.get("memory_result")
-        if (
-            memory_result is None
-            and memory_task is not None
-            and state.get("wait_for_memory", True)
-        ):
+        if memory_result is None and memory_task is not None and state.get("wait_for_memory", True):
             memory_result = await asyncio.shield(memory_task)
         request = state["request"]
         logical_turn_id = _required_logical_turn_id(request)
@@ -495,9 +540,7 @@ class AdviceAgent:
                     user_id=request.user_id,
                     relationship_id=request.relationship_id,
                     conversation_id=_required_conversation_id(request),
-                    last_error_type=_generation_error_name(
-                        state.get("generation_attempts", [])
-                    ),
+                    last_error_type=_generation_error_name(state.get("generation_attempts", [])),
                     fallback_used=True,
                 )
                 details["persisted"] = False
@@ -637,9 +680,7 @@ class AdviceAgent:
                     "联系可信任的家人、朋友或当地专业支持，暂时不要独自承受。",
                     "如果风险正在升级或无法保证安全，请立即联系当地紧急服务。",
                 ],
-                avoid_actions=[
-                    "不要独自接近冲突现场，也不要用酒精、武器或威胁来处理当前情绪。"
-                ],
+                avoid_actions=["不要独自接近冲突现场，也不要用酒精、武器或威胁来处理当前情绪。"],
                 risk_notes=reasons,
             )
             return {"response": response}
@@ -670,8 +711,7 @@ def _supports_keyword(callable_object: object, keyword: str) -> bool:
     except (TypeError, ValueError):
         return True
     return keyword in parameters or any(
-        parameter.kind == inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters.values()
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
     )
 
 

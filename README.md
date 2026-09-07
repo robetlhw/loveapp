@@ -196,14 +196,22 @@ Memory Inspector。默认身份固定为 `memory-debug-user` / `memory-debug-rel
 
 ```powershell
 uv run loveapp memory-test
+uv run loveapp memory-test --memory-version v1
+uv run loveapp memory-test --memory-version v2
 uv run loveapp memory-test --json --text "她喜欢安静的咖啡馆"
 uv run loveapp memory-test --isolated
+uv run loveapp memory-test --isolated --no-route
 ```
 
 交互模式支持 `/show`、`/show --all`、`/show <memory_id>`、`/context`、`/history`、
 `/runs`、`/reset`、`/json on|off`、`/help` 和 `/exit`。默认使用配置中的 Memory
 backend 和 extractor；`--isolated` 仅把 Store 切为进程内隔离实例，仍调用相同的
-`MemoryService`、Gate、Extractor、Admission、Relation 和 Lifecycle 链路。
+`MemoryService`、Gate、Extractor、Admission、Relation 和 Lifecycle 链路。默认还会先
+调用配置中的应用 Router，并在同一轮报告中展示路由结果；只检查 Memory 时可传
+`--no-route`。`--memory-version v1` 使用确定性 Relation Resolver（默认）；
+`--memory-version v2` 启用当前 Semantic Judge shadow evaluation，同时保留确定性
+fallback，不会由 Judge 直接执行 destructive Store mutation。每轮 `TURN SUMMARY` 会分别报告提取数量、归一化候选数量、Relation
+计数，以及 `update_proposed`、`update_planned` 和 Store 实际执行的 `update_applied`。
 
 旧的专项观察脚本仍可用于 force-gate/dry-run 实验：
 

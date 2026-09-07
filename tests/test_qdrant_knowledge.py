@@ -4,8 +4,9 @@ from qdrant_client import AsyncQdrantClient
 
 from loveapp.adapters.knowledge.qdrant import QdrantKnowledgeStore
 from loveapp.bootstrap import load_seed_documents
-from loveapp.domain.enums import AdviceScenario
-from loveapp.domain.knowledge import KnowledgeFilters
+from loveapp.core.timing import ExecutionTrace
+from loveapp.domain.enums import AdviceGoal, AdviceScenario, RelationshipStage
+from loveapp.domain.knowledge import KnowledgeDocument, KnowledgeFilters
 
 
 class FakeEmbeddingProvider:
@@ -103,3 +104,95 @@ async def test_soft_scenario_preference_does_not_exclude_semantic_match() -> Non
     assert embedding.query_calls == 1
     assert matches[0].base_score is not None
     await store.aclose()
+
+
+async def test_candidate_limit_is_configurable_and_recorded_in_trace() -> None:
+    client = AsyncQdrantClient(location=":memory:")
+    store = QdrantKnowledgeStore(
+        client,
+        "candidate_limit",
+        FakeEmbeddingProvider(),
+        candidate_limit=30,
+    )
+    await store.index_documents(load_seed_documents(), recreate=True)
+    trace = ExecutionTrace()
+
+    await store.search(
+        "聊天回复",
+        filters=KnowledgeFilters(scenario=AdviceScenario.CHAT_ANALYSIS, hard=True),
+        limit=3,
+        trace=trace,
+    )
+
+    vector_search = next(
+        record for record in trace.snapshot() if record.name == "rag_vector_search"
+    )
+    assert vector_search.details["candidate_limit"] == 30
+    assert vector_search.details["hard_filter"] is True
+    await store.aclose()
+
+
+async def test_detailed_search_keeps_nearest_candidates_below_threshold() -> None:
+    client = AsyncQdrantClient(location=":memory:")
+    store = QdrantKnowledgeStore(
+        client,
+        "threshold_diagnostics",
+        FakeEmbeddingProvider(),
+        min_score=1.1,
+    )
+    await store.index_documents(load_seed_documents(), recreate=True)
+
+    result = await store.search_detailed("聊天回复", limit=3)
+
+    assert result.returned == []
+    assert result.candidates == []
+    assert result.reranked_candidates == []
+    assert result.nearest_candidates
+    await store.aclose()
+
+
+async def test_configured_hard_filter_is_applied_without_mutating_call_filters() -> None:
+    client = AsyncQdrantClient(location=":memory:")
+    store = QdrantKnowledgeStore(
+        client,
+        "configured_hard_filter",
+        FakeEmbeddingProvider(),
+        hard_filter=True,
+    )
+    await store.index_documents(load_seed_documents(), recreate=True)
+
+    result = await store.search_detailed(
+        "和对象吵架了怎么办",
+        filters=KnowledgeFilters(scenario=AdviceScenario.CONFLICT),
+        limit=3,
+    )
+
+    assert result.returned
+    assert all(match.document.scenario == AdviceScenario.CONFLICT for match in result.returned)
+    await store.aclose()
+
+
+async def test_in_memory_hard_filter_matches_qdrant_empty_metadata_semantics() -> None:
+    from loveapp.adapters.knowledge.in_memory import InMemoryKnowledgeRetriever
+
+    document = KnowledgeDocument(
+        id="empty-metadata",
+        title="Empty metadata",
+        scenario=AdviceScenario.CONFLICT,
+        question="冲突问题",
+        answer="答案",
+    )
+    retriever = InMemoryKnowledgeRetriever([document])
+
+    result = await retriever.search_detailed(
+        "冲突问题",
+        filters=KnowledgeFilters(
+            scenario=AdviceScenario.CONFLICT,
+            goals=[AdviceGoal.REPAIR],
+            relationship_stage=RelationshipStage.DATING,
+            hard=True,
+        ),
+        limit=5,
+    )
+
+    assert result.returned == []

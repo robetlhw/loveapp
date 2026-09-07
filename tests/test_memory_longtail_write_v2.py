@@ -25,17 +25,21 @@ from loveapp.evaluation.memory_longtail_write_v2 import (
     LongTailWriteV2EvaluationError,
     _attribute_failure,
     _candidate_from_row,
+    _collapse_equivalent_ranked_candidates,
     _error_row,
     _evaluation_status,
     _retrieval_metrics,
     _row_expected_semantic_target_ids,
     _validate_equivalence_contract,
     compare_memory_longtail_write_v2_reports,
+    compare_memory_longtail_write_v2_semantic_remediation,
+    compare_memory_longtail_write_v2_top_k_ablation,
     evaluate_memory_longtail_write_v2,
     evaluate_memory_longtail_write_v2_fixture,
     finalize_memory_longtail_write_v2_live_validation,
     load_memory_longtail_write_v2_dataset,
     render_memory_longtail_write_v2_report,
+    render_memory_longtail_write_v2_top_k_ablation,
 )
 
 ROOT = Path(__file__).parents[1]
@@ -106,6 +110,63 @@ class _ScriptedJudge:
             prompt_tokens=10,
             completion_tokens=5,
             total_tokens=15,
+        )
+
+
+class _CandidateWiseTraceJudge:
+    """Emit adapter-shaped trace details while keeping the evaluator test offline."""
+
+    async def propose_relation(
+        self,
+        *,
+        incoming: MemoryCandidate,
+        candidates: list[MemoryItem],
+        trace: Any = None,
+    ) -> SemanticRelationProposal:
+        del incoming
+        target_ids = [candidate.id for candidate in candidates if candidate.id == "O001"]
+        relation = ClaimRelation.SAME if target_ids else ClaimRelation.UNCERTAIN
+        candidate_relations = [
+            {
+                "memory_id": candidate.id,
+                "relation": (
+                    ClaimRelation.SAME.value
+                    if candidate.id in target_ids
+                    else ClaimRelation.UNRELATED.value
+                ),
+                "is_direct_target": candidate.id in target_ids,
+                "confidence": 0.96 if candidate.id in target_ids else 0.91,
+            }
+            for candidate in candidates
+        ]
+        if trace is not None:
+            with trace.measure("memory_semantic_relation_model") as details:
+                details.update(
+                    {
+                        "target_policy_status": "accepted",
+                        "max_target_count": 5,
+                        "raw_target_count": len(target_ids),
+                        "raw_target_ids": ",".join(target_ids),
+                        "candidate_relations_json": json.dumps(
+                            candidate_relations,
+                            separators=(",", ":"),
+                        ),
+                        # The evaluator must preserve both rather than silently
+                        # replacing the model-reported value with the derived one.
+                        "reported_overall_relation": ClaimRelation.COMPLEMENTARY.value,
+                        "derived_overall_relation": relation.value,
+                    }
+                )
+        return SemanticRelationProposal(
+            relation=relation,
+            target_memory_ids=target_ids,
+            same_semantic_dimension=bool(target_ids),
+            confidence=0.96 if target_ids else 0.0,
+            reason="Candidate-wise evaluator observability regression.",
+            judge_model="candidate-wise-trace-test",
+            prompt_tokens=12,
+            completion_tokens=6,
+            total_tokens=18,
         )
 
 
@@ -237,6 +298,42 @@ async def test_v2_embedding_is_text_only_and_candidate_trace_is_explainable() ->
     assert target["subject"] == "partner"
     assert target["source"] == "overlay"
     assert "cheap_score" in target["score"]
+
+
+@pytest.mark.asyncio
+async def test_v2_relation_stage_exposes_candidate_wise_and_target_relations() -> None:
+    report = await evaluate_memory_longtail_write_v2(
+        CASES,
+        SHARED,
+        embedding_provider=_ControlledEmbeddingProvider(
+            target_texts=_gold_texts("LTW2-001")
+        ),
+        judge=_CandidateWiseTraceJudge(),
+        case_id="LTW2-001",
+        fail_on_error=True,
+    )
+
+    row = report["rows"][0]
+    for field in ("oracle_relation", "retrieved_relation"):
+        stage = row[field]
+        assert [item["memory_id"] for item in stage["candidate_relations"]] == stage[
+            "candidate_ids"
+        ]
+        assert stage["candidate_relation_trace_complete"] is True
+        assert stage["direct_target_ids"] == ["O001"]
+        assert stage["final_target_ids"] == ["O001"]
+        assert stage["per_target_relations"] == [
+            {
+                "memory_id": "O001",
+                "relation": "same",
+                "is_direct_target": True,
+                "confidence": 0.96,
+            }
+        ]
+        assert stage["reported_overall_relation"] == "complementary"
+        assert stage["derived_overall_relation"] == "same"
+        assert stage["proposal"]["relation"] == "same"
+        assert stage["proposal"]["target_memory_ids"] == ["O001"]
 
 
 @pytest.mark.asyncio
@@ -755,6 +852,154 @@ def test_v2_retrieval_metrics_count_duplicate_equivalence_slots_by_stage() -> No
     assert metrics["equivalence_group_duplicate_slot_count_at_5"] == 1
 
 
+def _collapse_candidate(
+    memory_id: str,
+    *,
+    cheap_score: float,
+    vector_score: float,
+    confidence: float,
+) -> dict[str, object]:
+    return {
+        "memory_id": memory_id,
+        "rank": 0,
+        "confidence": confidence,
+        "score": {
+            "cheap_score": cheap_score,
+            "semantic_similarity": vector_score,
+        },
+    }
+
+
+def test_v2_equivalence_collapse_uses_documented_deterministic_priority() -> None:
+    candidates = [
+        _collapse_candidate("C-LOW", cheap_score=0.8, vector_score=0.99, confidence=0.99),
+        _collapse_candidate("C-HIGH", cheap_score=0.9, vector_score=0.5, confidence=0.5),
+        _collapse_candidate("V-LOW", cheap_score=0.8, vector_score=0.7, confidence=0.99),
+        _collapse_candidate("V-HIGH", cheap_score=0.8, vector_score=0.8, confidence=0.5),
+        _collapse_candidate("F-LOW", cheap_score=0.7, vector_score=0.7, confidence=0.6),
+        _collapse_candidate("F-HIGH", cheap_score=0.7, vector_score=0.7, confidence=0.9),
+        _collapse_candidate("Z-ID", cheap_score=0.6, vector_score=0.6, confidence=0.6),
+        _collapse_candidate("A-ID", cheap_score=0.6, vector_score=0.6, confidence=0.6),
+    ]
+    groups = {
+        "C-LOW": "EQ-CHEAP",
+        "C-HIGH": "EQ-CHEAP",
+        "V-LOW": "EQ-VECTOR",
+        "V-HIGH": "EQ-VECTOR",
+        "F-LOW": "EQ-CONFIDENCE",
+        "F-HIGH": "EQ-CONFIDENCE",
+        "Z-ID": "EQ-ID",
+        "A-ID": "EQ-ID",
+    }
+
+    collapsed = _collapse_equivalent_ranked_candidates(
+        candidates,
+        equivalence_group_by_id=groups,
+        limit=5,
+    )
+
+    representatives = {
+        group["equivalent_memory_group_id"]: group["representative_memory_id"]
+        for group in collapsed["equivalence_collapse_groups"]
+    }
+    assert representatives == {
+        "EQ-CHEAP": "C-HIGH",
+        "EQ-VECTOR": "V-HIGH",
+        "EQ-CONFIDENCE": "F-HIGH",
+        "EQ-ID": "A-ID",
+    }
+    assert collapsed["pre_collapse_candidate_count"] == 8
+    assert collapsed["post_collapse_candidate_count"] == 4
+    assert collapsed["equivalence_groups_collapsed"] == 4
+    assert collapsed["duplicate_slots_removed"] == 4
+    assert collapsed["top5_duplicate_semantic_memory_count"] == 0
+
+
+def test_v2_equivalence_collapse_precedes_judge_limit() -> None:
+    candidates = [
+        _collapse_candidate("D1", cheap_score=1.0, vector_score=1.0, confidence=0.9),
+        _collapse_candidate("D2", cheap_score=0.99, vector_score=0.99, confidence=0.9),
+        *[
+            _collapse_candidate(
+                f"N{index}",
+                cheap_score=0.9 - index / 100,
+                vector_score=0.9 - index / 100,
+                confidence=0.9,
+            )
+            for index in range(1, 6)
+        ],
+    ]
+
+    collapsed = _collapse_equivalent_ranked_candidates(
+        candidates,
+        equivalence_group_by_id={"D1": "EQ-D", "D2": "EQ-D"},
+        limit=5,
+    )
+
+    assert [row["memory_id"] for row in collapsed["ranked"]] == [
+        "D1",
+        "N1",
+        "N2",
+        "N3",
+        "N4",
+    ]
+    assert collapsed["pre_collapse_candidate_count"] == 7
+    assert collapsed["post_collapse_candidate_count"] == 6
+    assert collapsed["duplicate_slots_removed"] == 1
+    assert collapsed["top5_duplicate_semantic_memory_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_v2_ltw2_004_judge_sees_one_equivalent_semantic_memory() -> None:
+    judge = _ScriptedJudge(ClaimRelation.SAME, ["O016"])
+    report = await evaluate_memory_longtail_write_v2(
+        CASES,
+        SHARED,
+        embedding_provider=FixtureTextEmbeddingProvider(),
+        judge=judge,
+        case_id="LTW2-004",
+        use_production_retriever=True,
+        fail_on_error=True,
+    )
+
+    row = report["rows"][0]
+    retrieval = row["retrieval"]
+    retrieved_judge_ids = judge.calls[1]
+    assert "O016" in retrieved_judge_ids
+    assert "SI001" not in retrieved_judge_ids
+    assert retrieved_judge_ids == [
+        candidate["memory_id"] for candidate in retrieval["ranked"]
+    ]
+    assert retrieval["pre_collapse_candidate_count"] == 20
+    assert retrieval["post_collapse_candidate_count"] < 20
+    assert retrieval["equivalence_groups_collapsed"] >= 1
+    assert retrieval["duplicate_slots_removed"] >= 1
+    assert retrieval["top5_duplicate_semantic_memory_count"] == 0
+    metrics = report["retrieval_metrics"]
+    for field in (
+        "pre_collapse_candidate_count",
+        "post_collapse_candidate_count",
+        "equivalence_groups_collapsed",
+        "duplicate_slots_removed",
+        "top5_duplicate_semantic_memory_count",
+    ):
+        assert metrics[field] == retrieval[field]
+    assert metrics["top5_duplicate_semantic_memory_count"] == 0
+    assert "`top5_duplicate_semantic_memory_count`" in (
+        render_memory_longtail_write_v2_report(report)
+    )
+    assert all(
+        set(group)
+        == {
+            "equivalent_memory_group_id",
+            "representative_memory_id",
+            "representative_rank_before_collapse",
+            "removed_memory_ids",
+        }
+        for group in retrieval["equivalence_collapse_groups"]
+    )
+
+
 def test_v2_conditional_retention_and_end_to_end_recall_use_distinct_denominators() -> None:
     inventory = [_retrieval_metric_candidate(f"G{index}", 0) for index in range(1, 4)]
     vector = [
@@ -775,6 +1020,12 @@ def test_v2_conditional_retention_and_end_to_end_recall_use_distinct_denominator
     assert metrics["conditional_gold_retention_at_5"] == 0.5
     assert metrics["gold_retention_at_5"] == 0.5
     assert metrics["end_to_end_gold_recall_at_5"] == 0.3333
+    assert metrics["semantic_candidate_limit"] == 1
+    assert metrics["semantic_hit_at_k"] == 1.0
+    assert metrics["semantic_recall_at_k"] == 0.3333
+    assert metrics["semantic_gold_retention_at_k"] == 0.5
+    assert metrics["semantic_target_set_exact_at_k"] == 0.0
+    assert metrics["semantic_mrr_at_k"] == 1.0
 
 
 def test_v2_error_attribution_distinguishes_embedding_failure_and_review_scope() -> None:
@@ -823,6 +1074,130 @@ def test_v2_store_exception_is_primary_over_derived_write_policy_mismatch() -> N
 
 
 @pytest.mark.parametrize(
+    ("candidate_relations", "actual_targets", "expected_diagnostic"),
+    [
+        (
+            [
+                {
+                    "memory_id": "O001",
+                    "relation": "same",
+                    "is_direct_target": False,
+                    "confidence": 0.9,
+                },
+                {
+                    "memory_id": "O002",
+                    "relation": "complementary",
+                    "is_direct_target": True,
+                    "confidence": 0.9,
+                },
+            ],
+            ["O002"],
+            "DIRECT_TARGET_ELIGIBILITY_ERROR",
+        ),
+        (
+            [
+                {
+                    "memory_id": "O001",
+                    "relation": "same",
+                    "is_direct_target": True,
+                    "confidence": 0.9,
+                }
+            ],
+            [],
+            "TARGET_AGGREGATION_ERROR",
+        ),
+    ],
+)
+def test_v2_target_failure_attribution_separates_eligibility_from_aggregation(
+    candidate_relations: list[dict[str, object]],
+    actual_targets: list[str],
+    expected_diagnostic: str,
+) -> None:
+    case = _case("LTW2-001")
+    stage = {
+        "judge_status": "completed",
+        "candidate_ids": [item["memory_id"] for item in candidate_relations],
+        "candidate_relations": candidate_relations,
+        "candidate_relation_trace_complete": True,
+        "proposal": {
+            "relation": case["expected_relation"],
+            "target_memory_ids": actual_targets,
+        },
+        "validation": {"would_update": False},
+    }
+
+    failure = _attribute_failure(
+        case=case,
+        collision=None,
+        retrieval_checks={"gold_in_top_20": True, "gold_retained_after_ranking": True},
+        retrieved_checks={"target_set": False, "relation": True},
+        relation_stage=stage,
+        store_result={"error": None, "checks": {"write_action": True}},
+        retrieval={"vector": [], "ranked": []},
+    )
+
+    assert failure["primary"] == "TARGET_SELECTION_ERROR"
+    assert expected_diagnostic in failure["secondary"]
+
+
+def test_v2_relation_failure_attribution_exposes_classification_diagnostic() -> None:
+    case = _case("LTW2-001")
+    failure = _attribute_failure(
+        case=case,
+        collision=None,
+        retrieval_checks={"gold_in_top_20": True, "gold_retained_after_ranking": True},
+        retrieved_checks={"target_set": True, "relation": False},
+        relation_stage={
+            "judge_status": "completed",
+            "candidate_relations": [],
+            "proposal": {
+                "relation": ClaimRelation.COMPLEMENTARY.value,
+                "target_memory_ids": list(case["expected_target_ids"]),
+            },
+            "validation": {"would_update": False},
+        },
+        store_result={"error": None, "checks": {"write_action": True}},
+        retrieval={"vector": [], "ranked": []},
+    )
+
+    assert failure["primary"] == "SEMANTIC_RELATION_ERROR"
+    assert "RELATION_CLASSIFICATION_ERROR" in failure["secondary"]
+
+
+def test_v2_ranking_drop_does_not_manufacture_direct_target_blame() -> None:
+    case = _case("LTW2-001")
+    failure = _attribute_failure(
+        case=case,
+        collision=None,
+        retrieval_checks={"gold_in_top_20": True, "gold_retained_after_ranking": False},
+        retrieved_checks={"target_set": False, "relation": True},
+        relation_stage={
+            "judge_status": "completed",
+            "candidate_ids": ["O002"],
+            "candidate_relation_trace_complete": True,
+            "candidate_relations": [
+                {
+                    "memory_id": "O002",
+                    "relation": "unrelated",
+                    "is_direct_target": False,
+                    "confidence": 0.9,
+                }
+            ],
+            "proposal": {
+                "relation": case["expected_relation"],
+                "target_memory_ids": [],
+            },
+            "validation": {"would_update": False},
+        },
+        store_result={"error": None, "checks": {"write_action": True}},
+        retrieval={"vector": [], "ranked": []},
+    )
+
+    assert failure["primary"] == "RANKING_DROP"
+    assert "DIRECT_TARGET_ELIGIBILITY_ERROR" not in failure["secondary"]
+
+
+@pytest.mark.parametrize(
     ("error", "primary", "secondary"),
     [
         (
@@ -856,6 +1231,9 @@ async def test_v2_report_exposes_coverage_and_model_telemetry() -> None:
     assert "judge_evaluated_count" in report["telemetry"]["judge"]
     assert "judge_relation_mismatch_count" in report["telemetry"]["judge"]
     assert "Model and Evaluation Telemetry" in rendered
+    assert "Secondary diagnostic" in rendered
+    assert "Candidate-wise Failure Trace" in rendered
+    assert "Bounded Failure Details" in rendered
     assert "Review-excluded Metrics" in rendered
     assert "Collision Details" in rendered
 
@@ -1044,6 +1422,219 @@ def test_v2_fixture_live_comparison_rejects_repeat_or_rank_scope_mismatch() -> N
     assert compare_memory_longtail_write_v2_reports(fixture, live)["status"] == "SCOPE_MISMATCH"
 
 
+def _semantic_remediation_report(
+    *,
+    status: str,
+    retrieved_relation_accuracy: float,
+    retrieved_macro_f1: float,
+    contradiction_recall: float,
+    contradiction_f1: float,
+    target_set_accuracy: float,
+    target_micro_f1: float,
+    multi_target_count: int,
+    exact_multi_target_count: int,
+    overbroad_multi_target_count: int,
+    avg_total_tokens: float,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "dataset": {
+            "case_sha256": "frozen-cases",
+            "shared_bank_sha256": "frozen-shared-bank",
+        },
+        "case_count": EXPECTED_CASE_COUNT,
+        "repeat": 1,
+        "hard_cases_only": False,
+        "retrieval_metrics": {
+            "raw_retrieval_recall_at_20": 1.0,
+            "equivalence_aware_recall_at_20": 1.0,
+            "conditional_gold_retention_at_5": 0.95,
+            "end_to_end_gold_recall_at_5": 0.90,
+            "top5_duplicate_semantic_memory_count": 0,
+        },
+        "oracle_relation_metrics": {
+            "relation_accuracy": 0.80,
+            "macro_f1": 0.75,
+            "target_set_accuracy": 0.85,
+            "target_micro_f1": 0.90,
+        },
+        "retrieved_relation_metrics": {
+            "relation_accuracy": retrieved_relation_accuracy,
+            "macro_f1": retrieved_macro_f1,
+            "target_set_accuracy": target_set_accuracy,
+            "target_micro_f1": target_micro_f1,
+        },
+        "contradiction_diagnostics": {
+            "retrieved": {"recall": contradiction_recall, "f1": contradiction_f1}
+        },
+        "multi_target_metrics": {
+            "retrieved_proposal_count": multi_target_count,
+            "exact_expected_multi_target_proposal_count": exact_multi_target_count,
+            "overbroad_multi_target_proposal_count": overbroad_multi_target_count,
+        },
+        "safety_metrics": {"destructive_safety_violation_count": 0},
+        "telemetry": {
+            "judge": {
+                "retrieved": {
+                    "avg_prompt_tokens": avg_total_tokens - 100,
+                    "avg_completion_tokens": 100.0,
+                    "avg_total_tokens": avg_total_tokens,
+                }
+            }
+        },
+        "rows": [],
+    }
+
+
+def test_v2_semantic_remediation_comparison_reports_before_after_and_delta() -> None:
+    baseline = _semantic_remediation_report(
+        status="SEMANTIC_JUDGE_REMEDIATION_REQUIRED",
+        retrieved_relation_accuracy=0.60,
+        retrieved_macro_f1=0.505,
+        contradiction_recall=0.0,
+        contradiction_f1=0.0,
+        target_set_accuracy=0.275,
+        target_micro_f1=0.5435,
+        multi_target_count=19,
+        exact_multi_target_count=0,
+        overbroad_multi_target_count=19,
+        avg_total_tokens=1327.0,
+    )
+    remediation = _semantic_remediation_report(
+        status="MEMORY_V2_FREEZE_READY",
+        retrieved_relation_accuracy=0.78,
+        retrieved_macro_f1=0.71,
+        contradiction_recall=0.80,
+        contradiction_f1=0.80,
+        target_set_accuracy=0.65,
+        target_micro_f1=0.72,
+        multi_target_count=5,
+        exact_multi_target_count=3,
+        overbroad_multi_target_count=4,
+        avg_total_tokens=1400.0,
+    )
+
+    comparison = compare_memory_longtail_write_v2_semantic_remediation(
+        baseline,
+        remediation,
+    )
+
+    assert comparison["status"] == "COMPARABLE"
+    assert comparison["baseline_status"] == "SEMANTIC_JUDGE_REMEDIATION_REQUIRED"
+    assert comparison["remediation_status"] == "MEMORY_V2_FREEZE_READY"
+    assert comparison["metrics"]["retrieved_relation_accuracy"] == {
+        "baseline": 0.60,
+        "remediation": 0.78,
+        "delta": 0.18,
+    }
+    assert comparison["metrics"]["retrieved_contradiction_recall"]["delta"] == 0.8
+    assert comparison["metrics"]["overbroad_multi_target_proposal_count"]["delta"] == -15.0
+    assert comparison["metrics"]["destructive_safety_violation_count"]["delta"] == 0.0
+    assert comparison["metrics"]["retrieved_judge_avg_total_tokens"]["delta"] == 73.0
+
+    remediation["dataset"]["case_sha256"] = "different-cases"
+    assert (
+        compare_memory_longtail_write_v2_semantic_remediation(baseline, remediation)[
+            "status"
+        ]
+        == "SCOPE_MISMATCH"
+    )
+
+
+def test_v2_semantic_remediation_comparison_uses_legacy_duplicate_metric_and_scope() -> None:
+    baseline = _semantic_remediation_report(
+        status="SEMANTIC_JUDGE_REMEDIATION_REQUIRED",
+        retrieved_relation_accuracy=0.60,
+        retrieved_macro_f1=0.505,
+        contradiction_recall=0.0,
+        contradiction_f1=0.0,
+        target_set_accuracy=0.275,
+        target_micro_f1=0.5435,
+        multi_target_count=19,
+        exact_multi_target_count=0,
+        overbroad_multi_target_count=19,
+        avg_total_tokens=1327.0,
+    )
+    remediation = _semantic_remediation_report(
+        status="SEMANTIC_JUDGE_REMEDIATION_REQUIRED",
+        retrieved_relation_accuracy=0.75,
+        retrieved_macro_f1=0.6512,
+        contradiction_recall=1.0,
+        contradiction_f1=0.9091,
+        target_set_accuracy=0.45,
+        target_micro_f1=0.6737,
+        multi_target_count=17,
+        exact_multi_target_count=0,
+        overbroad_multi_target_count=16,
+        avg_total_tokens=1912.05,
+    )
+    baseline["filters"] = {"case_id": None, "slice": None}
+    remediation["filters"] = {"case_id": None, "slice": None}
+    baseline["parameters"] = {"vector_top_k": 20, "cheap_rank_top_n": 5}
+    remediation["parameters"] = {"vector_top_k": 20, "cheap_rank_top_n": 5}
+    baseline["retrieval_metrics"].pop("top5_duplicate_semantic_memory_count")
+    baseline["retrieval_metrics"]["equivalence_group_duplicate_slot_count_at_5"] = 17
+
+    comparison = compare_memory_longtail_write_v2_semantic_remediation(
+        baseline, remediation
+    )
+
+    assert comparison["status"] == "COMPARABLE"
+    assert comparison["metrics"]["top5_duplicate_semantic_memory_count"] == {
+        "baseline": 17,
+        "remediation": 0,
+        "delta": -17.0,
+    }
+    remediation["parameters"]["vector_top_k"] = 10
+    assert (
+        compare_memory_longtail_write_v2_semantic_remediation(baseline, remediation)[
+            "status"
+        ]
+        == "SCOPE_MISMATCH"
+    )
+
+
+def test_v2_report_renders_semantic_remediation_before_after_table() -> None:
+    baseline = _semantic_remediation_report(
+        status="SEMANTIC_JUDGE_REMEDIATION_REQUIRED",
+        retrieved_relation_accuracy=0.60,
+        retrieved_macro_f1=0.505,
+        contradiction_recall=0.0,
+        contradiction_f1=0.0,
+        target_set_accuracy=0.275,
+        target_micro_f1=0.5435,
+        multi_target_count=19,
+        exact_multi_target_count=0,
+        overbroad_multi_target_count=19,
+        avg_total_tokens=1327.0,
+    )
+    remediation = _semantic_remediation_report(
+        status="MEMORY_V2_FREEZE_READY",
+        retrieved_relation_accuracy=0.78,
+        retrieved_macro_f1=0.71,
+        contradiction_recall=0.80,
+        contradiction_f1=0.80,
+        target_set_accuracy=0.65,
+        target_micro_f1=0.72,
+        multi_target_count=5,
+        exact_multi_target_count=3,
+        overbroad_multi_target_count=4,
+        avg_total_tokens=1400.0,
+    )
+    remediation["semantic_remediation_comparison"] = (
+        compare_memory_longtail_write_v2_semantic_remediation(baseline, remediation)
+    )
+
+    rendered = render_memory_longtail_write_v2_report(remediation)
+
+    assert "## Baseline Final Live vs Semantic Judge Remediation" in rendered
+    assert "- Comparison status: `COMPARABLE`" in rendered
+    assert "| Metric | Baseline Final Live | Remediation | Delta |" in rendered
+    assert "| `retrieved_relation_accuracy` | 0.6000 | 0.7800 | 0.1800 |" in rendered
+    assert "| `retrieved_contradiction_recall` | 0.0000 | 0.8000 | 0.8000 |" in rendered
+    assert "| `overbroad_multi_target_proposal_count` | 19 | 4 | -15.0000 |" in rendered
+
+
 def _final_validation_report(*, hard: bool = False) -> dict[str, Any]:
     report: dict[str, Any] = {
         "dataset": {
@@ -1054,6 +1645,7 @@ def _final_validation_report(*, hard: bool = False) -> dict[str, Any]:
         "retrieval_metrics": {
             "raw_retrieval_recall_at_20": 0.95,
             "equivalence_aware_recall_at_20": 0.97,
+            "top5_duplicate_semantic_memory_count": 0,
         },
         "retrieved_relation_metrics": {
             "relation_accuracy": 0.75,
@@ -1091,6 +1683,132 @@ def _final_validation_report(*, hard: bool = False) -> dict[str, Any]:
     return report
 
 
+def _top_k_ablation_report(
+    k: int,
+    *,
+    semantic_recall: float,
+    relation_accuracy: float,
+    target_accuracy: float,
+    target_f1: float,
+    safety_violations: int,
+) -> dict[str, Any]:
+    return {
+        "dataset": {"case_sha256": "cases", "shared_bank_sha256": "bank"},
+        "filters": {"case_id": None, "slice": None},
+        "case_count": 40,
+        "repeat": 1,
+        "passed_case_count": 10 + k,
+        "failed_case_count": 30 - k,
+        "parameters": {
+            "vector_top_k": 20,
+            "cheap_rank_top_n": k,
+            "semantic_judge_candidate_limit": k,
+            "semantic_judge_protocol": "candidate-wise-v1",
+        },
+        "retrieval_metrics": {
+            "semantic_hit_at_k": semantic_recall,
+            "semantic_recall_at_k": semantic_recall,
+            "semantic_gold_retention_at_k": semantic_recall,
+            "semantic_target_set_exact_at_k": semantic_recall,
+            "semantic_mrr_at_k": semantic_recall,
+            "hard_negative_promotion_rate": 0.1,
+        },
+        "retrieved_relation_metrics": {
+            "relation_accuracy": relation_accuracy,
+            "macro_f1": relation_accuracy,
+            "target_set_accuracy": target_accuracy,
+            "target_micro_precision": target_f1,
+            "target_micro_recall": target_f1,
+            "target_micro_f1": target_f1,
+        },
+        "multi_target_metrics": {
+            "retrieved_proposal_count": 10,
+            "expected_multi_target_case_count": 4,
+            "exact_expected_multi_target_proposal_count": 1,
+            "overbroad_multi_target_proposal_count": 3,
+        },
+        "write_metrics": {
+            "store_action_accuracy": 0.8,
+            "store_application_error_count": 0,
+        },
+        "safety_metrics": {
+            "destructive_safety_violation_count": safety_violations,
+        },
+        "telemetry": {
+            "judge": {
+                "retrieved": {
+                    "unexpected_target_count": 2,
+                    "avg_prompt_tokens": 1000 + 100 * k,
+                    "avg_completion_tokens": 100,
+                    "avg_total_tokens": 1100 + 100 * k,
+                    "latency_p50_ms": 1000,
+                    "latency_p95_ms": 1500,
+                }
+            }
+        },
+        "rows": [],
+    }
+
+
+def test_v2_top_k_ablation_selects_best_safe_recall_arm() -> None:
+    comparison = compare_memory_longtail_write_v2_top_k_ablation(
+        {
+            3: _top_k_ablation_report(
+                3,
+                semantic_recall=0.775,
+                relation_accuracy=0.65,
+                target_accuracy=0.40,
+                target_f1=0.60,
+                safety_violations=0,
+            ),
+            4: _top_k_ablation_report(
+                4,
+                semantic_recall=0.85,
+                relation_accuracy=0.675,
+                target_accuracy=0.40,
+                target_f1=0.6436,
+                safety_violations=1,
+            ),
+            5: _top_k_ablation_report(
+                5,
+                semantic_recall=0.90,
+                relation_accuracy=0.775,
+                target_accuracy=0.475,
+                target_f1=0.6882,
+                safety_violations=0,
+            ),
+        }
+    )
+
+    assert comparison["status"] == "COMPARABLE"
+    assert comparison["recommended_semantic_top_k"] == 5
+    assert comparison["arms"]["4"]["destructive_safety_violation_count"] == 1
+    rendered = render_memory_longtail_write_v2_top_k_ablation(comparison)
+    assert "| `semantic_recall_at_k` | 0.7750 | 0.8500 | 0.9000 |" in rendered
+    assert "Recommended semantic Top-K: **5**" in rendered
+
+
+def test_v2_top_k_ablation_fails_closed_for_scope_mismatch() -> None:
+    reports = {
+        k: _top_k_ablation_report(
+            k,
+            semantic_recall=0.9,
+            relation_accuracy=0.75,
+            target_accuracy=0.5,
+            target_f1=0.7,
+            safety_violations=0,
+        )
+        for k in (3, 4, 5)
+    }
+    reports[4]["dataset"]["case_sha256"] = "different"
+
+    comparison = compare_memory_longtail_write_v2_top_k_ablation(reports)
+
+    assert comparison["status"] == "SCOPE_MISMATCH"
+    assert comparison["recommended_semantic_top_k"] is None
+    assert "top_4_dataset_or_run_scope_mismatch" in comparison["scope_errors"]
+
+
 def test_v2_final_live_status_combines_full_quality_and_hard_stability() -> None:
     full, hard = finalize_memory_longtail_write_v2_live_validation(
         _final_validation_report(),
@@ -1098,14 +1816,53 @@ def test_v2_final_live_status_combines_full_quality_and_hard_stability() -> None
         repository={"repo": "test", "branch": "main", "commit_sha": "abc"},
     )
 
-    assert full["status"] == "MEMORY_V2_FREEZE_READY"
-    assert hard["status"] == "MEMORY_V2_FREEZE_READY"
+    assert full["status"] == "MEMORY_V2_FREEZE_READY_MINIMUM"
+    assert hard["status"] == "MEMORY_V2_FREEZE_READY_MINIMUM"
     assert full["final_validation"]["checks"]["hard_case_scope_complete"] is True
+    assert full["final_validation"]["stretch_target_met"] is True
     assert full["production_store_mutation_permitted"] is False
     markdown = render_memory_longtail_write_v2_report(full)
     assert "## Final Questions" in markdown
-    assert "13. Current status: **MEMORY_V2_FREEZE_READY**" in markdown
+    assert "13. Current status: **MEMORY_V2_FREEZE_READY_MINIMUM**" in markdown
     assert "raw_retrieval_recall_at_20" in markdown
+
+
+def test_v2_final_live_minimum_freeze_line_is_distinct_from_stretch() -> None:
+    full = _final_validation_report()
+    full["retrieved_relation_metrics"].update(
+        {
+            "relation_accuracy": 0.70,
+            "macro_f1": 0.60,
+            "target_set_accuracy": 0.50,
+            "target_micro_f1": 0.65,
+        }
+    )
+
+    finalized, _ = finalize_memory_longtail_write_v2_live_validation(
+        full,
+        _final_validation_report(hard=True),
+        repository={"repo": "test", "branch": "main", "commit_sha": "abc"},
+    )
+
+    assert finalized["status"] == "MEMORY_V2_FREEZE_READY_MINIMUM"
+    assert all(finalized["final_validation"]["minimum_freeze_checks"].values())
+    assert finalized["final_validation"]["stretch_target_met"] is False
+
+
+def test_v2_final_live_status_rejects_duplicate_semantic_top5_slots() -> None:
+    full = _final_validation_report()
+    full["retrieval_metrics"]["top5_duplicate_semantic_memory_count"] = 1
+
+    finalized, _ = finalize_memory_longtail_write_v2_live_validation(
+        full,
+        _final_validation_report(hard=True),
+        repository={"repo": "test", "branch": "main", "commit_sha": "abc"},
+    )
+
+    validation = finalized["final_validation"]
+    assert finalized["status"] == "SEMANTIC_JUDGE_REMEDIATION_REQUIRED"
+    assert validation["checks"]["top5_duplicate_semantic_memory_count"] is False
+    assert "top5_duplicate_semantic_memory_count" in validation["failed_checks"]
 
 
 @pytest.mark.parametrize(
@@ -1126,7 +1883,7 @@ def test_v2_final_live_status_fails_closed_by_stage(
     if mutation == "retrieval":
         full["retrieval_metrics"]["raw_retrieval_recall_at_20"] = 0.94
     elif mutation == "relation":
-        full["retrieved_relation_metrics"]["relation_accuracy"] = 0.74
+        full["retrieved_relation_metrics"]["relation_accuracy"] = 0.69
     elif mutation == "stability":
         hard["hard_case_consistency"]["target_consistency_rate"] = 0.6667
     else:

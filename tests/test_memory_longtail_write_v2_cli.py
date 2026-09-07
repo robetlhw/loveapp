@@ -32,7 +32,11 @@ def _report() -> dict[str, object]:
 
 
 def test_longtail_write_v2_cli_help_exposes_retrieval_parameters() -> None:
-    result = CliRunner().invoke(cli.app, ["eval", "memory-longtail-write-v2", "--help"])
+    result = CliRunner().invoke(
+        cli.app,
+        ["eval", "memory-longtail-write-v2", "--help"],
+        terminal_width=200,
+    )
 
     assert result.exit_code == 0, result.output
     for option in (
@@ -47,6 +51,9 @@ def test_longtail_write_v2_cli_help_exposes_retrieval_parameters() -> None:
         "--hard-cases",
         "--compare-fixture",
         "--final-live-val",
+        "--semantic-remed",
+        "--baseline-report",
+        "--hard-baseline-",
         "--output",
         "--fail-on-error",
     ):
@@ -396,3 +403,139 @@ def test_longtail_write_v2_cli_final_live_rejects_fixture_mode() -> None:
 
     assert result.exit_code != 0
     assert "requires --mode live" in result.output
+
+
+def test_longtail_write_v2_cli_semantic_remediation_writes_fixed_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    full = _report() | {"status": "MEMORY_V2_FREEZE_READY"}
+    hard = _report() | {"status": "MEMORY_V2_FREEZE_READY"}
+    observed: dict[str, object] = {}
+
+    async def fake_remediation(*args: object, **kwargs: object) -> tuple[dict, dict]:
+        observed["args"] = args
+        observed["kwargs"] = kwargs
+        return full, hard
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "get_settings", lambda: object())
+    monkeypatch.setattr(
+        cli,
+        "_run_semantic_remediation_memory_longtail_write_v2_eval",
+        fake_remediation,
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "eval",
+            "memory-longtail-write-v2",
+            "--semantic-remediation-validation",
+            "--baseline-report",
+            "baseline.json",
+            "--hard-baseline-report",
+            "hard-baseline.json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    output_dir = tmp_path / ".data/evals"
+    expected = {
+        "memory_longtail_write_v2_semantic_remediation_live.json",
+        "memory_longtail_write_v2_semantic_remediation_live.md",
+        "memory_longtail_write_v2_semantic_remediation_hard.json",
+        "memory_longtail_write_v2_semantic_remediation_hard.md",
+    }
+    assert {path.name for path in output_dir.iterdir()} == expected
+    assert observed["kwargs"]["baseline_report"] == Path("baseline.json")
+    assert observed["kwargs"]["hard_baseline_report"] == Path("hard-baseline.json")
+    assert observed["kwargs"]["compare_fixture"] is True
+
+
+@pytest.mark.asyncio
+async def test_semantic_remediation_runner_attaches_full_and_hard_comparisons(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline_path = tmp_path / "baseline.json"
+    hard_baseline_path = tmp_path / "hard-baseline.json"
+    baseline_path.write_text(json.dumps({"status": "OLD_FULL"}), encoding="utf-8")
+    hard_baseline_path.write_text(json.dumps({"status": "OLD_HARD"}), encoding="utf-8")
+    full = _report() | {"status": "NEW_FULL"}
+    hard = _report() | {"status": "NEW_HARD"}
+    calls: list[tuple[str, str]] = []
+
+    async def fake_final(*args: object, **kwargs: object) -> tuple[dict, dict]:
+        del args, kwargs
+        return full, hard
+
+    def fake_compare(baseline: dict, remediation: dict) -> dict[str, str]:
+        calls.append((baseline["status"], remediation["status"]))
+        return {"status": "COMPARABLE"}
+
+    monkeypatch.setattr(cli, "_run_final_live_memory_longtail_write_v2_eval", fake_final)
+    monkeypatch.setattr(
+        cli,
+        "compare_memory_longtail_write_v2_semantic_remediation",
+        fake_compare,
+    )
+
+    actual_full, actual_hard = (
+        await cli._run_semantic_remediation_memory_longtail_write_v2_eval(
+            Path("cases.jsonl"),
+            Path("shared.jsonl"),
+            settings=object(),
+            vector_limit=20,
+            rank_limit=5,
+            fail_on_error=False,
+            compare_fixture=True,
+            baseline_report=baseline_path,
+            hard_baseline_report=hard_baseline_path,
+        )
+    )
+
+    assert calls == [("OLD_FULL", "NEW_FULL"), ("OLD_HARD", "NEW_HARD")]
+    assert actual_full["semantic_remediation_comparison"] == {"status": "COMPARABLE"}
+    assert actual_hard["semantic_remediation_comparison"] == {"status": "COMPARABLE"}
+    assert actual_full["semantic_remediation_baseline"] == {
+        "artifact": str(baseline_path),
+        "status": "OLD_FULL",
+    }
+    assert actual_hard["semantic_remediation_baseline"] == {
+        "artifact": str(hard_baseline_path),
+        "status": "OLD_HARD",
+    }
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "message"),
+    [
+        (["--mode", "fixture"], "requires --mode live"),
+        (["--case", "LTW2-001"], "cannot be combined"),
+        (["--repeat", "3"], "manages its own"),
+        (["--final-live-validation"], "cannot be combined"),
+        (["--output", "custom.json"], "--output is not supported"),
+    ],
+)
+def test_longtail_write_v2_cli_semantic_remediation_rejects_incompatible_options(
+    extra_args: list[str],
+    message: str,
+) -> None:
+    result = CliRunner().invoke(
+        cli.app,
+        ["eval", "memory-longtail-write-v2", "--semantic-remediation-validation", *extra_args],
+    )
+
+    assert result.exit_code != 0
+    assert message in " ".join(result.output.split())
+
+
+def test_load_longtail_write_v2_report_fails_closed_for_invalid_baseline(
+    tmp_path: Path,
+) -> None:
+    invalid = tmp_path / "invalid.json"
+    invalid.write_text("[]", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        cli._load_memory_longtail_write_v2_report(invalid)

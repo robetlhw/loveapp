@@ -243,7 +243,17 @@ async def test_recovered_location_seeds_a_new_date_task_without_polluting_patch(
 @pytest.mark.asyncio
 async def test_exact_postponed_activation_scenario_builds_full_plan(
     app_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class _ReferenceDate(date):
+        @classmethod
+        def today(cls) -> date:
+            return cls(2026, 8, 27)
+
+    monkeypatch.setattr(
+        "loveapp.application.date_planning.fact_parsing.date",
+        _ReferenceDate,
+    )
     container = build_container(app_settings)
     try:
         active_task = None

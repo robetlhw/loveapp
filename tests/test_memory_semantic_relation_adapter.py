@@ -73,15 +73,54 @@ def _judge(
     return judge, completions
 
 
+def _candidate_wise_payload(
+    *,
+    candidate_relations: list[tuple[str, str, object]],
+    target_memory_ids: object,
+    overall_relation: object,
+    confidence: object,
+    reason: str,
+    direct_target_ids: list[str] | None = None,
+) -> dict[str, object]:
+    if direct_target_ids is None:
+        if isinstance(target_memory_ids, str):
+            direct_target_ids = [target_memory_ids]
+        elif isinstance(target_memory_ids, list):
+            direct_target_ids = [
+                value for value in target_memory_ids if isinstance(value, str)
+            ]
+        else:
+            direct_target_ids = []
+    direct_targets = set(direct_target_ids)
+    return {
+        "candidate_relations": [
+            {
+                "memory_id": memory_id,
+                "relation": relation,
+                "is_direct_target": memory_id in direct_targets,
+                "confidence": candidate_confidence,
+            }
+            for memory_id, relation, candidate_confidence in candidate_relations
+        ],
+        "target_memory_ids": target_memory_ids,
+        "overall_relation": overall_relation,
+        "confidence": confidence,
+        "reason": reason,
+    }
+
+
 @pytest.mark.asyncio
 async def test_semantic_relation_adapter_can_request_bounded_target_sets() -> None:
-    payload = {
-        "relation": "complementary",
-        "target_memory_ids": ["first", "second"],
-        "same_semantic_dimension": False,
-        "confidence": 0.94,
-        "reason": "The incoming claim explicitly contains two related details.",
-    }
+    payload = _candidate_wise_payload(
+        candidate_relations=[
+            ("first", "complementary", 0.94),
+            ("second", "complementary", 0.92),
+        ],
+        target_memory_ids=["first", "second"],
+        overall_relation="complementary",
+        confidence=0.94,
+        reason="The incoming claim explicitly contains two related details.",
+    )
     judge, completions = _judge(json.dumps(payload), max_target_count=5)
 
     try:
@@ -105,13 +144,13 @@ async def test_semantic_relation_adapter_can_request_bounded_target_sets() -> No
 
 @pytest.mark.asyncio
 async def test_semantic_relation_adapter_fails_closed_for_unknown_target() -> None:
-    payload = {
-        "relation": "update",
-        "target_memory_ids": ["not-a-candidate"],
-        "same_semantic_dimension": True,
-        "confidence": 0.99,
-        "reason": "The incoming claim updates a candidate.",
-    }
+    payload = _candidate_wise_payload(
+        candidate_relations=[("social-pattern-old", "update", 0.99)],
+        target_memory_ids=["not-a-candidate"],
+        overall_relation="update",
+        confidence=0.99,
+        reason="The incoming claim updates a candidate.",
+    )
     judge, _ = _judge(json.dumps(payload))
     trace = ExecutionTrace()
     try:
@@ -129,6 +168,324 @@ async def test_semantic_relation_adapter_fails_closed_for_unknown_target() -> No
     assert details["target_policy_status"] == "fail_closed"
     assert details["target_policy_reasons"] == "unknown_target_id"
     assert details["target_policy_rejected_ids"] == "not-a-candidate"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("candidate_relations", "expected_reason", "expected_rejected"),
+    [
+        ([], "missing_candidate_relation_id", ""),
+        (
+            [("not-a-candidate", "unrelated", 0.9)],
+            "unknown_candidate_relation_id,missing_candidate_relation_id",
+            "not-a-candidate",
+        ),
+        (
+            [
+                ("social-pattern-old", "unrelated", 0.9),
+                ("social-pattern-old", "unrelated", 0.8),
+            ],
+            "duplicate_candidate_relation_ids",
+            "",
+        ),
+    ],
+    ids=["missing", "unknown", "duplicate"],
+)
+async def test_semantic_relation_adapter_requires_exact_candidate_coverage(
+    candidate_relations: list[tuple[str, str, object]],
+    expected_reason: str,
+    expected_rejected: str,
+) -> None:
+    payload = _candidate_wise_payload(
+        candidate_relations=candidate_relations,
+        target_memory_ids=[],
+        overall_relation="unrelated",
+        confidence=0.9,
+        reason="Candidate coverage must be exact.",
+    )
+    judge, _ = _judge(json.dumps(payload))
+    trace = ExecutionTrace()
+    try:
+        proposal = await judge.propose_relation(
+            incoming=_incoming(),
+            candidates=[_target()],
+            trace=trace,
+        )
+    finally:
+        await judge.aclose()
+
+    assert proposal.relation == ClaimRelation.UNCERTAIN
+    assert proposal.target_memory_ids == []
+    details = _model_trace_details(trace)
+    assert details["target_policy_status"] == "fail_closed"
+    assert details["target_policy_reasons"] == expected_reason
+    assert details["target_policy_rejected_ids"] == expected_rejected
+
+
+@pytest.mark.asyncio
+async def test_semantic_relation_adapter_rejects_target_without_direct_relation() -> None:
+    payload = _candidate_wise_payload(
+        candidate_relations=[("social-pattern-old", "unrelated", 0.91)],
+        target_memory_ids=["social-pattern-old"],
+        overall_relation="update",
+        confidence=0.99,
+        reason="Overall output must not turn an unrelated candidate into a target.",
+        direct_target_ids=[],
+    )
+    judge, _ = _judge(json.dumps(payload))
+    trace = ExecutionTrace()
+    try:
+        proposal = await judge.propose_relation(
+            incoming=_incoming(),
+            candidates=[_target()],
+            trace=trace,
+        )
+    finally:
+        await judge.aclose()
+
+    assert proposal.relation == ClaimRelation.UNCERTAIN
+    assert proposal.target_memory_ids == []
+    details = _model_trace_details(trace)
+    assert details["target_policy_reasons"] == (
+        "target_not_marked_direct,target_set_mismatch_direct_targets"
+    )
+
+
+@pytest.mark.asyncio
+async def test_semantic_relation_adapter_allows_non_direct_complementary_context() -> None:
+    payload = _candidate_wise_payload(
+        candidate_relations=[("social-pattern-old", "complementary", 0.91)],
+        target_memory_ids=[],
+        overall_relation="complementary",
+        confidence=0.91,
+        reason="The candidate is useful context but the incoming claim does not act on it.",
+        direct_target_ids=[],
+    )
+    judge, _ = _judge(json.dumps(payload))
+    trace = ExecutionTrace()
+    try:
+        proposal = await judge.propose_relation(
+            incoming=_incoming(),
+            candidates=[_target()],
+            trace=trace,
+        )
+    finally:
+        await judge.aclose()
+
+    assert proposal.relation == ClaimRelation.UNRELATED
+    assert proposal.target_memory_ids == []
+    details = _model_trace_details(trace)
+    assert details["target_policy_status"] == "accepted"
+    assert json.loads(str(details["candidate_relations_json"]))[0] == {
+        "memory_id": "social-pattern-old",
+        "relation": "complementary",
+        "is_direct_target": False,
+        "confidence": 0.91,
+    }
+
+
+@pytest.mark.asyncio
+async def test_semantic_relation_adapter_fails_closed_when_direct_set_is_not_aggregated() -> None:
+    payload = _candidate_wise_payload(
+        candidate_relations=[("social-pattern-old", "update", 0.94)],
+        target_memory_ids=[],
+        overall_relation="update",
+        confidence=0.94,
+        reason="A direct flag cannot be omitted from the final target set.",
+        direct_target_ids=["social-pattern-old"],
+    )
+    judge, _ = _judge(json.dumps(payload))
+    trace = ExecutionTrace()
+    try:
+        proposal = await judge.propose_relation(
+            incoming=_incoming(),
+            candidates=[_target()],
+            trace=trace,
+        )
+    finally:
+        await judge.aclose()
+
+    assert proposal.relation == ClaimRelation.UNCERTAIN
+    assert proposal.target_memory_ids == []
+    details = _model_trace_details(trace)
+    assert details["target_policy_reasons"] == "target_set_mismatch_direct_targets"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("relation", ["unrelated", "uncertain"])
+async def test_semantic_relation_adapter_rejects_non_targetable_direct_flag(
+    relation: str,
+) -> None:
+    payload = _candidate_wise_payload(
+        candidate_relations=[("social-pattern-old", relation, 0.9)],
+        target_memory_ids=["social-pattern-old"],
+        overall_relation=relation,
+        confidence=0.9,
+        reason="Non-targetable relations cannot be marked direct.",
+    )
+    judge, _ = _judge(json.dumps(payload))
+    trace = ExecutionTrace()
+    try:
+        proposal = await judge.propose_relation(
+            incoming=_incoming(),
+            candidates=[_target()],
+            trace=trace,
+        )
+    finally:
+        await judge.aclose()
+
+    assert proposal.relation == ClaimRelation.UNCERTAIN
+    assert proposal.target_memory_ids == []
+    details = _model_trace_details(trace)
+    assert details["target_policy_reasons"] == "non_targetable_relation_marked_direct"
+
+
+@pytest.mark.asyncio
+async def test_semantic_relation_adapter_derives_overall_from_selected_relation() -> None:
+    payload = _candidate_wise_payload(
+        candidate_relations=[
+            ("social-pattern-old", "update", 0.88),
+            ("background", "unrelated", 0.97),
+        ],
+        target_memory_ids=["social-pattern-old"],
+        overall_relation="complementary",
+        confidence=0.99,
+        reason="Only the state-pattern candidate is a direct target.",
+    )
+    judge, _ = _judge(json.dumps(payload), max_target_count=5)
+    trace = ExecutionTrace()
+    try:
+        proposal = await judge.propose_relation(
+            incoming=_incoming(),
+            candidates=[
+                _target(),
+                _target().model_copy(update={"id": "background"}),
+            ],
+            trace=trace,
+        )
+    finally:
+        await judge.aclose()
+
+    assert proposal.relation == ClaimRelation.UPDATE
+    assert proposal.target_memory_ids == ["social-pattern-old"]
+    assert proposal.confidence == 0.88
+    assert proposal.same_semantic_dimension is True
+    details = _model_trace_details(trace)
+    assert details["reported_overall_relation"] == "complementary"
+    assert details["derived_overall_relation"] == "update"
+    assert json.loads(str(details["candidate_relations_json"])) == [
+        {
+            "memory_id": "social-pattern-old",
+            "relation": "update",
+            "is_direct_target": True,
+            "confidence": 0.88,
+        },
+        {
+            "memory_id": "background",
+            "relation": "unrelated",
+            "is_direct_target": False,
+            "confidence": 0.97,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_semantic_relation_adapter_derives_mixed_target_relation_by_precedence() -> None:
+    payload = _candidate_wise_payload(
+        candidate_relations=[
+            ("first", "complementary", 0.92),
+            ("second", "contradiction", 0.81),
+        ],
+        target_memory_ids=["first", "second"],
+        overall_relation="complementary",
+        confidence=0.95,
+        reason="Both explicit claims directly address independent candidates.",
+    )
+    judge, _ = _judge(json.dumps(payload), max_target_count=5)
+    try:
+        proposal = await judge.propose_relation(
+            incoming=_incoming(),
+            candidates=[
+                _target().model_copy(update={"id": "first"}),
+                _target().model_copy(update={"id": "second"}),
+            ],
+        )
+    finally:
+        await judge.aclose()
+
+    assert proposal.relation == ClaimRelation.CONTRADICTION
+    assert proposal.target_memory_ids == ["first", "second"]
+    assert proposal.confidence == 0.81
+    assert proposal.same_semantic_dimension is True
+
+
+@pytest.mark.asyncio
+async def test_semantic_relation_adapter_aggregates_multiple_coexisting_claims_as_complementary(
+) -> None:
+    payload = _candidate_wise_payload(
+        candidate_relations=[
+            ("first", "same", 0.92),
+            ("second", "complementary", 0.88),
+        ],
+        target_memory_ids=["first", "second"],
+        overall_relation="same",
+        confidence=0.95,
+        reason="The incoming memory explicitly combines two coexisting propositions.",
+    )
+    judge, _ = _judge(json.dumps(payload), max_target_count=5)
+    try:
+        proposal = await judge.propose_relation(
+            incoming=_incoming(),
+            candidates=[
+                _target().model_copy(update={"id": "first"}),
+                _target().model_copy(update={"id": "second"}),
+            ],
+        )
+    finally:
+        await judge.aclose()
+
+    assert proposal.relation == ClaimRelation.COMPLEMENTARY
+    assert proposal.target_memory_ids == ["first", "second"]
+    assert proposal.confidence == 0.88
+
+
+@pytest.mark.asyncio
+async def test_semantic_relation_adapter_prompt_separates_semantics_from_authority() -> None:
+    payload = _candidate_wise_payload(
+        candidate_relations=[("social-pattern-old", "contradiction", 0.8)],
+        target_memory_ids=["social-pattern-old"],
+        overall_relation="contradiction",
+        confidence=0.8,
+        reason="The claims conflict even though incoming evidence is weak.",
+    )
+    judge, completions = _judge(json.dumps(payload))
+    try:
+        await judge.propose_relation(incoming=_incoming(), candidates=[_target()])
+    finally:
+        await judge.aclose()
+
+    assert len(completions.requests) == 1
+    messages = completions.requests[0]["messages"]
+    assert isinstance(messages, list)
+    prompt = messages[0]["content"]
+    assert "Classify incoming_memory against every candidate separately" in prompt
+    assert "Related != Target" in prompt
+    assert "Possible explanation != Target" in prompt
+    assert "is_direct_target=false" in prompt
+    assert "event instances at different times are not SAME" in prompt
+    assert "pattern and one event instance are never SAME" in prompt
+    assert "claim-level semantic content" in prompt
+    assert "weak, subjective" in prompt
+    assert "Direct COMPLEMENTARY examples" in prompt
+    assert "linked new event instance" in prompt
+    assert "earlier baseline" in prompt
+    assert "UNRELATED boundary examples" in prompt
+    assert "newly asserted recurring pattern" in prompt
+    assert "Semantic relation != write authority" in prompt
+    assert "Validator, not this Judge" in prompt
+    assert "currently single" in prompt
+    assert "quiet small restaurants" in prompt
+    assert "will hike" in prompt
 
 
 def test_semantic_relation_adapter_rejects_unbounded_target_configuration() -> None:
@@ -208,13 +565,13 @@ def _target() -> MemoryItem:
 
 @pytest.mark.asyncio
 async def test_semantic_relation_adapter_parses_strict_first_response() -> None:
-    payload = {
-        "relation": "update",
-        "target_memory_ids": ["social-pattern-old"],
-        "same_semantic_dimension": True,
-        "confidence": 0.93,
-        "reason": "The sustained social-integration pattern changed.",
-    }
+    payload = _candidate_wise_payload(
+        candidate_relations=[("social-pattern-old", "update", 0.93)],
+        target_memory_ids=["social-pattern-old"],
+        overall_relation="update",
+        confidence=0.93,
+        reason="The sustained social-integration pattern changed.",
+    )
     judge, completions = _judge(json.dumps(payload))
     trace = ExecutionTrace()
 
@@ -238,14 +595,47 @@ async def test_semantic_relation_adapter_parses_strict_first_response() -> None:
 
 
 @pytest.mark.asyncio
-async def test_semantic_relation_adapter_repairs_bounded_structured_output() -> None:
-    payload = {
-        "relation": " UPDATE ",
-        "target_memory_ids": "social-pattern-old",
-        "same_semantic_dimension": True,
-        "confidence": "0.93",
-        "reason": "The sustained social-integration pattern changed.",
+@pytest.mark.parametrize("direct_value", [None, "true"], ids=["missing", "string"])
+async def test_semantic_relation_adapter_requires_strict_direct_target_boolean(
+    direct_value: object,
+) -> None:
+    candidate_relation: dict[str, object] = {
+        "memory_id": "social-pattern-old",
+        "relation": "update",
+        "confidence": 0.93,
     }
+    if direct_value is not None:
+        candidate_relation["is_direct_target"] = direct_value
+    payload = {
+        "candidate_relations": [candidate_relation],
+        "target_memory_ids": ["social-pattern-old"],
+        "overall_relation": "update",
+        "confidence": 0.93,
+        "reason": "The direct-target field is required and must be a JSON boolean.",
+    }
+    judge, completions = _judge(json.dumps(payload))
+
+    try:
+        with pytest.raises(
+            ValueError,
+            match=r"^semantic relation judge returned invalid structured output$",
+        ):
+            await judge.propose_relation(incoming=_incoming(), candidates=[_target()])
+    finally:
+        await judge.aclose()
+
+    assert len(completions.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_semantic_relation_adapter_repairs_bounded_structured_output() -> None:
+    payload = _candidate_wise_payload(
+        candidate_relations=[("social-pattern-old", " UPDATE ", "0.93")],
+        target_memory_ids="social-pattern-old",
+        overall_relation=" UPDATE ",
+        confidence="0.93",
+        reason="The sustained social-integration pattern changed.",
+    )
     content = f"Proposed JSON:\n```json\n{json.dumps(payload)}\n```\nEnd."
     judge, completions = _judge(content)
     trace = ExecutionTrace()
@@ -299,20 +689,21 @@ async def test_semantic_relation_adapter_repairs_bounded_structured_output() -> 
     assert details["attempt_1_status"] == "repaired"
     assert details["local_repair_applied"] is True
     assert details["local_repair_steps"] == (
-        "embedded_json,relation_casefold,confidence_numeric_string,target_id_scalar"
+        "embedded_json,overall_relation_casefold,candidate_relation_casefold,"
+        "candidate_confidence_numeric_string,confidence_numeric_string,target_id_scalar"
     )
     assert details["parse_status"] == "completed"
 
 
 @pytest.mark.asyncio
 async def test_semantic_relation_adapter_truncates_overlong_reason_without_retry() -> None:
-    payload = {
-        "relation": "contradiction",
-        "target_memory_ids": ["social-pattern-old"],
-        "same_semantic_dimension": True,
-        "confidence": 0.7,
-        "reason": "x" * 600,
-    }
+    payload = _candidate_wise_payload(
+        candidate_relations=[("social-pattern-old", "contradiction", 0.7)],
+        target_memory_ids=["social-pattern-old"],
+        overall_relation="contradiction",
+        confidence=0.7,
+        reason="x" * 600,
+    )
     judge, completions = _judge(json.dumps(payload))
     trace = ExecutionTrace()
 
@@ -338,13 +729,13 @@ async def test_semantic_relation_adapter_truncates_overlong_reason_without_retry
 
 @pytest.mark.asyncio
 async def test_semantic_relation_adapter_retries_invalid_json_once() -> None:
-    retry_payload = {
-        "relation": "uncertain",
-        "target_memory_ids": [],
-        "same_semantic_dimension": False,
-        "confidence": 0.72,
-        "reason": "No unique target is safe.",
-    }
+    retry_payload = _candidate_wise_payload(
+        candidate_relations=[("social-pattern-old", "uncertain", 0.72)],
+        target_memory_ids=[],
+        overall_relation="uncertain",
+        confidence=0.72,
+        reason="No unique target is safe.",
+    )
     judge, completions = _judge(
         "This is not structured output.",
         json.dumps(retry_payload),
@@ -386,41 +777,41 @@ async def test_semantic_relation_adapter_retries_invalid_json_once() -> None:
         f"The relation is update because {RAW_SECRET}.",
         (
             json.dumps(
-                {
-                    "relation": "same",
-                    "target_memory_ids": ["social-pattern-old"],
-                    "same_semantic_dimension": True,
-                    "confidence": 0.9,
-                    "reason": "First object.",
-                }
+                _candidate_wise_payload(
+                    candidate_relations=[("social-pattern-old", "same", 0.9)],
+                    target_memory_ids=["social-pattern-old"],
+                    overall_relation="same",
+                    confidence=0.9,
+                    reason="First object.",
+                )
             )
             + json.dumps(
-                {
-                    "relation": "update",
-                    "target_memory_ids": ["social-pattern-old"],
-                    "same_semantic_dimension": True,
-                    "confidence": 0.9,
-                    "reason": "Second object.",
-                }
+                _candidate_wise_payload(
+                    candidate_relations=[("social-pattern-old", "update", 0.9)],
+                    target_memory_ids=["social-pattern-old"],
+                    overall_relation="update",
+                    confidence=0.9,
+                    reason="Second object.",
+                )
             )
         ),
         json.dumps(
-            {
-                "relation": RAW_SECRET,
-                "target_memory_ids": ["social-pattern-old"],
-                "same_semantic_dimension": True,
-                "confidence": 0.95,
-                "reason": "Invalid relation must fail closed.",
-            }
+            _candidate_wise_payload(
+                candidate_relations=[("social-pattern-old", RAW_SECRET, 0.95)],
+                target_memory_ids=["social-pattern-old"],
+                overall_relation="update",
+                confidence=0.95,
+                reason="Invalid relation must fail closed.",
+            )
         ),
         json.dumps(
-            {
-                "relation": "update",
-                "target_memory_ids": ["social-pattern-old"],
-                "same_semantic_dimension": True,
-                "confidence": 1.5,
-                "reason": RAW_SECRET,
-            }
+            _candidate_wise_payload(
+                candidate_relations=[("social-pattern-old", "update", 1.5)],
+                target_memory_ids=["social-pattern-old"],
+                overall_relation="update",
+                confidence=1.5,
+                reason=RAW_SECRET,
+            )
         ),
     ],
     ids=[
@@ -469,13 +860,13 @@ async def test_semantic_relation_adapter_rejects_invalid_output_without_raw_leak
 @pytest.mark.asyncio
 async def test_invalid_adapter_output_becomes_uncertain_in_shadow_mode() -> None:
     content = json.dumps(
-        {
-            "relation": RAW_SECRET,
-            "target_memory_ids": ["social-pattern-old"],
-            "same_semantic_dimension": True,
-            "confidence": 0.99,
-            "reason": "An invalid proposal must not authorize a mutation.",
-        }
+        _candidate_wise_payload(
+            candidate_relations=[("social-pattern-old", RAW_SECRET, 0.99)],
+            target_memory_ids=["social-pattern-old"],
+            overall_relation="update",
+            confidence=0.99,
+            reason="An invalid proposal must not authorize a mutation.",
+        )
     )
     judge, completions = _judge(content)
     trace = ExecutionTrace()

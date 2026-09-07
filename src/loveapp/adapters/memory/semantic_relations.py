@@ -10,7 +10,7 @@ from time import perf_counter
 from typing import Any, Literal
 
 from openai import AsyncOpenAI
-from pydantic import SecretStr, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
 from loveapp.domain.memory import ClaimRelation, MemoryCandidate, MemoryItem
 from loveapp.domain.memory_semantic_relation import SemanticRelationProposal
@@ -91,6 +91,7 @@ class OpenAICompatibleSemanticRelationJudge:
                 "total_tokens": None,
             }
             parsed: _ParsedProposal | None = None
+            proposal: SemanticRelationProposal | None = None
 
             for attempt in (1, 2):
                 details["attempt_count"] = attempt
@@ -133,7 +134,7 @@ class OpenAICompatibleSemanticRelationJudge:
                     details["local_repair_steps"] = ",".join(parsed.repair_steps)
                 details["parse_status"] = "completed"
                 policy_diagnostic = _target_policy_diagnostics(
-                    parsed.proposal,
+                    parsed.output,
                     candidates=candidates,
                     max_target_count=self._max_target_count,
                 )
@@ -141,19 +142,38 @@ class OpenAICompatibleSemanticRelationJudge:
                 details["target_policy_rejected_ids"] = ",".join(
                     policy_diagnostic["rejected_ids"]
                 )
-                details["raw_target_count"] = len(parsed.proposal.target_memory_ids)
-                details["raw_target_ids"] = ",".join(parsed.proposal.target_memory_ids[:5])
+                details["raw_target_count"] = len(parsed.output.target_memory_ids)
+                details["raw_target_ids"] = ",".join(parsed.output.target_memory_ids[:5])
+                details["candidate_relation_count"] = len(
+                    parsed.output.candidate_relations
+                )
+                details["candidate_relations_json"] = json.dumps(
+                    [
+                        {
+                            "memory_id": item.memory_id,
+                            "relation": item.relation.value,
+                            "is_direct_target": item.is_direct_target,
+                            "confidence": item.confidence,
+                        }
+                        for item in parsed.output.candidate_relations
+                    ],
+                    separators=(",", ":"),
+                )
+                details["reported_overall_relation"] = (
+                    parsed.output.overall_relation.value
+                )
                 proposal = _validate_target_policy(
-                    parsed.proposal,
+                    parsed.output,
                     candidates=candidates,
                     max_target_count=self._max_target_count,
                 )
+                details["derived_overall_relation"] = proposal.relation.value
                 details["target_policy_status"] = (
                     "accepted" if policy_diagnostic["valid"] else "fail_closed"
                 )
                 break
 
-            if parsed is None:  # pragma: no cover - loop exits or raises above
+            if parsed is None or proposal is None:  # pragma: no cover - loop exits or raises
                 raise ValueError("semantic relation judge returned invalid structured output")
 
             prompt_tokens = usage_totals["prompt_tokens"]
@@ -218,8 +238,27 @@ def _candidate_payload(item: MemoryItem) -> dict[str, object]:
 
 @dataclass(frozen=True, slots=True)
 class _ParsedProposal:
-    proposal: SemanticRelationProposal
+    output: _CandidateWiseRelationOutput
     repair_steps: tuple[str, ...]
+
+
+class _CandidateRelationOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    memory_id: str = Field(min_length=1, max_length=200)
+    relation: ClaimRelation
+    is_direct_target: bool = Field(strict=True)
+    confidence: float = Field(ge=0, le=1)
+
+
+class _CandidateWiseRelationOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_relations: list[_CandidateRelationOutput] = Field(max_length=5)
+    target_memory_ids: list[str] = Field(max_length=5)
+    overall_relation: ClaimRelation
+    confidence: float = Field(ge=0, le=1)
+    reason: str = Field(min_length=1, max_length=500)
 
 
 def _parse_proposal_result(content: str | None) -> _ParsedProposal:
@@ -245,12 +284,40 @@ def _parse_proposal_result(content: str | None) -> _ParsedProposal:
     if not isinstance(payload, dict):
         raise ValueError("semantic relation judge returned invalid structured output") from None
     payload = dict(payload)
-    relation = payload.get("relation")
-    if isinstance(relation, str):
-        normalized_relation = relation.casefold().strip()
-        if normalized_relation != relation:
-            repair_steps.append("relation_casefold")
-        payload["relation"] = normalized_relation
+    overall_relation = payload.get("overall_relation")
+    if isinstance(overall_relation, str):
+        normalized_relation = overall_relation.casefold().strip()
+        if normalized_relation != overall_relation:
+            repair_steps.append("overall_relation_casefold")
+        payload["overall_relation"] = normalized_relation
+    candidate_relations = payload.get("candidate_relations")
+    candidate_relation_repaired = False
+    candidate_confidence_repaired = False
+    if isinstance(candidate_relations, list):
+        normalized_candidates: list[object] = []
+        for candidate_relation in candidate_relations:
+            if not isinstance(candidate_relation, dict):
+                normalized_candidates.append(candidate_relation)
+                continue
+            normalized_candidate = dict(candidate_relation)
+            relation = normalized_candidate.get("relation")
+            if isinstance(relation, str):
+                normalized_relation = relation.casefold().strip()
+                if normalized_relation != relation:
+                    candidate_relation_repaired = True
+                normalized_candidate["relation"] = normalized_relation
+            candidate_confidence = normalized_candidate.get("confidence")
+            if isinstance(candidate_confidence, str) and _NUMBER_PATTERN.fullmatch(
+                candidate_confidence.strip()
+            ):
+                normalized_candidate["confidence"] = float(candidate_confidence)
+                candidate_confidence_repaired = True
+            normalized_candidates.append(normalized_candidate)
+        payload["candidate_relations"] = normalized_candidates
+    if candidate_relation_repaired:
+        repair_steps.append("candidate_relation_casefold")
+    if candidate_confidence_repaired:
+        repair_steps.append("candidate_confidence_numeric_string")
     confidence = payload.get("confidence")
     if isinstance(confidence, str) and _NUMBER_PATTERN.fullmatch(confidence.strip()):
         payload["confidence"] = float(confidence)
@@ -264,12 +331,12 @@ def _parse_proposal_result(content: str | None) -> _ParsedProposal:
         payload["reason"] = reason[:_MAX_REASON_LENGTH]
         repair_steps.append("reason_truncated")
     try:
-        proposal = SemanticRelationProposal.model_validate(payload)
+        output = _CandidateWiseRelationOutput.model_validate(payload)
     except ValidationError:
         # ValidationError includes rejected input values; keep raw model output
         # out of traces and fail-closed diagnostics.
         raise ValueError("semantic relation judge returned invalid structured output") from None
-    return _ParsedProposal(proposal=proposal, repair_steps=tuple(repair_steps))
+    return _ParsedProposal(output=output, repair_steps=tuple(repair_steps))
 
 
 def _strip_json_fence(content: str) -> str | None:
@@ -342,50 +409,168 @@ _JSON_FENCE_PATTERN = re.compile(
 )
 _JSON_ONLY_RETRY_PROMPT = """
 Your previous response could not be parsed as the required schema. Return only one JSON
-object with exactly these fields: relation, target_memory_ids, same_semantic_dimension,
-confidence, reason. Keep reason at or below 500 characters. Do not include markdown
-fences or explanatory text.
+object with exactly these fields: candidate_relations, target_memory_ids,
+overall_relation, confidence, reason. candidate_relations must contain exactly one entry
+for every supplied candidate, and every entry must contain exactly memory_id, relation,
+is_direct_target, and confidence. Keep reason at or below 500 characters. Do not include
+markdown fences or explanatory text.
 """.strip()
 
 
 _SYSTEM_PROMPT = """
 You judge the semantic relation between one incoming open-world relationship memory and a
-small retrieved candidate set. Return one strict JSON object with exactly these fields:
-relation, target_memory_ids, same_semantic_dimension, confidence, reason.
+small retrieved candidate set. Classify incoming_memory against every candidate separately,
+then construct the minimal target set. Do this in one response and one model call.
 
-relation must be one of: same, update, contradiction, complementary, unrelated, uncertain.
-Target IDs must come only from candidate_memories. A target is a memory that directly
-expresses the same fact, independently changeable state/dimension, or directly related
-event being judged. Related-by-topic, background context, or merely sharing a person is
-not enough: related does not mean target. {target_instruction} Keep reason concise and at
-or below 500 characters.
+Return one strict JSON object with exactly these fields:
+- candidate_relations: exactly one object for every candidate_memory, in input order. Each
+  object has exactly memory_id, relation, is_direct_target, confidence.
+- is_direct_target: true only when the incoming claim directly repeats, modifies, adds to,
+  or negates that candidate claim. Semantic or contextual relevance alone is false.
+- target_memory_ids: the minimal set consisting exactly of candidates marked
+  is_direct_target=true.
+- overall_relation: your summary label. Code derives the authoritative overall relation
+  from the selected candidate relations, so this field never selects targets.
+- confidence: confidence in the overall semantic assessment.
+- reason: a concise reason of at most 500 characters.
+
+Every relation must be one of: same, update, contradiction, complementary, unrelated,
+uncertain. Every memory_id and target ID must come from candidate_memories.
+{target_instruction}
 
 Definitions:
-- same: the same durable fact or sustained pattern restated without material change.
+- same: the same durable fact, state, pattern, or event identity restated without material
+  change. New duration, timing, frequency, scope, cause, or other material qualifiers are
+  claim-level additions, not mere restatement. The same event type at another time is not
+  the same event.
 - update: the same independently changeable subject and semantic dimension has a newer,
   explicit sustained state/pattern that materially replaces the old one.
 - contradiction: the incoming and candidate facts cannot both be true for the same
   subject and semantic dimension. This is a factual relation only; do not downgrade it
   to uncertain because replacement authority or write permission is unclear.
-- complementary: related facts in independently changeable dimensions can coexist.
-- unrelated: no meaningful lifecycle relation.
+- complementary: the incoming claim directly adds claim-level semantic content that can
+  coexist with and complete or qualify the candidate. A new instance of the same event
+  type is complementary, not same. Topic or contextual relevance alone is not
+  complementary.
+- unrelated: no direct SAME, UPDATE, CONTRADICTION, or COMPLEMENTARY relation. Claims may
+  still share a person, topic, event, or contextual theme.
 - uncertain: the evidence is insufficient to determine whether the claims are the same,
   changing, conflicting, complementary, or unrelated, or no single direct target can be
   identified from a semantic identity/evidence match.
 
-Safety rules:
+Semantic classification rules:
 - Similar wording alone never proves update.
+- Two event instances at different times are not SAME even when their event type matches;
+  classify a distinct compatible event as COMPLEMENTARY.
+- A sustained pattern and one event instance are never SAME.
 - A single event does not replace a sustained pattern or state.
 - A pattern does not replace an event or a different state dimension.
 - Social-circle integration and family integration are distinct dimensions.
-- A belief or inference does not replace a stronger reported fact.
 - Historical facts do not replace newer current facts.
 - {ambiguity_instruction}
-- For same, update, complementary, or contradiction, return only the minimal direct
-  target set. Do not include every related candidate. For unrelated or uncertain, return
-  an empty target_memory_ids array.
-- Do not use write-risk considerations to change the factual relation label; write
-  authorization belongs to the downstream validator.
+- Related != Target. Semantic similarity != Target. Same topic != Target. Same subject !=
+  Target. Same domain != Target. Possible explanation != Target. Contextually useful for
+  advice != Target.
+- COMPLEMENTARY does not automatically make a candidate a direct target. It is valid to
+  classify a candidate as complementary while setting is_direct_target=false.
+- A COMPLEMENTARY candidate is a direct target when the incoming claim itself adds a
+  specific detail to that candidate, reports a clearly linked new instance of its event
+  series, or gives a concrete event instance of its sustained pattern. In those cases set
+  is_direct_target=true. Do not confuse this with merely useful background.
+- This pattern/event rule is directional: an incoming concrete event may instantiate an
+  old sustained pattern, but an incoming newly asserted pattern does not directly target
+  one isolated historical event merely because that event is an example.
+- A candidate may enter target_memory_ids only when is_direct_target=true. Unrelated and
+  uncertain candidates must always have is_direct_target=false.
+- If one candidate completely captures the direct semantic relationship, do not include
+  additional candidates merely because they share the same topic, person, event, or
+  contextual theme.
+- Prefer the narrow claim that the incoming directly extends. When an exact prior event or
+  state captures the relation, broader patterns, possible explanations, and other nearby
+  events remain non-direct. Use the broader pattern only when it is itself the claim being
+  instantiated and no narrower candidate captures that relation.
+- Multi-target is valid only when the incoming claim itself explicitly and independently
+  acts on every selected semantic target. Never use multi-target to express ambiguity.
+- For an explicit multi-clause incoming claim, evaluate each clause independently. If one
+  clause changes daily chat and another changes video contact, both matching old claims are
+  direct targets. Do not omit the second target merely because its candidate relation is
+  complementary rather than update.
+- A different condition or time window does not by itself make a candidate non-direct when
+  an explicit clause changes the same independently measurable behavior, such as video
+  contact or proactive sharing. Judge the changed metric, not only matching qualifiers.
+- Multiple paraphrases of one proposition do not create multiple independent targets.
+  Mark only the candidate that best matches the incoming claim's evidence scope as direct;
+  keep redundant nearby paraphrases non-direct.
+- Semantic relation != write authority. A weak belief can semantically contradict a strong
+  fact even when it cannot replace that fact. Proposed status, low confidence, user belief,
+  and weak evidence affect downstream write permission, not the factual relation label.
+- The downstream Validator, not this Judge, decides whether update, merge, or supersession
+  is authorized.
+- When an incoming claim is explicitly weak, subjective, and spans several inferred
+  dimensions without directly denying an observed candidate fact, classify that candidate
+  as uncertain with is_direct_target=false rather than forcing contradiction.
+- When a candidate clearly describes an earlier baseline and the incoming claim explicitly
+  describes a newer sustained state in the same dimension, classify it as update, not
+  contradiction. Contradiction is for incompatible claims about the same state/time without
+  a supported transition.
+
+Direct COMPLEMENTARY examples:
+1. Old: "When stressed, she likes walking alone." Incoming: "She usually walks by the river
+   near work for about forty minutes." This adds a specific detail to the old habit:
+   complementary, is_direct_target=true.
+2. Old: "Last week she commented on my post once." Incoming: "Yesterday she commented on
+   another post again." This is a linked new event instance: complementary,
+   is_direct_target=true.
+3. Old pattern: "When busy, her replies become short." Incoming event: "Yesterday she was
+   exhausted and sent only a few short replies." This event instantiates the pattern:
+   complementary, is_direct_target=true; never same.
+4. Old: "Quiet hotel rooms matter to her." Incoming: "She would stay farther from sights
+   to get a quieter room." This adds a compatible trade-off/detail, so it is complementary,
+   not update, and is_direct_target=true.
+5. Old: "When upset, she processes things alone for a while." Incoming: "She usually takes
+   one night and speaks the next day." The concrete duration and sequence are new material
+   qualifiers: complementary, not same, and is_direct_target=true.
+
+Non-direct COMPLEMENTARY example:
+- Incoming: "She rarely initiates chats lately." Candidate: "When work is busy, her replies
+  become short." The candidate may be useful context, but it does not complete or qualify
+  the incoming initiation-frequency claim: is_direct_target=false.
+
+UNRELATED boundary examples:
+- Incoming preference: "She likes history podcasts before sleep." Candidate preference:
+  "She often listens to interview and culture podcasts." These are different coexisting
+  content preferences under one medium; the incoming claim does not qualify the candidate,
+  so relation is unrelated and is_direct_target=false.
+- Incoming pattern: "We recently started cooking together every week." Candidate event:
+  "We cooked dinner together once last week." One past event neither defines nor receives
+  the newly asserted recurring pattern, so relation is unrelated and
+  is_direct_target=false.
+
+Weak multi-dimensional inference example:
+- Incoming infers that she may not want to meet or initiate chats but explicitly says there
+  is insufficient evidence. A candidate reports observed chat initiations or one recent
+  conversation. Internal willingness and observed behavior are different dimensions, so
+  they can coexist; use uncertain with is_direct_target=false. Do not turn a possible desire
+  or motive into a denial of observed behavior unless the incoming explicitly asserts that
+  the behavior itself stopped or changed.
+
+Contradiction examples (classify the old candidate as contradiction and target it):
+1. Old: "She explicitly said she is currently single." Incoming: "I suspect she may
+   actually have another partner, but I have no evidence." The new claim is weak, yet the
+   claims conflict; relation is contradiction. Validator decides write authority.
+2. Old: "She has always preferred quiet small restaurants." Incoming: "I feel she may
+   actually prefer very noisy places." Relation is contradiction, not uncertain.
+3. Old: "We confirmed that we will hike after returning home." Incoming: "I think she may
+   no longer want to go, but she has not explicitly cancelled." Relation is contradiction;
+   lack of cancellation affects mutation permission only.
+
+Output example:
+{{"candidate_relations":[{{"memory_id":"M1","relation":"update",
+"is_direct_target":true,"confidence":0.93}},
+{{"memory_id":"M2","relation":"complementary","is_direct_target":false,
+"confidence":0.90}}],
+"target_memory_ids":["M1"],"overall_relation":"update","confidence":0.93,
+"reason":"M1 is the only direct same-dimension change; M2 is related background."}}
 
 This is a semantic proposal only. Never describe or request a database mutation.
 """.strip()
@@ -418,7 +603,7 @@ def _system_prompt(*, max_target_count: int) -> str:
 
 
 def _validate_target_policy(
-    proposal: SemanticRelationProposal,
+    output: _CandidateWiseRelationOutput,
     *,
     candidates: list[MemoryItem],
     max_target_count: int,
@@ -427,30 +612,57 @@ def _validate_target_policy(
 
     The model still owns semantic relation classification.  These guards prevent a
     malformed or over-broad proposal from being mistaken for an authorized target set:
-    target IDs must come from the supplied candidates, be unique, and obey relation
-    cardinality.  A violation fails closed as ``uncertain`` with no targets.
+    target IDs must come from the supplied candidates, be unique, match the explicit
+    direct-target flags, and obey cardinality.  A violation fails closed as ``uncertain``
+    with no targets.
     """
 
     diagnostic = _target_policy_diagnostics(
-        proposal,
+        output,
         candidates=candidates,
         max_target_count=max_target_count,
     )
-    if diagnostic["valid"]:
-        return proposal
-    return proposal.model_copy(
-        update={
-            "relation": ClaimRelation.UNCERTAIN,
-            "target_memory_ids": [],
-            "same_semantic_dimension": False,
-            "confidence": 0.0,
-            "reason": "Target policy violation; proposal failed closed.",
-        }
+    if not diagnostic["valid"]:
+        return SemanticRelationProposal(
+            relation=ClaimRelation.UNCERTAIN,
+            target_memory_ids=[],
+            same_semantic_dimension=False,
+            confidence=0.0,
+            reason="Target policy violation; proposal failed closed.",
+        )
+
+    relations_by_id = {
+        item.memory_id: item for item in output.candidate_relations
+    }
+    selected = [relations_by_id[target_id] for target_id in output.target_memory_ids]
+    if selected:
+        relation = _derive_overall_relation([item.relation for item in selected])
+        confidence = min(item.confidence for item in selected)
+    else:
+        relation = (
+            ClaimRelation.UNCERTAIN
+            if any(
+                item.relation == ClaimRelation.UNCERTAIN
+                for item in output.candidate_relations
+            )
+            else ClaimRelation.UNRELATED
+        )
+        confidence = output.confidence
+    return SemanticRelationProposal(
+        relation=relation,
+        target_memory_ids=list(output.target_memory_ids),
+        same_semantic_dimension=any(
+            item.relation
+            in {ClaimRelation.SAME, ClaimRelation.UPDATE, ClaimRelation.CONTRADICTION}
+            for item in selected
+        ),
+        confidence=confidence,
+        reason=output.reason,
     )
 
 
 def _target_policy_diagnostics(
-    proposal: SemanticRelationProposal,
+    output: _CandidateWiseRelationOutput,
     *,
     candidates: list[MemoryItem],
     max_target_count: int,
@@ -458,31 +670,72 @@ def _target_policy_diagnostics(
     """Explain structural target-policy decisions without semantic re-judging."""
 
     candidate_ids = {candidate.id for candidate in candidates}
-    target_ids = list(proposal.target_memory_ids)
-    targeted = proposal.relation in {
-        # Keep this local to avoid coupling the adapter to application policy constants.
-        ClaimRelation.SAME,
-        ClaimRelation.UPDATE,
-        ClaimRelation.CONTRADICTION,
-        ClaimRelation.COMPLEMENTARY,
-    }
+    target_ids = list(output.target_memory_ids)
+    non_targetable_relations = {ClaimRelation.UNRELATED, ClaimRelation.UNCERTAIN}
     reasons: list[str] = []
+    relation_ids = [item.memory_id for item in output.candidate_relations]
+    if len(relation_ids) != len(set(relation_ids)):
+        reasons.append("duplicate_candidate_relation_ids")
+    unknown_relation_ids = sorted(
+        {memory_id for memory_id in relation_ids if memory_id not in candidate_ids}
+    )
+    if unknown_relation_ids:
+        reasons.append("unknown_candidate_relation_id")
+    missing_relation_ids = sorted(candidate_ids.difference(relation_ids))
+    if missing_relation_ids:
+        reasons.append("missing_candidate_relation_id")
     if len(target_ids) > max_target_count:
         reasons.append("target_count_exceeds_max")
     if len(target_ids) != len(set(target_ids)):
         reasons.append("duplicate_target_ids")
-    rejected_ids = sorted({target_id for target_id in target_ids if target_id not in candidate_ids})
-    if rejected_ids:
+    unknown_target_ids = sorted(
+        {target_id for target_id in target_ids if target_id not in candidate_ids}
+    )
+    if unknown_target_ids:
         reasons.append("unknown_target_id")
-    if targeted and not target_ids:
-        reasons.append("target_required_for_relation")
-    if not targeted and target_ids:
-        reasons.append("target_forbidden_for_relation")
+    relations_by_id = {item.memory_id: item for item in output.candidate_relations}
+    direct_target_ids = [
+        item.memory_id for item in output.candidate_relations if item.is_direct_target
+    ]
+    if len(direct_target_ids) > max_target_count:
+        reasons.append("direct_target_count_exceeds_max")
+    if any(
+        target_id in relations_by_id
+        and not relations_by_id[target_id].is_direct_target
+        for target_id in target_ids
+    ):
+        reasons.append("target_not_marked_direct")
+    if any(
+        item.is_direct_target and item.relation in non_targetable_relations
+        for item in output.candidate_relations
+    ):
+        reasons.append("non_targetable_relation_marked_direct")
+    if not unknown_target_ids and set(target_ids) != set(direct_target_ids):
+        reasons.append("target_set_mismatch_direct_targets")
     return {
         "valid": not reasons,
         "reasons": reasons,
-        "rejected_ids": rejected_ids,
+        "rejected_ids": sorted(
+            set(unknown_relation_ids).union(unknown_target_ids)
+        ),
     }
+
+
+def _derive_overall_relation(relations: list[ClaimRelation]) -> ClaimRelation:
+    """Derive the legacy single relation without letting it select targets."""
+
+    if len(relations) > 1 and all(
+        relation in {ClaimRelation.SAME, ClaimRelation.COMPLEMENTARY}
+        for relation in relations
+    ):
+        return ClaimRelation.COMPLEMENTARY
+    precedence = (
+        ClaimRelation.CONTRADICTION,
+        ClaimRelation.UPDATE,
+        ClaimRelation.SAME,
+        ClaimRelation.COMPLEMENTARY,
+    )
+    return next(relation for relation in precedence if relation in relations)
 
 
 __all__ = ["OpenAICompatibleSemanticRelationJudge"]
