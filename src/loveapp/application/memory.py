@@ -93,6 +93,7 @@ from .contextual_memory_updates import (
 from .memory_admission import (
     assess_governed_transition_eligibility,
     assess_memory_admission,
+    assess_pattern_evidence_links,
     build_admission_policies,
     interaction_pattern_has_frequency,
     interaction_pattern_has_multiple_evidence,
@@ -626,12 +627,19 @@ class MemoryService:
                 text,
                 active,
             )
+            pattern_evidence_links = assess_pattern_evidence_links(candidate, active)
             assessment = assess_memory_admission(
                 candidate,
                 text,
                 conflict=conflict,
+                corroborating_evidence_count=(
+                    pattern_evidence_links.linked_event_count
+                    if pattern_evidence_links.valid
+                    else 0
+                ),
                 policies=self._admission_policies,
                 governed_transition_eligibility=governed_transition_eligibility,
+                pattern_evidence_links=pattern_evidence_links,
             )
             decision = (
                 AdmissionDecision.CONFIRM

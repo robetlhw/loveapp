@@ -1459,6 +1459,126 @@ async def test_strong_verifier_cannot_confirm_single_event_as_pattern() -> None:
     assert result.saved[0].item.admission_decision == AdmissionDecision.STRONG_REVIEW
 
 
+async def test_service_admits_model_inferred_pattern_with_two_active_event_links() -> None:
+    source_text = "\u8bb0\u4e00\u4e0b: partner initiated chats repeatedly this week"
+    store = InMemoryMemoryStore(clock=lambda: NOW)
+    events = []
+    for index in range(2):
+        event = _candidate(
+            kind=MemoryKind.INTERACTION_EVENT,
+            text=f"partner initiated chat {index + 1}",
+            subject="relationship",
+            raw_predicate=f"partner_initiated_chat_{index + 1}",
+            payload={
+                "participants": ["user", "partner"],
+                "action": "initiated_chat",
+            },
+        ).model_copy(
+            update={
+                "occurred_at": NOW - timedelta(days=index + 1),
+                "time_kind": TimeKind.POINT,
+            }
+        )
+        saved = await store.save_memory(
+            user_id=USER_ID,
+            relationship_id=RELATIONSHIP_ID,
+            candidate=event,
+            source_message_id=f"event-source-{index + 1}",
+            status=MemoryStatus.CONFIRMED,
+        )
+        events.append(saved.item)
+    pattern = _candidate(
+        kind=MemoryKind.INTERACTION_PATTERN,
+        text=source_text,
+        subject="relationship",
+        raw_predicate="partner_initiative_increased",
+        payload={
+            "metric": "initiation_balance",
+            "current": "partner_to_user",
+            "source": "model_inferred",
+            "evidence_ids": [item.id for item in events],
+            "time_window": ["2026-08-03", "2026-08-05"],
+        },
+    ).model_copy(update={"perspective": MemoryPerspective.MODEL_INFERRED})
+    service = MemoryService(
+        store,
+        StaticExtractor([_claim(pattern, "linked-pattern")]),
+        clock=lambda: NOW,
+    )
+
+    result = await service.remember_text(
+        user_id=USER_ID,
+        relationship_id=RELATIONSHIP_ID,
+        text=source_text,
+    )
+
+    assert result.rejected_by_policy == 0
+    assert len(result.saved) == 1
+    assert result.saved[0].item.kind == MemoryKind.INTERACTION_PATTERN
+    assert result.saved[0].item.payload["evidence_ids"] == [item.id for item in events]
+
+
+async def test_service_rejects_model_inferred_pattern_with_invented_event_link() -> None:
+    source_text = "\u8bb0\u4e00\u4e0b: partner initiated chats repeatedly this week"
+    store = InMemoryMemoryStore(clock=lambda: NOW)
+    event = _candidate(
+        kind=MemoryKind.INTERACTION_EVENT,
+        text="partner initiated chat once",
+        subject="relationship",
+        raw_predicate="partner_initiated_chat",
+        payload={
+            "participants": ["user", "partner"],
+            "action": "initiated_chat",
+        },
+    ).model_copy(update={"occurred_at": NOW, "time_kind": TimeKind.POINT})
+    saved_event = await store.save_memory(
+        user_id=USER_ID,
+        relationship_id=RELATIONSHIP_ID,
+        candidate=event,
+        source_message_id="valid-event-source",
+        status=MemoryStatus.CONFIRMED,
+    )
+    pattern = _candidate(
+        kind=MemoryKind.INTERACTION_PATTERN,
+        text=source_text,
+        subject="relationship",
+        raw_predicate="partner_initiative_increased",
+        payload={
+            "metric": "initiation_balance",
+            "current": "partner_to_user",
+            "source": "model_inferred",
+            "evidence_ids": [saved_event.item.id, "invented-event-id"],
+        },
+    ).model_copy(update={"perspective": MemoryPerspective.MODEL_INFERRED})
+    service = MemoryService(
+        store,
+        StaticExtractor([_claim(pattern, "invalid-linked-pattern")]),
+        clock=lambda: NOW,
+    )
+
+    result = await service.remember_text(
+        user_id=USER_ID,
+        relationship_id=RELATIONSHIP_ID,
+        text=source_text,
+    )
+
+    memories = await store.list_memories(
+        user_id=USER_ID,
+        relationship_id=RELATIONSHIP_ID,
+    )
+    audits = await store.list_transition_audits(
+        user_id=USER_ID,
+        relationship_id=RELATIONSHIP_ID,
+        source_message_id=result.message.id,
+    )
+    assert result.saved == []
+    assert result.rejected_by_policy == 1
+    assert [item.kind for item in memories] == [MemoryKind.INTERACTION_EVENT]
+    assert len(audits) == 1
+    assert audits[0].rule_name == "admission_policy"
+    assert audits[0].reason == "model_inferred_pattern_invalid_event_evidence"
+
+
 async def test_admission_policy_default_ttl_override_is_applied() -> None:
     source_text = "记一下：I prefer quiet cafes"
     candidate = _preference("quiet cafes", text="I prefer quiet cafes")

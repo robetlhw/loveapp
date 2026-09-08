@@ -1315,7 +1315,7 @@ async def test_flash_trace_keeps_raw_predicate_before_canonicalization() -> None
     assert claims[0]["evidence_spans"] == [source_text]
     assert claims[0]["payload"] == {"metric": "contact_frequency"}
     assert claims[0]["extractor_model"] == "flash-model"
-    assert claims[0]["prompt_version"] == "memory-v2.6"
+    assert claims[0]["prompt_version"] == "memory-v2.7"
     await extractor.aclose()
 
 

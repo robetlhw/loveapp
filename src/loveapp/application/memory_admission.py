@@ -43,6 +43,16 @@ class GovernedTransitionEligibility:
     state_dimension: str | None = None
 
 
+@dataclass(frozen=True)
+class PatternEvidenceLinkAssessment:
+    required: bool
+    valid: bool
+    linked_event_count: int = 0
+    reason: str = "not_required"
+    linked_event_ids: tuple[str, ...] = ()
+    rejected_evidence_ids: tuple[str, ...] = ()
+
+
 _GOVERNED_TRANSITION_MIN_CONFIDENCE = 0.9
 _CURRENT_TRANSITION_EVIDENCE_PATTERN = re.compile(
     r"(?:现在|当前|如今|最近|近来|这(?:几|些|段)(?:天|周|星期|个月|月|年|时间)|"
@@ -134,6 +144,7 @@ def assess_memory_admission(
     corroborating_evidence_count: int = 0,
     policies: dict[MemoryKind, MemoryAdmissionPolicy] | None = None,
     governed_transition_eligibility: GovernedTransitionEligibility | None = None,
+    pattern_evidence_links: PatternEvidenceLinkAssessment | None = None,
 ) -> AdmissionAssessment:
     policy = (policies or DEFAULT_ADMISSION_POLICIES)[candidate.kind]
     evidence_valid = bool(candidate.evidence_spans) and all(
@@ -195,6 +206,22 @@ def assess_memory_admission(
         "pattern_has_frequency": pattern_has_frequency,
         "pattern_has_multiple_evidence": pattern_has_multiple,
         "pattern_adjustment": pattern_adjustment,
+        "pattern_evidence_link_required": bool(
+            pattern_evidence_links is not None and pattern_evidence_links.required
+        ),
+        "pattern_evidence_link_valid": bool(
+            pattern_evidence_links is None or pattern_evidence_links.valid
+        ),
+        "pattern_linked_event_count": (
+            pattern_evidence_links.linked_event_count
+            if pattern_evidence_links is not None
+            else 0
+        ),
+        "pattern_evidence_link_reason": (
+            pattern_evidence_links.reason
+            if pattern_evidence_links is not None
+            else "not_evaluated"
+        ),
         "governed_transition_candidate": bool(
             governed_transition_eligibility is not None
             and governed_transition_eligibility.eligible
@@ -220,6 +247,13 @@ def assess_memory_admission(
             score,
             breakdown,
             "evidence_not_in_source",
+        )
+    if pattern_evidence_links is not None and not pattern_evidence_links.valid:
+        return AdmissionAssessment(
+            AdmissionDecision.REJECT,
+            score,
+            breakdown,
+            pattern_evidence_links.reason,
         )
     if not temporal_valid:
         decision = AdmissionDecision.PROPOSE if policy.allow_proposed else AdmissionDecision.REJECT
@@ -381,6 +415,73 @@ def interaction_pattern_has_multiple_evidence(
     corroborating_evidence_count: int = 0,
 ) -> bool:
     return len(candidate.evidence_spans) + corroborating_evidence_count >= 2
+
+
+def assess_pattern_evidence_links(
+    candidate: MemoryCandidate,
+    active_memories: list[MemoryItem],
+) -> PatternEvidenceLinkAssessment:
+    """Validate stored Event references for a model-inferred Pattern.
+
+    Shape validation alone cannot establish that an ID points to an Event in
+    the current user/relationship scope.  ``active_memories`` is already
+    scoped and lifecycle-filtered by ``MemoryService``, so this boundary can
+    authorize evidence without adding a Store API or trusting model payload.
+    """
+
+    if candidate.kind != MemoryKind.INTERACTION_PATTERN:
+        return PatternEvidenceLinkAssessment(required=False, valid=True)
+    source = candidate.payload.get("source")
+    if (
+        source != MemoryPerspective.MODEL_INFERRED.value
+        and candidate.perspective != MemoryPerspective.MODEL_INFERRED
+    ):
+        return PatternEvidenceLinkAssessment(required=False, valid=True)
+
+    raw_ids = candidate.payload.get("evidence_ids")
+    if (
+        not isinstance(raw_ids, list)
+        or not raw_ids
+        or any(not isinstance(value, str) or not value.strip() for value in raw_ids)
+    ):
+        return PatternEvidenceLinkAssessment(
+            required=True,
+            valid=False,
+            reason="model_inferred_pattern_missing_event_evidence",
+        )
+    evidence_ids = tuple(dict.fromkeys(str(value).strip() for value in raw_ids))
+    active_events = {
+        item.id: item
+        for item in active_memories
+        if item.kind == MemoryKind.INTERACTION_EVENT
+        and item.status in {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}
+    }
+    rejected = tuple(memory_id for memory_id in evidence_ids if memory_id not in active_events)
+    linked = tuple(memory_id for memory_id in evidence_ids if memory_id in active_events)
+    if rejected:
+        return PatternEvidenceLinkAssessment(
+            required=True,
+            valid=False,
+            linked_event_count=len(linked),
+            reason="model_inferred_pattern_invalid_event_evidence",
+            linked_event_ids=linked,
+            rejected_evidence_ids=rejected,
+        )
+    if len(linked) < 2:
+        return PatternEvidenceLinkAssessment(
+            required=True,
+            valid=False,
+            linked_event_count=len(linked),
+            reason="model_inferred_pattern_insufficient_event_evidence",
+            linked_event_ids=linked,
+        )
+    return PatternEvidenceLinkAssessment(
+        required=True,
+        valid=True,
+        linked_event_count=len(linked),
+        reason="model_inferred_pattern_event_evidence_valid",
+        linked_event_ids=linked,
+    )
 
 
 def _temporal_shape_is_valid(candidate: MemoryCandidate) -> bool:

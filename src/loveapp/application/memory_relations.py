@@ -537,6 +537,45 @@ def _resolve_preference(
         return None
     normalized_value = normalize_preference_value(value)
     polarity = _preference_polarity(candidate)
+    # Preference relation policy is owned by the predicate registry.  Keep a
+    # narrow legacy fallback for rows written before the registry metadata was
+    # introduced, but never let a hard-coded list override an explicit
+    # cardinality/update policy supplied by the registry.
+    spec = predicate_spec(candidate.canonical_predicate)
+    single_value_policy = False
+    multi_value_policy = False
+    policy_conflict = False
+    policy_protected = False
+    if spec is not None:
+        if spec.update_policy in {
+            PredicateUpdatePolicy.REPLACE,
+            PredicateUpdatePolicy.TRANSITION,
+        }:
+            # An explicit replacement policy is sufficient when a legacy
+            # registry entry omitted cardinality.  A MULTI+REPLACE entry is
+            # internally inconsistent and must fail closed instead of
+            # silently choosing one side.
+            policy_conflict = spec.cardinality == PredicateCardinality.MULTI
+            single_value_policy = not policy_conflict
+        elif spec.update_policy in {
+            PredicateUpdatePolicy.APPEND,
+            PredicateUpdatePolicy.MERGE,
+        }:
+            # Likewise, APPEND/MERGE can govern an entry whose cardinality is
+            # still unknown, but cannot authorize a SINGLE-value replacement.
+            policy_conflict = spec.cardinality == PredicateCardinality.SINGLE
+            multi_value_policy = not policy_conflict
+        else:
+            policy_protected = True
+    else:
+        # Legacy/custom canonical rows have no registry contract.  Preserve
+        # the reviewed single-value preference dimensions that predate the
+        # registry while remaining conservative for all other predicates.
+        single_value_policy = candidate.canonical_predicate in {
+            "preference.food.spiciness",
+            "preference.environment.noise",
+            "preference.budget.range",
+        }
     related = [
         item
         for item in active_memories
@@ -558,6 +597,28 @@ def _resolve_preference(
                     "normalized_preference",
                     "Equivalent preference wording maps to the same normalized value.",
                 )
+            # An explicit opposite polarity is a contradiction of the same
+            # semantic value.  Confirmed evidence may transition it; proposed
+            # evidence must remain fail-closed.  This behavior is independent
+            # of single/multi cardinality because polarity itself is the
+            # governed conflict dimension, but a protected/inconsistent
+            # registry policy still fails closed.
+            if policy_conflict or policy_protected:
+                return ClaimRelationResolution(
+                    ClaimRelation.UNCERTAIN,
+                    (),
+                    "preference_update_policy_protected",
+                    "The preference registry does not authorize this polarity replacement.",
+                    {
+                        "canonical_predicate": candidate.canonical_predicate,
+                        "cardinality": (
+                            spec.cardinality.value if spec is not None else "unknown"
+                        ),
+                        "update_policy": (
+                            spec.update_policy.value if spec is not None else "unknown"
+                        ),
+                    },
+                )
             relation = (
                 ClaimRelation.UPDATE
                 if incoming_status == MemoryStatus.CONFIRMED
@@ -577,11 +638,7 @@ def _resolve_preference(
                 "The new preference is a compatible parent or child category.",
             )
 
-    if related and candidate.canonical_predicate in {
-        "preference.food.spiciness",
-        "preference.environment.noise",
-        "preference.budget.range",
-    }:
+    if related and single_value_policy:
         relation = (
             ClaimRelation.UPDATE
             if incoming_status == MemoryStatus.CONFIRMED
@@ -592,13 +649,46 @@ def _resolve_preference(
             tuple(item.id for item in related),
             "single_value_preference_dimension",
             "This preference dimension is treated as a current single-value setting.",
+            {
+                "canonical_predicate": candidate.canonical_predicate,
+                "cardinality": spec.cardinality.value if spec is not None else "unknown",
+                "update_policy": spec.update_policy.value if spec is not None else "legacy",
+            },
+        )
+    if related and (policy_conflict or policy_protected):
+        return ClaimRelationResolution(
+            ClaimRelation.UNCERTAIN,
+            (),
+            "preference_update_policy_protected",
+            (
+                "The preference registry contains inconsistent cardinality/update policy metadata."
+                if policy_conflict
+                else (
+                    "The preference registry does not authorize deterministic "
+                    "replacement for this dimension."
+                )
+            ),
+            {
+                "canonical_predicate": candidate.canonical_predicate,
+                "cardinality": spec.cardinality.value if spec is not None else "unknown",
+                "update_policy": spec.update_policy.value if spec is not None else "unknown",
+            },
         )
     if related:
+        # A registered multi-value/merge policy explicitly authorizes keeping
+        # distinct values together.  Unknown legacy preferences retain the
+        # historical complementary behavior below.
         return ClaimRelationResolution(
             ClaimRelation.COMPLEMENTARY,
             tuple(item.id for item in related[:5]),
             "compatible_preference_values",
             "Different values in this open preference dimension may coexist.",
+            {
+                "canonical_predicate": candidate.canonical_predicate,
+                "cardinality": spec.cardinality.value if spec is not None else "unknown",
+                "update_policy": spec.update_policy.value if spec is not None else "legacy",
+                "registry_multi_value": multi_value_policy,
+            },
         )
     return None
 

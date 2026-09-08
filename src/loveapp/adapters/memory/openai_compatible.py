@@ -30,7 +30,7 @@ from loveapp.domain.runtime_context import PendingMemoryContext
 from loveapp.ports.memory import MemoryAttemptCallback
 from loveapp.ports.observability import TraceRecorder
 
-_MEMORY_PROMPT_VERSION = "memory-v2.6"
+_MEMORY_PROMPT_VERSION = "memory-v2.7"
 
 
 class OpenAICompatibleMemoryExtractor:
@@ -1006,15 +1006,30 @@ COMPOUND_MEMORY、CONTEXT_DEPENDENT_REPLY、TRANSIENT、SMALL_TALK、NO_MEMORY�
   relationship.interaction_reciprocity、partner.relationship_status、
   interaction.contact_frequency、interaction.topic_scope、interaction.channel、
   interaction.initiation_balance、interaction.response_engagement、
-  interaction.emotional_disclosure、preference.general、preference.food.cuisine、
+  interaction.emotional_disclosure、profile.residence、profile.occupation、
+  profile.contact_method、profile.birthday、preference.general、preference.food.cuisine、
   preference.food.spiciness、preference.environment.noise、preference.activity.type、
-  preference.budget.range。
+  preference.budget.range、preference.personal_interest.topic、preference.consumption.item、
+  preference.lifestyle.habit、preference.relationship.partner_trait、preference.communication.style、
+  preference.value.priority。
 - 无法可靠映射时必须使用 predicate_type=custom、custom_predicate=<英文 snake_case>，
   canonical_predicate 必须为 null；不得伪造新的 canonical 值。
+- V2.1 偏好分类优先使用已注册的 domain + dimension 组合：
+  personal_interest/topic、consumption/item、lifestyle/habit、relationship/partner_trait、
+  communication/style、value/priority；只有无法可靠归类时才使用 preference.general 或 custom。
+- stable_fact 只有明确的现居地、职业、主要联系方式和生日可分别使用已注册的
+  profile.residence、profile.occupation、profile.contact_method、profile.birthday，并将明确值写入
+  object 或 payload.value。其他开放事实不得猜测为 profile predicate，继续使用 custom。
 - raw_predicate 保留你最初识别的英文谓词；predicate 继续输出该原始谓词以兼容旧结构。
 - explicitness 只能是 explicit、strongly_implied、weakly_inferred、speculative。
 - requires_inference 表示该声明是否需要跨句、指代或因果推断。
 - 状态型记忆将 state_dimension/state_value 直接放在 claim 中；payload 中也保留同名字段。
+- interaction_event 的 payload 在有信息时使用结构化字段 participants、action、time、location、
+  emotion、outcome、source；source 只能是 user_reported 或 model_inferred。Event 只表示一次已经
+  发生的有边界行为，不要用事件字段表达长期频率或趋势。
+- interaction_pattern 的 payload 必须保留 metric；用户直接陈述的趋势可使用 source=user_reported，
+  系统从事件归纳的趋势必须使用 source=model_inferred，并提供 evidence_ids（或等价 evidence
+  数组）和可验证的 time_window。没有证据时不要伪造 model_inferred pattern。
 - 不得决定数据库操作，不得输出或猜测 supersedes_id；Python 生命周期策略会选择目标。
 
 核心规则：

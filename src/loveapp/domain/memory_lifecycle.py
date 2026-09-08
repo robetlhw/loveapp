@@ -19,7 +19,9 @@ from loveapp.domain.memory import (
 from loveapp.domain.memory_dimensions import (
     INTERACTION_PATTERN_DIMENSIONS,
     is_relationship_interaction_subject,
+    normalize_interaction_event_payload,
     normalize_interaction_pattern_payload,
+    normalize_interaction_pattern_provenance,
     normalize_interaction_state_value,
     normalize_state_dimension,
     normalize_state_value,
@@ -477,11 +479,32 @@ def normalize_memory_candidate(
             ttl = relationship_state_ttl(dimension)
             if candidate.expires_at is None and ttl is not None:
                 updates["expires_at"] = reference_time + ttl
+    elif effective_kind == MemoryKind.INTERACTION_EVENT:
+        normalized_event_payload = normalize_interaction_event_payload(
+            payload,
+            perspective=candidate.perspective,
+            occurred_at=candidate.occurred_at,
+            period_start=candidate.period_start,
+            period_end=candidate.period_end,
+            emotions=candidate.emotions,
+        )
+        if normalized_event_payload != payload:
+            payload = normalized_event_payload
     elif effective_kind == MemoryKind.INTERACTION_PATTERN:
+        evidence_text = " ".join(candidate.evidence_spans) or candidate.original_text
         normalized_interaction_payload = normalize_interaction_pattern_payload(
             payload,
-            " ".join(candidate.evidence_spans) or candidate.original_text,
+            evidence_text,
             candidate.raw_predicate or payload.get("predicate"),
+        )
+        normalized_interaction_payload = normalize_interaction_pattern_provenance(
+            normalized_interaction_payload,
+            perspective=candidate.perspective,
+            period_start=candidate.period_start,
+            period_end=candidate.period_end,
+            temporal_expression=normalized_interaction_payload.get(
+                "temporal_expression"
+            ),
         )
         metric = normalized_interaction_payload.get("metric")
         if normalized_interaction_payload != payload:
@@ -827,6 +850,15 @@ def _is_strictly_older(target: MemoryItem, trigger: MemoryCandidate) -> bool:
     if not isinstance(trigger, MemoryItem):
         return True
     target_time, trigger_time = _legacy_comparison_times(target, trigger)
+    # Legacy rows often have only ``updated_at`` while a newer interaction
+    # event carries an explicit occurrence time.  If both rows were persisted
+    # in the same clock tick, the shared-field comparison above is tied and
+    # would leave the stale row visible forever.  An explicit trigger
+    # occurrence is a safe tie-breaker: it is the business-time evidence that
+    # the transition happened after the legacy row was written.  Keep this
+    # narrow (tie-only) so ordinary mixed-field ordering remains unchanged.
+    if target_time == trigger_time and trigger.occurred_at is not None:
+        return target.updated_at < trigger.occurred_at
     return target.id != trigger.id and target_time < trigger_time
 
 

@@ -287,6 +287,38 @@ CANONICAL_PREDICATES: dict[str, CanonicalPredicateSpec] = {
         temporal_behavior=PREDICATE_TEMPORAL_PATTERN,
         update_policy=PREDICATE_UPDATE_REPLACE,
     ),
+    # Stable profile facts are deliberately finite and single-valued.  The
+    # registry authorizes replacement of the current value while the existing
+    # write batch keeps the superseded row as history.  Open-world facts do not
+    # inherit this policy and remain Custom/fail-closed.
+    "profile.residence": CanonicalPredicateSpec(
+        name="profile.residence",
+        state_dimension="profile.residence",
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_STATE,
+        update_policy=PREDICATE_UPDATE_REPLACE,
+    ),
+    "profile.occupation": CanonicalPredicateSpec(
+        name="profile.occupation",
+        state_dimension="profile.occupation",
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_STATE,
+        update_policy=PREDICATE_UPDATE_REPLACE,
+    ),
+    "profile.contact_method": CanonicalPredicateSpec(
+        name="profile.contact_method",
+        state_dimension="profile.contact_method",
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_STATE,
+        update_policy=PREDICATE_UPDATE_REPLACE,
+    ),
+    "profile.birthday": CanonicalPredicateSpec(
+        name="profile.birthday",
+        state_dimension="profile.birthday",
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
+        update_policy=PREDICATE_UPDATE_REPLACE,
+    ),
     "preference.general": CanonicalPredicateSpec(
         name="preference.general",
         cardinality=PREDICATE_CARDINALITY_MULTI,
@@ -309,6 +341,12 @@ CANONICAL_PREDICATES: dict[str, CanonicalPredicateSpec] = {
     ),
     "preference.environment.noise": CanonicalPredicateSpec(
         name="preference.environment.noise",
+        # Keep the environment preference in the same bounded domain as its
+        # value-level aliases (e.g. ``安静``/``热闹``).  Without this registry
+        # metadata the domain guard cannot prove that a typed ``noise`` claim
+        # belongs to this predicate and may conservatively downgrade it to a
+        # custom predicate.
+        semantic_domain="environment",
         cardinality=PREDICATE_CARDINALITY_SINGLE,
         temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
         update_policy=PREDICATE_UPDATE_REPLACE,
@@ -326,6 +364,53 @@ CANONICAL_PREDICATES: dict[str, CanonicalPredicateSpec] = {
         cardinality=PREDICATE_CARDINALITY_SINGLE,
         temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
         update_policy=PREDICATE_UPDATE_REPLACE,
+    ),
+    # These bounded category predicates provide a stable vocabulary for the
+    # preference domains described by Memory V2.1.  They intentionally remain
+    # open-valued and append-only: values such as a hobby, communication
+    # style, or relationship trait may coexist.  Unknown categories continue
+    # to fall back to ``preference.general``/Custom through the normalizer.
+    "preference.personal_interest.topic": CanonicalPredicateSpec(
+        name="preference.personal_interest.topic",
+        semantic_domain="personal_interest",
+        cardinality=PREDICATE_CARDINALITY_MULTI,
+        temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
+        update_policy=PREDICATE_UPDATE_APPEND,
+    ),
+    "preference.consumption.item": CanonicalPredicateSpec(
+        name="preference.consumption.item",
+        semantic_domain="consumption",
+        cardinality=PREDICATE_CARDINALITY_MULTI,
+        temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
+        update_policy=PREDICATE_UPDATE_APPEND,
+    ),
+    "preference.lifestyle.habit": CanonicalPredicateSpec(
+        name="preference.lifestyle.habit",
+        semantic_domain="lifestyle",
+        cardinality=PREDICATE_CARDINALITY_MULTI,
+        temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
+        update_policy=PREDICATE_UPDATE_APPEND,
+    ),
+    "preference.relationship.partner_trait": CanonicalPredicateSpec(
+        name="preference.relationship.partner_trait",
+        semantic_domain="relationship",
+        cardinality=PREDICATE_CARDINALITY_MULTI,
+        temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
+        update_policy=PREDICATE_UPDATE_APPEND,
+    ),
+    "preference.communication.style": CanonicalPredicateSpec(
+        name="preference.communication.style",
+        semantic_domain="communication",
+        cardinality=PREDICATE_CARDINALITY_MULTI,
+        temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
+        update_policy=PREDICATE_UPDATE_APPEND,
+    ),
+    "preference.value.priority": CanonicalPredicateSpec(
+        name="preference.value.priority",
+        semantic_domain="value",
+        cardinality=PREDICATE_CARDINALITY_MULTI,
+        temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
+        update_policy=PREDICATE_UPDATE_APPEND,
     ),
 }
 
@@ -619,6 +704,36 @@ _PREFERENCE_PREDICATES = {
     "date": "preference.activity.type",
     "budget": "preference.budget.range",
     "price": "preference.budget.range",
+    # V2.1 bounded preference categories.  Keep aliases explicit rather than
+    # guessing a category from arbitrary free text.
+    "personal_interest": "preference.personal_interest.topic",
+    "interest": "preference.personal_interest.topic",
+    "consumption": "preference.consumption.item",
+    "consumption_preference": "preference.consumption.item",
+    "lifestyle": "preference.lifestyle.habit",
+    "relationship": "preference.relationship.partner_trait",
+    "relationship_preference": "preference.relationship.partner_trait",
+    "communication": "preference.communication.style",
+    "communication_preference": "preference.communication.style",
+    "value": "preference.value.priority",
+    "value_preference": "preference.value.priority",
+}
+
+# The V2.1 category shape uses ``domain`` + ``dimension`` instead of the
+# legacy ``preference_type`` field.  Only reviewed pairs are accepted here;
+# an unknown pair still follows the normal custom/general fail-closed path.
+_PREFERENCE_DOMAIN_DIMENSIONS = {
+    ("food", "cuisine"): "preference.food.cuisine",
+    ("food", "spiciness"): "preference.food.spiciness",
+    ("environment", "noise"): "preference.environment.noise",
+    ("activity", "type"): "preference.activity.type",
+    ("budget", "range"): "preference.budget.range",
+    ("personal_interest", "topic"): "preference.personal_interest.topic",
+    ("consumption", "item"): "preference.consumption.item",
+    ("lifestyle", "habit"): "preference.lifestyle.habit",
+    ("relationship", "partner_trait"): "preference.relationship.partner_trait",
+    ("communication", "style"): "preference.communication.style",
+    ("value", "priority"): "preference.value.priority",
 }
 
 # These are deliberately broad semantic markers, rather than a list of
@@ -636,7 +751,10 @@ _PREFERENCE_DOMAIN_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
         ),
     ),
     "environment": (
-        re.compile(r"安静|热闹|噪音|环境|氛围|室内|户外|自然|灯光"),
+        # This domain currently governs only the reviewed ``noise``
+        # dimension.  Broad environment words (outdoor, lighting, ambience)
+        # are not sufficient to infer that narrower setting.
+        re.compile(r"安静|清静|宁静|热闹|吵闹|嘈杂|噪音|quiet|noisy|noise|loud", re.IGNORECASE),
     ),
     "budget": (
         re.compile(r"预算|价格|花费|消费|便宜|实惠|省钱|贵|经济"),
@@ -654,6 +772,17 @@ _PREFERENCE_DOMAIN_BY_TYPE = {
     "environment": "environment",
     "budget": "budget",
     "price": "budget",
+    "personal_interest": "personal_interest",
+    "interest": "personal_interest",
+    "consumption": "consumption",
+    "consumption_preference": "consumption",
+    "lifestyle": "lifestyle",
+    "relationship": "relationship",
+    "relationship_preference": "relationship",
+    "communication": "communication",
+    "communication_preference": "communication",
+    "value": "value",
+    "value_preference": "value",
 }
 
 _STATE_VALUE_ALIASES = {
@@ -699,6 +828,53 @@ _PREFERENCE_VALUE_ALIASES = {
 }
 
 
+_STABLE_FACT_PREDICATE_ALIASES = {
+    # Residence/location.  Broad words such as ``location`` are safe here
+    # because this map is consulted only for ``stable_fact`` candidates.
+    "residence": "profile.residence",
+    "current_residence": "profile.residence",
+    "residential_location": "profile.residence",
+    "current_location": "profile.residence",
+    "home_location": "profile.residence",
+    "location": "profile.residence",
+    "lives_in": "profile.residence",
+    "resides_in": "profile.residence",
+    "居住地": "profile.residence",
+    "现居地": "profile.residence",
+    "居住城市": "profile.residence",
+    # Current occupation/work identity.
+    "occupation": "profile.occupation",
+    "profession": "profile.occupation",
+    "job": "profile.occupation",
+    "job_title": "profile.occupation",
+    "work": "profile.occupation",
+    "works_as": "profile.occupation",
+    "职业": "profile.occupation",
+    "工作": "profile.occupation",
+    # Primary contact method/address.  This does not infer contact data from
+    # arbitrary numbers; a model must explicitly choose one of these aliases.
+    "contact_method": "profile.contact_method",
+    "preferred_contact_method": "profile.contact_method",
+    "contact_details": "profile.contact_method",
+    "phone": "profile.contact_method",
+    "phone_number": "profile.contact_method",
+    "mobile_number": "profile.contact_method",
+    "wechat_id": "profile.contact_method",
+    "联系方式": "profile.contact_method",
+    "联系电话": "profile.contact_method",
+    "手机号": "profile.contact_method",
+    "微信号": "profile.contact_method",
+    # Birthday/date of birth.
+    "birthday": "profile.birthday",
+    "birth_date": "profile.birthday",
+    "date_of_birth": "profile.birthday",
+    "dob": "profile.birthday",
+    "生日": "profile.birthday",
+    "出生日期": "profile.birthday",
+}
+_STABLE_FACT_PREDICATES = frozenset(_STABLE_FACT_PREDICATE_ALIASES.values())
+
+
 def normalize_predicate(
     *,
     kind: object,
@@ -714,6 +890,33 @@ def normalize_predicate(
     requested_canonical = _clean_string(canonical_predicate)
     requested_custom = _clean_string(custom_predicate)
     requested_type = str(getattr(predicate_type, "value", predicate_type or "")).casefold()
+    raw_identifier = _normalize_identifier(raw) if raw else None
+
+    if kind_value == "stable_fact":
+        requested_identifier = (
+            _normalize_identifier(requested_canonical) if requested_canonical else None
+        )
+        stable_predicate = (
+            requested_identifier
+            if requested_identifier in _STABLE_FACT_PREDICATES
+            else _STABLE_FACT_PREDICATE_ALIASES.get(requested_identifier or "")
+            or _STABLE_FACT_PREDICATE_ALIASES.get(raw_identifier or "")
+        )
+        if stable_predicate is not None:
+            spec = CANONICAL_PREDICATES[stable_predicate]
+            return PredicateNormalization(
+                raw_predicate=raw or requested_canonical or stable_predicate,
+                predicate_type="canonical",
+                canonical_predicate=stable_predicate,
+                custom_predicate=None,
+                state_dimension=spec.state_dimension,
+                state_value=_stable_fact_value(payload),
+                alias_hit=(
+                    requested_identifier != stable_predicate
+                    if requested_identifier
+                    else raw_identifier != stable_predicate
+                ),
+            )
 
     if kind_value == "preference":
         canonical = _preference_predicate(payload, requested_canonical or raw)
@@ -741,6 +944,23 @@ def normalize_predicate(
             state_dimension=None,
             state_value=None,
             alias_hit=canonical != requested_canonical and bool(requested_canonical),
+        )
+
+    # Profile predicates are authorized only for stable facts.  A model cannot
+    # opt an event or relationship state into profile replacement semantics
+    # merely by emitting a registered-looking canonical name.
+    if kind_value != "stable_fact" and (
+        requested_canonical in _STABLE_FACT_PREDICATES
+        or raw_identifier in _STABLE_FACT_PREDICATES
+    ):
+        custom = requested_custom or raw or requested_canonical or "unknown"
+        return PredicateNormalization(
+            raw_predicate=raw or requested_canonical or custom,
+            predicate_type="custom",
+            canonical_predicate=None,
+            custom_predicate=_normalize_identifier(custom),
+            state_dimension=None,
+            state_value=None,
         )
 
     state_dimension = _clean_string(
@@ -809,7 +1029,6 @@ def normalize_predicate(
                 state_value=value,
             )
 
-    raw_identifier = _normalize_identifier(raw) if raw else None
     if raw_identifier in CANONICAL_PREDICATES:
         spec = CANONICAL_PREDICATES[raw_identifier]
         value = _normalize_state_value(raw_identifier, payload.get("state_value"))
@@ -854,6 +1073,16 @@ def normalize_predicate(
     )
 
 
+def _stable_fact_value(payload: dict[str, Any]) -> str | None:
+    for key in ("state_value", "value", "object"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        normalized = unicodedata.normalize("NFKC", value).casefold().strip()
+        return re.sub(r"\s+", " ", normalized)
+    return None
+
+
 def normalize_preference_value(value: object) -> str:
     normalized = _normalize_identifier(str(value or ""))
     return _PREFERENCE_VALUE_ALIASES.get(normalized, normalized)
@@ -884,12 +1113,31 @@ def is_high_risk_predicate(value: str | None) -> bool:
 
 
 def _preference_predicate(payload: dict[str, Any], requested: str | None) -> str:
-    if requested in CANONICAL_PREDICATES and requested.startswith("preference."):
+    if (
+        requested in CANONICAL_PREDICATES
+        and requested.startswith("preference.")
+        and requested != "preference.general"
+    ):
         return requested
     preference_type = _normalize_identifier(
         str(payload.get("preference_type_hint") or payload.get("preference_type") or "")
     )
-    return _PREFERENCE_PREDICATES.get(preference_type, "preference.general")
+    if preference_type in _PREFERENCE_PREDICATES:
+        return _PREFERENCE_PREDICATES[preference_type]
+
+    domain = _normalize_preference_domain_value(
+        payload.get("domain")
+        or payload.get("preference_domain")
+        or payload.get("category")
+    )
+    dimension = _normalize_identifier(
+        str(payload.get("dimension") or payload.get("preference_dimension") or "")
+    )
+    if domain and dimension:
+        category_predicate = _PREFERENCE_DOMAIN_DIMENSIONS.get((domain, dimension))
+        if category_predicate is not None:
+            return category_predicate
+    return "preference.general"
 
 
 def _enforce_preference_domain(
@@ -923,15 +1171,15 @@ def _enforce_preference_domain(
         if len(hinted_candidates) == 1:
             return next(iter(hinted_candidates)), requested_custom or raw_predicate or canonical
 
-    explicit_domain = _explicit_preference_domain(payload)
     observed_domains = _observed_preference_domains(payload)
-    if explicit_domain is not None:
-        observed_domains.add(explicit_domain)
 
     if spec.semantic_domain is None:
         # ``preference.general`` remains a compatibility fallback when the
-        # value has no reliable domain.  A uniquely recognizable domain can,
-        # however, use the corresponding registered sibling predicate.
+        # value has no reliable domain.  Only value-level semantic evidence
+        # may identify a registered sibling here.  A broad ``domain`` alone
+        # never proves a narrower dimension such as environment/noise or
+        # relationship/partner_trait; otherwise registry shape would create
+        # false canonical uniqueness.
         sibling_candidates = {
             name
             for name, sibling in CANONICAL_PREDICATES.items()
@@ -943,6 +1191,10 @@ def _enforce_preference_domain(
         # registered domain, preserve the claim as Custom instead of allowing
         # an untyped canonical preference into governance.
         return None, requested_custom or raw_predicate or canonical
+
+    explicit_domain = _explicit_preference_domain(payload)
+    if explicit_domain is not None:
+        observed_domains.add(explicit_domain)
 
     if not observed_domains:
         # A canonical claim without a value cannot be proven inconsistent.
@@ -967,17 +1219,32 @@ def _explicit_preference_domain(payload: dict[str, Any]) -> str | None:
     preference_type = _normalize_identifier(
         str(payload.get("preference_type_hint") or payload.get("preference_type") or "")
     )
-    return _PREFERENCE_DOMAIN_BY_TYPE.get(preference_type)
+    return _PREFERENCE_DOMAIN_BY_TYPE.get(preference_type) or _normalize_preference_domain_value(
+        payload.get("domain")
+        or payload.get("preference_domain")
+        or payload.get("category")
+    )
 
 
 def _preference_hint_domain(payload: dict[str, Any]) -> str | None:
+    # Only the repair layer's explicit type hint is authoritative here.
+    # ``domain`` is intentionally not a hint: it describes a broad category
+    # and cannot authorize a narrower registered dimension on its own.
     hint = _normalize_identifier(str(payload.get("preference_type_hint") or ""))
-    return _PREFERENCE_DOMAIN_BY_TYPE.get(hint)
+    return _PREFERENCE_DOMAIN_BY_TYPE.get(hint) or _normalize_preference_domain_value(hint)
 
 
 def _observed_preference_domains(payload: dict[str, Any]) -> set[str]:
     values: list[str] = []
-    for key in ("preference", "object", "activity_type", "summary", "evidence", "evidence_spans"):
+    for key in (
+        "preference",
+        "object",
+        "value",
+        "activity_type",
+        "summary",
+        "evidence",
+        "evidence_spans",
+    ):
         value = payload.get(key)
         if isinstance(value, str):
             values.append(value)
@@ -989,6 +1256,40 @@ def _observed_preference_domains(payload: dict[str, Any]) -> set[str]:
         for domain, patterns in _PREFERENCE_DOMAIN_PATTERNS.items()
         if any(pattern.search(text) for pattern in patterns)
     }
+
+
+def _normalize_preference_domain_value(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = _normalize_identifier(value)
+    aliases = {
+        "personal_interest": "personal_interest",
+        "personal_interest_preference": "personal_interest",
+        "consumption": "consumption",
+        "consumption_preference": "consumption",
+        "lifestyle": "lifestyle",
+        "lifestyle_preference": "lifestyle",
+        "relationship": "relationship",
+        "relationship_preference": "relationship",
+        "communication": "communication",
+        "communication_preference": "communication",
+        "value": "value",
+        "value_preference": "value",
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+    return normalized if normalized in {
+        "food",
+        "activity",
+        "environment",
+        "budget",
+        "personal_interest",
+        "consumption",
+        "lifestyle",
+        "relationship",
+        "communication",
+        "value",
+    } else None
 
 
 def _normalize_state_value(canonical_predicate: str, value: object) -> str | None:

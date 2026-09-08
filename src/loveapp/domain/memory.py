@@ -302,6 +302,14 @@ def _normalize_memory_input(value: object) -> object:
     if not isinstance(value, dict):
         return value
     normalized = dict(value)
+    # The V2.1 design document uses a JSON ``type`` discriminator in its
+    # examples, while the persisted/production contract calls the same field
+    # ``kind``.  Accept the documented alias at the model boundary and map
+    # only the bounded kind vocabulary; an unknown value is left intact so
+    # Pydantic still fails closed with the normal enum validation error.
+    type_alias = normalized.pop("type", None)
+    if "kind" not in normalized and type_alias is not None:
+        normalized["kind"] = _normalize_memory_kind_alias(type_alias)
     aliases = {
         "memory_kind": "kind",
         "target": "object",
@@ -327,7 +335,28 @@ def _normalize_memory_input(value: object) -> object:
 
     temporal = normalized.pop("temporal", None)
     time_alias = normalized.pop("time", None)
-    if temporal is None:
+    # V2.1 interaction events use ``time`` as a payload field, while older
+    # claims use the same top-level key as a temporal-shape alias (``point``,
+    # ``interval`` or a temporal object).  Preserve event-specific values for
+    # the payload contract without changing legacy temporal parsing.
+    event_time_payload: object = None
+    kind_hint = normalized.get("kind") or normalized.get("memory_kind")
+    time_is_legacy_kind = (
+        isinstance(time_alias, str)
+        and time_alias.casefold().strip() in {item.value for item in TimeKind}
+    )
+    if (
+        isinstance(kind_hint, str)
+        and kind_hint.casefold().strip()
+        in {"interaction_event", "event", "interaction_episode"}
+        and time_alias is not None
+        and not isinstance(time_alias, dict)
+        and not time_is_legacy_kind
+    ):
+        event_time_payload = time_alias
+        if _looks_like_iso_datetime(time_alias) and "occurred_at" not in normalized:
+            normalized["occurred_at"] = time_alias
+    if temporal is None and event_time_payload is None:
         temporal = time_alias
     normalized.pop("reference_time", None)
     temporal_expression_alias: str | None = None
@@ -370,6 +399,12 @@ def _normalize_memory_input(value: object) -> object:
         "current",
         "preference",
         "preference_type",
+        "domain",
+        "dimension",
+        "value",
+        "preference_domain",
+        "preference_dimension",
+        "category",
         "temporal_expression",
         "event_status",
         "memory_role",
@@ -377,7 +412,30 @@ def _normalize_memory_input(value: object) -> object:
         "state_value",
         "state_dimension",
         "activity_type",
+        "action",
+        "location",
+        "place",
+        "venue",
+        "where",
+        "emotion",
+        "feeling",
+        "outcome",
+        "result",
+        "effect",
+        "source",
+        "provenance",
+        "origin",
+        "evidence_ids",
+        "event_ids",
+        "source_event_ids",
+        "supporting_event_ids",
+        "time_window",
+        "time_range",
+        "window",
         "participants",
+        "actors",
+        "involved_participants",
+        "involved_people",
         "relationship_evidence",
         "related_plan_id",
         "completes_plan_id",
@@ -388,6 +446,8 @@ def _normalize_memory_input(value: object) -> object:
                 normalized.pop(key)
     if temporal_expression_alias:
         payload.setdefault("temporal_expression", temporal_expression_alias)
+    if event_time_payload is not None:
+        payload.setdefault("time", event_time_payload)
     if payload or raw_payload is not None:
         normalized["payload"] = payload
     precision = normalized.get("temporal_precision")
@@ -416,6 +476,32 @@ def _normalize_temporal_precision(value: str) -> str:
 
 def _looks_like_iso_datetime(value: object) -> bool:
     return isinstance(value, str) and re.match(r"^\d{4}-\d{2}-\d{2}", value.strip()) is not None
+
+
+def _normalize_memory_kind_alias(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    normalized = value.casefold().strip().replace("-", "_")
+    aliases = {
+        "fact": MemoryKind.STABLE_FACT.value,
+        "stable_fact": MemoryKind.STABLE_FACT.value,
+        "preference": MemoryKind.PREFERENCE.value,
+        "event": MemoryKind.INTERACTION_EVENT.value,
+        "interaction_event": MemoryKind.INTERACTION_EVENT.value,
+        "interaction_episode": MemoryKind.INTERACTION_EVENT.value,
+        "pattern": MemoryKind.INTERACTION_PATTERN.value,
+        "interaction_pattern": MemoryKind.INTERACTION_PATTERN.value,
+        "interaction_trend": MemoryKind.INTERACTION_PATTERN.value,
+        "plan": MemoryKind.PLANNED_EVENT.value,
+        "planned_event": MemoryKind.PLANNED_EVENT.value,
+        "pending_event": MemoryKind.PLANNED_EVENT.value,
+        "intent": MemoryKind.ACTION_INTENT.value,
+        "action_intent": MemoryKind.ACTION_INTENT.value,
+        "pending_action": MemoryKind.ACTION_INTENT.value,
+        "relationship_state": MemoryKind.RELATIONSHIP_STATE.value,
+        "advice_outcome": MemoryKind.ADVICE_OUTCOME.value,
+    }
+    return aliases.get(normalized, value)
 
 
 class MemoryCandidate(BaseModel):
@@ -722,7 +808,17 @@ class MemoryCompactionResult(BaseModel):
 
 
 def normalize_candidate_predicate(candidate: MemoryCandidate) -> MemoryCandidate:
-    semantic_payload = dict(candidate.payload)
+    payload = dict(candidate.payload)
+    if candidate.kind == MemoryKind.PREFERENCE:
+        # Memory V2.1 expresses typed preferences as
+        # ``domain + dimension + value``.  The established persistence and
+        # dedupe contract uses ``preference`` for the value, so reconcile the
+        # two representations once at the normalization boundary.
+        value = payload.get("value")
+        if "preference" not in payload and isinstance(value, str) and value.strip():
+            payload["preference"] = value.strip()
+
+    semantic_payload = dict(payload)
     semantic_payload.setdefault("summary", candidate.summary)
     semantic_payload.setdefault("original_text", candidate.original_text)
     semantic_payload.setdefault("evidence_spans", candidate.evidence_spans)
@@ -742,7 +838,6 @@ def normalize_candidate_predicate(candidate: MemoryCandidate) -> MemoryCandidate
         "state_dimension": normalized.state_dimension,
         "state_value": normalized.state_value,
     }
-    payload = dict(candidate.payload)
     if normalized.predicate_type == PredicateType.CANONICAL.value:
         if normalized.canonical_predicate and normalized.canonical_predicate.startswith(
             "interaction."
@@ -838,6 +933,24 @@ def _memory_identity_parts(candidate: MemoryCandidate) -> tuple[str, ...]:
         value = candidate.state_value or predicate.state_value
         if isinstance(dimension, str) and isinstance(value, str):
             return (kind, subject, "state", dimension, value)
+
+    # Registered Stable Fact dimensions use their normalized value for
+    # identity even when the extractor supplied the value through
+    # ``payload.value`` rather than the legacy ``payload.object`` field.
+    # Custom facts never receive a profile dimension, so they retain the
+    # existing open-world identity and conservative relation behavior.
+    if (
+        candidate.kind == MemoryKind.STABLE_FACT
+        and isinstance(predicate.state_dimension, str)
+        and predicate.state_dimension.startswith("profile.")
+        and isinstance(predicate.state_value, str)
+    ):
+        return (
+            kind,
+            subject,
+            predicate_name,
+            predicate.state_value,
+        )
 
     # ``contact.status`` can legitimately arrive as a legacy stable fact
     # before lifecycle normalization upgrades it. Its registered state value

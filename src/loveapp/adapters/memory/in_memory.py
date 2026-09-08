@@ -28,6 +28,7 @@ from loveapp.domain.memory import (
     utc_now,
 )
 from loveapp.domain.memory_context import attach_memories, select_context_memories
+from loveapp.domain.memory_dimensions import merge_interaction_pattern_provenance
 from loveapp.domain.memory_write import (
     MemoryTransitionAudit,
     MemoryWriteBatch,
@@ -433,11 +434,21 @@ class InMemoryMemoryStore:
         candidate = normalize_candidate_predicate(candidate)
         key = memory_dedupe_key(candidate)
         if source_message_id is not None:
+            source_message = self._messages.get(source_message_id)
+            if source_message is not None and (
+                source_message.user_id,
+                source_message.relationship_id,
+            ) != (user_id, relationship_id):
+                raise ValueError(
+                    "memory source message is outside the current relationship scope"
+                )
             idempotent = next(
                 (
                     item
                     for item in self._memories.values()
                     if item.source_message_id == source_message_id
+                    and item.user_id == user_id
+                    and item.relationship_id == relationship_id
                     and item.dedupe_key == key
                 ),
                 None,
@@ -488,6 +499,11 @@ class InMemoryMemoryStore:
             item.lifecycle_review_required = (
                 item.lifecycle_review_required or candidate.lifecycle_review_required
             )
+            if item.kind == MemoryKind.INTERACTION_PATTERN:
+                item.payload = merge_interaction_pattern_provenance(
+                    item.payload,
+                    candidate.payload,
+                )
             item.dedupe_key = key
             self._sync_plan_for_memory(item)
             return MemorySaveResult(item=item.model_copy(deep=True), created=False)

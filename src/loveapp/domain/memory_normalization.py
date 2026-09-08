@@ -9,6 +9,8 @@ from loveapp.domain.memory_dimensions import (
     normalize_interaction_metric,
     normalize_state_dimension,
     normalize_state_value,
+    validate_interaction_event_payload,
+    validate_interaction_pattern_payload,
 )
 from loveapp.domain.memory_lifecycle import normalize_memory_candidate
 from loveapp.domain.memory_predicates import CANONICAL_PREDICATES, normalize_predicate
@@ -66,7 +68,29 @@ def validate_normalized_memory_candidate(
             "custom output must retain exactly one custom predicate",
         )
 
+    if candidate.kind == MemoryKind.INTERACTION_EVENT:
+        try:
+            validate_interaction_event_payload(
+                candidate.payload,
+                perspective=candidate.perspective,
+            )
+        except ValueError as exc:
+            raise NormalizationContractError(
+                "INTERACTION_EVENT_PAYLOAD_INVALID",
+                str(exc),
+            ) from exc
+
     if candidate.kind == MemoryKind.INTERACTION_PATTERN:
+        try:
+            validate_interaction_pattern_payload(
+                candidate.payload,
+                perspective=candidate.perspective,
+            )
+        except ValueError as exc:
+            raise NormalizationContractError(
+                "INTERACTION_PATTERN_PAYLOAD_INVALID",
+                str(exc),
+            ) from exc
         metric = normalize_interaction_metric(candidate.payload.get("metric"))
         if metric not in INTERACTION_PATTERN_DIMENSIONS:
             if allow_legacy_open_world and (

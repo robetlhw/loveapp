@@ -5,7 +5,7 @@ from loveapp.adapters.memory.openai_compatible import (
 
 
 def test_extraction_prompt_uses_structured_short_reply_contract() -> None:
-    assert _MEMORY_PROMPT_VERSION == "memory-v2.6"
+    assert _MEMORY_PROMPT_VERSION == "memory-v2.7"
     assert "previous_assistant_question、expected_slot、topic" in _SYSTEM_PROMPT
     assert "不要把\n  问答文本拼成新的 user_message" in _SYSTEM_PROMPT
     assert "requires_inference=true" in _SYSTEM_PROMPT
@@ -41,3 +41,12 @@ def test_extraction_prompt_defines_independently_updateable_atomization() -> Non
     assert "advice_outcome 与当前冲突已解决的 relationship_state 分开" in _SYSTEM_PROMPT
     assert "不要过度拆分" in _SYSTEM_PROMPT
     assert "reply speed、message length、\n    topic initiation 三条 claims" in _SYSTEM_PROMPT
+
+
+def test_extraction_prompt_exposes_v21_event_pattern_and_preference_contract() -> None:
+    assert "participants、action、time、location" in _SYSTEM_PROMPT
+    assert "source=user_reported" in _SYSTEM_PROMPT
+    assert "source=model_inferred" in _SYSTEM_PROMPT
+    assert "evidence_ids" in _SYSTEM_PROMPT
+    assert "personal_interest/topic" in _SYSTEM_PROMPT
+    assert "preference.relationship.partner_trait" in _SYSTEM_PROMPT

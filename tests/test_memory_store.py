@@ -495,6 +495,93 @@ async def test_sqlite_deduplicates_equivalent_interaction_pattern_states(
     assert improving_saved.created is True
 
 
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+async def test_pattern_same_merge_retains_new_structured_provenance(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    store = (
+        InMemoryMemoryStore()
+        if backend == "memory"
+        else SQLiteMemoryStore(tmp_path / "pattern-provenance.db")
+    )
+    first = _inferred_pattern(
+        evidence_ids=["event-1", "event-2"],
+        time_window={"start": "2026-09-01", "end": "2026-09-02"},
+        original_text="partner initiated chats twice",
+    )
+    repeated = _inferred_pattern(
+        evidence_ids=["event-2", "event-3"],
+        time_window={"start": "2026-09-03", "end": "2026-09-04"},
+        original_text="partner continued initiating chats",
+    )
+
+    first_saved = await store.save_memory(
+        user_id="pattern-provenance-user",
+        relationship_id="primary",
+        candidate=first,
+    )
+    repeated_saved = await store.save_memory(
+        user_id="pattern-provenance-user",
+        relationship_id="primary",
+        candidate=repeated,
+    )
+
+    assert repeated_saved.created is False
+    assert repeated_saved.item.id == first_saved.item.id
+    assert repeated_saved.item.payload["evidence_ids"] == [
+        "event-1",
+        "event-2",
+        "event-3",
+    ]
+    assert repeated_saved.item.payload["time_window"] == {
+        "start": "2026-09-03",
+        "end": "2026-09-04",
+    }
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+async def test_source_message_idempotency_cannot_cross_relationship_scope(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    store = (
+        InMemoryMemoryStore()
+        if backend == "memory"
+        else SQLiteMemoryStore(tmp_path / "source-scope.db")
+    )
+    source = await store.add_message(
+        user_id="source-owner",
+        relationship_id="relationship-a",
+        conversation_id="conversation-a",
+        message_id="scoped-source-message",
+        role=MessageRole.USER,
+        content="partner initiated chats twice",
+    )
+    candidate = _inferred_pattern(
+        evidence_ids=["event-1", "event-2"],
+        time_window={"start": "2026-09-01", "end": "2026-09-02"},
+        original_text=source.content,
+    )
+    first = await store.save_memory(
+        user_id=source.user_id,
+        relationship_id=source.relationship_id,
+        candidate=candidate,
+        source_message_id=source.id,
+    )
+
+    with pytest.raises(ValueError, match=r"source message.*outside"):
+        await store.save_memory(
+            user_id="source-owner",
+            relationship_id="relationship-b",
+            candidate=candidate,
+            source_message_id=source.id,
+        )
+
+    memories = await store.list_memories(user_id="source-owner")
+    assert [memory.id for memory in memories] == [first.item.id]
+
+
 async def test_delete_and_clear_remove_memories_from_context(tmp_path: Path) -> None:
     store = SQLiteMemoryStore(tmp_path / "forget.db")
     await store.save_relationship_context(
@@ -655,6 +742,29 @@ def _preference(value: str) -> MemoryCandidate:
         perspective=MemoryPerspective.USER_REPORTED,
         confidence=1,
         payload={"preference": value, "preference_type": "like"},
+    )
+
+
+def _inferred_pattern(
+    *,
+    evidence_ids: list[str],
+    time_window: dict[str, str],
+    original_text: str,
+) -> MemoryCandidate:
+    return MemoryCandidate(
+        kind=MemoryKind.INTERACTION_PATTERN,
+        subject="relationship",
+        summary=original_text,
+        original_text=original_text,
+        perspective=MemoryPerspective.MODEL_INFERRED,
+        payload={
+            "predicate": "interaction.contact_frequency",
+            "metric": "contact_frequency",
+            "current": "high",
+            "source": "model_inferred",
+            "evidence_ids": evidence_ids,
+            "time_window": time_window,
+        },
     )
 
 

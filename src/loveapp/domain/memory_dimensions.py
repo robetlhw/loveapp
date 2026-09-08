@@ -2,7 +2,7 @@ import re
 import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 
 @dataclass(frozen=True)
@@ -154,6 +154,81 @@ INTERACTION_PATTERN_DIMENSIONS = frozenset(
         "emotional_disclosure",
     }
 )
+
+# Interaction payloads intentionally remain dictionaries at the persistence
+# boundary for backwards compatibility.  These bounded vocabularies and
+# helpers provide a small, deterministic contract without introducing a
+# second Memory model or changing the Store schema.
+INTERACTION_MEMORY_SOURCES = frozenset({"user_reported", "model_inferred"})
+INTERACTION_EVENT_PAYLOAD_FIELDS = frozenset(
+    {
+        "participants",
+        "action",
+        "activity_type",
+        "time",
+        "location",
+        "emotion",
+        "outcome",
+        "source",
+    }
+)
+INTERACTION_PATTERN_PAYLOAD_FIELDS = frozenset(
+    {"source", "evidence", "evidence_ids", "time_window"}
+)
+
+_INTERACTION_SOURCE_ALIASES = {
+    "reported": "user_reported",
+    "user": "user_reported",
+    "user_reported": "user_reported",
+    "explicit": "user_reported",
+    "inferred": "model_inferred",
+    "model": "model_inferred",
+    "model_inferred": "model_inferred",
+    "system_inferred": "model_inferred",
+}
+_EVENT_PARTICIPANT_ALIASES = {
+    "i": "user",
+    "me": "user",
+    "myself": "user",
+    "user": "user",
+    "我": "user",
+    "用户": "user",
+    "she": "partner",
+    "he": "partner",
+    "her": "partner",
+    "him": "partner",
+    "partner": "partner",
+    "other": "partner",
+    "对方": "partner",
+    "她": "partner",
+    "他": "partner",
+}
+_EVENT_BOTH_PARTICIPANT_ALIASES = {
+    "we",
+    "both",
+    "couple",
+    "dyad",
+    "relationship",
+    "user_and_partner",
+    "partner_and_user",
+    "我们",
+    "双方",
+    "两人",
+    "彼此",
+}
+_EVENT_ACTION_ALIASES = ("action", "activity_type", "activity", "event_action", "verb")
+_EVENT_TIME_ALIASES = ("time", "event_time", "time_expression", "temporal_expression")
+_EVENT_LOCATION_ALIASES = ("location", "place", "venue", "where")
+_EVENT_EMOTION_ALIASES = ("emotion", "feeling")
+_EVENT_OUTCOME_ALIASES = ("outcome", "result", "effect")
+_PATTERN_SOURCE_ALIASES = ("source", "provenance", "origin")
+_PATTERN_EVIDENCE_ID_ALIASES = (
+    "evidence_ids",
+    "event_ids",
+    "source_event_ids",
+    "supporting_event_ids",
+)
+_PATTERN_TIME_WINDOW_ALIASES = ("time_window", "time_range", "window")
 
 _INITIATION_BALANCE_VALUES = frozenset(
     {"partner_to_user", "balanced", "user_to_partner", "mixed"}
@@ -487,6 +562,532 @@ def normalize_interaction_metric(value: object) -> str | None:
         return None
     normalized = _normalize_identifier(value)
     return INTERACTION_METRIC_ALIASES.get(normalized, normalized)
+
+
+def normalize_interaction_event_payload(
+    payload: Mapping[str, object],
+    *,
+    perspective: object = None,
+    occurred_at: datetime | None = None,
+    period_start: datetime | None = None,
+    period_end: datetime | None = None,
+    emotions: list[str] | None = None,
+) -> dict[str, object]:
+    """Normalize the bounded fields of an ``interaction_event`` payload.
+
+    Event payloads historically were free-form dictionaries.  This helper
+    deliberately adds only canonical aliases and light type-preserving
+    normalization; it does not discard legacy keys or infer a new event.
+    Shape enforcement is kept in :func:`validate_interaction_event_payload` so
+    callers can choose the appropriate contract boundary.
+    """
+
+    normalized = dict(payload)
+    _copy_payload_alias(normalized, "action", _EVENT_ACTION_ALIASES)
+    _copy_payload_alias(normalized, "time", _EVENT_TIME_ALIASES)
+    _copy_payload_alias(normalized, "location", _EVENT_LOCATION_ALIASES)
+    _copy_payload_alias(normalized, "emotion", _EVENT_EMOTION_ALIASES)
+    _copy_payload_alias(normalized, "outcome", _EVENT_OUTCOME_ALIASES)
+
+    if "participants" not in normalized:
+        for alias in ("actors", "involved_participants", "involved_people"):
+            if alias in normalized:
+                normalized["participants"] = normalized[alias]
+                break
+    if "participants" in normalized:
+        normalized["participants"] = _normalize_event_participants(
+            normalized["participants"]
+        )
+
+    if "action" in normalized:
+        if isinstance(normalized["action"], str) and normalized["action"].strip():
+            normalized["action"] = normalized["action"].strip()
+            normalized.setdefault("activity_type", normalized["action"])
+    else:
+        action = _first_nonempty_text(normalized, "activity_type")
+        if action is not None:
+            normalized["action"] = action
+            # ``activity_type`` is the pre-V2 key used by plans and relationship
+            # evidence.  Keep it synchronized when it was omitted, but preserve a
+            # deliberately more specific value supplied by older callers.
+            normalized.setdefault("activity_type", action)
+
+    if "time" not in normalized:
+        temporal_expression = normalized.get("temporal_expression")
+        if isinstance(temporal_expression, str) and temporal_expression.strip():
+            normalized["time"] = temporal_expression.strip()
+        elif occurred_at is not None:
+            normalized["time"] = occurred_at.isoformat()
+        elif period_start is not None or period_end is not None:
+            normalized["time"] = _format_temporal_range(period_start, period_end)
+    elif isinstance(normalized["time"], datetime):
+        normalized["time"] = normalized["time"].isoformat()
+    elif isinstance(normalized["time"], str):
+        normalized["time"] = normalized["time"].strip()
+
+    for field in ("location", "outcome"):
+        value = normalized.get(field)
+        if isinstance(value, str):
+            normalized[field] = value.strip()
+    if isinstance(normalized.get("emotion"), str):
+        normalized["emotion"] = normalized["emotion"].strip()
+    elif (
+        "emotion" not in normalized
+        and emotions
+        and len(emotions) == 1
+        and isinstance(emotions[0], str)
+        and emotions[0].strip()
+    ):
+        # Keep the complete top-level ``emotions`` list on the candidate while
+        # exposing the singular schema field when there is exactly one item.
+        normalized["emotion"] = emotions[0].strip()
+
+    if "source" in normalized:
+        source = normalized["source"]
+        if isinstance(source, str) and source.strip():
+            normalized["source"] = normalize_interaction_source(source) or source.strip()
+    else:
+        source_alias_found = False
+        for alias in ("provenance", "origin"):
+            if alias not in normalized:
+                continue
+            source_alias_found = True
+            source = normalized[alias]
+            if isinstance(source, str) and source.strip():
+                normalized["source"] = normalize_interaction_source(source) or source.strip()
+            else:
+                normalized["source"] = source
+            break
+        if not source_alias_found and perspective is not None:
+            normalized["source"] = interaction_source_for_perspective(perspective)
+
+    return normalized
+
+
+def validate_interaction_event_payload(
+    payload: Mapping[str, object],
+    *,
+    perspective: object = None,
+) -> None:
+    """Validate present Event schema fields without rejecting legacy omissions."""
+
+    if not isinstance(payload, Mapping):
+        raise ValueError("interaction_event payload must be an object")
+
+    participants = payload.get("participants")
+    if participants is not None:
+        if not isinstance(participants, (list, tuple)):
+            raise ValueError("interaction_event participants must be a list")
+        if len(participants) > 20:
+            raise ValueError("interaction_event participants cannot exceed 20 items")
+        if any(not isinstance(item, str) or not item.strip() for item in participants):
+            raise ValueError("interaction_event participants must contain non-empty strings")
+
+    for field, max_length in (
+        ("action", 120),
+        ("activity_type", 120),
+        ("time", 240),
+        ("location", 240),
+        ("outcome", 500),
+    ):
+        value = payload.get(field)
+        if value is not None and (
+            not isinstance(value, str) or not value.strip() or len(value.strip()) > max_length
+        ):
+            raise ValueError(f"interaction_event {field} must be a non-empty string")
+
+    emotion = payload.get("emotion")
+    if emotion is not None:
+        if isinstance(emotion, str):
+            if not emotion.strip() or len(emotion.strip()) > 120:
+                raise ValueError("interaction_event emotion must be a non-empty string")
+        elif isinstance(emotion, (list, tuple)):
+            if len(emotion) > 8 or any(
+                not isinstance(item, str) or not item.strip() for item in emotion
+            ):
+                raise ValueError("interaction_event emotion list is invalid")
+        else:
+            raise ValueError("interaction_event emotion must be a string or list")
+
+    source = payload.get("source")
+    if source is not None and normalize_interaction_source(source) is None:
+        raise ValueError(
+            "interaction_event source must be user_reported or model_inferred"
+        )
+    _validate_interaction_source_alignment(source, perspective, kind="event")
+
+
+def normalize_interaction_pattern_provenance(
+    payload: Mapping[str, object],
+    *,
+    perspective: object = None,
+    period_start: datetime | None = None,
+    period_end: datetime | None = None,
+    temporal_expression: object = None,
+) -> dict[str, object]:
+    """Normalize Pattern provenance, Event evidence IDs, and time window."""
+
+    normalized = dict(payload)
+    if "source" in normalized:
+        source = normalized["source"]
+        if isinstance(source, str) and source.strip():
+            normalized["source"] = normalize_interaction_source(source) or source.strip()
+    else:
+        source_alias_found = False
+        for alias in ("provenance", "origin"):
+            if alias not in normalized:
+                continue
+            source_alias_found = True
+            source = normalized[alias]
+            if isinstance(source, str) and source.strip():
+                normalized["source"] = normalize_interaction_source(source) or source.strip()
+            else:
+                normalized["source"] = source
+            break
+        if not source_alias_found and perspective is not None:
+            normalized["source"] = interaction_source_for_perspective(perspective)
+
+    evidence_value: object = None
+    evidence_is_explicit_id_field = False
+    for alias in _PATTERN_EVIDENCE_ID_ALIASES:
+        if alias in normalized:
+            evidence_value = normalized[alias]
+            evidence_is_explicit_id_field = True
+            break
+    if evidence_value is None and "evidence" in normalized:
+        evidence_value = normalized["evidence"]
+    if evidence_value is not None:
+        evidence_ids = (
+            _normalize_identifier_list(evidence_value)
+            if evidence_is_explicit_id_field
+            else _normalize_pattern_evidence_ids(evidence_value)
+        )
+        if evidence_ids is not None:
+            normalized["evidence_ids"] = evidence_ids
+            # ``evidence`` is the name used by the redesign document and older
+            # callers.  Preserve it while exposing the explicit ID field.
+            if "evidence" in normalized:
+                normalized["evidence"] = evidence_ids
+
+    if "time_window" not in normalized:
+        for alias in _PATTERN_TIME_WINDOW_ALIASES[1:]:
+            if alias in normalized:
+                normalized["time_window"] = normalized[alias]
+                break
+    if "time_window" not in normalized:
+        if period_start is not None or period_end is not None:
+            normalized["time_window"] = _temporal_window_dict(period_start, period_end)
+        elif isinstance(temporal_expression, str) and temporal_expression.strip():
+            normalized["time_window"] = {"label": temporal_expression.strip()}
+        elif isinstance(normalized.get("temporal_expression"), str) and normalized[
+            "temporal_expression"
+        ].strip():
+            normalized["time_window"] = {
+                "label": normalized["temporal_expression"].strip()
+            }
+    else:
+        normalized["time_window"] = _normalize_time_window(normalized["time_window"])
+    return normalized
+
+
+def merge_interaction_pattern_provenance(
+    existing: Mapping[str, object],
+    incoming: Mapping[str, object],
+) -> dict[str, object]:
+    """Preserve linked Event evidence when an equivalent Pattern is merged."""
+
+    merged = dict(existing)
+    existing_ids = existing.get("evidence_ids")
+    incoming_ids = incoming.get("evidence_ids")
+    if isinstance(incoming_ids, (list, tuple)):
+        retained_ids = (
+            list(existing_ids)
+            if isinstance(existing_ids, (list, tuple))
+            else []
+        )
+        evidence_ids = list(
+            dict.fromkeys(
+                str(value).strip()
+                for value in [*retained_ids, *incoming_ids]
+                if isinstance(value, str) and value.strip()
+            )
+        )[-20:]
+        if evidence_ids:
+            merged["evidence_ids"] = evidence_ids
+            if "evidence" in existing or "evidence" in incoming:
+                merged["evidence"] = evidence_ids
+    if incoming.get("time_window") is not None:
+        # A SAME merge is a fresh observation of the same current Pattern.
+        # Keep its latest declared observation window while retaining all
+        # linked evidence IDs above.
+        merged["time_window"] = incoming["time_window"]
+    return merged
+
+
+def validate_interaction_pattern_payload(
+    payload: Mapping[str, object],
+    *,
+    perspective: object = None,
+) -> None:
+    """Validate optional Pattern provenance fields at the contract boundary."""
+
+    if not isinstance(payload, Mapping):
+        raise ValueError("interaction_pattern payload must be an object")
+    source = payload.get("source")
+    if source is not None and normalize_interaction_source(source) is None:
+        raise ValueError(
+            "interaction_pattern source must be user_reported or model_inferred"
+        )
+    _validate_interaction_source_alignment(source, perspective, kind="pattern")
+
+    evidence_ids = payload.get("evidence_ids")
+    evidence = payload.get("evidence")
+    if evidence_ids is not None:
+        _validate_identifier_list(evidence_ids, field="evidence_ids")
+    if evidence is not None:
+        _validate_identifier_list(evidence, field="evidence")
+    if (
+        evidence_ids is not None
+        and evidence is not None
+        and list(evidence_ids) != list(evidence)
+    ):
+        raise ValueError("interaction_pattern evidence and evidence_ids differ")
+    # Inferred patterns must cite stable event identifiers.  Free-form
+    # evidence text is useful for user-reported claims, but it cannot prove a
+    # link to stored Event rows and therefore must not authorize inference.
+    if source == "model_inferred" and not evidence_ids:
+        raise ValueError("model_inferred interaction_pattern requires evidence IDs")
+
+    if "time_window" in payload:
+        _validate_time_window(payload["time_window"])
+
+
+def normalize_interaction_source(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return _INTERACTION_SOURCE_ALIASES.get(_normalize_identifier(value))
+
+
+def interaction_source_for_perspective(value: object) -> str:
+    return (
+        "model_inferred"
+        if _normalize_identifier(str(value)) == "model_inferred"
+        else "user_reported"
+    )
+
+
+def _copy_payload_alias(
+    payload: dict[str, object],
+    canonical: str,
+    aliases: tuple[str, ...],
+) -> None:
+    if canonical in payload:
+        return
+    for alias in aliases:
+        if alias in payload:
+            payload[canonical] = payload[alias]
+            return
+
+
+def _first_nonempty_text(payload: Mapping[str, object], *fields: str) -> str | None:
+    for field in fields:
+        value = payload.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _normalize_event_participants(value: object) -> object:
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return value
+        direct = _normalize_event_participant(text)
+        if direct is not None:
+            return direct
+        parts = [part.strip() for part in re.split(r"[,，、/和与及]+", text) if part.strip()]
+        return _dedupe_participants(parts) if parts else value
+    if isinstance(value, (list, tuple)):
+        if not all(isinstance(item, str) for item in value):
+            return value
+        return _dedupe_participants(list(value))
+    return value
+
+
+def _normalize_event_participant(value: str) -> list[str] | None:
+    key = _normalize_identifier(value)
+    if key in _EVENT_BOTH_PARTICIPANT_ALIASES:
+        return ["user", "partner"]
+    alias = _EVENT_PARTICIPANT_ALIASES.get(key)
+    if alias is not None:
+        return [alias]
+    return None
+
+
+def _dedupe_participants(values: list[str]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        normalized = value.strip()
+        if not normalized:
+            continue
+        mapped = _normalize_event_participant(normalized)
+        for item in (mapped or [normalized]):
+            if item not in result:
+                result.append(item)
+    return result
+
+
+def _normalize_identifier_list(value: object) -> object:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, (list, tuple)):
+        if not all(isinstance(item, str) for item in value):
+            return value
+        return list(dict.fromkeys(item.strip() for item in value if item.strip()))
+    return value
+
+
+def _normalize_pattern_evidence_ids(value: object) -> list[str] | None:
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if _looks_like_evidence_id(text) else None
+    if isinstance(value, (list, tuple)):
+        if not all(isinstance(item, str) for item in value):
+            return None
+        values = [item.strip() for item in value if item.strip()]
+        if values and all(_looks_like_evidence_id(item) for item in values):
+            return list(dict.fromkeys(values))
+    return None
+
+
+def _looks_like_evidence_id(value: str) -> bool:
+    return bool(
+        value
+        and value.isascii()
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,159}", value) is not None
+    )
+
+
+def _validate_interaction_source_alignment(
+    source: object,
+    perspective: object,
+    *,
+    kind: str,
+) -> None:
+    """Reject contradictory provenance declarations at the contract boundary.
+
+    ``perspective`` is the authoritative claim-level provenance.  Keeping a
+    conflicting payload source would let an inferred Pattern masquerade as a
+    user report and bypass its Event-evidence requirement.
+    """
+
+    if source is None or perspective is None:
+        return
+    normalized_source = normalize_interaction_source(source)
+    expected_source = interaction_source_for_perspective(perspective)
+    if normalized_source is not None and normalized_source != expected_source:
+        raise ValueError(
+            f"interaction_{kind} source conflicts with claim perspective"
+        )
+
+
+def _validate_identifier_list(value: object, *, field: str) -> None:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"interaction_pattern {field} must be a list")
+    if len(value) > 20 or any(not isinstance(item, str) or not item.strip() for item in value):
+        raise ValueError(f"interaction_pattern {field} contains invalid IDs")
+
+
+def _format_temporal_range(
+    period_start: datetime | None,
+    period_end: datetime | None,
+) -> str:
+    start = period_start.isoformat() if period_start is not None else ""
+    end = period_end.isoformat() if period_end is not None else ""
+    return f"{start}/{end}".strip("/")
+
+
+def _temporal_window_dict(
+    period_start: datetime | None,
+    period_end: datetime | None,
+) -> dict[str, str]:
+    value: dict[str, str] = {}
+    if period_start is not None:
+        value["start"] = period_start.isoformat()
+    if period_end is not None:
+        value["end"] = period_end.isoformat()
+    return value
+
+
+def _normalize_time_window(value: object) -> object:
+    if isinstance(value, str):
+        text = value.strip()
+        if "/" in text:
+            start_text, end_text = (part.strip() for part in text.split("/", 1))
+            if _parse_datetime_text(start_text) is not None and _parse_datetime_text(
+                end_text
+            ) is not None:
+                return {"start": start_text, "end": end_text}
+        return {"label": text}
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return {"start": _normalize_time_value(value[0]), "end": _normalize_time_value(value[1])}
+    if isinstance(value, Mapping):
+        normalized = dict(value)
+        aliases = {"from": "start", "to": "end"}
+        for alias, canonical in aliases.items():
+            if canonical not in normalized and alias in normalized:
+                normalized[canonical] = normalized[alias]
+            normalized.pop(alias, None)
+        for field in ("start", "end", "label", "precision"):
+            if field in normalized:
+                normalized[field] = _normalize_time_value(normalized[field])
+        return normalized
+    return value
+
+
+def _normalize_time_value(value: object) -> object:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, str):
+        return value.strip()
+    return value
+
+
+def _validate_time_window(value: object) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError("interaction_pattern time_window must be an object")
+    allowed = {"start", "end", "label", "precision"}
+    unknown = set(value) - allowed
+    if unknown:
+        raise ValueError("interaction_pattern time_window contains unknown fields")
+    if not any(value.get(field) for field in allowed):
+        raise ValueError("interaction_pattern time_window cannot be empty")
+    for field in ("start", "end", "label", "precision"):
+        item = value.get(field)
+        if item is not None and (not isinstance(item, str) or not item.strip()):
+            raise ValueError(f"interaction_pattern time_window {field} must be text")
+    start = _parse_datetime_text(value.get("start"))
+    end = _parse_datetime_text(value.get("end"))
+    if start is not None and end is not None:
+        try:
+            reversed_range = start > end
+        except TypeError:
+            # A naive and an aware timestamp cannot be ordered safely without
+            # an explicit timezone policy; fail closed rather than guessing.
+            raise ValueError(
+                "interaction_pattern time_window timestamps must share timezone shape"
+            ) from None
+        if reversed_range:
+            raise ValueError("interaction_pattern time_window start cannot be later than end")
+
+
+def _parse_datetime_text(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def normalize_interaction_pattern_payload(

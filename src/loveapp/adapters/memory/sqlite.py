@@ -35,6 +35,7 @@ from loveapp.domain.memory import (
     utc_now,
 )
 from loveapp.domain.memory_context import attach_memories, select_context_memories
+from loveapp.domain.memory_dimensions import merge_interaction_pattern_provenance
 from loveapp.domain.memory_predicates import normalize_predicate
 from loveapp.domain.memory_write import (
     MemoryTransitionAudit,
@@ -2512,13 +2513,26 @@ async def _save_memory_in_transaction(
 ) -> MemorySaveResult:
     dedupe_key = memory_dedupe_key(candidate)
     if source_message_id is not None:
+        source_message = await _fetchone(
+            connection,
+            "SELECT user_id, relationship_id FROM messages WHERE id = ?",
+            (source_message_id,),
+        )
+        if source_message is not None and (
+            source_message["user_id"],
+            source_message["relationship_id"],
+        ) != (user_id, relationship_id):
+            raise ValueError(
+                "memory source message is outside the current relationship scope"
+            )
         idempotent = await _fetchone(
             connection,
             """
             SELECT * FROM memory_items
-            WHERE source_message_id = ? AND dedupe_key = ?
+            WHERE source_message_id = ? AND user_id = ? AND relationship_id = ?
+              AND dedupe_key = ?
             """,
-            (source_message_id, dedupe_key),
+            (source_message_id, user_id, relationship_id, dedupe_key),
         )
         if idempotent is not None:
             return MemorySaveResult(item=_row_to_memory(idempotent), created=False)
@@ -2560,6 +2574,12 @@ async def _save_memory_in_transaction(
         merged_evidence = list(
             dict.fromkeys([*existing_evidence, *candidate.evidence_spans])
         )[:8]
+        merged_payload = json.loads(duplicate["payload_json"])
+        if candidate.kind == MemoryKind.INTERACTION_PATTERN:
+            merged_payload = merge_interaction_pattern_provenance(
+                merged_payload,
+                candidate.payload,
+            )
         explicitness = max(
             (str(duplicate["explicitness"]), candidate.explicitness.value),
             key=_explicitness_rank,
@@ -2569,7 +2589,7 @@ async def _save_memory_in_transaction(
             UPDATE memory_items
             SET status = ?, confidence = MAX(confidence, ?),
                 importance = MAX(importance, ?), updated_at = ?, last_seen_at = ?,
-                evidence_spans_json = ?, dedupe_key = ?,
+                evidence_spans_json = ?, payload_json = ?, dedupe_key = ?,
                 canonical_predicate = COALESCE(canonical_predicate, ?),
                 raw_predicate = COALESCE(raw_predicate, ?),
                 predicate_type = CASE WHEN ? = 'canonical' THEN ? ELSE predicate_type END,
@@ -2593,6 +2613,7 @@ async def _save_memory_in_transaction(
                 _dump_datetime(now),
                 _dump_datetime(now),
                 _dump_json(merged_evidence),
+                _dump_json(merged_payload),
                 dedupe_key,
                 candidate.canonical_predicate,
                 candidate.raw_predicate,
