@@ -3559,8 +3559,19 @@ def memory_longtail_write_v2_eval(
     ] = 20,
     rank_limit: Annotated[
         int,
-        typer.Option("--rank-limit", min=1, help="Cheap-ranker output and Judge input limit."),
+        typer.Option("--rank-limit", min=1, help="Cheap-ranker output limit."),
     ] = 5,
+    semantic_judge_limit: Annotated[
+        int | None,
+        typer.Option(
+            "--semantic-judge-limit",
+            min=1,
+            help=(
+                "Semantic Judge candidate limit; defaults to --rank-limit. "
+                "Use this for isolated Top-K ablations."
+            ),
+        ),
+    ] = None,
     fail_on_error: Annotated[
         bool,
         typer.Option("--fail-on-error", help="Stop on provider or evaluator errors."),
@@ -3620,6 +3631,10 @@ def memory_longtail_write_v2_eval(
 
     if rank_limit > vector_limit:
         raise typer.BadParameter("--rank-limit must not exceed --vector-limit")
+    if semantic_judge_limit is not None and semantic_judge_limit > rank_limit:
+        raise typer.BadParameter(
+            "--semantic-judge-limit must not exceed --rank-limit"
+        )
     if hard_cases and case is not None:
         raise typer.BadParameter("--hard-cases cannot be combined with --case")
     if hard_cases and slice_name is not None:
@@ -3674,6 +3689,7 @@ def memory_longtail_write_v2_eval(
                     settings=get_settings(),
                     vector_limit=vector_limit,
                     rank_limit=rank_limit,
+                    semantic_judge_limit=semantic_judge_limit,
                     fail_on_error=fail_on_error,
                     compare_fixture=compare_fixture,
                     baseline_report=baseline_report,
@@ -3700,6 +3716,7 @@ def memory_longtail_write_v2_eval(
                     settings=get_settings(),
                     vector_limit=vector_limit,
                     rank_limit=rank_limit,
+                    semantic_judge_limit=semantic_judge_limit,
                     fail_on_error=fail_on_error,
                     compare_fixture=compare_fixture,
                 )
@@ -3723,6 +3740,7 @@ def memory_longtail_write_v2_eval(
                     slice_name=slice_name,
                     vector_limit=vector_limit,
                     rank_limit=rank_limit,
+                    semantic_judge_limit=semantic_judge_limit,
                     fail_on_error=fail_on_error,
                     repeat=effective_repeat,
                     hard_cases=hard_cases,
@@ -3737,6 +3755,7 @@ def memory_longtail_write_v2_eval(
                     slice_name=slice_name,
                     vector_limit=vector_limit,
                     rank_limit=rank_limit,
+                    semantic_judge_limit=semantic_judge_limit,
                     fail_on_error=fail_on_error,
                     repeat=effective_repeat,
                     hard_cases=hard_cases,
@@ -3752,6 +3771,7 @@ def memory_longtail_write_v2_eval(
                         slice_name=slice_name,
                         vector_limit=vector_limit,
                         rank_limit=rank_limit,
+                        semantic_judge_limit=semantic_judge_limit,
                         fail_on_error=fail_on_error,
                         repeat=effective_repeat,
                         hard_cases=hard_cases,
@@ -4074,6 +4094,7 @@ async def _run_live_memory_longtail_write_v2_eval(
     slice_name: str | None,
     vector_limit: int,
     rank_limit: int,
+    semantic_judge_limit: int | None = None,
     fail_on_error: bool,
     repeat: int = 1,
     hard_cases: bool = False,
@@ -4116,6 +4137,7 @@ async def _run_live_memory_longtail_write_v2_eval(
             slice_name=slice_name,
             vector_limit=vector_limit,
             rank_limit=rank_limit,
+            semantic_judge_limit=semantic_judge_limit,
             fail_on_error=fail_on_error,
             repeat=repeat,
             hard_cases=hard_cases,
@@ -4148,6 +4170,7 @@ async def _run_final_live_memory_longtail_write_v2_eval(
     settings: Any,
     vector_limit: int,
     rank_limit: int,
+    semantic_judge_limit: int | None = None,
     fail_on_error: bool,
     compare_fixture: bool,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -4161,6 +4184,7 @@ async def _run_final_live_memory_longtail_write_v2_eval(
         slice_name=None,
         vector_limit=vector_limit,
         rank_limit=rank_limit,
+        semantic_judge_limit=semantic_judge_limit,
         fail_on_error=fail_on_error,
         repeat=1,
         hard_cases=False,
@@ -4173,6 +4197,7 @@ async def _run_final_live_memory_longtail_write_v2_eval(
         slice_name=None,
         vector_limit=vector_limit,
         rank_limit=rank_limit,
+        semantic_judge_limit=semantic_judge_limit,
         fail_on_error=fail_on_error,
         repeat=3,
         hard_cases=True,
@@ -4183,6 +4208,7 @@ async def _run_final_live_memory_longtail_write_v2_eval(
             shared_bank,
             vector_limit=vector_limit,
             rank_limit=rank_limit,
+            semantic_judge_limit=semantic_judge_limit,
             fail_on_error=fail_on_error,
         )
         full_report["fixture_comparison"] = compare_memory_longtail_write_v2_reports(
@@ -4222,6 +4248,7 @@ async def _run_semantic_remediation_memory_longtail_write_v2_eval(
     settings: Any,
     vector_limit: int,
     rank_limit: int,
+    semantic_judge_limit: int | None = None,
     fail_on_error: bool,
     compare_fixture: bool,
     baseline_report: Path,
@@ -4237,6 +4264,7 @@ async def _run_semantic_remediation_memory_longtail_write_v2_eval(
         settings=settings,
         vector_limit=vector_limit,
         rank_limit=rank_limit,
+        semantic_judge_limit=semantic_judge_limit,
         fail_on_error=fail_on_error,
         compare_fixture=compare_fixture,
     )

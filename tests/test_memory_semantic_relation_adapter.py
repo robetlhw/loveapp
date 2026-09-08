@@ -223,6 +223,40 @@ async def test_semantic_relation_adapter_requires_exact_candidate_coverage(
 
 
 @pytest.mark.asyncio
+async def test_semantic_relation_adapter_rejects_candidate_relation_order_mismatch() -> None:
+    payload = _candidate_wise_payload(
+        candidate_relations=[
+            ("second", "unrelated", 0.91),
+            ("first", "same", 0.93),
+        ],
+        target_memory_ids=["first"],
+        overall_relation="same",
+        confidence=0.93,
+        reason="Candidate-wise entries must preserve supplied order.",
+    )
+    judge, _ = _judge(json.dumps(payload))
+    trace = ExecutionTrace()
+    candidates = [
+        _target().model_copy(update={"id": "first"}),
+        _target().model_copy(update={"id": "second"}),
+    ]
+    try:
+        proposal = await judge.propose_relation(
+            incoming=_incoming(),
+            candidates=candidates,
+            trace=trace,
+        )
+    finally:
+        await judge.aclose()
+
+    assert proposal.relation == ClaimRelation.UNCERTAIN
+    assert proposal.target_memory_ids == []
+    details = _model_trace_details(trace)
+    assert details["target_policy_status"] == "fail_closed"
+    assert details["target_policy_reasons"] == "candidate_relation_order_mismatch"
+
+
+@pytest.mark.asyncio
 async def test_semantic_relation_adapter_rejects_target_without_direct_relation() -> None:
     payload = _candidate_wise_payload(
         candidate_relations=[("social-pattern-old", "unrelated", 0.91)],

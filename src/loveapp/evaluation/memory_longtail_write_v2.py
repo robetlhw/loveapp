@@ -305,7 +305,6 @@ class FixtureV2SemanticRelationJudge:
         candidates: list[MemoryItem],
         trace: object | None = None,
     ) -> SemanticRelationProposal:
-        del trace
         self.calls.append([candidate.id for candidate in candidates])
         case = self._by_text.get(incoming.original_text)
         if case is None:
@@ -317,6 +316,56 @@ class FixtureV2SemanticRelationJudge:
             for memory_id in _expected_semantic_target_ids(case)
             if str(memory_id) in candidate_ids
         ]
+        target_set = set(targets)
+        candidate_relations = [
+            {
+                "memory_id": candidate.id,
+                "relation": (
+                    relation.value
+                    if candidate.id in target_set
+                    else (
+                        ClaimRelation.UNCERTAIN.value
+                        if relation == ClaimRelation.UNCERTAIN
+                        else ClaimRelation.UNRELATED.value
+                    )
+                ),
+                "is_direct_target": candidate.id in target_set,
+                "confidence": 0.99 if candidate.id in target_set else 0.95,
+            }
+            for candidate in candidates
+        ]
+        if trace is not None:
+            measure = getattr(trace, "measure", None)
+            if callable(measure):
+                with measure("memory_semantic_relation_model") as details:
+                    details.update(
+                        {
+                            "model": "fixture-v2-reviewed",
+                            "candidate_count": len(candidates),
+                            "max_target_count": 5,
+                            "attempt_count": 0,
+                            "retry_count": 0,
+                            "parse_status": "fixture",
+                            "target_policy_status": "accepted",
+                            "raw_target_count": len(targets),
+                            "raw_target_ids": ",".join(targets),
+                            "candidate_relations_json": json.dumps(
+                                candidate_relations,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                            "reported_overall_relation": relation.value,
+                            "derived_overall_relation": relation.value,
+                            "relation": relation.value,
+                            "confidence": 0.99,
+                            "same_semantic_dimension": relation in TARGETED_RELATIONS,
+                            "target_count": len(targets),
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                            "total_tokens": 0,
+                            "judge_latency_ms": 0.0,
+                        }
+                    )
         return SemanticRelationProposal(
             relation=relation,
             target_memory_ids=targets,
@@ -342,6 +391,7 @@ async def evaluate_memory_longtail_write_v2_fixture(
     slice_name: str | None = None,
     vector_limit: int = 20,
     rank_limit: int = 5,
+    semantic_judge_limit: int | None = None,
     fail_on_error: bool = False,
     repeat: int = 1,
     hard_cases: bool = False,
@@ -365,6 +415,7 @@ async def evaluate_memory_longtail_write_v2_fixture(
         slice_name=slice_name,
         vector_limit=vector_limit,
         rank_limit=rank_limit,
+        semantic_judge_limit=semantic_judge_limit,
         fail_on_error=fail_on_error,
         repeat=repeat,
         hard_cases=hard_cases,
@@ -487,6 +538,20 @@ def compare_memory_longtail_write_v2_reports(
     live_repeat = int(live.get("repeat", 1) or 1)
     fixture_parameters = fixture.get("parameters", {})
     live_parameters = live.get("parameters", {})
+    fixture_semantic_limit = (
+        fixture_parameters.get("semantic_judge_candidate_limit")
+        if isinstance(fixture_parameters, Mapping)
+        else None
+    )
+    live_semantic_limit = (
+        live_parameters.get("semantic_judge_candidate_limit")
+        if isinstance(live_parameters, Mapping)
+        else None
+    )
+    if fixture_semantic_limit is None and isinstance(fixture_parameters, Mapping):
+        fixture_semantic_limit = fixture_parameters.get("cheap_rank_top_n")
+    if live_semantic_limit is None and isinstance(live_parameters, Mapping):
+        live_semantic_limit = live_parameters.get("cheap_rank_top_n")
     same_scope = (
         fixture_dataset.get("case_sha256") == live_dataset.get("case_sha256")
         and fixture_dataset.get("shared_bank_sha256") == live_dataset.get("shared_bank_sha256")
@@ -499,6 +564,7 @@ def compare_memory_longtail_write_v2_reports(
         and fixture_parameters.get("vector_top_k") == live_parameters.get("vector_top_k")
         and fixture_parameters.get("cheap_rank_top_n")
         == live_parameters.get("cheap_rank_top_n")
+        and fixture_semantic_limit == live_semantic_limit
     )
     return {
         "status": "COMPARABLE" if same_scope else "SCOPE_MISMATCH",
@@ -530,6 +596,8 @@ def compare_memory_longtail_write_v2_reports(
                 if isinstance(live_parameters, Mapping)
                 else None
             ),
+            "fixture_semantic_judge_candidate_limit": fixture_semantic_limit,
+            "live_semantic_judge_candidate_limit": live_semantic_limit,
             "fixture_filters": fixture.get("filters"),
             "live_filters": live.get("filters"),
         },
@@ -744,6 +812,7 @@ def compare_memory_longtail_write_v2_top_k_ablation(
         first = baselines[0]
         first_dataset = first.get("dataset", {})
         first_parameters = first.get("parameters", {})
+        cheap_rank_values: set[int] = set()
         for k, report in available.items():
             dataset = report.get("dataset", {})
             parameters = report.get("parameters", {})
@@ -762,14 +831,22 @@ def compare_memory_longtail_write_v2_top_k_ablation(
                 scope_errors.append(f"top_{k}_dataset_or_run_scope_mismatch")
             if parameters.get("vector_top_k") != 20:
                 scope_errors.append(f"top_{k}_vector_top_k_not_20")
-            if parameters.get("cheap_rank_top_n") != k:
-                scope_errors.append(f"top_{k}_cheap_rank_limit_mismatch")
-            if parameters.get("semantic_judge_candidate_limit") != k:
+            cheap_rank = parameters.get("cheap_rank_top_n")
+            if isinstance(cheap_rank, int) and not isinstance(cheap_rank, bool):
+                cheap_rank_values.add(cheap_rank)
+            semantic_limit = parameters.get("semantic_judge_candidate_limit")
+            # Legacy reports coupled cheap ranking and Judge limits.  New
+            # ablations may keep cheap ranking fixed while varying only Judge K.
+            if semantic_limit is None:
+                semantic_limit = cheap_rank
+            if semantic_limit != k:
                 scope_errors.append(f"top_{k}_judge_limit_mismatch")
             if parameters.get("semantic_judge_protocol") != first_parameters.get(
                 "semantic_judge_protocol"
             ):
                 scope_errors.append(f"top_{k}_judge_protocol_mismatch")
+        if len(cheap_rank_values) > 1 and cheap_rank_values != set(expected_ks):
+            scope_errors.append("cheap_rank_limit_not_fixed_across_ablation")
 
     def section(report: Mapping[str, Any], name: str) -> Mapping[str, Any]:
         value = report.get(name, {})
@@ -825,13 +902,24 @@ def compare_memory_longtail_write_v2_top_k_ablation(
         )
         arms[str(k)] = {
             "semantic_top_k": k,
+            "cheap_rank_top_n": (
+                report.get("parameters", {}).get("cheap_rank_top_n")
+                if isinstance(report.get("parameters"), Mapping)
+                else None
+            ),
             "semantic_hit_at_k": number(
                 retrieval.get("semantic_hit_at_k"), semantic_hit
             ),
             "semantic_recall_at_k": number(semantic_recall),
             "semantic_gold_retention_at_k": number(semantic_retention),
-            "semantic_target_set_recall_at_k": number(semantic_recall),
-            "semantic_gold_target_set_exact_at_k": number(semantic_exact),
+            "semantic_target_set_recall_at_k": number(
+                retrieval.get("semantic_target_recall_at_k"),
+                number(semantic_recall),
+            ),
+            "semantic_gold_target_set_exact_at_k": number(
+                retrieval.get("semantic_target_set_exact_semantic_at_k"),
+                number(semantic_exact),
+            ),
             "semantic_mrr_at_k": number(
                 retrieval.get("semantic_mrr_at_k"), semantic_mrr
             ),
@@ -921,6 +1009,7 @@ def render_memory_longtail_write_v2_top_k_ablation(
 
     arms = comparison.get("arms", {})
     metrics = (
+        "cheap_rank_top_n",
         "semantic_hit_at_k",
         "semantic_recall_at_k",
         "semantic_gold_retention_at_k",
@@ -1413,6 +1502,7 @@ async def _evaluate_memory_longtail_write_v2_once(
     slice_name: str | None = None,
     vector_limit: int = 20,
     rank_limit: int = 5,
+    semantic_judge_limit: int | None = None,
     validator: LongTailSemanticRelationValidator | None = None,
     fail_on_error: bool = False,
     case_ids: Sequence[str] | None = None,
@@ -1429,6 +1519,12 @@ async def _evaluate_memory_longtail_write_v2_once(
         raise ValueError("vector_limit must be positive")
     if rank_limit < 1 or rank_limit > vector_limit:
         raise ValueError("rank_limit must be between 1 and vector_limit")
+    if semantic_judge_limit is None:
+        semantic_judge_limit = rank_limit
+    if semantic_judge_limit < 1 or semantic_judge_limit > rank_limit:
+        raise ValueError(
+            "semantic_judge_limit must be between 1 and rank_limit"
+        )
     dataset = load_memory_longtail_write_v2_dataset(case_path, shared_bank_path)
     selected_case_ids = set(case_ids) if case_ids is not None else None
     cases = [
@@ -1542,6 +1638,7 @@ async def _evaluate_memory_longtail_write_v2_once(
                     validator=validator,
                     vector_limit=vector_limit,
                     rank_limit=rank_limit,
+                    semantic_judge_limit=semantic_judge_limit,
                     collision=collision_by_case.get(case["case_id"]),
                     production_retriever=production_retriever,
                 )
@@ -1560,6 +1657,7 @@ async def _evaluate_memory_longtail_write_v2_once(
         slice_name=slice_name,
         vector_limit=vector_limit,
         rank_limit=rank_limit,
+        semantic_judge_limit=semantic_judge_limit,
         embedding_telemetry=embedding_telemetry,
     )
     return report
@@ -1575,6 +1673,7 @@ async def evaluate_memory_longtail_write_v2(
     slice_name: str | None = None,
     vector_limit: int = 20,
     rank_limit: int = 5,
+    semantic_judge_limit: int | None = None,
     validator: LongTailSemanticRelationValidator | None = None,
     fail_on_error: bool = False,
     repeat: int = 1,
@@ -1594,6 +1693,16 @@ async def evaluate_memory_longtail_write_v2(
 
     if repeat < 1 or repeat > 100:
         raise ValueError("repeat must be between 1 and 100")
+    if vector_limit < 1:
+        raise ValueError("vector_limit must be positive")
+    if rank_limit < 1 or rank_limit > vector_limit:
+        raise ValueError("rank_limit must be between 1 and vector_limit")
+    if semantic_judge_limit is None:
+        semantic_judge_limit = rank_limit
+    if semantic_judge_limit < 1 or semantic_judge_limit > rank_limit:
+        raise ValueError(
+            "semantic_judge_limit must be between 1 and rank_limit"
+        )
 
     dataset = load_memory_longtail_write_v2_dataset(case_path, shared_bank_path)
     available_ids = [str(case["case_id"]) for case in dataset["cases"]]
@@ -1654,6 +1763,7 @@ async def evaluate_memory_longtail_write_v2(
             slice_name=slice_name,
             vector_limit=vector_limit,
             rank_limit=rank_limit,
+            semantic_judge_limit=semantic_judge_limit,
             embedding_telemetry=_empty_embedding_telemetry(embedding_provider),
         )
         report.update(
@@ -1687,6 +1797,7 @@ async def evaluate_memory_longtail_write_v2(
             slice_name=None,
             vector_limit=vector_limit,
             rank_limit=rank_limit,
+            semantic_judge_limit=semantic_judge_limit,
             validator=validator,
             fail_on_error=fail_on_error,
             case_ids=selected_ids,
@@ -1734,6 +1845,7 @@ async def evaluate_memory_longtail_write_v2(
         slice_name=slice_name,
         vector_limit=vector_limit,
         rank_limit=rank_limit,
+        semantic_judge_limit=semantic_judge_limit,
         embedding_telemetry=merged_embedding,
     )
     report.update(
@@ -1943,6 +2055,7 @@ async def _evaluate_v2_case(
     validator: LongTailSemanticRelationValidator,
     vector_limit: int,
     rank_limit: int,
+    semantic_judge_limit: int,
     collision: dict[str, Any] | None,
     production_retriever: HybridMemoryRetriever | None = None,
 ) -> dict[str, Any]:
@@ -2049,8 +2162,21 @@ async def _evaluate_v2_case(
         collision=collision,
         records=bank_records,
     )
+    # The cheap-ranked output remains the fixed Top-N retrieval artifact.  The
+    # semantic Judge receives only its configured prefix so Top-K ablations can
+    # vary Judge context without changing retrieval/ranking itself.
+    retrieval["semantic_ranked"] = [
+        dict(item) for item in retrieval["ranked"][:semantic_judge_limit]
+    ]
     retrieval_latency_ms = round((perf_counter() - retrieval_started) * 1000, 3)
-    ranked_items = [item_by_id[item["memory_id"]] for item in retrieval["ranked"]]
+    # Keep the complete cheap-ranked Top-N in the retrieval report, while
+    # allowing the semantic Judge ablation to inspect a smaller prefix.  This
+    # separation is intentional: Top-K experiments must not silently alter
+    # cheap-ranking/equivalence-collapse behavior.
+    ranked_items = [
+        item_by_id[item["memory_id"]]
+        for item in retrieval["semantic_ranked"]
+    ]
     oracle_ids = {
         row["memory_id"]
         for row in case["overlay"]
@@ -3185,6 +3311,7 @@ def _build_report(
     slice_name: str | None,
     vector_limit: int,
     rank_limit: int,
+    semantic_judge_limit: int,
     embedding_telemetry: dict[str, Any],
 ) -> dict[str, Any]:
     retrieval_metrics = _retrieval_metrics(rows)
@@ -3290,7 +3417,7 @@ def _build_report(
             "candidate_pool_contract": "120 shared + 5 overlay = 125 per case",
             "vector_top_k": vector_limit,
             "cheap_rank_top_n": rank_limit,
-            "semantic_judge_candidate_limit": rank_limit,
+            "semantic_judge_candidate_limit": semantic_judge_limit,
             "equivalence_collapse": "documented_group_id_before_semantic_top_k",
             "semantic_judge_protocol": "candidate_wise_single_call_direct_target_v2",
             "retrieval_engine": retrieval_engines,
@@ -3457,6 +3584,23 @@ def _retrieval_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             count += bool(set(ids) & set(_row_expected_retrieval_candidate_ids(row)))
         return count
 
+    def semantic_values(row: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+        """Return the candidates actually supplied to the semantic Judge.
+
+        Older artifacts do not contain ``semantic_ranked``; for those reports
+        the cheap-ranked list is the historical semantic input and remains a
+        safe compatibility fallback.
+        """
+
+        retrieval = row.get("retrieval", {})
+        if not isinstance(retrieval, Mapping):
+            return []
+        values = retrieval.get("semantic_ranked")
+        if isinstance(values, list):
+            return [item for item in values if isinstance(item, Mapping)]
+        values = retrieval.get("ranked", [])
+        return [item for item in values if isinstance(item, Mapping)]
+
     def equivalence_target_hits(source: str, limit: int | None = None) -> int:
         count = 0
         for row in eligible:
@@ -3483,17 +3627,23 @@ def _retrieval_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         reciprocal_ranks.append(1 / min(ranks) if ranks else 0.0)
         semantic_ranks = [
             index
-            for index, item in enumerate(
-                row.get("retrieval", {}).get("ranked", []),
-                start=1,
-            )
-            if item["memory_id"] in expected
+            for index, item in enumerate(semantic_values(row), start=1)
+            if item.get("memory_id") in expected
         ]
         semantic_reciprocal_ranks.append(
             1 / min(semantic_ranks) if semantic_ranks else 0.0
         )
     top20_hits = target_hits("vector", 20)
-    ranked_hits = target_hits("ranked")
+    ranked_hits = sum(
+        len(
+            {
+                str(item.get("memory_id"))
+                for item in semantic_values(row)
+            }
+            & set(_row_expected_retrieval_candidate_ids(row))
+        )
+        for row in eligible
+    )
     candidate_counts = [row.get("candidate_pool_size", 0) for row in rows]
     # Retention is measured against the unrelated candidates that actually
     # survived Vector Top-20, not against every row in the ranked output.  The
@@ -3572,15 +3722,44 @@ def _retrieval_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         if "retrieval" in row and row["retrieval"].get("vector_ranking_latency_ms") is not None
     ]
     semantic_candidate_limit = max(
-        (
-            len(row.get("retrieval", {}).get("ranked", []))
-            for row in rows
-        ),
+        (len(semantic_values(row)) for row in rows),
         default=0,
     )
     semantic_exact_count = sum(
         set(_row_expected_retrieval_candidate_ids(row))
-        <= {item["memory_id"] for item in row.get("retrieval", {}).get("ranked", [])}
+        <= {str(item.get("memory_id")) for item in semantic_values(row)}
+        for row in eligible
+    )
+    semantic_target_expected_total = sum(
+        len(_row_expected_semantic_target_ids(row)) for row in rows
+    )
+    semantic_target_hits = sum(
+        len(
+            {
+                str(item.get("memory_id")) for item in semantic_values(row)
+            }
+            & set(_row_expected_semantic_target_ids(row))
+        )
+        for row in rows
+    )
+    semantic_target_set_exact_count = sum(
+        set(_row_expected_semantic_target_ids(row))
+        <= {
+            str(item.get("memory_id")) for item in semantic_values(row)
+        }
+        for row in rows
+        if _row_expected_semantic_target_ids(row)
+    )
+    semantic_target_case_count = sum(
+        bool(_row_expected_semantic_target_ids(row)) for row in rows
+    )
+    semantic_case_hit_count = sum(
+        bool(
+            {
+                str(item.get("memory_id")) for item in semantic_values(row)
+            }
+            & set(_row_expected_retrieval_candidate_ids(row))
+        )
         for row in eligible
     )
     return {
@@ -3611,10 +3790,18 @@ def _retrieval_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         "mrr": round(mean(reciprocal_ranks), 4) if reciprocal_ranks else 0.0,
         "semantic_candidate_limit": semantic_candidate_limit,
-        "semantic_hit_at_k": _ratio(case_hits("ranked"), len(eligible)),
+        "semantic_hit_at_k": _ratio(semantic_case_hit_count, len(eligible)),
         "semantic_recall_at_k": end_to_end_recall_at_5,
         "semantic_gold_retention_at_k": conditional_retention,
         "semantic_target_set_exact_at_k": _ratio(semantic_exact_count, len(eligible)),
+        "semantic_target_recall_at_k": _ratio(
+            semantic_target_hits,
+            semantic_target_expected_total,
+        ),
+        "semantic_target_set_exact_semantic_at_k": _ratio(
+            semantic_target_set_exact_count,
+            semantic_target_case_count,
+        ),
         "semantic_mrr_at_k": (
             round(mean(semantic_reciprocal_ranks), 4)
             if semantic_reciprocal_ranks

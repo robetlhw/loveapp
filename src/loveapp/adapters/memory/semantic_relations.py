@@ -694,6 +694,14 @@ def _target_policy_diagnostics(
     if unknown_target_ids:
         reasons.append("unknown_target_id")
     relations_by_id = {item.memory_id: item for item in output.candidate_relations}
+    expected_relation_ids = [candidate.id for candidate in candidates]
+    if (
+        len(relation_ids) == len(set(relation_ids))
+        and not unknown_relation_ids
+        and not missing_relation_ids
+        and relation_ids != expected_relation_ids
+    ):
+        reasons.append("candidate_relation_order_mismatch")
     direct_target_ids = [
         item.memory_id for item in output.candidate_relations if item.is_direct_target
     ]

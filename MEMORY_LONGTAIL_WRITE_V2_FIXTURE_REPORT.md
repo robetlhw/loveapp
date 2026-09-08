@@ -49,7 +49,8 @@
 ## Retrieval and Ranking
 
 - Vector retrieval stage: **Top-20** candidates
-- Cheap ranking stage: **Top-5** candidates (also supplied to the Semantic Judge)
+- Cheap ranking stage: vector candidates are reranked before documented equivalence groups are collapsed
+- Semantic Judge stage: **Top-5** collapsed semantic candidates
 - Retrieval engine: `['benchmark_staged']`
 - Embedding input: `natural_language_text_only`
 - Embedding input detail: incoming/seed natural-language text only
@@ -85,18 +86,23 @@
 | `end_to_end_gold_recall_at_5` | 0.5500 |
 | `target_set_recall_at_5` | 0.5500 |
 | `gold_target_set_exact_at_5` | 0.5429 |
-| `hard_negative_promotion_count` | 6 |
-| `hard_negative_promotion_rate` | 0.1714 |
+| `hard_negative_promotion_count` | 7 |
+| `hard_negative_promotion_rate` | 0.2000 |
 | `unrelated_candidate_vector_count` | 762 |
-| `unrelated_candidate_ranked_count` | 168 |
-| `unrelated_candidate_retention_rate` | 0.2205 |
+| `unrelated_candidate_ranked_count` | 178 |
+| `unrelated_candidate_retention_rate` | 0.2336 |
 | `equivalence_group_duplicate_slot_count_at_20` | 16 |
-| `equivalence_group_duplicate_slot_count_at_5` | 10 |
+| `equivalence_group_duplicate_slot_count_at_5` | 0 |
+| `pre_collapse_candidate_count` | 800 |
+| `post_collapse_candidate_count` | 784 |
+| `equivalence_groups_collapsed` | 16 |
+| `duplicate_slots_removed` | 16 |
+| `top5_duplicate_semantic_memory_count` | 0 |
 | `avg_candidate_count` | 125 |
-| `retrieval_latency_p50_ms` | 11.9140 |
-| `retrieval_latency_p95_ms` | 17.2950 |
-| `cheap_ranking_latency_p50_ms` | 0.2210 |
-| `cheap_ranking_latency_p95_ms` | 0.3180 |
+| `retrieval_latency_p50_ms` | 10.9070 |
+| `retrieval_latency_p95_ms` | 17.4850 |
+| `cheap_ranking_latency_p50_ms` | 0.5060 |
+| `cheap_ranking_latency_p95_ms` | 0.8660 |
 | `vector_ranking_latency_p50_ms` | 0.0000 |
 | `vector_ranking_latency_p95_ms` | 0.0000 |
 
@@ -232,6 +238,11 @@ Metric definitions: `raw_retrieval_recall_at_20` counts exact physical Gold IDs 
 | Boundary | Value |
 |---|---:|
 | `multi_target_proposal_count` | 7 |
+| `retrieved_multi_target_proposal_count` | 3 |
+| `expected_multi_target_case_count` | 4 |
+| `exact_expected_multi_target_proposal_count` | 3 |
+| `overbroad_multi_target_proposal_count` | 0 |
+| `policy_boundary_count` | 3 |
 | `multi_target_validator_denied_count` | 7 |
 | `destructive_multi_target_write_count` | 0 |
 | `multi_target_status` | UNSUPPORTED_FAIL_CLOSED |
@@ -289,11 +300,11 @@ Metric definitions: `raw_retrieval_recall_at_20` counts exact physical Gold IDs 
 | `embedding_failure_count` | 0 |
 | `embedding_document_failure_count` | 0 |
 | `embedding_query_failure_count` | 0 |
-| `embedding_document_latency_p50_ms` | 48.7340 |
-| `embedding_document_latency_p95_ms` | 48.7340 |
-| `embedding_query_latency_p50_ms` | 0.2640 |
-| `embedding_query_latency_p95_ms` | 0.4400 |
-| `embedding_query_latency_total_ms` | 11.4350 |
+| `embedding_document_latency_p50_ms` | 31.4550 |
+| `embedding_document_latency_p95_ms` | 31.4550 |
+| `embedding_query_latency_p50_ms` | 0.2270 |
+| `embedding_query_latency_p95_ms` | 0.3850 |
+| `embedding_query_latency_total_ms` | 9.5920 |
 | `judge_models` | ['fixture-v2-reviewed'] |
 | `judge_call_count` | 80 |
 | `judge_evaluated_count` | 80 |
@@ -306,18 +317,18 @@ Metric definitions: `raw_retrieval_recall_at_20` counts exact physical Gold IDs 
 | `judge_target_candidate_unavailable_count` | 15 |
 | `judge_target_gold_available_mismatch_count` | 0 |
 | `judge_unexpected_target_count` | 0 |
-| `target_policy_accepted_count` | 0 |
+| `target_policy_accepted_count` | 80 |
 | `target_policy_fail_closed_count` | 0 |
-| `judge_latency_p50_ms` | 0.0390 |
-| `judge_latency_p95_ms` | 0.0720 |
+| `judge_latency_p50_ms` | 0.1220 |
+| `judge_latency_p95_ms` | 0.1700 |
 | `judge_prompt_tokens` | 0 |
 | `judge_completion_tokens` | 0 |
 | `judge_total_tokens` | 0 |
 | `judge_avg_prompt_tokens` | 0.0000 |
 | `judge_avg_completion_tokens` | 0.0000 |
 | `judge_avg_total_tokens` | 0.0000 |
-| `oracle_judge` | {'call_count': 40, 'completed_count': 40, 'failure_count': 0, 'latency_p50_ms': 0.053, 'latency_p95_ms': 0.074, 'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0, 'avg_prompt_tokens': 0.0, 'avg_completion_tokens': 0.0, 'avg_total_tokens': 0.0} |
-| `retrieved_judge` | {'call_count': 40, 'completed_count': 40, 'failure_count': 0, 'latency_p50_ms': 0.022, 'latency_p95_ms': 0.045, 'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0, 'avg_prompt_tokens': 0.0, 'avg_completion_tokens': 0.0, 'avg_total_tokens': 0.0} |
+| `oracle_judge` | {'call_count': 40, 'completed_count': 40, 'failure_count': 0, 'relation_mismatch_count': 0, 'target_mismatch_count': 0, 'unexpected_target_count': 0, 'target_candidate_unavailable_count': 0, 'latency_p50_ms': 0.131, 'latency_p95_ms': 0.183, 'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0, 'avg_prompt_tokens': 0.0, 'avg_completion_tokens': 0.0, 'avg_total_tokens': 0.0} |
+| `retrieved_judge` | {'call_count': 40, 'completed_count': 40, 'failure_count': 0, 'relation_mismatch_count': 0, 'target_mismatch_count': 15, 'unexpected_target_count': 0, 'target_candidate_unavailable_count': 15, 'latency_p50_ms': 0.079, 'latency_p95_ms': 0.131, 'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0, 'avg_prompt_tokens': 0.0, 'avg_completion_tokens': 0.0, 'avg_total_tokens': 0.0} |
 | `estimated_cost_per_100_writes` | N/A |
 
 ## Failure Attribution
@@ -328,6 +339,11 @@ Counts below are evaluated-row counts; in repeat mode one case may contribute mo
 |---|---:|
 | `RETRIEVAL_MISS` | 16 |
 | `SAFETY_DOWNGRADE` | 1 |
+
+| Secondary diagnostic | Count |
+|---|---:|
+| `TARGET_SELECTION_ERROR` | 15 |
+| `WRITE_POLICY_ERROR` | 7 |
 
 ## Failed Cases
 
@@ -350,6 +366,354 @@ Counts below are evaluated-row counts; in repeat mode one case may contribute mo
 | - | LTW2-035 | event_vs_pattern | RETRIEVAL_MISS | ['TARGET_SELECTION_ERROR'] | complementary | complementary | [] | add_without_supersede |
 | - | LTW2-036 | multi_target_ambiguity | RETRIEVAL_MISS | ['TARGET_SELECTION_ERROR'] | update | update | [] | add_without_supersede |
 | - | LTW2-040 | multi_target_ambiguity | RETRIEVAL_MISS | - | uncertain | uncertain | [] | add_without_supersede |
+
+### Candidate-wise Failure Trace
+
+| Run | Case | Candidate | Relation | Direct target | Final target | Gold target | Overall | Validator pass |
+|---:|---|---|---|---:|---:|---:|---|---:|
+| - | LTW2-002 | SP007 | unrelated | False | False | False | same | False |
+| - | LTW2-002 | SP003 | unrelated | False | False | False | same | False |
+| - | LTW2-002 | O007 | unrelated | False | False | False | same | False |
+| - | LTW2-002 | SP009 | unrelated | False | False | False | same | False |
+| - | LTW2-002 | SP005 | unrelated | False | False | False | same | False |
+| - | LTW2-005 | SR005 | unrelated | False | False | False | same | False |
+| - | LTW2-005 | SR021 | unrelated | False | False | False | same | False |
+| - | LTW2-005 | SR024 | unrelated | False | False | False | same | False |
+| - | LTW2-005 | SR018 | unrelated | False | False | False | same | False |
+| - | LTW2-005 | SR003 | unrelated | False | False | False | same | False |
+| - | LTW2-006 | SP018 | unrelated | False | False | False | complementary | False |
+| - | LTW2-006 | O030 | unrelated | False | False | False | complementary | False |
+| - | LTW2-006 | SP015 | unrelated | False | False | False | complementary | False |
+| - | LTW2-006 | SP009 | unrelated | False | False | False | complementary | False |
+| - | LTW2-006 | SE029 | unrelated | False | False | False | complementary | False |
+| - | LTW2-010 | SR009 | unrelated | False | False | False | complementary | False |
+| - | LTW2-010 | O050 | unrelated | False | False | False | complementary | False |
+| - | LTW2-010 | SR025 | unrelated | False | False | False | complementary | False |
+| - | LTW2-010 | SE018 | unrelated | False | False | False | complementary | False |
+| - | LTW2-010 | SE007 | unrelated | False | False | False | complementary | False |
+| - | LTW2-011 | O052 | unrelated | False | False | False | update | False |
+| - | LTW2-011 | SR019 | unrelated | False | False | False | update | False |
+| - | LTW2-011 | SR024 | unrelated | False | False | False | update | False |
+| - | LTW2-011 | SR013 | unrelated | False | False | False | update | False |
+| - | LTW2-011 | SR018 | unrelated | False | False | False | update | False |
+| - | LTW2-012 | SR002 | unrelated | False | False | False | update | False |
+| - | LTW2-012 | SR021 | unrelated | False | False | False | update | False |
+| - | LTW2-012 | SR018 | unrelated | False | False | False | update | False |
+| - | LTW2-012 | SR026 | unrelated | False | False | False | update | False |
+| - | LTW2-012 | SR030 | unrelated | False | False | False | update | False |
+| - | LTW2-013 | SR012 | unrelated | False | False | False | update | False |
+| - | LTW2-013 | SR008 | unrelated | False | False | False | update | False |
+| - | LTW2-013 | SR021 | unrelated | False | False | False | update | False |
+| - | LTW2-013 | SR002 | unrelated | False | False | False | update | False |
+| - | LTW2-013 | SP009 | unrelated | False | False | False | update | False |
+| - | LTW2-014 | O066 | update | True | True | True | update | False |
+| - | LTW2-014 | SR001 | unrelated | False | False | False | update | False |
+| - | LTW2-014 | SE002 | unrelated | False | False | False | update | False |
+| - | LTW2-014 | SR025 | unrelated | False | False | False | update | False |
+| - | LTW2-014 | SE018 | unrelated | False | False | False | update | False |
+| - | LTW2-015 | SI026 | unrelated | False | False | False | update | False |
+| - | LTW2-015 | SI010 | unrelated | False | False | False | update | False |
+| - | LTW2-015 | SI024 | unrelated | False | False | False | update | False |
+| - | LTW2-015 | SI002 | unrelated | False | False | False | update | False |
+| - | LTW2-015 | SI007 | unrelated | False | False | False | update | False |
+| - | LTW2-016 | SP017 | unrelated | False | False | False | contradiction | False |
+| - | LTW2-016 | SP014 | unrelated | False | False | False | contradiction | False |
+| - | LTW2-016 | SP011 | unrelated | False | False | False | contradiction | False |
+| - | LTW2-016 | SR019 | unrelated | False | False | False | contradiction | False |
+| - | LTW2-016 | SP027 | unrelated | False | False | False | contradiction | False |
+| - | LTW2-018 | SP028 | unrelated | False | False | False | contradiction | False |
+| - | LTW2-018 | SP009 | unrelated | False | False | False | contradiction | False |
+| - | LTW2-018 | SP010 | unrelated | False | False | False | contradiction | False |
+| - | LTW2-018 | SP013 | unrelated | False | False | False | contradiction | False |
+| - | LTW2-018 | SP016 | unrelated | False | False | False | contradiction | False |
+| - | LTW2-019 | SR023 | unrelated | False | False | False | contradiction | False |
+| - | LTW2-019 | SR030 | unrelated | False | False | False | contradiction | False |
+| - | LTW2-019 | SR015 | unrelated | False | False | False | contradiction | False |
+| - | LTW2-019 | SR002 | unrelated | False | False | False | contradiction | False |
+| - | LTW2-019 | SR018 | unrelated | False | False | False | contradiction | False |
+| - | LTW2-020 | SI025 | unrelated | False | False | False | contradiction | False |
+| - | LTW2-020 | SE023 | unrelated | False | False | False | contradiction | False |
+| - | LTW2-020 | SE014 | unrelated | False | False | False | contradiction | False |
+| - | LTW2-020 | SI022 | unrelated | False | False | False | contradiction | False |
+| - | LTW2-020 | SI026 | unrelated | False | False | False | contradiction | False |
+| - | LTW2-031 | O153 | unrelated | False | False | False | complementary | False |
+| - | LTW2-031 | SR018 | unrelated | False | False | False | complementary | False |
+| - | LTW2-031 | SE006 | unrelated | False | False | False | complementary | False |
+| - | LTW2-031 | SR024 | unrelated | False | False | False | complementary | False |
+| - | LTW2-031 | SR026 | unrelated | False | False | False | complementary | False |
+| - | LTW2-035 | O172 | unrelated | False | False | False | complementary | False |
+| - | LTW2-035 | SE018 | unrelated | False | False | False | complementary | False |
+| - | LTW2-035 | SI023 | unrelated | False | False | False | complementary | False |
+| - | LTW2-035 | SR009 | unrelated | False | False | False | complementary | False |
+| - | LTW2-035 | SR022 | unrelated | False | False | False | complementary | False |
+| - | LTW2-036 | SR001 | unrelated | False | False | False | update | False |
+| - | LTW2-036 | SI015 | unrelated | False | False | False | update | False |
+| - | LTW2-036 | SE001 | unrelated | False | False | False | update | False |
+| - | LTW2-036 | SR009 | unrelated | False | False | False | update | False |
+| - | LTW2-036 | SE002 | unrelated | False | False | False | update | False |
+| - | LTW2-040 | SP030 | uncertain | False | False | False | uncertain | True |
+| - | LTW2-040 | SE011 | uncertain | False | False | False | uncertain | True |
+| - | LTW2-040 | SP003 | uncertain | False | False | False | uncertain | True |
+| - | LTW2-040 | SE029 | uncertain | False | False | False | uncertain | True |
+| - | LTW2-040 | SE004 | uncertain | False | False | False | uncertain | True |
+
+### Bounded Failure Details
+
+#### LTW2-002 / run 1
+
+- Incoming: 她一直都不喜欢特别辣的菜。
+- Final target set: []
+- Gold target set: ['O006']
+- Overall relation: same
+- Validator: pass=False, validated_relation=uncertain, would_update=False, reasons=['failed:event_pattern_state_protection', 'failed:kind_compatible', 'failed:same_scope', 'failed:source_message_is_distinct', 'failed:subject_compatible', 'failed:target_active', 'failed:target_count_within_bounds', 'failed:target_exists_in_retrieved_set', 'failed:target_not_expired', 'fail_closed']
+- Top-K candidates:
+
+  - 1. SP007: 她吃饭时不太能接受特别辣的菜。 [relation=unrelated, direct=False]
+  - 2. SP003: 她旅行时更偏向慢节奏，不喜欢一天排太多景点。 [relation=unrelated, direct=False]
+  - 3. O007: 她喜欢低甜度甜品。 [relation=unrelated, direct=False]
+  - 4. SP009: 她周末更愿意去公园、展馆这类地方，而不是大型商场。 [relation=unrelated, direct=False]
+  - 5. SP005: 她不太喜欢临时改行程，希望提前知道大概安排。 [relation=unrelated, direct=False]
+
+#### LTW2-005 / run 1
+
+- Incoming: 她不开心的时候还是不会马上告诉我具体原因。
+- Final target set: []
+- Gold target set: ['O021']
+- Overall relation: same
+- Validator: pass=False, validated_relation=uncertain, would_update=False, reasons=['failed:event_pattern_state_protection', 'failed:kind_compatible', 'failed:same_scope', 'failed:source_message_is_distinct', 'failed:subject_compatible', 'failed:target_active', 'failed:target_count_within_bounds', 'failed:target_exists_in_retrieved_set', 'failed:target_not_expired', 'fail_closed']
+- Top-K candidates:
+
+  - 1. SR005: 她不高兴时通常不会马上说原因。 [relation=unrelated, direct=False]
+  - 2. SR021: 她不喜欢在情绪很高的时候立刻做关系决定。 [relation=unrelated, direct=False]
+  - 3. SR024: 她工作压力小的时候更愿意主动安排周末活动。 [relation=unrelated, direct=False]
+  - 4. SR018: 她工作特别累的时候更愿意一个人散步。 [relation=unrelated, direct=False]
+  - 5. SR003: 她心情不错的时候会主动分享一些很小的日常。 [relation=unrelated, direct=False]
+
+#### LTW2-006 / run 1
+
+- Incoming: 她一般会去公司附近那条河边走四十分钟左右。
+- Final target set: []
+- Gold target set: ['O026']
+- Overall relation: complementary
+- Validator: pass=False, validated_relation=uncertain, would_update=False, reasons=['failed:same_scope', 'failed:source_message_is_distinct', 'failed:subject_compatible', 'failed:target_active', 'failed:target_count_within_bounds', 'failed:target_exists_in_retrieved_set', 'failed:target_not_expired', 'fail_closed']
+- Top-K candidates:
+
+  - 1. SP018: 她现在住的地方离公司通勤大约四十分钟。 [relation=unrelated, direct=False]
+  - 2. O030: 她公司离江边大概十分钟。 [relation=unrelated, direct=False]
+  - 3. SP015: 她有一个关系很好的大学室友，现在还经常联系。 [relation=unrelated, direct=False]
+  - 4. SP009: 她周末更愿意去公园、展馆这类地方，而不是大型商场。 [relation=unrelated, direct=False]
+  - 5. SE029: 她上周末在家休息了两天，没有安排外出。 [relation=unrelated, direct=False]
+
+#### LTW2-010 / run 1
+
+- Incoming: 除了工作，我们最近也会聊她家里的事情，只是频率没有工作话题高。
+- Final target set: []
+- Gold target set: ['O046']
+- Overall relation: complementary
+- Validator: pass=False, validated_relation=uncertain, would_update=False, reasons=['failed:same_scope', 'failed:source_message_is_distinct', 'failed:subject_compatible', 'failed:target_active', 'failed:target_count_within_bounds', 'failed:target_exists_in_retrieved_set', 'failed:target_not_expired', 'fail_closed']
+- Top-K candidates:
+
+  - 1. SR009: 我们周末的聊天频率通常比工作日高。 [relation=unrelated, direct=False]
+  - 2. O050: 我们周末聊天通常更多。 [relation=unrelated, direct=False]
+  - 3. SR025: 我们一旦把周末计划定下来，一般很少在当天临时更改。 [relation=unrelated, direct=False]
+  - 4. SE018: 我们最近一次见面时聊到了她换领导后的工作变化。 [relation=unrelated, direct=False]
+  - 5. SE007: 上个月我们一起去了苏州两天。 [relation=unrelated, direct=False]
+
+#### LTW2-011 / run 1
+
+- Incoming: 最近三周基本都是我先发消息，她已经很少主动开话题了。
+- Final target set: []
+- Gold target set: ['O051']
+- Overall relation: update
+- Validator: pass=False, validated_relation=uncertain, would_update=False, reasons=['failed:confirmed_protection', 'failed:destructive_role_eligible', 'failed:event_pattern_state_protection', 'failed:kind_compatible', 'failed:perspective_protection', 'failed:same_scope', 'failed:source_message_is_distinct', 'failed:subject_compatible', 'failed:target_active', 'failed:target_count_within_bounds', 'failed:target_exists_in_retrieved_set', 'failed:target_not_expired', 'failed:temporal_evidence_available', 'failed:temporal_order_plausible', 'fail_closed']
+- Top-K candidates:
+
+  - 1. O052: 她工作忙的时候回复会变短。 [relation=unrelated, direct=False]
+  - 2. SR019: 她遇到家里的烦心事时更少主动讲细节。 [relation=unrelated, direct=False]
+  - 3. SR024: 她工作压力小的时候更愿意主动安排周末活动。 [relation=unrelated, direct=False]
+  - 4. SR013: 她觉得被误解时往往会先解释事实，再谈感受。 [relation=unrelated, direct=False]
+  - 5. SR018: 她工作特别累的时候更愿意一个人散步。 [relation=unrelated, direct=False]
+
+#### LTW2-012 / run 1
+
+- Incoming: 这一个月她几乎不再和我讲工作上的情绪，问了也只是说没事。
+- Final target set: []
+- Gold target set: ['O056']
+- Overall relation: update
+- Validator: pass=False, validated_relation=uncertain, would_update=False, reasons=['failed:confirmed_protection', 'failed:destructive_role_eligible', 'failed:event_pattern_state_protection', 'failed:kind_compatible', 'failed:perspective_protection', 'failed:same_scope', 'failed:source_message_is_distinct', 'failed:subject_compatible', 'failed:target_active', 'failed:target_count_within_bounds', 'failed:target_exists_in_retrieved_set', 'failed:target_not_expired', 'failed:temporal_evidence_available', 'failed:temporal_order_plausible', 'fail_closed']
+- Top-K candidates:
+
+  - 1. SR002: 她遇到工作上的烦心事时，有时会先自己消化一阵。 [relation=unrelated, direct=False]
+  - 2. SR021: 她不喜欢在情绪很高的时候立刻做关系决定。 [relation=unrelated, direct=False]
+  - 3. SR018: 她工作特别累的时候更愿意一个人散步。 [relation=unrelated, direct=False]
+  - 4. SR026: 她不太喜欢连续多条消息追问同一个问题。 [relation=unrelated, direct=False]
+  - 5. SR030: 她如果对一个活动真的感兴趣，会主动问具体时间。 [relation=unrelated, direct=False]
+
+#### LTW2-013 / run 1
+
+- Incoming: 她上个月已经搬到浦东了，现在平时都是从浦东那边通勤。
+- Final target set: []
+- Gold target set: ['O061']
+- Overall relation: update
+- Validator: pass=False, validated_relation=uncertain, would_update=False, reasons=['failed:confirmed_protection', 'failed:destructive_role_eligible', 'failed:event_pattern_state_protection', 'failed:kind_compatible', 'failed:perspective_protection', 'failed:same_scope', 'failed:source_message_is_distinct', 'failed:subject_compatible', 'failed:target_active', 'failed:target_count_within_bounds', 'failed:target_exists_in_retrieved_set', 'failed:target_not_expired', 'failed:temporal_evidence_available', 'failed:temporal_order_plausible', 'fail_closed']
+- Top-K candidates:
+
+  - 1. SR012: 她遇到不确定的计划时倾向先说再看看。 [relation=unrelated, direct=False]
+  - 2. SR008: 她忙的时候回复会变短，但不一定完全不回。 [relation=unrelated, direct=False]
+  - 3. SR021: 她不喜欢在情绪很高的时候立刻做关系决定。 [relation=unrelated, direct=False]
+  - 4. SR002: 她遇到工作上的烦心事时，有时会先自己消化一阵。 [relation=unrelated, direct=False]
+  - 5. SP009: 她周末更愿意去公园、展馆这类地方，而不是大型商场。 [relation=unrelated, direct=False]
+
+#### LTW2-014 / run 1
+
+- Incoming: 从八月中旬开始我们差不多两三天才认真聊一次，这个频率已经持续半个月了。
+- Final target set: ['O066']
+- Gold target set: ['O066']
+- Overall relation: update
+- Validator: pass=False, validated_relation=uncertain, would_update=False, reasons=['failed:temporal_evidence_available', 'fail_closed']
+- Top-K candidates:
+
+  - 1. O066: 之前我们基本每天都会认真聊一会儿。 [relation=update, direct=True]
+  - 2. SR001: 我们工作日通常都是晚上才会认真聊天。 [relation=unrelated, direct=False]
+  - 3. SE002: 八月中旬我们因为旅行预算问题争执过一次。 [relation=unrelated, direct=False]
+  - 4. SR025: 我们一旦把周末计划定下来，一般很少在当天临时更改。 [relation=unrelated, direct=False]
+  - 5. SE018: 我们最近一次见面时聊到了她换领导后的工作变化。 [relation=unrelated, direct=False]
+
+#### LTW2-015 / run 1
+
+- Incoming: 我想了一下还是先不表白了，至少等最近这段尴尬缓下来再说。
+- Final target set: []
+- Gold target set: ['O071']
+- Overall relation: update
+- Validator: pass=False, validated_relation=uncertain, would_update=False, reasons=['failed:confirmed_protection', 'failed:destructive_role_eligible', 'failed:event_pattern_state_protection', 'failed:kind_compatible', 'failed:perspective_protection', 'failed:same_scope', 'failed:source_message_is_distinct', 'failed:subject_compatible', 'failed:target_active', 'failed:target_count_within_bounds', 'failed:target_exists_in_retrieved_set', 'failed:target_not_expired', 'failed:temporal_evidence_available', 'failed:temporal_order_plausible', 'fail_closed']
+- Top-K candidates:
+
+  - 1. SI026: 我想以后她明确说忙的时候先不追着问。 [relation=unrelated, direct=False]
+  - 2. SI010: 我想以后发生分歧时尽量少在微信里争论。 [relation=unrelated, direct=False]
+  - 3. SI024: 我想以后约会取消时尽快重新定一个新时间。 [relation=unrelated, direct=False]
+  - 4. SI002: 我们暂定下周六晚上一起吃饭。 [relation=unrelated, direct=False]
+  - 5. SI007: 我们计划下个月去看一个摄影展。 [relation=unrelated, direct=False]
+
+#### LTW2-016 / run 1
+
+- Incoming: 我总觉得她可能其实不太想让我融入她朋友圈，只是嘴上不好拒绝。
+- Final target set: []
+- Gold target set: ['O076']
+- Overall relation: contradiction
+- Validator: pass=False, validated_relation=uncertain, would_update=False, reasons=['failed:same_scope', 'failed:source_message_is_distinct', 'failed:subject_compatible', 'failed:target_active', 'failed:target_count_within_bounds', 'failed:target_exists_in_retrieved_set', 'failed:target_not_expired', 'fail_closed']
+- Top-K candidates:
+
+  - 1. SP017: 她大学期间学过一点摄影。 [relation=unrelated, direct=False]
+  - 2. SP014: 她通常工作日七点以后才下班。 [relation=unrelated, direct=False]
+  - 3. SP011: 她住宿时很在意房间是否安静。 [relation=unrelated, direct=False]
+  - 4. SR019: 她遇到家里的烦心事时更少主动讲细节。 [relation=unrelated, direct=False]
+  - 5. SP027: 她买衣服时更看重舒适，不太追求品牌。 [relation=unrelated, direct=False]
+
+#### LTW2-018 / run 1
+
+- Incoming: 我感觉她可能其实更喜欢很热闹的地方，因为上次在酒吧她看起来挺开心。
+- Final target set: []
+- Gold target set: ['O086']
+- Overall relation: contradiction
+- Validator: pass=False, validated_relation=uncertain, would_update=False, reasons=['failed:same_scope', 'failed:source_message_is_distinct', 'failed:subject_compatible', 'failed:target_active', 'failed:target_count_within_bounds', 'failed:target_exists_in_retrieved_set', 'failed:target_not_expired', 'fail_closed']
+- Top-K candidates:
+
+  - 1. SP028: 她听播客时更常听人物访谈和文化类节目。 [relation=unrelated, direct=False]
+  - 2. SP009: 她周末更愿意去公园、展馆这类地方，而不是大型商场。 [relation=unrelated, direct=False]
+  - 3. SP010: 她看电影更喜欢剧情片，不太看恐怖片。 [relation=unrelated, direct=False]
+  - 4. SP013: 她目前在一家互联网公司做产品相关工作。 [relation=unrelated, direct=False]
+  - 5. SP016: 她家里养过一只猫。 [relation=unrelated, direct=False]
+
+#### LTW2-019 / run 1
+
+- Incoming: 我有点觉得她是不是已经不想主动找我了，不过最近样本也不多。
+- Final target set: []
+- Gold target set: ['O091']
+- Overall relation: contradiction
+- Validator: pass=False, validated_relation=uncertain, would_update=False, reasons=['failed:same_scope', 'failed:source_message_is_distinct', 'failed:subject_compatible', 'failed:target_active', 'failed:target_count_within_bounds', 'failed:target_exists_in_retrieved_set', 'failed:target_not_expired', 'fail_closed']
+- Top-K candidates:
+
+  - 1. SR023: 她在熟悉的人面前会比刚认识时健谈很多。 [relation=unrelated, direct=False]
+  - 2. SR030: 她如果对一个活动真的感兴趣，会主动问具体时间。 [relation=unrelated, direct=False]
+  - 3. SR015: 她表达感谢时更常通过行动而不是长篇文字。 [relation=unrelated, direct=False]
+  - 4. SR002: 她遇到工作上的烦心事时，有时会先自己消化一阵。 [relation=unrelated, direct=False]
+  - 5. SR018: 她工作特别累的时候更愿意一个人散步。 [relation=unrelated, direct=False]
+
+#### LTW2-020 / run 1
+
+- Incoming: 我觉得她可能已经不想去国庆后的徒步了，但她没有明确说取消。
+- Final target set: []
+- Gold target set: ['O096']
+- Overall relation: contradiction
+- Validator: pass=False, validated_relation=uncertain, would_update=False, reasons=['failed:same_scope', 'failed:source_message_is_distinct', 'failed:subject_compatible', 'failed:target_active', 'failed:target_count_within_bounds', 'failed:target_exists_in_retrieved_set', 'failed:target_not_expired', 'fail_closed']
+- Top-K candidates:
+
+  - 1. SI025: 我们考虑年底找一个周末去周边温泉。 [relation=unrelated, direct=False]
+  - 2. SE023: 两周前我们临时改过一次见面地点，但时间没变。 [relation=unrelated, direct=False]
+  - 3. SE014: 上周我们一起讨论了国庆假期怎么安排。 [relation=unrelated, direct=False]
+  - 4. SI022: 我准备先把自己的需求说清楚，而不是猜她怎么想。 [relation=unrelated, direct=False]
+  - 5. SI026: 我想以后她明确说忙的时候先不追着问。 [relation=unrelated, direct=False]
+
+#### LTW2-031 / run 1
+
+- Incoming: 昨天她因为工作特别累，只回了我几条很短的消息。
+- Final target set: []
+- Gold target set: ['O151']
+- Overall relation: complementary
+- Validator: pass=False, validated_relation=uncertain, would_update=False, reasons=['failed:same_scope', 'failed:source_message_is_distinct', 'failed:subject_compatible', 'failed:target_active', 'failed:target_count_within_bounds', 'failed:target_exists_in_retrieved_set', 'failed:target_not_expired', 'fail_closed']
+- Top-K candidates:
+
+  - 1. O153: 昨天她说新项目让她有点疲惫。 [relation=unrelated, direct=False]
+  - 2. SR018: 她工作特别累的时候更愿意一个人散步。 [relation=unrelated, direct=False]
+  - 3. SE006: 昨天她说最近新项目让她有点疲惫。 [relation=unrelated, direct=False]
+  - 4. SR024: 她工作压力小的时候更愿意主动安排周末活动。 [relation=unrelated, direct=False]
+  - 5. SR026: 她不太喜欢连续多条消息追问同一个问题。 [relation=unrelated, direct=False]
+
+#### LTW2-035 / run 1
+
+- Incoming: 今天我们在文字里又因为一个小分歧越聊越僵。
+- Final target set: []
+- Gold target set: ['O171']
+- Overall relation: complementary
+- Validator: pass=False, validated_relation=uncertain, would_update=False, reasons=['failed:same_scope', 'failed:source_message_is_distinct', 'failed:subject_compatible', 'failed:target_active', 'failed:target_count_within_bounds', 'failed:target_exists_in_retrieved_set', 'failed:target_not_expired', 'fail_closed']
+- Top-K candidates:
+
+  - 1. O172: 上个月我们因为电影选择有过一个小分歧。 [relation=unrelated, direct=False]
+  - 2. SE018: 我们最近一次见面时聊到了她换领导后的工作变化。 [relation=unrelated, direct=False]
+  - 3. SI023: 我们提过以后找时间一起做顿饭。 [relation=unrelated, direct=False]
+  - 4. SR009: 我们周末的聊天频率通常比工作日高。 [relation=unrelated, direct=False]
+  - 5. SR022: 如果一周没见面，我们通常会找一个晚上视频聊一会儿。 [relation=unrelated, direct=False]
+
+#### LTW2-036 / run 1
+
+- Incoming: 最近我们既减少了日常聊天，也很少视频了，整体联系频率比以前低很多。
+- Final target set: []
+- Gold target set: ['O176', 'O177']
+- Overall relation: update
+- Validator: pass=False, validated_relation=uncertain, would_update=False, reasons=['failed:confirmed_protection', 'failed:destructive_role_eligible', 'failed:event_pattern_state_protection', 'failed:kind_compatible', 'failed:perspective_protection', 'failed:same_scope', 'failed:source_message_is_distinct', 'failed:subject_compatible', 'failed:target_active', 'failed:target_count_within_bounds', 'failed:target_exists_in_retrieved_set', 'failed:target_not_expired', 'failed:temporal_evidence_available', 'failed:temporal_order_plausible', 'fail_closed']
+- Top-K candidates:
+
+  - 1. SR001: 我们工作日通常都是晚上才会认真聊天。 [relation=unrelated, direct=False]
+  - 2. SI015: 我们有一个还没定日期的短途旅行想法。 [relation=unrelated, direct=False]
+  - 3. SE001: 上周六我们一起去看了一个小型摄影展。 [relation=unrelated, direct=False]
+  - 4. SR009: 我们周末的聊天频率通常比工作日高。 [relation=unrelated, direct=False]
+  - 5. SE002: 八月中旬我们因为旅行预算问题争执过一次。 [relation=unrelated, direct=False]
+
+#### LTW2-040 / run 1
+
+- Incoming: 我感觉她最近可能既不太想见我，也不太想主动聊天，但我没有足够证据。
+- Final target set: []
+- Gold target set: []
+- Overall relation: uncertain
+- Validator: pass=True, validated_relation=uncertain, would_update=False, reasons=['non_destructive_relation']
+- Top-K candidates:
+
+  - 1. SP030: 她的生日在十二月。 [relation=uncertain, direct=False]
+  - 2. SE011: 她上周做完汇报以后主动跟我聊了很久。 [relation=uncertain, direct=False]
+  - 3. SP003: 她旅行时更偏向慢节奏，不喜欢一天排太多景点。 [relation=uncertain, direct=False]
+  - 4. SE029: 她上周末在家休息了两天，没有安排外出。 [relation=uncertain, direct=False]
+  - 5. SE004: 前天她下班后一个人去江边走了很久。 [relation=uncertain, direct=False]
+
 
 ## Governance Notes
 

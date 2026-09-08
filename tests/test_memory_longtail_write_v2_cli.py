@@ -46,6 +46,7 @@ def test_longtail_write_v2_cli_help_exposes_retrieval_parameters() -> None:
         "--slice",
         "--vector-limit",
         "--rank-limit",
+        "--semantic-judge",
         "--mode",
         "--repeat",
         "--hard-cases",
@@ -90,6 +91,8 @@ def test_longtail_write_v2_cli_writes_json_and_markdown_sidecar(
             "18",
             "--rank-limit",
             "4",
+            "--semantic-judge-limit",
+            "3",
             "--output",
             str(output),
             "--fail-on-error",
@@ -105,6 +108,7 @@ def test_longtail_write_v2_cli_writes_json_and_markdown_sidecar(
     assert received["case_id"] == "LTW2-011"
     assert received["vector_limit"] == 18
     assert received["rank_limit"] == 4
+    assert received["semantic_judge_limit"] == 3
     assert received["fail_on_error"] is True
 
 

@@ -199,6 +199,7 @@ async def _evaluate(
     relation: ClaimRelation,
     targets: list[str],
     provider: _ControlledEmbeddingProvider | None = None,
+    semantic_judge_limit: int | None = None,
 ) -> tuple[dict[str, Any], _ControlledEmbeddingProvider, _ScriptedJudge]:
     embedding = provider or _ControlledEmbeddingProvider(target_texts=_gold_texts(case_id))
     judge = _ScriptedJudge(relation, targets)
@@ -208,9 +209,28 @@ async def _evaluate(
         embedding_provider=embedding,
         judge=judge,
         case_id=case_id,
+        semantic_judge_limit=semantic_judge_limit,
         fail_on_error=True,
     )
     return report, embedding, judge
+
+
+@pytest.mark.asyncio
+async def test_v2_semantic_judge_limit_is_independent_of_cheap_rank_limit() -> None:
+    report, _, judge = await _evaluate(
+        "LTW2-001",
+        relation=ClaimRelation.SAME,
+        targets=["O001"],
+        semantic_judge_limit=3,
+    )
+
+    row = report["rows"][0]
+    assert report["parameters"]["cheap_rank_top_n"] == 5
+    assert report["parameters"]["semantic_judge_candidate_limit"] == 3
+    assert len(row["retrieval"]["ranked"]) == 5
+    assert len(row["retrieval"]["semantic_ranked"]) == 3
+    assert len(judge.calls[-1]) == 3
+    assert report["retrieval_metrics"]["semantic_candidate_limit"] == 3
 
 
 def test_v2_dataset_shape_and_collision_review_are_explicit() -> None:
