@@ -31,7 +31,10 @@ from loveapp.domain.memory import (
 )
 from loveapp.domain.memory_context import attach_memories, select_context_memories
 from loveapp.domain.memory_dimensions import merge_interaction_pattern_provenance
-from loveapp.domain.memory_event_enrichment import apply_conflict_event_enrichment
+from loveapp.domain.memory_event_enrichment import (
+    apply_conflict_event_enrichment,
+    apply_event_enrichment,
+)
 from loveapp.domain.memory_write import (
     MemoryTransitionAudit,
     MemoryWriteBatch,
@@ -708,6 +711,52 @@ class InMemoryMemoryStore:
                     extractor_model=target.extractor_model,
                     verifier_model=target.verifier_model,
                     prompt_version=target.prompt_version,
+                    evidence=[enrichment.evidence_span],
+                    reason=enrichment.reason,
+                    created_at=self._clock(),
+                )
+                self._transition_audits[audit.id] = audit
+                audits.append(audit.model_copy(deep=True))
+
+            for enrichment in batch.event_enrichments:
+                target = self._memories.get(enrichment.target_memory_id)
+                if (
+                    target is None
+                    or target.user_id != user_id
+                    or target.relationship_id != relationship_id
+                ):
+                    raise ValueError(
+                        "Event enrichment target is outside the current relationship scope"
+                    )
+                updated = apply_event_enrichment(
+                    target,
+                    enrichment,
+                    source_message_id=batch.source_message_id,
+                    updated_at=self._clock(),
+                )
+                self._memories[target.id] = updated
+                if target.id not in updated_memory_ids:
+                    updated_memory_ids.append(target.id)
+                audit = MemoryTransitionAudit(
+                    user_id=user_id,
+                    relationship_id=relationship_id,
+                    source_message_id=batch.source_message_id,
+                    incoming_memory_id=updated.id,
+                    target_memory_ids=[updated.id],
+                    relation=ClaimRelation.COMPLEMENTARY,
+                    decision=updated.admission_decision or AdmissionDecision.PROPOSE,
+                    rule_name=f"enrich_event_{enrichment.field.value}",
+                    admission_score=updated.admission_score,
+                    score_breakdown={
+                        "enrichment_type": "event_attribute",
+                        "field": enrichment.field.value,
+                        "antecedent_message_id": enrichment.antecedent_message_id,
+                    },
+                    raw_predicate=updated.raw_predicate,
+                    canonical_predicate=updated.canonical_predicate,
+                    extractor_model=updated.extractor_model,
+                    verifier_model=updated.verifier_model,
+                    prompt_version=updated.prompt_version,
                     evidence=[enrichment.evidence_span],
                     reason=enrichment.reason,
                     created_at=self._clock(),
