@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from loveapp.domain.memory import (
     AdmissionDecision,
@@ -10,6 +10,7 @@ from loveapp.domain.memory import (
     MemoryCandidate,
     MemorySaveResult,
     MemoryStatus,
+    MutationAction,
     utc_now,
 )
 from loveapp.domain.memory_event_enrichment import (
@@ -34,6 +35,17 @@ class MemoryAuditDraft(BaseModel):
     prompt_version: str | None = None
     evidence: list[str] = Field(default_factory=list)
     reason: str
+    mutation_action: MutationAction | None = None
+
+    @model_validator(mode="after")
+    def fill_mutation_action(self) -> "MemoryAuditDraft":
+        if self.mutation_action is None:
+            self.mutation_action = infer_mutation_action(
+                self.relation,
+                rule_name=self.rule_name,
+                target_memory_ids=self.target_memory_ids,
+            )
+        return self
 
 
 class MemoryWriteOperation(BaseModel):
@@ -43,9 +55,26 @@ class MemoryWriteOperation(BaseModel):
     target_memory_ids: list[str] = Field(default_factory=list)
     target_operation_indexes: list[int] = Field(default_factory=list)
     target_status: MemoryStatus = MemoryStatus.SUPERSEDED
+    mutation_action: MutationAction | None = None
+    source_event_operation_indexes: list[int] = Field(default_factory=list, max_length=20)
     rule_name: str = "local_unrelated"
     reason: str = "No deterministic lifecycle transition was required."
     score_breakdown: dict[str, object] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def fill_mutation_action(self) -> "MemoryWriteOperation":
+        if any(index < 0 for index in self.source_event_operation_indexes):
+            raise ValueError("source event operation indexes must be non-negative")
+        self.source_event_operation_indexes = list(
+            dict.fromkeys(self.source_event_operation_indexes)
+        )
+        if self.mutation_action is None:
+            self.mutation_action = infer_mutation_action(
+                self.relation,
+                rule_name=self.rule_name,
+                target_memory_ids=self.target_memory_ids,
+            )
+        return self
 
 
 class MemoryStatusUpdate(BaseModel):
@@ -94,7 +123,18 @@ class MemoryTransitionAudit(BaseModel):
     prompt_version: str | None = None
     evidence: list[str] = Field(default_factory=list)
     reason: str
+    mutation_action: MutationAction | None = None
     created_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def fill_mutation_action(self) -> "MemoryTransitionAudit":
+        if self.mutation_action is None:
+            self.mutation_action = infer_mutation_action(
+                self.relation,
+                rule_name=self.rule_name,
+                target_memory_ids=self.target_memory_ids,
+            )
+        return self
 
 
 class MemoryWriteBatchResult(BaseModel):
@@ -117,3 +157,64 @@ def resolve_operation_target_ids(
             raise ValueError("memory batch operation cannot target itself")
         resolved.append(saved_memory_ids[target_index])
     return list(dict.fromkeys(resolved))
+
+
+def resolve_operation_source_event_ids(
+    operation: MemoryWriteOperation,
+    saved_memory_ids: list[str],
+    *,
+    operation_index: int,
+) -> list[str]:
+    """Resolve typed Event links after operation IDs are allocated."""
+
+    resolved: list[str] = []
+    for source_index in operation.source_event_operation_indexes:
+        if source_index < 0 or source_index >= len(saved_memory_ids):
+            raise ValueError("memory batch source event operation index is out of range")
+        if source_index == operation_index:
+            raise ValueError("memory batch operation cannot link itself as an Event")
+        resolved.append(saved_memory_ids[source_index])
+    return list(dict.fromkeys(resolved))
+
+
+def attach_source_event_ids(
+    candidate: MemoryCandidate,
+    event_ids: list[str],
+) -> MemoryCandidate:
+    """Return a candidate with typed Event links mirrored into its payload."""
+
+    merged = list(dict.fromkeys([*candidate.source_event_ids, *event_ids]))
+    if not merged:
+        return candidate
+    payload = dict(candidate.payload)
+    payload["source_event_ids"] = merged
+    return candidate.model_copy(
+        update={
+            "source_event_ids": merged,
+            "payload": payload,
+        }
+    )
+
+
+def infer_mutation_action(
+    relation: ClaimRelation,
+    *,
+    rule_name: str = "",
+    target_memory_ids: list[str] | tuple[str, ...] = (),
+) -> MutationAction:
+    """Map an existing governed relation/rule to a bounded write action."""
+
+    rule = rule_name.casefold()
+    if rule.startswith("enrich_") or "enrichment" in rule or rule.startswith("contextual_"):
+        return MutationAction.ENRICH if "enrich" in rule else MutationAction.UPDATE
+    if "link" in rule:
+        return MutationAction.LINK
+    if relation == ClaimRelation.SAME:
+        return MutationAction.REFINE
+    if relation == ClaimRelation.UPDATE:
+        return MutationAction.SUPERSEDE if target_memory_ids else MutationAction.UPDATE
+    if relation in {ClaimRelation.CONTRADICTION, ClaimRelation.UNCERTAIN}:
+        return MutationAction.REJECT
+    if relation == ClaimRelation.COMPLEMENTARY:
+        return MutationAction.LINK if target_memory_ids else MutationAction.CREATE
+    return MutationAction.CREATE

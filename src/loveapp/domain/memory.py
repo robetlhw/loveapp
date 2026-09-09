@@ -141,6 +141,24 @@ class ClaimRelation(StrEnum):
     UNCERTAIN = "uncertain"
 
 
+class MutationAction(StrEnum):
+    """Governed storage action, kept separate from semantic claim relation.
+
+    A relation describes what the incoming proposition means relative to an
+    existing claim.  This enum describes the bounded write operation selected
+    by Python governance.  Model output is never accepted as an authority for
+    this field.
+    """
+
+    CREATE = "create"
+    ENRICH = "enrich"
+    REFINE = "refine"
+    LINK = "link"
+    UPDATE = "update"
+    SUPERSEDE = "supersede"
+    REJECT = "reject"
+
+
 class MemoryExtractionMode(StrEnum):
     """Extraction strategy selected before the shared governance pipeline."""
 
