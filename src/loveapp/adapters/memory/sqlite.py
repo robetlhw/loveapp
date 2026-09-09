@@ -38,6 +38,7 @@ from loveapp.domain.memory import (
 )
 from loveapp.domain.memory_context import attach_memories, select_context_memories
 from loveapp.domain.memory_dimensions import merge_interaction_pattern_provenance
+from loveapp.domain.memory_event_enrichment import apply_conflict_event_enrichment
 from loveapp.domain.memory_predicates import normalize_predicate
 from loveapp.domain.memory_write import (
     MemoryTransitionAudit,
@@ -940,6 +941,73 @@ class SQLiteMemoryStore:
                     prompt_version=updated.prompt_version,
                     evidence=[contextual_update.evidence_span],
                     reason=contextual_update.reason,
+                    created_at=now,
+                )
+                await _insert_transition_audit(connection, audit)
+                implicit_audits.append(audit)
+
+            for enrichment in batch.conflict_event_enrichments:
+                target_row = await _fetchone(
+                    connection,
+                    """
+                    SELECT * FROM memory_items
+                    WHERE id = ? AND user_id = ? AND relationship_id = ?
+                    """,
+                    (enrichment.target_memory_id, user_id, relationship_id),
+                )
+                if target_row is None:
+                    raise ValueError(
+                        "conflict Event enrichment target is outside the current relationship scope"
+                    )
+                target = _row_to_memory(target_row)
+                updated = apply_conflict_event_enrichment(
+                    target,
+                    enrichment,
+                    source_message_id=batch.source_message_id,
+                    updated_at=now,
+                )
+                await connection.execute(
+                    """
+                    UPDATE memory_items
+                    SET evidence_spans_json = ?, payload_json = ?,
+                        updated_at = ?, last_seen_at = ?
+                    WHERE id = ? AND user_id = ? AND relationship_id = ?
+                    """,
+                    (
+                        _dump_json(updated.evidence_spans),
+                        _dump_json(updated.payload),
+                        _dump_datetime(updated.updated_at),
+                        _dump_datetime(updated.last_seen_at),
+                        updated.id,
+                        user_id,
+                        relationship_id,
+                    ),
+                )
+                if updated.id not in updated_memory_ids:
+                    updated_memory_ids.append(updated.id)
+                audit = MemoryTransitionAudit(
+                    user_id=user_id,
+                    relationship_id=relationship_id,
+                    source_message_id=batch.source_message_id,
+                    incoming_memory_id=updated.id,
+                    target_memory_ids=[updated.id],
+                    relation=ClaimRelation.COMPLEMENTARY,
+                    decision=updated.admission_decision or AdmissionDecision.PROPOSE,
+                    rule_name="enrich_conflict_event_cause",
+                    admission_score=updated.admission_score,
+                    score_breakdown={
+                        "event_type": "conflict",
+                        "enrichment_type": "cause",
+                        "cause_category": enrichment.cause_category,
+                        "antecedent_message_id": enrichment.antecedent_message_id,
+                    },
+                    raw_predicate=updated.raw_predicate,
+                    canonical_predicate=updated.canonical_predicate,
+                    extractor_model=updated.extractor_model,
+                    verifier_model=updated.verifier_model,
+                    prompt_version=updated.prompt_version,
+                    evidence=[enrichment.evidence_span],
+                    reason=enrichment.reason,
                     created_at=now,
                 )
                 await _insert_transition_audit(connection, audit)

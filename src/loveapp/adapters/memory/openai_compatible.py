@@ -1008,34 +1008,46 @@ COMPOUND_MEMORY、CONTEXT_DEPENDENT_REPLY、TRANSIENT、SMALL_TALK、NO_MEMORY�
   interaction.contact_frequency、interaction.topic_scope、interaction.channel、
   interaction.initiation_balance、interaction.response_engagement、
   interaction.emotional_disclosure、interaction.conflict_frequency、
-  profile.residence、profile.occupation、
+  profile.residence、profile.occupation、profile.identity、
   profile.contact_method、profile.birthday、preference.general、preference.food.cuisine、
   preference.food.spiciness、preference.environment.noise、preference.activity.type、
   preference.budget.range、preference.personal_interest.topic、preference.consumption.item、
-  preference.lifestyle.habit、preference.relationship.partner_trait、
+  preference.hobby.activity、preference.interest.topic、preference.lifestyle.habit、
+  preference.relationship.partner_trait、preference.relationship.conflict_resolution、
   preference.relationship.interaction_style、preference.relationship.emotional_need、
-  preference.communication.style、preference.value.priority。
+  preference.communication.style、preference.communication.frequency、
+  preference.emotional.need、preference.value.priority。
 - 无法可靠映射时必须使用 predicate_type=custom、custom_predicate=<英文 snake_case>，
   canonical_predicate 必须为 null；不得伪造新的 canonical 值。
-- V2.1 偏好分类优先使用已注册的 domain + dimension 组合：
-  personal_interest/topic、consumption/item、lifestyle/habit、relationship/partner_trait、
-  relationship/interaction_style、relationship/emotional_need、communication/style、
-  value/priority；只有无法可靠归类时才使用 preference.general 或 custom。
-- stable_fact 只有明确的现居地、职业、主要联系方式和生日可分别使用已注册的
-  profile.residence、profile.occupation、profile.contact_method、profile.birthday，并将明确值写入
+- 偏好分类优先使用已注册的 domain + dimension 组合：food/cuisine、food/taste、
+  hobby/activity、interest/topic、lifestyle/habit、communication/style、
+  communication/frequency、relationship/partner_trait、relationship/interaction_style、
+  relationship/conflict_resolution、emotional/need，以及兼容的 personal_interest/topic、
+  consumption/item、relationship/emotional_need、value/priority。只有无法可靠归类时才使用
+  preference.general 或 custom。hobby 与 interest 是不同语义维度，不要合并为 stable_fact。
+- stable_fact 只描述相对稳定的现实属性，明确排除 hobby、interest、preference、belief 和 emotion。
+  明确的现居地、职业、主要联系方式、生日和身份标签可分别使用已注册的 profile.residence、
+  profile.occupation、profile.contact_method、profile.birthday、profile.identity，并将明确值写入
   object 或 payload.value。其他开放事实不得猜测为 profile predicate，继续使用 custom。
 - raw_predicate 保留你最初识别的英文谓词；predicate 继续输出该原始谓词以兼容旧结构。
 - explicitness 只能是 explicit、strongly_implied、weakly_inferred、speculative。
 - requires_inference 表示该声明是否需要跨句、指代或因果推断。
 - 状态型记忆将 state_dimension/state_value 直接放在 claim 中；payload 中也保留同名字段。
-- interaction_event 的 payload 在有信息时使用结构化字段 participants、action、time、location、
-  emotion、outcome、source；source 只能是 user_reported 或 model_inferred。Event 只表示一次已经
-  发生的有边界行为，不要用事件字段表达长期频率或趋势。可选输出 salience（0 到 1）和
-  importance_reason，作为事件价值的模型提示；Python 会结合 novelty、relationship impact、
-  emotional intensity 和 user attention 重新评估，模型提示不能授权 mutation。
+- interaction_event 的 payload 继续保留 participants、action、time、location 这些兼容基础字段，
+  并在有信息时使用结构化字段 event_type、cause、severity、resolution、emotion、outcome、source。
+  event_type 只使用
+  conversation、shared_activity、date、conflict、reconciliation、affection_expression、support、
+  milestone；未知时省略，禁止臆造。conflict 的 cause 使用
+  {"category": "snake_case", "description": "用户明确证据"}，未知字段留空。source 只能是
+  user_reported 或 model_inferred。Event 只表示一次已经发生的有边界行为，不要用事件字段表达
+  长期频率或趋势。可选输出 salience（0 到 1）、novelty（0 到 1）和 importance_reason，作为事件
+  价值的模型提示；只有“第一次/首次”等明确证据才可给高 novelty，不能因为 existing memories 中
+  没有同类记录就推断高 novelty。Python 会结合 known history、relationship impact、emotional
+  intensity 和 user attention 重新评估，模型提示不能授权 mutation。
 - interaction_pattern 的 payload 必须保留 metric；用户直接陈述的趋势可使用 source=user_reported，
-  系统从事件归纳的趋势必须使用 source=model_inferred，并提供 evidence_ids（或等价 evidence
-  数组）和可验证的 time_window。没有证据时不要伪造 model_inferred pattern。Pattern 只能描述
+  系统从事件归纳的趋势必须使用 source=derived_from_events，并提供 evidence_ids（或等价 evidence
+  数组）和可验证的 time_window。兼容旧的 source=model_inferred，但它不能绕过 evidence 要求。
+  没有证据时不要伪造 model_inferred pattern。Pattern 只能描述
   可观察的互动趋势（如主动性、联系频率、回应参与度、冲突频率），不得把“越来越喜欢我”、
   “不在乎我”等心理结论当成 Pattern；若原文同时给出可观察行为，只抽取该行为趋势。
 - 不得决定数据库操作，不得输出或猜测 supersedes_id；Python 生命周期策略会选择目标。

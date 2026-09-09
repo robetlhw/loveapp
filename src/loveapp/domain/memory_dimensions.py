@@ -172,16 +172,35 @@ INTERACTION_MEMORY_SOURCES = frozenset(
 INTERACTION_PATTERN_SOURCES = frozenset(
     {"user_reported", "model_inferred", "derived_from_events"}
 )
+INTERACTION_EVENT_TYPES = frozenset(
+    {
+        "conversation",
+        "shared_activity",
+        "date",
+        "conflict",
+        "reconciliation",
+        "affection_expression",
+        "support",
+        "milestone",
+    }
+)
 INTERACTION_EVENT_PAYLOAD_FIELDS = frozenset(
     {
+        "event_type",
         "participants",
         "action",
         "activity_type",
         "time",
         "location",
+        "cause",
+        "severity",
+        "resolution",
         "emotion",
         "outcome",
         "source",
+        "salience",
+        "novelty",
+        "relationship_impact",
     }
 )
 INTERACTION_PATTERN_PAYLOAD_FIELDS = frozenset(
@@ -241,8 +260,10 @@ _EVENT_BOTH_PARTICIPANT_ALIASES = {
     "彼此",
 }
 _EVENT_ACTION_ALIASES = ("action", "activity_type", "activity", "event_action", "verb")
+_EVENT_TYPE_ALIASES = ("event_type", "event_category", "domain_event_type")
 _EVENT_TIME_ALIASES = ("time", "event_time", "time_expression", "temporal_expression")
 _EVENT_LOCATION_ALIASES = ("location", "place", "venue", "where")
+_EVENT_CAUSE_ALIASES = ("cause", "conflict_cause")
 _EVENT_EMOTION_ALIASES = ("emotion", "feeling")
 _EVENT_OUTCOME_ALIASES = ("outcome", "result", "effect")
 _PATTERN_SOURCE_ALIASES = ("source", "provenance", "origin")
@@ -253,6 +274,114 @@ _PATTERN_EVIDENCE_ID_ALIASES = (
     "supporting_event_ids",
 )
 _PATTERN_TIME_WINDOW_ALIASES = ("time_window", "time_range", "window")
+
+_EVENT_TYPE_VALUE_ALIASES = {
+    "chat": "conversation",
+    "communication": "conversation",
+    "talk": "conversation",
+    "conversation": "conversation",
+    "activity": "shared_activity",
+    "meal": "shared_activity",
+    "shared_activity": "shared_activity",
+    "dating": "date",
+    "romantic_date": "date",
+    "date": "date",
+    "argument": "conflict",
+    "fight": "conflict",
+    "quarrel": "conflict",
+    "conflict": "conflict",
+    "repair": "reconciliation",
+    "reconcile": "reconciliation",
+    "reconciliation": "reconciliation",
+    "gift": "affection_expression",
+    "affection": "affection_expression",
+    "affection_expression": "affection_expression",
+    "comfort": "support",
+    "emotional_support": "support",
+    "support": "support",
+    "first": "milestone",
+    "first_date": "milestone",
+    "relationship_milestone": "milestone",
+    "milestone": "milestone",
+}
+_EVENT_TYPE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "milestone",
+        re.compile(r"(?:第一次|初次|头一次|首次)|\bfirst\s+(?:time|date|meeting)\b", re.I),
+    ),
+    (
+        "reconciliation",
+        re.compile(
+            r"(?:和好|说开|和解|修复|恢复正常|道歉后.{0,8}原谅)"
+            r"|\b(?:reconcil|made\s+up|repair)\w*\b",
+            re.I,
+        ),
+    ),
+    (
+        "conflict",
+        re.compile(
+            r"(?:吵架|争吵|争执|矛盾|冲突|冷战)"
+            r"|\b(?:argu|fight|quarrel|conflict)\w*\b",
+            re.I,
+        ),
+    ),
+    (
+        "support",
+        re.compile(
+            r"(?:安慰|支持|鼓励|陪伴|帮我扛|倾听)"
+            r"|\b(?:comfort|support|encourag)\w*\b",
+            re.I,
+        ),
+    ),
+    (
+        "affection_expression",
+        re.compile(
+            r"(?:表白|告白|示爱|说喜欢|送.{0,8}(?:礼物|花))"
+            r"|\b(?:confess|gift|affection)\w*\b",
+            re.I,
+        ),
+    ),
+    ("date", re.compile(r"(?:约会|正式约.{0,8}(?:吃饭|见面))|\bdate\b", re.I)),
+    (
+        "shared_activity",
+        re.compile(
+            r"(?:一起|共同).{0,12}(?:吃饭|看电影|散步|旅行|活动|逛|玩|见面)"
+            r"|\b(?:together|shared)\b",
+            re.I,
+        ),
+    ),
+    (
+        "conversation",
+        re.compile(
+            r"(?:聊天|谈话|通话|沟通|聊了|发消息)"
+            r"|\b(?:chat|talk|conversation|call)\w*\b",
+            re.I,
+        ),
+    ),
+)
+_CONFLICT_CAUSE_CATEGORY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "communication_frequency",
+        re.compile(r"(?:联系|回复|回消息|沟通|聊天).{0,10}(?:少|慢|不够|频率)|(?:少|慢|不够).{0,8}(?:联系|回复|沟通|聊天)"),
+    ),
+    ("financial_values", re.compile(r"(?:钱|花钱|消费|支出|预算|经济|消费观)")),
+    ("misunderstanding", re.compile(r"(?:误会|误解|没听懂|理解错)")),
+    ("trust", re.compile(r"(?:信任|怀疑|隐瞒|欺骗|撒谎)")),
+    ("boundary", re.compile(r"(?:边界|界限|底线|隐私)")),
+    ("availability", re.compile(r"(?:工作忙|没时间|时间安排|行程|排期)")),
+)
+_CONFLICT_CAUSE_CATEGORY_ALIASES = {
+    "contact_frequency": "communication_frequency",
+    "reply_frequency": "communication_frequency",
+    "communication": "communication_frequency",
+    "insufficient_contact": "communication_frequency",
+    "money": "financial_values",
+    "spending": "financial_values",
+    "consumption_values": "financial_values",
+    "miscommunication": "misunderstanding",
+    "boundaries": "boundary",
+    "schedule": "availability",
+}
 
 _INITIATION_BALANCE_VALUES = frozenset(
     {"partner_to_user", "balanced", "user_to_partner", "mixed"}
@@ -620,6 +749,7 @@ def normalize_interaction_event_payload(
     period_start: datetime | None = None,
     period_end: datetime | None = None,
     emotions: list[str] | None = None,
+    evidence_text: str = "",
 ) -> dict[str, object]:
     """Normalize the bounded fields of an ``interaction_event`` payload.
 
@@ -631,11 +761,22 @@ def normalize_interaction_event_payload(
     """
 
     normalized = dict(payload)
+    _copy_payload_alias(normalized, "event_type", _EVENT_TYPE_ALIASES)
     _copy_payload_alias(normalized, "action", _EVENT_ACTION_ALIASES)
     _copy_payload_alias(normalized, "time", _EVENT_TIME_ALIASES)
     _copy_payload_alias(normalized, "location", _EVENT_LOCATION_ALIASES)
+    _copy_payload_alias(normalized, "cause", _EVENT_CAUSE_ALIASES)
     _copy_payload_alias(normalized, "emotion", _EVENT_EMOTION_ALIASES)
     _copy_payload_alias(normalized, "outcome", _EVENT_OUTCOME_ALIASES)
+
+    event_type = normalize_interaction_event_type(normalized.get("event_type"))
+    if event_type is None:
+        event_type = infer_interaction_event_type(normalized, evidence_text=evidence_text)
+    if event_type is not None:
+        normalized["event_type"] = event_type
+
+    if "cause" in normalized:
+        normalized["cause"] = normalize_interaction_event_cause(normalized["cause"])
 
     if "participants" not in normalized:
         for alias in ("actors", "involved_participants", "involved_people"):
@@ -673,7 +814,7 @@ def normalize_interaction_event_payload(
     elif isinstance(normalized["time"], str):
         normalized["time"] = normalized["time"].strip()
 
-    for field in ("location", "outcome"):
+    for field in ("location", "outcome", "resolution"):
         value = normalized.get(field)
         if isinstance(value, str):
             normalized[field] = value.strip()
@@ -722,6 +863,10 @@ def validate_interaction_event_payload(
     if not isinstance(payload, Mapping):
         raise ValueError("interaction_event payload must be an object")
 
+    event_type = payload.get("event_type")
+    if event_type is not None and normalize_interaction_event_type(event_type) is None:
+        raise ValueError("interaction_event event_type is not in the reviewed ontology")
+
     participants = payload.get("participants")
     if participants is not None:
         if not isinstance(participants, (list, tuple)):
@@ -737,6 +882,7 @@ def validate_interaction_event_payload(
         ("time", 240),
         ("location", 240),
         ("outcome", 500),
+        ("resolution", 240),
     ):
         value = payload.get(field)
         if value is not None and (
@@ -757,6 +903,61 @@ def validate_interaction_event_payload(
         else:
             raise ValueError("interaction_event emotion must be a string or list")
 
+    cause = payload.get("cause")
+    if cause is not None:
+        if not isinstance(cause, Mapping):
+            raise ValueError("interaction_event cause must be an object")
+        if not cause or set(cause) - {"category", "description"}:
+            raise ValueError("interaction_event cause contains unknown or empty fields")
+        category = cause.get("category")
+        description = cause.get("description")
+        if category is not None and (
+            not isinstance(category, str)
+            or not category.strip()
+            or len(category.strip()) > 80
+            or re.fullmatch(r"[a-z][a-z0-9_]*", category.strip()) is None
+        ):
+            raise ValueError("interaction_event cause category must be snake_case text")
+        if description is not None and (
+            not isinstance(description, str)
+            or not description.strip()
+            or len(description.strip()) > 500
+        ):
+            raise ValueError("interaction_event cause description must be non-empty text")
+
+    severity = payload.get("severity")
+    if severity is not None:
+        valid_numeric = (
+            isinstance(severity, int)
+            and not isinstance(severity, bool)
+            and 1 <= severity <= 5
+        )
+        valid_text = isinstance(severity, str) and severity.casefold().strip() in {
+            "low",
+            "moderate",
+            "high",
+            "severe",
+        }
+        if not valid_numeric and not valid_text:
+            raise ValueError("interaction_event severity must be 1..5 or a bounded label")
+
+    for field in ("salience", "novelty"):
+        value = payload.get(field)
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not 0 <= float(value) <= 1
+        ):
+            raise ValueError(f"interaction_event {field} must be between 0 and 1")
+
+    impact = payload.get("relationship_impact")
+    if impact is not None and (
+        not isinstance(impact, str)
+        or impact.casefold().strip()
+        not in {"improving", "damaging", "unchanged", "unclear"}
+    ):
+        raise ValueError("interaction_event relationship_impact is invalid")
+
     source = payload.get("source")
     normalized_source = (
         normalize_interaction_source(source) if source is not None else None
@@ -770,6 +971,92 @@ def validate_interaction_event_payload(
             "interaction_event source cannot be derived_from_events"
         )
     _validate_interaction_source_alignment(source, perspective, kind="event")
+
+
+def normalize_interaction_event_type(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = _normalize_identifier(value)
+    normalized = _EVENT_TYPE_VALUE_ALIASES.get(normalized, normalized)
+    return normalized if normalized in INTERACTION_EVENT_TYPES else None
+
+
+def infer_interaction_event_type(
+    payload: Mapping[str, object],
+    *,
+    evidence_text: str = "",
+) -> str | None:
+    values = [
+        evidence_text,
+        payload.get("action"),
+        payload.get("activity_type"),
+        payload.get("predicate"),
+        payload.get("outcome"),
+        payload.get("resolution"),
+    ]
+    text = " ".join(
+        str(value) for value in values if isinstance(value, str) and value.strip()
+    )
+    return next(
+        (
+            event_type
+            for event_type, pattern in _EVENT_TYPE_PATTERNS
+            if pattern.search(text) is not None
+        ),
+        None,
+    )
+
+
+def is_conflict_interaction_event(
+    payload: Mapping[str, object],
+    *,
+    evidence_text: str = "",
+) -> bool:
+    return (
+        normalize_interaction_event_type(payload.get("event_type")) == "conflict"
+        or infer_interaction_event_type(payload, evidence_text=evidence_text) == "conflict"
+    )
+
+
+def normalize_interaction_event_cause(value: object) -> object:
+    if isinstance(value, str):
+        description = value.strip()
+        if not description:
+            return value
+        category = infer_conflict_cause_category(description)
+        return {
+            **({"category": category} if category is not None else {}),
+            "description": description,
+        }
+    if not isinstance(value, Mapping):
+        return value
+    normalized = dict(value)
+    category = normalized.get("category")
+    description = normalized.get("description")
+    if isinstance(category, str) and category.strip():
+        category_key = _normalize_identifier(category)
+        normalized["category"] = _CONFLICT_CAUSE_CATEGORY_ALIASES.get(
+            category_key,
+            category_key,
+        )
+    if isinstance(description, str):
+        normalized["description"] = description.strip()
+    if normalized.get("category") is None and isinstance(description, str):
+        inferred = infer_conflict_cause_category(description)
+        if inferred is not None:
+            normalized["category"] = inferred
+    return normalized
+
+
+def infer_conflict_cause_category(text: str) -> str | None:
+    return next(
+        (
+            category
+            for category, pattern in _CONFLICT_CAUSE_CATEGORY_PATTERNS
+            if pattern.search(text) is not None
+        ),
+        None,
+    )
 
 
 def normalize_interaction_pattern_provenance(

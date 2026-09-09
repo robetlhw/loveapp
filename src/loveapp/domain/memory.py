@@ -27,6 +27,9 @@ class MemoryKind(StrEnum):
     ADVICE_OUTCOME = "advice_outcome"
     PLANNED_EVENT = "planned_event"
     ACTION_INTENT = "action_intent"
+    # Compatibility kind for derived/current relationship projections.  Base
+    # extraction should prefer Fact, Preference, Event, or Pattern; callers
+    # must not treat this row kind as permission to infer a relationship state.
     RELATIONSHIP_STATE = "relationship_state"
 
     # Source-compatible aliases; persisted values use canonical values.
@@ -470,6 +473,9 @@ def _normalize_memory_input(value: object) -> object:
         "state_value",
         "state_dimension",
         "activity_type",
+        "event_type",
+        "event_category",
+        "domain_event_type",
         "action",
         "location",
         "place",
@@ -480,6 +486,10 @@ def _normalize_memory_input(value: object) -> object:
         "outcome",
         "result",
         "effect",
+        "cause",
+        "conflict_cause",
+        "severity",
+        "resolution",
         "source",
         "provenance",
         "origin",
@@ -590,6 +600,21 @@ def _synchronize_memory_evolution_metadata(
     if salience is not None and mirror_payload:
         payload["salience"] = round(float(salience), 4)
 
+    novelty = memory.novelty
+    if novelty is None and payload.get("novelty") is not None:
+        raw_novelty = payload["novelty"]
+        if isinstance(raw_novelty, bool):
+            raise ValueError("novelty must be a number between 0 and 1")
+        try:
+            novelty = float(raw_novelty)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("novelty must be a number between 0 and 1") from exc
+        if not 0 <= novelty <= 1:
+            raise ValueError("novelty must be a number between 0 and 1")
+        memory.novelty = novelty
+    if novelty is not None and mirror_payload:
+        payload["novelty"] = round(float(novelty), 4)
+
     importance_reason = memory.importance_reason
     if importance_reason is None and payload.get("importance_reason") is not None:
         raw_reason = payload["importance_reason"]
@@ -698,6 +723,7 @@ class MemoryCandidate(BaseModel):
     emotions: list[str] = Field(default_factory=list, max_length=8)
     importance: int = Field(default=3, ge=1, le=5)
     salience: float | None = Field(default=None, ge=0, le=1)
+    novelty: float | None = Field(default=None, ge=0, le=1)
     importance_reason: str | None = Field(default=None, max_length=500)
     perspective: MemoryPerspective = MemoryPerspective.USER_REPORTED
     epistemic_status: EpistemicStatus = EpistemicStatus.CONFIRMED
@@ -771,6 +797,7 @@ class AtomicClaim(BaseModel):
     emotions: list[str] = Field(default_factory=list, max_length=8)
     importance: int = Field(default=3, ge=1, le=5)
     salience: float | None = Field(default=None, ge=0, le=1)
+    novelty: float | None = Field(default=None, ge=0, le=1)
     importance_reason: str | None = Field(default=None, max_length=500)
     perspective: MemoryPerspective = MemoryPerspective.USER_REPORTED
     epistemic_status: EpistemicStatus = EpistemicStatus.CONFIRMED
@@ -849,6 +876,7 @@ class AtomicClaim(BaseModel):
             emotions=self.emotions,
             importance=self.importance,
             salience=self.salience,
+            novelty=self.novelty,
             importance_reason=self.importance_reason,
             perspective=self.perspective,
             epistemic_status=self.epistemic_status,
@@ -935,6 +963,7 @@ class MemoryContextItem(BaseModel):
     relationship_impact: RelationshipImpact
     importance: int = Field(default=3, ge=1, le=5)
     salience: float | None = Field(default=None, ge=0, le=1)
+    novelty: float | None = Field(default=None, ge=0, le=1)
     importance_reason: str | None = Field(default=None, max_length=500)
     perspective: MemoryPerspective
     epistemic_status: EpistemicStatus
@@ -975,6 +1004,7 @@ class MemoryContextItem(BaseModel):
                     "relationship_impact",
                     "importance",
                     "salience",
+                    "novelty",
                     "importance_reason",
                     "perspective",
                     "epistemic_status",

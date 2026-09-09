@@ -260,6 +260,13 @@ def assess_memory_admission(
             governed_transition_eligibility.target_memory_id
         )
 
+    proposed_floor = max(policy.strong_review_threshold - 0.2, 0.35)
+    if candidate.perspective == MemoryPerspective.USER_BELIEF:
+        proposed_floor = min(proposed_floor, 0.15)
+    source_type = str(candidate.payload.get("source_type") or "").casefold()
+    if source_type in {"hearsay", "third_party_report"}:
+        proposed_floor = min(proposed_floor, 0.35)
+
     if not evidence_valid:
         return AdmissionAssessment(
             AdmissionDecision.REJECT,
@@ -327,7 +334,11 @@ def assess_memory_admission(
             AdmissionDecision.REJECT,
             score,
             breakdown,
-            "interaction_pattern_boundary_invalid",
+            (
+                "interaction_pattern_boundary_invalid"
+                if score >= proposed_floor
+                else "below_admission_threshold"
+            ),
         )
     if not temporal_valid:
         decision = AdmissionDecision.PROPOSE if policy.allow_proposed else AdmissionDecision.REJECT
@@ -390,12 +401,6 @@ def assess_memory_admission(
             breakdown,
             "high_risk_or_ambiguous",
         )
-    proposed_floor = max(policy.strong_review_threshold - 0.2, 0.35)
-    if candidate.perspective == MemoryPerspective.USER_BELIEF:
-        proposed_floor = min(proposed_floor, 0.15)
-    source_type = str(candidate.payload.get("source_type") or "").casefold()
-    if source_type in {"hearsay", "third_party_report"}:
-        proposed_floor = min(proposed_floor, 0.35)
     if policy.allow_proposed and score >= proposed_floor:
         return AdmissionAssessment(
             AdmissionDecision.PROPOSE,

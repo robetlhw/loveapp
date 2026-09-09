@@ -86,6 +86,80 @@ _OBSERVABLE_PATTERN_EVIDENCE = re.compile(
     r"argu|fight|conflict|reconcil|ignore|refus)\w*\b",
     re.IGNORECASE,
 )
+_PREFERENCE_CUE_PATTERN = re.compile(
+    r"(?:喜欢|偏好|爱吃|爱好|感兴趣|希望.{0,24}(?:交流|沟通|联系|理解|陪伴)|"
+    r"不喜欢|不希望|讨厌|倾向于|习惯)"
+    r"|\b(?:prefer|like|dislike|interested\s+in|would\s+like)\b",
+    re.IGNORECASE,
+)
+_ROMANTIC_INTEREST_TARGET_PATTERN = re.compile(
+    r"(?:喜欢|爱|暗恋|心动|有好感).{0,6}(?:她|他|对方|女生|男生|女孩|男孩)"
+    r"|(?:她|他|对方|女生|男生|女孩|男孩).{0,6}(?:喜欢|爱|暗恋|心动|有好感)",
+)
+_PREFERENCE_ONTOLOGY_RULES: tuple[
+    tuple[str, str, re.Pattern[str], str | None],
+    ...,
+] = (
+    (
+        "relationship",
+        "conflict_resolution",
+        re.compile(r"(?:冷处理|冷战|吵架后|冲突后).{0,16}(?:沟通|说开|解决|一直|不要|避免)"),
+        "avoid_silent_treatment",
+    ),
+    (
+        "communication",
+        "frequency",
+        re.compile(r"(?:多交流|多沟通|常联系|经常沟通|保持联系|沟通频率)"),
+        "frequent",
+    ),
+    (
+        "emotional",
+        "need",
+        re.compile(r"(?:安全感|被理解|被安慰|情绪支持|陪伴|表达感受|情感需求)"),
+        None,
+    ),
+    (
+        "food",
+        "taste",
+        re.compile(r"(?:吃辣|口味.{0,6}(?:辣|甜|咸|酸)|(?:喜欢|偏好).{0,8}(?:辣|甜|咸|酸))"),
+        None,
+    ),
+    (
+        "food",
+        "cuisine",
+        re.compile(r"(?:喜欢|偏好|爱吃).{0,12}(?:菜|料理|寿司|火锅|食物|餐|饭|面|肉|鱼)"),
+        None,
+    ),
+    (
+        "interest",
+        "topic",
+        re.compile(r"(?:对.{0,16}(?:感兴趣|有兴趣)|兴趣(?:是|在于)|关注.{0,12}(?:领域|话题))"),
+        None,
+    ),
+    (
+        "lifestyle",
+        "habit",
+        re.compile(r"(?:晚上|早上|睡前|每天|平时|习惯|作息|一个人|独处).{0,18}(?:听|看|走|跑|运动|阅读|音乐)"),
+        None,
+    ),
+    (
+        "hobby",
+        "activity",
+        re.compile(r"(?:喜欢|爱好|常玩|常打|常听|常看).{0,16}(?:篮球|足球|羽毛球|跑步|游泳|健身|音乐|画画|绘画|乐器|桌游|游戏|摄影)"),
+        None,
+    ),
+)
+_PREFERENCE_DEFAULT_DIMENSION = {
+    "food": "cuisine",
+    "hobby": "activity",
+    "interest": "topic",
+    "lifestyle": "habit",
+    "communication": "style",
+    "communication_frequency": "frequency",
+    "relationship": "partner_trait",
+    "conflict_resolution": "conflict_resolution",
+    "emotional": "need",
+}
 
 
 class NormalizationContractError(ValueError):
@@ -241,6 +315,7 @@ def normalize_memory_candidate_contract(
             str(candidate.state_dimension or candidate.payload.get("state_dimension")),
         )
     candidate = normalize_memory_epistemics(candidate)
+    candidate = align_foundational_ontology_boundary(candidate)
     candidate = align_interaction_event_pattern_boundary(candidate)
     candidate = enforce_interaction_pattern_observability(candidate)
     normalized = normalize_memory_candidate(candidate, reference_time)
@@ -258,6 +333,197 @@ def normalize_memory_candidate_contract(
         allow_legacy_open_world=allow_legacy_open_world,
     )
     return normalized
+
+
+def align_foundational_ontology_boundary(
+    candidate: MemoryCandidate,
+) -> MemoryCandidate:
+    """Map Fact/Preference semantics without trusting the model's final kind.
+
+    The mapper is deliberately narrower than extraction: it recognizes only
+    reviewed preference categories and never turns a single observed action
+    into a durable preference.  Legacy epistemic propositions keep their
+    storage-compatible kind, but are explicitly marked as beliefs and cannot
+    acquire governed ``profile.*`` fact semantics.
+    """
+
+    payload = dict(candidate.payload)
+    evidence = " ".join(
+        part
+        for part in [candidate.original_text, *candidate.evidence_spans]
+        if isinstance(part, str) and part.strip()
+    )
+
+    if (
+        candidate.kind == MemoryKind.STABLE_FACT
+        and candidate.perspective == MemoryPerspective.USER_BELIEF
+    ):
+        payload["semantic_type"] = "belief"
+        payload["objective_fact"] = False
+        updates: dict[str, object] = {"payload": payload}
+        if (
+            isinstance(candidate.canonical_predicate, str)
+            and candidate.canonical_predicate.startswith("profile.")
+        ):
+            custom = candidate.custom_predicate or _belief_custom_predicate(candidate)
+            payload["predicate"] = custom
+            updates.update(
+                {
+                    "payload": payload,
+                    "raw_predicate": custom,
+                    "predicate_type": PredicateType.CUSTOM,
+                    "canonical_predicate": None,
+                    "custom_predicate": custom,
+                    "state_dimension": None,
+                    "state_value": None,
+                }
+            )
+        return candidate.model_copy(update=updates)
+
+    if candidate.kind not in {MemoryKind.STABLE_FACT, MemoryKind.PREFERENCE}:
+        return candidate
+    if candidate.kind == MemoryKind.STABLE_FACT and _is_registered_profile_declaration(
+        candidate
+    ):
+        return candidate
+
+    explicit_preference = _has_explicit_preference_shape(payload)
+    preference_language = bool(_PREFERENCE_CUE_PATTERN.search(evidence))
+    romantic_interest = bool(_ROMANTIC_INTEREST_TARGET_PATTERN.search(evidence))
+    if candidate.kind == MemoryKind.STABLE_FACT and (
+        not (explicit_preference or preference_language) or romantic_interest
+    ):
+        return candidate
+
+    domain, dimension, canonical_value = _preference_ontology_classification(
+        payload,
+        evidence,
+    )
+    if domain is None or dimension is None:
+        # Existing Preference rows may remain open-world Custom.  A Fact is
+        # reclassified only when the reviewed ontology can name its category.
+        return candidate
+    value = _preference_value(payload, evidence, canonical_value=canonical_value)
+    if value is None:
+        return candidate
+
+    payload["semantic_type"] = "preference"
+    payload["domain"] = domain
+    payload["dimension"] = dimension
+    payload["preference"] = value
+    payload.setdefault("value", value)
+    if canonical_value == "avoid_silent_treatment":
+        payload["preference_type"] = "avoid"
+    else:
+        payload.setdefault(
+            "preference_type",
+            "dislike" if re.search(r"(?:不喜欢|讨厌|避免|不要)", evidence) else "like",
+        )
+    return candidate.model_copy(
+        update={
+            "kind": MemoryKind.PREFERENCE,
+            "payload": payload,
+            "time_kind": (
+                TimeKind.TIMELESS
+                if candidate.time_kind == TimeKind.UNKNOWN
+                else candidate.time_kind
+            ),
+        }
+    )
+
+
+def _has_explicit_preference_shape(payload: dict[str, object]) -> bool:
+    return any(
+        payload.get(field) is not None
+        for field in (
+            "preference",
+            "preference_type",
+            "preference_type_hint",
+            "preference_domain",
+            "preference_dimension",
+        )
+    ) or str(payload.get("domain") or "").casefold() in {
+        "food",
+        "hobby",
+        "interest",
+        "lifestyle",
+        "communication",
+        "communication_frequency",
+        "relationship",
+        "conflict_resolution",
+        "emotional",
+    }
+
+
+def _preference_ontology_classification(
+    payload: dict[str, object],
+    evidence: str,
+) -> tuple[str | None, str | None, str | None]:
+    raw_domain = str(
+        payload.get("domain")
+        or payload.get("preference_domain")
+        or payload.get("category")
+        or ""
+    ).casefold().strip().replace("-", "_")
+    domain_aliases = {
+        "personal_interest": "interest",
+        "communication_frequency": "communication",
+        "conflict_resolution": "relationship",
+    }
+    domain = domain_aliases.get(raw_domain, raw_domain) or None
+    raw_dimension = str(
+        payload.get("dimension") or payload.get("preference_dimension") or ""
+    ).casefold().strip().replace("-", "_")
+    if domain is not None:
+        dimension = raw_dimension or _PREFERENCE_DEFAULT_DIMENSION.get(raw_domain or domain)
+        if dimension is not None:
+            return domain, dimension, None
+    for matched_domain, dimension, pattern, canonical_value in _PREFERENCE_ONTOLOGY_RULES:
+        if pattern.search(evidence) is not None:
+            return matched_domain, dimension, canonical_value
+    return None, None, None
+
+
+def _preference_value(
+    payload: dict[str, object],
+    evidence: str,
+    *,
+    canonical_value: str | None,
+) -> str | None:
+    if canonical_value is not None:
+        return canonical_value
+    for field in ("preference", "value", "object"):
+        value = payload.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    extractors = (
+        re.compile(r"对(?P<value>.{1,40}?)很感兴趣"),
+        re.compile(r"(?:喜欢|爱吃|偏好|爱好)(?P<value>.{1,40})"),
+        re.compile(r"希望.{0,20}(?P<value>多(?:交流|沟通|联系))"),
+    )
+    for pattern in extractors:
+        match = pattern.search(evidence)
+        if match is not None:
+            return match.group("value").strip(" 。.!！?？")
+    return None
+
+
+def _is_registered_profile_declaration(candidate: MemoryCandidate) -> bool:
+    values = (
+        candidate.canonical_predicate,
+        candidate.raw_predicate,
+        candidate.payload.get("predicate"),
+    )
+    return any(
+        isinstance(value, str) and value.startswith("profile.")
+        for value in values
+    )
+
+
+def _belief_custom_predicate(candidate: MemoryCandidate) -> str:
+    source = candidate.raw_predicate or candidate.payload.get("predicate") or "proposition"
+    normalized = re.sub(r"[^a-z0-9_]+", "_", str(source).casefold()).strip("_")
+    return f"believed_{normalized or 'proposition'}"[:120]
 
 
 def align_interaction_event_pattern_boundary(

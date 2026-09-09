@@ -12,6 +12,7 @@ from loveapp.domain.memory import (
     MemoryStatus,
     utc_now,
 )
+from loveapp.domain.memory_event_enrichment import ConflictEventEnrichment
 from loveapp.domain.relationship_plan import PlanStatus
 
 
@@ -62,6 +63,9 @@ class MemoryWriteBatch(BaseModel):
     source_message_id: str | None = None
     operations: list[MemoryWriteOperation] = Field(default_factory=list)
     contextual_updates: list[ContextualMemoryUpdate] = Field(default_factory=list)
+    conflict_event_enrichments: list[ConflictEventEnrichment] = Field(
+        default_factory=list
+    )
     status_updates: list[MemoryStatusUpdate] = Field(default_factory=list)
     plan_updates: list[RelationshipPlanStatusUpdate] = Field(default_factory=list)
     audit_only: list[MemoryAuditDraft] = Field(default_factory=list)

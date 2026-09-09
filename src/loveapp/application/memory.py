@@ -48,6 +48,7 @@ from loveapp.domain.memory_dimensions import (
     normalize_state_value,
 )
 from loveapp.domain.memory_epistemics import is_epistemically_confirmed
+from loveapp.domain.memory_event_enrichment import ConflictEventEnrichment
 from loveapp.domain.memory_lifecycle import (
     governed_state_identity,
     governed_state_value,
@@ -91,6 +92,10 @@ from loveapp.ports.embeddings import EmbeddingProvider
 from loveapp.ports.memory import MemoryExtractor, MemoryStore, StrongClaimVerifier
 from loveapp.ports.observability import TraceRecorder
 
+from .conflict_event_enrichment import (
+    ConflictEventEnrichmentResolution,
+    resolve_conflict_event_enrichment,
+)
 from .contextual_memory_updates import (
     ExplicitMemoryCorrectionResolution,
     may_contain_contextual_memory_update,
@@ -527,6 +532,7 @@ class MemoryService:
         admission_breakdowns: list[dict[str, object]] = []
         candidate_observations: list[_CandidateObservation] = []
         audit_only: list[MemoryAuditDraft] = []
+        conflict_event_enrichments: list[ConflictEventEnrichment] = []
         extracted_candidates = [claim.to_candidate() for claim in extraction.claims]
         if deterministic_candidates:
             remaining_extracted = list(extracted_candidates)
@@ -952,6 +958,96 @@ class MemoryService:
                     target_operation_indexes=[],
                 )
                 continue
+            conflict_enrichment = resolve_conflict_event_enrichment(
+                candidate,
+                current_text=text,
+                conversation_history=conversation_history,
+                existing_memories=active,
+                pending_memory_context=gate_decision.pending_memory_context,
+            )
+            if conflict_enrichment.detected:
+                enriched_candidate = candidate.model_copy(
+                    update={
+                        "admission_score": assessment.score,
+                        "admission_decision": decision,
+                        "claim_relation": (
+                            ClaimRelation.COMPLEMENTARY
+                            if conflict_enrichment.resolved
+                            else ClaimRelation.UNCERTAIN
+                        ),
+                        "lifecycle_review_required": not conflict_enrichment.resolved,
+                    }
+                )
+                if conflict_enrichment.resolved:
+                    conflict_event_enrichments.append(
+                        conflict_enrichment.to_enrichment(
+                            confidence=enriched_candidate.confidence,
+                        )
+                    )
+                else:
+                    audit_only.append(
+                        MemoryAuditDraft(
+                            candidate_index=candidate_index,
+                            relation=ClaimRelation.UNCERTAIN,
+                            decision=decision,
+                            target_memory_ids=list(
+                                conflict_enrichment.semantic_candidate_ids
+                            ),
+                            rule_name="conflict_event_enrichment_no_op",
+                            admission_score=assessment.score,
+                            score_breakdown={
+                                **assessment.score_breakdown,
+                                "enrichment_type": "conflict_cause",
+                                "resolution_reason": conflict_enrichment.reason,
+                            },
+                            raw_predicate=enriched_candidate.raw_predicate,
+                            canonical_predicate=(
+                                enriched_candidate.canonical_predicate
+                            ),
+                            extractor_model=enriched_candidate.extractor_model,
+                            verifier_model=enriched_candidate.verifier_model,
+                            prompt_version=enriched_candidate.prompt_version,
+                            evidence=enriched_candidate.evidence_spans,
+                            reason=conflict_enrichment.reason,
+                        )
+                    )
+                _record_conflict_event_enrichment_trace(
+                    trace,
+                    candidate_index=candidate_index,
+                    resolution=conflict_enrichment,
+                )
+                _record_candidate_observation(
+                    trace,
+                    candidate_index=candidate_index,
+                    candidate=enriched_candidate,
+                    alias_hit=predicate_normalization.alias_hit,
+                    admission_reason=assessment.reason,
+                    score_breakdown=assessment.score_breakdown,
+                    compared_memory_ids=[item.id for item in active],
+                    strong_called=strong_called,
+                    strong_compared_memory_ids=strong_compared_memory_ids,
+                    relation=enriched_candidate.claim_relation
+                    or ClaimRelation.UNCERTAIN,
+                    relation_rule=(
+                        "enrich_conflict_event_cause"
+                        if conflict_enrichment.resolved
+                        else "conflict_event_enrichment_no_op"
+                    ),
+                    relation_reason=conflict_enrichment.reason,
+                    relation_target_memory_ids=list(
+                        conflict_enrichment.semantic_candidate_ids
+                    ),
+                    planned_action=(
+                        "enrich" if conflict_enrichment.resolved else "no_op"
+                    ),
+                    planned_target_memory_ids=(
+                        [conflict_enrichment.target.id]
+                        if conflict_enrichment.target is not None
+                        else []
+                    ),
+                    target_operation_indexes=[],
+                )
+                continue
             candidate = candidate.model_copy(
                 update={
                     "admission_score": assessment.score,
@@ -1130,7 +1226,12 @@ class MemoryService:
                             )
         try:
             prepared_saved = []
-            if operations or audit_only or contextual_updates:
+            if (
+                operations
+                or audit_only
+                or contextual_updates
+                or conflict_event_enrichments
+            ):
                 committed = await self.store.commit_memory_batch(
                     user_id=message.user_id,
                     relationship_id=message.relationship_id,
@@ -1138,6 +1239,7 @@ class MemoryService:
                         source_message_id=message.id,
                         operations=operations,
                         contextual_updates=contextual_updates,
+                        conflict_event_enrichments=conflict_event_enrichments,
                         status_updates=status_updates,
                         plan_updates=plan_updates,
                         audit_only=audit_only,
@@ -2526,6 +2628,42 @@ def _record_explicit_correction_trace(
                 "resolution_status": "resolved" if resolution.resolved else "no_op",
                 "resolution_reason": resolution.reason,
                 "source_evidence": resolution.evidence_span,
+            }
+        )
+
+
+def _record_conflict_event_enrichment_trace(
+    trace: TraceRecorder | None,
+    *,
+    candidate_index: int,
+    resolution: ConflictEventEnrichmentResolution,
+) -> None:
+    if trace is None:
+        return
+    with trace.measure("memory_conflict_event_enrichment") as details:
+        details.update(
+            {
+                "candidate_index": candidate_index,
+                "enrichment_probe": resolution.detected,
+                "enrichment_type": "conflict_cause",
+                "semantic_candidate_ids_json": json.dumps(
+                    list(resolution.semantic_candidate_ids)
+                ),
+                "rejected_candidates_json": json.dumps(
+                    [
+                        {"memory_id": memory_id, "reason": reason}
+                        for memory_id, reason in resolution.rejected_candidates
+                    ]
+                ),
+                "selected_target_memory_id": (
+                    resolution.target.id if resolution.target is not None else None
+                ),
+                "antecedent_message_id": resolution.antecedent_message_id,
+                "cause_category": resolution.cause_category,
+                "resolution_status": (
+                    "resolved" if resolution.resolved else "no_op"
+                ),
+                "resolution_reason": resolution.reason,
             }
         )
 

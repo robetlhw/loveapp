@@ -482,6 +482,7 @@ def normalize_memory_candidate(
             if candidate.expires_at is None and ttl is not None:
                 updates["expires_at"] = reference_time + ttl
     elif effective_kind == MemoryKind.INTERACTION_EVENT:
+        event_evidence = " ".join(candidate.evidence_spans) or candidate.original_text
         normalized_event_payload = normalize_interaction_event_payload(
             payload,
             perspective=candidate.perspective,
@@ -489,6 +490,7 @@ def normalize_memory_candidate(
             period_start=candidate.period_start,
             period_end=candidate.period_end,
             emotions=candidate.emotions,
+            evidence_text=event_evidence,
         )
         if normalized_event_payload != payload:
             payload = normalized_event_payload

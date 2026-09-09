@@ -13,6 +13,7 @@ from loveapp.domain.memory import (
     MemoryValence,
     RelationshipImpact,
 )
+from loveapp.domain.memory_dimensions import normalize_interaction_event_type
 
 _FIRST_INTERACTION_PATTERN = re.compile(
     r"(?:第一次|初次|头一次|首次|第一次见面|初次约会)"
@@ -34,6 +35,11 @@ _ATTENTION_PATTERN = re.compile(
     r"|\b(?:important|memorable|kept\s+thinking|mentioned\s+again)\b",
     re.IGNORECASE,
 )
+_RECURRENCE_EVENT_PATTERN = re.compile(
+    r"(?:最近|这几天|又|再次|重新|经常|反复|又开始|再次出现)"
+    r"|\b(?:again|repeatedly|often|recently)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -41,15 +47,18 @@ class EventSalienceAssessment:
     score: float
     importance: int
     reason: str
-    novelty: float
+    novelty: float | None
+    novelty_basis: str
     relationship_impact: float
     emotional_intensity: float
     user_attention: float
 
     @property
-    def factors(self) -> dict[str, float]:
+    def factors(self) -> dict[str, float | None]:
         return {
-            "novelty": round(self.novelty, 4),
+            "novelty": (
+                round(self.novelty, 4) if self.novelty is not None else None
+            ),
             "relationship_impact": round(self.relationship_impact, 4),
             "emotional_intensity": round(self.emotional_intensity, 4),
             "user_attention": round(self.user_attention, 4),
@@ -68,6 +77,7 @@ def assess_event_salience(
             candidate.importance,
             "not_interaction_event",
             0,
+            "not_applicable",
             0,
             0,
             0,
@@ -84,10 +94,29 @@ def assess_event_salience(
     ]
     repeated_mention = any(_same_occurrence(candidate, item) for item in comparable)
     explicit_first = bool(_FIRST_INTERACTION_PATTERN.search(evidence))
+    explicit_recurrence = bool(_RECURRENCE_EVENT_PATTERN.search(evidence))
     conflict = bool(_CONFLICT_EVENT_PATTERN.search(evidence))
     repair = bool(_REPAIR_EVENT_PATTERN.search(evidence))
+    known_recurrence = _has_known_recurring_pattern(candidate, existing_memories)
 
-    novelty = 1.0 if explicit_first else 0.72 if not comparable else 0.22
+    if explicit_first:
+        novelty = 1.0
+        novelty_basis = "explicit_first"
+    elif explicit_recurrence:
+        novelty = 0.2
+        novelty_basis = "explicit_recurrence_signal"
+    elif known_recurrence:
+        novelty = 0.2
+        novelty_basis = "known_recurring_pattern"
+    elif comparable:
+        novelty = 0.22
+        novelty_basis = "comparable_event_history"
+    else:
+        # Absence from the Store is not evidence that an event is novel in the
+        # real relationship.  Keep novelty unknown and use a neutral value only
+        # inside the salience calculation.
+        novelty = None
+        novelty_basis = "unknown_relationship_history"
     impact = _relationship_impact_score(candidate)
     if conflict:
         impact = max(impact, 1.0)
@@ -103,7 +132,13 @@ def assess_event_salience(
     if explicit_first:
         attention = max(attention, 0.65)
 
-    score = novelty * 0.32 + impact * 0.34 + emotional * 0.19 + attention * 0.15
+    effective_novelty = 0.5 if novelty is None else novelty
+    score = (
+        effective_novelty * 0.32
+        + impact * 0.34
+        + emotional * 0.19
+        + attention * 0.15
+    )
     if conflict:
         score = max(score, 0.82)
     elif repair:
@@ -137,6 +172,7 @@ def assess_event_salience(
         importance=max(candidate.importance, derived_importance),
         reason=reason,
         novelty=novelty,
+        novelty_basis=novelty_basis,
         relationship_impact=impact,
         emotional_intensity=emotional,
         user_attention=attention,
@@ -155,17 +191,28 @@ def apply_event_salience(
     payload = dict(candidate.payload)
     if candidate.salience is not None and abs(candidate.salience - assessment.score) > 1e-9:
         payload["extractor_salience_hint"] = round(candidate.salience, 4)
+    if candidate.novelty is not None and (
+        assessment.novelty is None
+        or abs(candidate.novelty - assessment.novelty) > 1e-9
+    ):
+        payload["extractor_novelty_hint"] = round(candidate.novelty, 4)
+    if assessment.novelty is None:
+        payload.pop("novelty", None)
+    else:
+        payload["novelty"] = assessment.novelty
     payload.update(
         {
             "salience": assessment.score,
             "importance_reason": assessment.reason,
             "salience_factors": assessment.factors,
             "salience_source": "deterministic_contextual_assessment",
+            "novelty_basis": assessment.novelty_basis,
         }
     )
     return candidate.model_copy(
         update={
             "salience": assessment.score,
+            "novelty": assessment.novelty,
             "importance": assessment.importance,
             "importance_reason": assessment.reason,
             "payload": payload,
@@ -198,6 +245,7 @@ def _event_signature(candidate: MemoryCandidate) -> str:
                 candidate.payload.get("activity_type"),
                 candidate.custom_predicate,
                 candidate.raw_predicate,
+                candidate.payload.get("event_type"),
             )
             if isinstance(value, str) and value.strip()
         ),
@@ -205,6 +253,26 @@ def _event_signature(candidate: MemoryCandidate) -> str:
     )
     normalized = unicodedata.normalize("NFKC", str(value)).casefold().strip()
     return re.sub(r"[^\w.\u4e00-\u9fff]+", "_", normalized).strip("_")
+
+
+def _has_known_recurring_pattern(
+    candidate: MemoryCandidate,
+    existing_memories: list[MemoryItem],
+) -> bool:
+    event_type = normalize_interaction_event_type(candidate.payload.get("event_type"))
+    if event_type != "conflict" and not _CONFLICT_EVENT_PATTERN.search(
+        _event_evidence(candidate)
+    ):
+        return False
+    return any(
+        item.kind == MemoryKind.INTERACTION_PATTERN
+        and item.status in {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}
+        and (
+            item.canonical_predicate == "interaction.conflict_frequency"
+            or item.payload.get("metric") == "conflict_frequency"
+        )
+        for item in existing_memories
+    )
 
 
 def _same_occurrence(incoming: MemoryCandidate, existing: MemoryItem) -> bool:

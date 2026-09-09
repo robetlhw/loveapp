@@ -31,6 +31,7 @@ from loveapp.domain.memory import (
 )
 from loveapp.domain.memory_context import attach_memories, select_context_memories
 from loveapp.domain.memory_dimensions import merge_interaction_pattern_provenance
+from loveapp.domain.memory_event_enrichment import apply_conflict_event_enrichment
 from loveapp.domain.memory_write import (
     MemoryTransitionAudit,
     MemoryWriteBatch,
@@ -662,6 +663,53 @@ class InMemoryMemoryStore:
                     prompt_version=target.prompt_version,
                     evidence=[contextual_update.evidence_span],
                     reason=contextual_update.reason,
+                    created_at=self._clock(),
+                )
+                self._transition_audits[audit.id] = audit
+                audits.append(audit.model_copy(deep=True))
+
+            for enrichment in batch.conflict_event_enrichments:
+                target = self._memories.get(enrichment.target_memory_id)
+                if (
+                    target is None
+                    or target.user_id != user_id
+                    or target.relationship_id != relationship_id
+                ):
+                    raise ValueError(
+                        "conflict Event enrichment target is outside the current relationship scope"
+                    )
+                updated = apply_conflict_event_enrichment(
+                    target,
+                    enrichment,
+                    source_message_id=batch.source_message_id,
+                    updated_at=self._clock(),
+                )
+                self._memories[target.id] = updated
+                if target.id not in updated_memory_ids:
+                    updated_memory_ids.append(target.id)
+                audit = MemoryTransitionAudit(
+                    user_id=user_id,
+                    relationship_id=relationship_id,
+                    source_message_id=batch.source_message_id,
+                    incoming_memory_id=target.id,
+                    target_memory_ids=[target.id],
+                    relation=ClaimRelation.COMPLEMENTARY,
+                    decision=target.admission_decision or AdmissionDecision.PROPOSE,
+                    rule_name="enrich_conflict_event_cause",
+                    admission_score=target.admission_score,
+                    score_breakdown={
+                        "event_type": "conflict",
+                        "enrichment_type": "cause",
+                        "cause_category": enrichment.cause_category,
+                        "antecedent_message_id": enrichment.antecedent_message_id,
+                    },
+                    raw_predicate=target.raw_predicate,
+                    canonical_predicate=target.canonical_predicate,
+                    extractor_model=target.extractor_model,
+                    verifier_model=target.verifier_model,
+                    prompt_version=target.prompt_version,
+                    evidence=[enrichment.evidence_span],
+                    reason=enrichment.reason,
                     created_at=self._clock(),
                 )
                 self._transition_audits[audit.id] = audit

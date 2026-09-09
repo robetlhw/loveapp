@@ -326,6 +326,13 @@ CANONICAL_PREDICATES: dict[str, CanonicalPredicateSpec] = {
         temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
         update_policy=PREDICATE_UPDATE_REPLACE,
     ),
+    "profile.identity": CanonicalPredicateSpec(
+        name="profile.identity",
+        state_dimension="profile.identity",
+        cardinality=PREDICATE_CARDINALITY_MULTI,
+        temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
+        update_policy=PREDICATE_UPDATE_APPEND,
+    ),
     "preference.general": CanonicalPredicateSpec(
         name="preference.general",
         cardinality=PREDICATE_CARDINALITY_MULTI,
@@ -384,6 +391,20 @@ CANONICAL_PREDICATES: dict[str, CanonicalPredicateSpec] = {
         temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
         update_policy=PREDICATE_UPDATE_APPEND,
     ),
+    "preference.hobby.activity": CanonicalPredicateSpec(
+        name="preference.hobby.activity",
+        semantic_domain="hobby",
+        cardinality=PREDICATE_CARDINALITY_MULTI,
+        temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
+        update_policy=PREDICATE_UPDATE_APPEND,
+    ),
+    "preference.interest.topic": CanonicalPredicateSpec(
+        name="preference.interest.topic",
+        semantic_domain="interest",
+        cardinality=PREDICATE_CARDINALITY_MULTI,
+        temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
+        update_policy=PREDICATE_UPDATE_APPEND,
+    ),
     "preference.consumption.item": CanonicalPredicateSpec(
         name="preference.consumption.item",
         semantic_domain="consumption",
@@ -422,6 +443,27 @@ CANONICAL_PREDICATES: dict[str, CanonicalPredicateSpec] = {
     "preference.communication.style": CanonicalPredicateSpec(
         name="preference.communication.style",
         semantic_domain="communication",
+        cardinality=PREDICATE_CARDINALITY_MULTI,
+        temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
+        update_policy=PREDICATE_UPDATE_APPEND,
+    ),
+    "preference.communication.frequency": CanonicalPredicateSpec(
+        name="preference.communication.frequency",
+        semantic_domain="communication_frequency",
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
+        update_policy=PREDICATE_UPDATE_REPLACE,
+    ),
+    "preference.relationship.conflict_resolution": CanonicalPredicateSpec(
+        name="preference.relationship.conflict_resolution",
+        semantic_domain="conflict_resolution",
+        cardinality=PREDICATE_CARDINALITY_MULTI,
+        temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
+        update_policy=PREDICATE_UPDATE_APPEND,
+    ),
+    "preference.emotional.need": CanonicalPredicateSpec(
+        name="preference.emotional.need",
+        semantic_domain="emotional",
         cardinality=PREDICATE_CARDINALITY_MULTI,
         temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
         update_policy=PREDICATE_UPDATE_APPEND,
@@ -731,7 +773,8 @@ _PREFERENCE_PREDICATES = {
     # V2.1 bounded preference categories.  Keep aliases explicit rather than
     # guessing a category from arbitrary free text.
     "personal_interest": "preference.personal_interest.topic",
-    "interest": "preference.personal_interest.topic",
+    "hobby": "preference.hobby.activity",
+    "interest": "preference.interest.topic",
     "consumption": "preference.consumption.item",
     "consumption_preference": "preference.consumption.item",
     "lifestyle": "preference.lifestyle.habit",
@@ -743,6 +786,10 @@ _PREFERENCE_PREDICATES = {
     "communication": "preference.communication.style",
     "communication_preference": "preference.communication.style",
     "communication_style": "preference.communication.style",
+    "communication_frequency": "preference.communication.frequency",
+    "conflict_resolution": "preference.relationship.conflict_resolution",
+    "emotional": "preference.emotional.need",
+    "emotional_preference": "preference.emotional.need",
     "value": "preference.value.priority",
     "value_preference": "preference.value.priority",
 }
@@ -753,10 +800,14 @@ _PREFERENCE_PREDICATES = {
 _PREFERENCE_DOMAIN_DIMENSIONS = {
     ("food", "cuisine"): "preference.food.cuisine",
     ("food", "spiciness"): "preference.food.spiciness",
+    ("food", "taste"): "preference.food.spiciness",
     ("environment", "noise"): "preference.environment.noise",
     ("activity", "type"): "preference.activity.type",
     ("budget", "range"): "preference.budget.range",
     ("personal_interest", "topic"): "preference.personal_interest.topic",
+    ("hobby", "activity"): "preference.hobby.activity",
+    ("hobby", "topic"): "preference.hobby.activity",
+    ("interest", "topic"): "preference.interest.topic",
     ("consumption", "item"): "preference.consumption.item",
     ("lifestyle", "habit"): "preference.lifestyle.habit",
     ("relationship", "partner_trait"): "preference.relationship.partner_trait",
@@ -764,6 +815,11 @@ _PREFERENCE_DOMAIN_DIMENSIONS = {
     ("relationship", "emotional_need"): "preference.relationship.emotional_need",
     ("communication", "style"): "preference.communication.style",
     ("communication", "communication_style"): "preference.communication.style",
+    ("communication", "frequency"): "preference.communication.frequency",
+    ("communication", "communication_frequency"): "preference.communication.frequency",
+    ("relationship", "conflict_resolution"): "preference.relationship.conflict_resolution",
+    ("emotional", "need"): "preference.emotional.need",
+    ("emotional", "emotional_need"): "preference.emotional.need",
     ("value", "priority"): "preference.value.priority",
 }
 
@@ -790,6 +846,24 @@ _PREFERENCE_DOMAIN_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
     "budget": (
         re.compile(r"预算|价格|花费|消费|便宜|实惠|省钱|贵|经济"),
     ),
+    "hobby": (
+        re.compile(r"篮球|足球|羽毛球|跑步|游泳|健身|音乐|听歌|画画|绘画|乐器|桌游|游戏"),
+    ),
+    "interest": (
+        re.compile(r"感兴趣|兴趣|摄影|历史|科技|艺术|文学|播客|研究"),
+    ),
+    "lifestyle": (
+        re.compile(r"习惯|作息|早睡|早起|熬夜|独处|一个人|睡前|生活方式"),
+    ),
+    "communication_frequency": (
+        re.compile(r"多交流|多沟通|经常沟通|常联系|保持联系|沟通频率"),
+    ),
+    "conflict_resolution": (
+        re.compile(r"冷处理|冷战|说开|及时沟通|吵架后|冲突后|解决矛盾"),
+    ),
+    "emotional": (
+        re.compile(r"安全感|被理解|被安慰|情绪支持|陪伴|表达感受|情感需求"),
+    ),
 }
 
 _PREFERENCE_DOMAIN_BY_TYPE = {
@@ -804,7 +878,8 @@ _PREFERENCE_DOMAIN_BY_TYPE = {
     "budget": "budget",
     "price": "budget",
     "personal_interest": "personal_interest",
-    "interest": "personal_interest",
+    "hobby": "hobby",
+    "interest": "interest",
     "consumption": "consumption",
     "consumption_preference": "consumption",
     "lifestyle": "lifestyle",
@@ -816,6 +891,10 @@ _PREFERENCE_DOMAIN_BY_TYPE = {
     "communication": "communication",
     "communication_preference": "communication",
     "communication_style": "communication",
+    "communication_frequency": "communication_frequency",
+    "conflict_resolution": "conflict_resolution",
+    "emotional": "emotional",
+    "emotional_preference": "emotional",
     "value": "value",
     "value_preference": "value",
 }
@@ -906,6 +985,13 @@ _STABLE_FACT_PREDICATE_ALIASES = {
     "dob": "profile.birthday",
     "生日": "profile.birthday",
     "出生日期": "profile.birthday",
+    # Open-valued identity labels (for example role or self-description) are
+    # multi-valued and therefore never inherit single-value replacement.
+    "identity": "profile.identity",
+    "identity_label": "profile.identity",
+    "self_identity": "profile.identity",
+    "身份": "profile.identity",
+    "身份认同": "profile.identity",
 }
 _STABLE_FACT_PREDICATES = frozenset(_STABLE_FACT_PREDICATE_ALIASES.values())
 
@@ -1207,6 +1293,19 @@ def _enforce_preference_domain(
             return next(iter(hinted_candidates)), requested_custom or raw_predicate or canonical
 
     observed_domains = _observed_preference_domains(payload)
+    explicit_pair = _explicit_preference_domain_dimension_predicate(payload)
+
+    # A reviewed domain+dimension pair proposed by the semantic layer is only
+    # accepted when the value/evidence independently supports the registered
+    # semantic domain.  This lets deterministic V3 classifications disambiguate
+    # overlapping values such as photography (activity vs interest) without
+    # weakening the existing guard for an unsupported model label.
+    if (
+        explicit_pair == canonical
+        and spec.semantic_domain is not None
+        and spec.semantic_domain in observed_domains
+    ):
+        return canonical, requested_custom or raw_predicate or canonical
 
     if spec.semantic_domain is None:
         # ``preference.general`` remains a compatibility fallback when the
@@ -1254,11 +1353,29 @@ def _explicit_preference_domain(payload: dict[str, Any]) -> str | None:
     preference_type = _normalize_identifier(
         str(payload.get("preference_type_hint") or payload.get("preference_type") or "")
     )
-    return _PREFERENCE_DOMAIN_BY_TYPE.get(preference_type) or _normalize_preference_domain_value(
+    return _PREFERENCE_DOMAIN_BY_TYPE.get(
+        preference_type
+    ) or _normalize_preference_domain_value(
         payload.get("domain")
         or payload.get("preference_domain")
         or payload.get("category")
     )
+
+
+def _explicit_preference_domain_dimension_predicate(
+    payload: dict[str, Any],
+) -> str | None:
+    domain = _normalize_preference_domain_value(
+        payload.get("domain")
+        or payload.get("preference_domain")
+        or payload.get("category")
+    )
+    dimension = _normalize_identifier(
+        str(payload.get("dimension") or payload.get("preference_dimension") or "")
+    )
+    if not domain or not dimension:
+        return None
+    return _PREFERENCE_DOMAIN_DIMENSIONS.get((domain, dimension))
 
 
 def _preference_hint_domain(payload: dict[str, Any]) -> str | None:
@@ -1300,6 +1417,10 @@ def _normalize_preference_domain_value(value: object) -> str | None:
     aliases = {
         "personal_interest": "personal_interest",
         "personal_interest_preference": "personal_interest",
+        "hobby": "hobby",
+        "hobby_preference": "hobby",
+        "interest": "interest",
+        "interest_preference": "interest",
         "consumption": "consumption",
         "consumption_preference": "consumption",
         "lifestyle": "lifestyle",
@@ -1308,6 +1429,12 @@ def _normalize_preference_domain_value(value: object) -> str | None:
         "relationship_preference": "relationship",
         "communication": "communication",
         "communication_preference": "communication",
+        "communication_frequency": "communication_frequency",
+        "communication_frequency_preference": "communication_frequency",
+        "conflict_resolution": "conflict_resolution",
+        "conflict_resolution_preference": "conflict_resolution",
+        "emotional": "emotional",
+        "emotional_preference": "emotional",
         "value": "value",
         "value_preference": "value",
     }
@@ -1319,10 +1446,15 @@ def _normalize_preference_domain_value(value: object) -> str | None:
         "environment",
         "budget",
         "personal_interest",
+        "hobby",
+        "interest",
         "consumption",
         "lifestyle",
         "relationship",
         "communication",
+        "communication_frequency",
+        "conflict_resolution",
+        "emotional",
         "value",
     } else None
 
