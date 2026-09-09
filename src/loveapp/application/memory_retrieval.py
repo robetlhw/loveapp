@@ -218,6 +218,125 @@ class MemoryContextBuilder:
         )
 
 
+def expand_linked_memories(
+    retrieved: Sequence[RetrievedMemory],
+    active_memories: Sequence[MemoryItem],
+    *,
+    query: str | None = None,
+    reference_time: datetime | None = None,
+    max_linked_events: int = 4,
+    max_items: int | None = None,
+    token_budget: int | None = None,
+) -> list[RetrievedMemory]:
+    """Expand advice-oriented results with active states and their Events.
+
+    This is a read-only projection.  It never changes lifecycle status and it
+    only follows typed ``source_event_ids``/``supporting_event_ids`` links.
+    Ordinary factual queries retain the normal retrieval result without
+    automatically dumping historical Event details into context.
+    """
+
+    if not _query_requests_linked_evidence(query):
+        return list(retrieved)
+    now = reference_time or utc_now()
+    active_by_id = {
+        item.id: item
+        for item in active_memories
+        if _is_retrievable(item, now, mode=MemoryRetrievalMode.CURRENT)
+    }
+    results = list(retrieved)
+    selected_ids = {result.item.id for result in results}
+    # Advice should see the current relationship snapshot even when the query
+    # itself contains no predicate vocabulary.
+    current_states = sorted(
+        (
+            item
+            for item in active_by_id.values()
+            if memory_role(item) == MemoryRole.CURRENT_STATE
+        ),
+        key=lambda item: _retrieval_sort_key(
+            RetrievedMemory(
+                item=item,
+                score=_score(
+                    item,
+                    semantic_similarity=_lexical_similarity(query or "", _retrieval_text(item)),
+                    predicate_match=_predicate_match(item, query or ""),
+                    now=now,
+                ),
+                retrieval_text=_retrieval_text(item),
+            )
+        ),
+    )
+    for item in current_states[:3]:
+        if item.id in selected_ids:
+            continue
+        result = RetrievedMemory(
+            item=item,
+            score=_score(
+                item,
+                semantic_similarity=_lexical_similarity(query or "", _retrieval_text(item)),
+                predicate_match=_predicate_match(item, query or ""),
+                now=now,
+            ),
+            retrieval_text=_retrieval_text(item),
+        )
+        results.append(result)
+        selected_ids.add(item.id)
+
+    linked_ids: list[str] = []
+    for result in results:
+        if memory_role(result.item) not in {
+            MemoryRole.CURRENT_STATE,
+            MemoryRole.INTERACTION_PATTERN,
+        }:
+            continue
+        for memory_id in [*result.item.source_event_ids, *result.item.supporting_event_ids]:
+            if memory_id not in linked_ids:
+                linked_ids.append(memory_id)
+    for memory_id in linked_ids[:max(max_linked_events, 0)]:
+        item = active_by_id.get(memory_id)
+        if item is None or item.id in selected_ids or item.kind != MemoryKind.INTERACTION_EVENT:
+            continue
+        results.append(
+            RetrievedMemory(
+                item=item,
+                score=_score(
+                    item,
+                    semantic_similarity=_lexical_similarity(query or "", _retrieval_text(item)),
+                    predicate_match=_predicate_match(item, query or ""),
+                    now=now,
+                ),
+                retrieval_text=_retrieval_text(item),
+            )
+        )
+        selected_ids.add(item.id)
+    if max_items is not None:
+        max_items = max(max_items, 0)
+        if len(results) > max_items:
+            priority_ids = {
+                item.id for item in current_states[:3]
+            } | set(linked_ids[:max(max_linked_events, 0)])
+            prioritized = [
+                result for result in results if result.item.id in priority_ids
+            ]
+            remainder = [
+                result for result in results if result.item.id not in priority_ids
+            ]
+            results = [*prioritized, *remainder][:max_items]
+    if token_budget is not None:
+        budget = max(token_budget, 0)
+        bounded: list[RetrievedMemory] = []
+        used_tokens = 0
+        for result in results:
+            estimated = _estimate_tokens(result.item)
+            if used_tokens + estimated > budget:
+                continue
+            bounded.append(result)
+            used_tokens += estimated
+        results = bounded
+    return results
+
+
 _PREDICATE_TERMS: dict[str, frozenset[str]] = {
     "interaction.contact_frequency": frozenset(
         {"冷淡", "回复", "回我", "联系", "主动", "互动", "聊天", "见面", "频率", "少", "慢"}
@@ -250,6 +369,21 @@ _PLAN_TERMS = frozenset(
 _RELATIONSHIP_TERMS = frozenset(
     {"她", "对方", "我们", "关系", "伴侣", "对象", "冷淡", "联系", "回复", "冲突", "吵架"}
 )
+
+_LINKED_EVIDENCE_QUERY_PATTERN = re.compile(
+    r"(?:应该怎么(?:办|做|回应)|怎么(?:办|做|回应)|建议|现在应该|"
+    r"what\s+should\s+i\s+do|how\s+should\s+i\s+respond|advice|suggest)",
+    re.IGNORECASE,
+)
+
+
+def _query_requests_linked_evidence(query: str | None) -> bool:
+    if not query:
+        return False
+    # The linked current state is itself the semantic guard.  Advice wording
+    # alone is enough to request expansion; unrelated queries never enter this
+    # path because they do not contain an active State with typed links.
+    return bool(_LINKED_EVIDENCE_QUERY_PATTERN.search(query))
 
 
 def _is_retrievable(
@@ -495,5 +629,6 @@ __all__ = [
     "MemoryRetrievalMode",
     "MemoryRetrievalScore",
     "RetrievedMemory",
+    "expand_linked_memories",
     "resolve_memory_retrieval_mode",
 ]

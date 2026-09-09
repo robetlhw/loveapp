@@ -127,6 +127,7 @@ from .memory_retrieval import (
     MemoryContextBuilder,
     MemoryRetrievalMode,
     RetrievedMemory,
+    expand_linked_memories,
     resolve_memory_retrieval_mode,
 )
 from .memory_semantic_relations import LongTailRelationShadowEvaluator
@@ -177,6 +178,7 @@ class MemoryService:
         self._tentative_min_confidence = tentative_min_confidence
         self._belief_min_confidence = belief_min_confidence
         self._context_limit = context_limit
+        self._context_token_budget = max(context_token_budget, 0)
         self._history_limit = history_limit
         self._context_wait_seconds = max(context_wait_seconds, 0)
         self._gate = gate or MemoryGate()
@@ -2102,6 +2104,14 @@ class MemoryService:
             reference_time=context_time,
             mode=mode,
         )
+        retrieved = expand_linked_memories(
+            retrieved,
+            active,
+            query=query,
+            reference_time=context_time,
+            max_items=self._context_limit,
+            token_budget=self._context_token_budget,
+        )
         base = RelationshipContext(
             user_id=user_id,
             relationship_id=relationship_id,
@@ -2146,12 +2156,20 @@ class MemoryService:
             active = [item for item in active if item.id not in reconciled_ids]
         if mode == MemoryRetrievalMode.HISTORY:
             active.extend(item for item in memories if item.status == MemoryStatus.SUPERSEDED)
-        return await self._memory_retriever.retrieve(
+        retrieved = await self._memory_retriever.retrieve(
             active,
             query=query,
             limit=limit or self._context_limit,
             reference_time=reference_time,
             mode=mode,
+        )
+        return expand_linked_memories(
+            retrieved,
+            active,
+            query=query,
+            reference_time=reference_time,
+            max_items=limit or self._context_limit,
+            token_budget=self._context_token_budget,
         )
 
 
