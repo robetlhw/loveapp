@@ -1,6 +1,6 @@
 import re
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from loveapp.domain.memory import (
     AdmissionDecision,
@@ -12,8 +12,25 @@ from loveapp.domain.memory import (
     MemoryStatus,
     PredicateType,
 )
-from loveapp.domain.memory_lifecycle import governed_state_identity, governed_state_value
+from loveapp.domain.memory_dimensions import (
+    INTERACTION_PATTERN_DIMENSIONS,
+    dimension_for_predicate,
+    infer_initiation_balance,
+    interaction_pattern_state,
+    normalize_interaction_metric,
+)
+from loveapp.domain.memory_epistemics import is_epistemically_confirmed
+from loveapp.domain.memory_lifecycle import (
+    governed_state_identity,
+    governed_state_value,
+    memory_concept,
+)
+from loveapp.domain.memory_normalization import (
+    interaction_pattern_has_recurrence_signal,
+    interaction_pattern_has_time_window,
+)
 from loveapp.domain.memory_predicates import is_high_risk_predicate
+from loveapp.domain.memory_type_compatibility import assess_memory_type_compatibility
 
 
 @dataclass(frozen=True)
@@ -130,8 +147,9 @@ _KNOWN_SUBJECTS = {
 }
 
 _FREQUENCY_PATTERN = re.compile(
-    r"经常|总是|每次|一直|反复|每天|每周|通常|频繁|很少|偶尔|"
-    r"always|often|usually|every\s+(?:day|week|time)|repeatedly",
+    r"经常|总是|每次|一直|反复|每天|每周|通常|频繁|很少|偶尔|多次|持续|"
+    r"基本都|几乎都|大多数时候|越来越|"
+    r"always|often|usually|every\s+(?:day|week|time)|repeatedly|over\s+time",
     re.IGNORECASE,
 )
 
@@ -154,18 +172,15 @@ def assess_memory_admission(
     inference_adjustment = -0.18 if candidate.requires_inference else 0.0
     evidence_adjustment = 0.0 if evidence_valid else -0.5
     subject_adjustment = 0.0 if candidate.subject.casefold() in _KNOWN_SUBJECTS else -0.05
-    perspective_adjustment = (
-        -0.15
-        if candidate.perspective
-        in {MemoryPerspective.USER_BELIEF, MemoryPerspective.MODEL_INFERRED}
-        else 0.0
-    )
+    perspective_adjustment = -0.15 if not is_epistemically_confirmed(candidate) else 0.0
     conflict_adjustment = -0.05 if conflict else 0.0
     pattern_has_frequency = interaction_pattern_has_frequency(candidate)
     pattern_has_multiple = interaction_pattern_has_multiple_evidence(
         candidate,
         corroborating_evidence_count=corroborating_evidence_count,
     )
+    pattern_has_recurrence = interaction_pattern_has_recurrence_signal(candidate)
+    pattern_has_window = interaction_pattern_has_time_window(candidate)
     pattern_adjustment = 0.0
     if candidate.kind == MemoryKind.INTERACTION_PATTERN:
         if pattern_has_frequency:
@@ -199,12 +214,15 @@ def assess_memory_admission(
         "subject_resolved": candidate.subject.casefold() in _KNOWN_SUBJECTS,
         "subject_adjustment": subject_adjustment,
         "perspective_adjustment": perspective_adjustment,
+        "epistemic_status": candidate.epistemic_status.value,
         "conflict": conflict,
         "conflict_adjustment": conflict_adjustment,
         "temporal_shape_valid": temporal_valid,
         "temporal_adjustment": temporal_adjustment,
         "pattern_has_frequency": pattern_has_frequency,
         "pattern_has_multiple_evidence": pattern_has_multiple,
+        "pattern_has_recurrence": pattern_has_recurrence,
+        "pattern_has_time_window": pattern_has_window,
         "pattern_adjustment": pattern_adjustment,
         "pattern_evidence_link_required": bool(
             pattern_evidence_links is not None and pattern_evidence_links.required
@@ -255,6 +273,61 @@ def assess_memory_admission(
             breakdown,
             pattern_evidence_links.reason,
         )
+    # A model-inferred Pattern is only safe when its recurrence/window
+    # provenance is explicit.  User-reported Pattern-shaped claims retain the
+    # existing admission/review path (and clear one-off behaviours are
+    # demoted to Events by normalization).  Likewise, an explicitly governed
+    # state transition is a replacement of an already-qualified state rather
+    # than a new inferred Pattern, so its target's lifecycle evidence is the
+    # authority for this boundary.
+    pattern_boundary_invalid = False
+    if candidate.kind == MemoryKind.INTERACTION_PATTERN:
+        governed_exception = (
+            governed_transition_eligibility is not None
+            and governed_transition_eligibility.eligible
+        ) or candidate.payload.get("contextual_update_type") == "correction"
+        lifecycle_surface = memory_concept(candidate) in {
+            "active_conflict",
+            "contact_unavailable",
+            "contact_restored",
+            "contact_reduced",
+            "response_unresponsive",
+            "response_restored",
+            "relationship_repaired",
+            "relationship_started",
+        }
+        # A recurring claim with no declared window (or a low-confidence
+        # windowed claim) is not safe to admit as a durable Pattern.  Keep the
+        # legacy strong-review path for an otherwise unqualified user report
+        # such as a free-form one-off sentence; normalization repairs clear
+        # bounded actions to Events, while genuinely ambiguous reports remain
+        # reviewable rather than silently confirmed.
+        pattern_boundary_invalid = (
+            not governed_exception
+            and (
+                (
+                    candidate.confidence < 0.75
+                    and str(candidate.payload.get("source_type") or "").casefold()
+                    not in {"hearsay", "third_party_report"}
+                )
+                or (
+                    pattern_has_recurrence
+                    and not pattern_has_window
+                    and not lifecycle_surface
+                )
+                or (
+                    candidate.perspective == MemoryPerspective.MODEL_INFERRED
+                    and (not pattern_has_recurrence or not pattern_has_window)
+                )
+            )
+        )
+    if pattern_boundary_invalid:
+        return AdmissionAssessment(
+            AdmissionDecision.REJECT,
+            score,
+            breakdown,
+            "interaction_pattern_boundary_invalid",
+        )
     if not temporal_valid:
         decision = AdmissionDecision.PROPOSE if policy.allow_proposed else AdmissionDecision.REJECT
         return AdmissionAssessment(decision, score, breakdown, "invalid_temporal_shape")
@@ -291,7 +364,7 @@ def assess_memory_admission(
         explicit_requirement_met
         and multi_evidence_requirement_met
         and not candidate.requires_inference
-        and candidate.perspective == MemoryPerspective.USER_REPORTED
+        and is_epistemically_confirmed(candidate)
         and candidate.predicate_type != PredicateType.CUSTOM
         and not conflict
     )
@@ -352,6 +425,8 @@ def assess_governed_transition_eligibility(
     value = governed_state_value(candidate)
     if identity is None or value is None:
         return GovernedTransitionEligibility(False, "ungoverned_or_invalid_state")
+    if not is_epistemically_confirmed(candidate):
+        return GovernedTransitionEligibility(False, "nonreported_perspective")
 
     targets = [
         item
@@ -360,6 +435,10 @@ def assess_governed_transition_eligibility(
         and item.subject.casefold() == candidate.subject.casefold()
         and governed_state_identity(item) == identity
         and governed_state_value(item) not in {None, value}
+        and assess_memory_type_compatibility(
+            candidate,
+            item,
+        ).lifecycle_replace_allowed
     ]
     if not targets:
         return GovernedTransitionEligibility(
@@ -381,8 +460,6 @@ def assess_governed_transition_eligibility(
     }
     if candidate.explicitness != EvidenceExplicitness.EXPLICIT:
         return GovernedTransitionEligibility(False, "nonexplicit_evidence", **common)
-    if candidate.perspective != MemoryPerspective.USER_REPORTED:
-        return GovernedTransitionEligibility(False, "nonreported_perspective", **common)
     if candidate.requires_inference:
         return GovernedTransitionEligibility(False, "requires_inference", **common)
     if candidate.confidence < min_confidence:
@@ -456,32 +533,223 @@ def assess_pattern_evidence_links(
         if item.kind == MemoryKind.INTERACTION_EVENT
         and item.status in {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}
     }
-    rejected = tuple(memory_id for memory_id in evidence_ids if memory_id not in active_events)
-    linked = tuple(memory_id for memory_id in evidence_ids if memory_id in active_events)
-    if rejected:
+    missing = tuple(memory_id for memory_id in evidence_ids if memory_id not in active_events)
+    compatible = tuple(
+        memory_id
+        for memory_id in evidence_ids
+        if memory_id in active_events
+        and _pattern_event_evidence_compatible(candidate, active_events[memory_id])
+    )
+    incompatible = tuple(
+        memory_id
+        for memory_id in evidence_ids
+        if memory_id in active_events and memory_id not in compatible
+    )
+    if missing:
         return PatternEvidenceLinkAssessment(
             required=True,
             valid=False,
-            linked_event_count=len(linked),
+            linked_event_count=len(compatible),
             reason="model_inferred_pattern_invalid_event_evidence",
-            linked_event_ids=linked,
-            rejected_evidence_ids=rejected,
+            linked_event_ids=compatible,
+            rejected_evidence_ids=missing,
         )
-    if len(linked) < 2:
+    if incompatible:
         return PatternEvidenceLinkAssessment(
             required=True,
             valid=False,
-            linked_event_count=len(linked),
+            linked_event_count=len(compatible),
+            reason="model_inferred_pattern_incompatible_event_evidence",
+            linked_event_ids=compatible,
+            rejected_evidence_ids=incompatible,
+        )
+    if len(compatible) < 2:
+        return PatternEvidenceLinkAssessment(
+            required=True,
+            valid=False,
+            linked_event_count=len(compatible),
             reason="model_inferred_pattern_insufficient_event_evidence",
-            linked_event_ids=linked,
+            linked_event_ids=compatible,
         )
     return PatternEvidenceLinkAssessment(
         required=True,
         valid=True,
-        linked_event_count=len(linked),
+        linked_event_count=len(compatible),
         reason="model_inferred_pattern_event_evidence_valid",
-        linked_event_ids=linked,
+        linked_event_ids=compatible,
     )
+
+
+def _pattern_event_evidence_compatible(
+    pattern: MemoryCandidate,
+    event: MemoryItem,
+) -> bool:
+    if not is_epistemically_confirmed(event):
+        return False
+    evidence_subject = pattern.payload.get("evidence_subject")
+    if (
+        isinstance(evidence_subject, str)
+        and evidence_subject.strip()
+        and evidence_subject.casefold() != event.subject.casefold()
+    ):
+        return False
+    expected_participants = _participants_key(pattern.payload.get("participants"))
+    if expected_participants and expected_participants != _participants_key(
+        event.payload.get("participants")
+    ):
+        return False
+    if not _event_is_inside_pattern_window(pattern, event):
+        return False
+
+    metric = normalize_interaction_metric(pattern.payload.get("metric"))
+    event_metric = _event_pattern_metric(event)
+    if metric not in INTERACTION_PATTERN_DIMENSIONS or event_metric != metric:
+        return False
+    if metric == "initiation_balance":
+        expected_state = interaction_pattern_state(metric, pattern.payload)
+        event_direction = _event_initiation_direction(event)
+        if expected_state in {"partner_to_user", "user_to_partner"}:
+            return event_direction == expected_state
+    return True
+
+
+def _participants_key(value: object) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(
+        sorted(
+            str(item).casefold().strip()
+            for item in value
+            if isinstance(item, str) and item.strip()
+        )
+    )
+
+
+def _event_is_inside_pattern_window(
+    pattern: MemoryCandidate,
+    event: MemoryItem,
+) -> bool:
+    window = pattern.payload.get("time_window")
+    start = pattern.period_start
+    end = pattern.period_end
+    if isinstance(window, dict):
+        start = start or _parse_window_boundary(window.get("start"), is_end=False)
+        end = end or _parse_window_boundary(window.get("end"), is_end=True)
+    if start is None and end is None:
+        return False
+    event_time = event.occurred_at or event.period_end or event.period_start
+    if event_time is None:
+        return False
+    if start is not None:
+        event_time, aligned_start = _align_datetimes(event_time, start)
+        if event_time < aligned_start:
+            return False
+    if end is not None:
+        event_time, aligned_end = _align_datetimes(event_time, end)
+        if event_time > aligned_end:
+            return False
+    return True
+
+
+def _parse_window_boundary(value: object, *, is_end: bool) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if is_end and len(value.strip()) == 10:
+        parsed += timedelta(days=1) - timedelta(microseconds=1)
+    return parsed
+
+
+def _event_pattern_metric(event: MemoryItem) -> str | None:
+    values = (
+        event.canonical_predicate,
+        event.custom_predicate,
+        event.raw_predicate,
+        event.payload.get("predicate"),
+        event.payload.get("action"),
+        event.payload.get("activity_type"),
+    )
+    for value in values:
+        dimension = dimension_for_predicate(value)
+        if dimension in INTERACTION_PATTERN_DIMENSIONS:
+            return dimension
+    texts = [
+        str(value).casefold().replace("-", "_")
+        for value in (*values, event.summary, event.original_text)
+        if isinstance(value, str) and value.strip()
+    ]
+    if any(
+        re.search(
+            r"(?:initiat|started|contacted_user|messaged_user|"
+            r"user_(?:contacted|messaged|invited|shared)_partner|"
+            r"partner_(?:contacted|messaged|invited|shared|disclosed)|"
+            r"主动.{0,10}(?:联系|找|发消息|聊天|约|邀请|分享|告诉))",
+            text,
+        )
+        for text in texts
+    ):
+        return "initiation_balance"
+    if any(
+        re.search(r"(?:argu|quarrel|fight|conflict|吵架|争吵|争执|矛盾|冲突|冷战)", text)
+        for text in texts
+    ):
+        return "conflict_frequency"
+    if any(
+        re.search(
+            r"(?:disclos|opened_up|shared_(?:work|feeling|personal)|分享|告诉)",
+            text,
+        )
+        for text in texts
+    ):
+        return "emotional_disclosure"
+    if any(re.search(r"(?:repl(?:y|ied)|respond|回复|回应)", text) for text in texts):
+        return "response_engagement"
+    if any(
+        re.search(r"(?:contact|messag|chat|call|meet|联系|消息|聊天|电话|见面)", text)
+        for text in texts
+    ):
+        return "contact_frequency"
+    return None
+
+
+def _event_initiation_direction(event: MemoryItem) -> str | None:
+    values = (
+        event.payload.get("action"),
+        event.payload.get("activity_type"),
+        event.payload.get("predicate"),
+        event.raw_predicate,
+        event.custom_predicate,
+        event.summary,
+        event.original_text,
+    )
+    texts = [
+        value.casefold().replace("-", "_")
+        for value in values
+        if isinstance(value, str) and value.strip()
+    ]
+    if any(
+        re.search(
+            r"(?:partner|she|he).{0,20}"
+            r"(?:initiat|started|contact|messag|invit|shar|disclos)",
+            text,
+        )
+        for text in texts
+    ):
+        return "partner_to_user"
+    if any(
+        re.search(
+            r"(?:user|\bi\b).{0,20}"
+            r"(?:initiat|started|contact|messag|invit|shar|disclos)",
+            text,
+        )
+        for text in texts
+    ):
+        return "user_to_partner"
+    return infer_initiation_balance(" ".join(event.evidence_spans))
 
 
 def _temporal_shape_is_valid(candidate: MemoryCandidate) -> bool:

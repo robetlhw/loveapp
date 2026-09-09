@@ -225,6 +225,9 @@ _PREDICATE_TERMS: dict[str, frozenset[str]] = {
     "interaction.response_engagement": frozenset(
         {"冷淡", "回复", "回我", "消息", "回应", "聊天", "慢", "少", "主动"}
     ),
+    "interaction.conflict_frequency": frozenset(
+        {"冲突", "冷战", "吵架", "矛盾", "争吵", "争执", "频繁", "次数", "越来越多"}
+    ),
     "relationship.conflict_status": frozenset(
         {"关系", "冲突", "冷战", "吵架", "矛盾", "争吵", "和好", "解决", "不开心"}
     ),
@@ -367,7 +370,11 @@ def _score(
     timestamp = _align_timezone(timestamp, now)
     age_days = max((now - timestamp).total_seconds() / 86400, 0.0)
     recency = 1.0 / (1.0 + age_days / 30.0)
-    importance = min(max(item.importance / 5.0, 0.0), 1.0)
+    salience = item.salience if item.kind == MemoryKind.INTERACTION_EVENT else None
+    importance = min(
+        max(item.importance / 5.0, salience or 0.0, 0.0),
+        1.0,
+    )
     confidence = min(max(item.confidence, 0.0), 1.0)
     lifecycle_priority = _lifecycle_priority(item)
     total = (
@@ -410,7 +417,7 @@ def _deduplicate(
 ) -> list[RetrievedMemory]:
     if preserve_history:
         return sorted(results, key=_retrieval_sort_key)
-    grouped: dict[tuple[str, str, str], RetrievedMemory] = {}
+    grouped: dict[tuple[str, str, str, str], RetrievedMemory] = {}
     ungrouped: list[RetrievedMemory] = []
     for result in results:
         key = semantic_context_key(result.item)

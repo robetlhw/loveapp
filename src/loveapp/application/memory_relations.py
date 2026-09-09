@@ -26,6 +26,11 @@ from loveapp.domain.memory_predicates import (
     normalize_preference_value,
     predicate_spec,
 )
+from loveapp.domain.memory_type_compatibility import (
+    MemoryComparisonMode,
+    MemoryTypeCompatibility,
+    assess_memory_type_compatibility,
+)
 
 
 @dataclass(frozen=True)
@@ -51,8 +56,28 @@ def resolve_claim_relation(
     a model supplied a similarly named payload field.
     """
 
+    semantic_memories, evidence_only, incompatible = _partition_type_candidates(
+        candidate,
+        active_memories,
+    )
+    type_diagnostics = {
+        "semantic_candidate_ids": [item.id for item in semantic_memories],
+        "evidence_candidate_ids": [item.id for item, _ in evidence_only],
+        "type_rejected_candidates": [
+            {"memory_id": item.id, "reason": compatibility.reason}
+            for item, compatibility in incompatible
+        ],
+    }
+
     candidate_key = memory_dedupe_key(candidate)
-    same = [item for item in active_memories if memory_dedupe_key(item) == candidate_key]
+    same = [
+        item
+        for item in semantic_memories
+        if memory_dedupe_key(item) == candidate_key
+        and assess_memory_type_compatibility(candidate, item).allows(
+            ClaimRelation.SAME
+        )
+    ]
     if same:
         keeper = max(same, key=_keeper_rank)
         return ClaimRelationResolution(
@@ -60,6 +85,7 @@ def resolve_claim_relation(
             (keeper.id,),
             "normalized_dedupe",
             "The normalized claim identity already exists in this relationship.",
+            type_diagnostics,
         )
 
     state_identity = governed_state_identity(candidate)
@@ -72,12 +98,26 @@ def resolve_claim_relation(
     if state_identity is not None and state_value is not None and state_update_allowed:
         same_dimension = [
             item
-            for item in active_memories
+            for item in semantic_memories
             if item.subject.casefold() == candidate.subject.casefold()
             and governed_state_identity(item) == state_identity
             and governed_state_value(item) not in {None, state_value}
         ]
         if same_dimension:
+            if not all(
+                assess_memory_type_compatibility(
+                    candidate,
+                    item,
+                ).lifecycle_replace_allowed
+                for item in same_dimension
+            ):
+                return ClaimRelationResolution(
+                    ClaimRelation.CONTRADICTION,
+                    tuple(item.id for item in same_dimension),
+                    "epistemic_state_conflict",
+                    "Belief and factual state claims may conflict but cannot replace one another.",
+                    type_diagnostics,
+                )
             confirmed = [item for item in same_dimension if item.status == MemoryStatus.CONFIRMED]
             if incoming_status == MemoryStatus.CONFIRMED:
                 return ClaimRelationResolution(
@@ -102,11 +142,28 @@ def resolve_claim_relation(
         )
         opposite = [
             item
-            for item in active_memories
+            for item in semantic_memories
             if item.subject.casefold() == candidate.subject.casefold()
             and memory_concept(item) == opposite_concept
         ]
         if opposite:
+            if not all(
+                assess_memory_type_compatibility(
+                    candidate,
+                    item,
+                ).lifecycle_replace_allowed
+                for item in opposite
+            ):
+                return ClaimRelationResolution(
+                    ClaimRelation.CONTRADICTION,
+                    tuple(item.id for item in opposite),
+                    "epistemic_contact_state_conflict",
+                    (
+                        "Belief and factual contact claims may conflict but cannot "
+                        "replace one another."
+                    ),
+                    type_diagnostics,
+                )
             confirmed = [item for item in opposite if item.status == MemoryStatus.CONFIRMED]
             if incoming_status == MemoryStatus.CONFIRMED:
                 return ClaimRelationResolution(
@@ -127,27 +184,62 @@ def resolve_claim_relation(
         and candidate.predicate_type == PredicateType.CANONICAL
         and candidate.canonical_predicate is not None
     ):
-        preference_resolution = _resolve_preference(candidate, active_memories, incoming_status)
+        preference_resolution = _resolve_preference(
+            candidate,
+            semantic_memories,
+            incoming_status,
+        )
         if preference_resolution is not None:
             return preference_resolution
 
     canonical_resolution = _resolve_canonical_predicate_relation(
         candidate,
-        active_memories,
+        semantic_memories,
         incoming_status=incoming_status,
     )
     if canonical_resolution is not None:
         return canonical_resolution
 
+    if evidence_only and not semantic_memories:
+        return ClaimRelationResolution(
+            ClaimRelation.UNRELATED,
+            (),
+            "event_pattern_evidence_only",
+            "Event and pattern memories use an evidence link instead of a direct claim relation.",
+            type_diagnostics,
+        )
+    if incompatible and not semantic_memories:
+        return ClaimRelationResolution(
+            ClaimRelation.UNRELATED,
+            (),
+            "memory_type_boundary",
+            "No historical memory is type-compatible for direct semantic relation.",
+            type_diagnostics,
+        )
+
     if candidate.predicate_type == PredicateType.CUSTOM:
         related_custom = [
             item
-            for item in active_memories
+            for item in semantic_memories
             if item.subject.casefold() == candidate.subject.casefold()
             and item.kind == candidate.kind
             and item.predicate_type == PredicateType.CUSTOM
         ]
         if related_custom:
+            same_event_family = [
+                item
+                for item in related_custom
+                if candidate.kind == MemoryKind.INTERACTION_EVENT
+                and item.custom_predicate == candidate.custom_predicate
+            ]
+            if same_event_family:
+                return ClaimRelationResolution(
+                    ClaimRelation.COMPLEMENTARY,
+                    tuple(item.id for item in same_event_family[:5]),
+                    "custom_event_occurrence",
+                    "A distinct event occurrence is retained as complementary evidence.",
+                    type_diagnostics,
+                )
             return ClaimRelationResolution(
                 ClaimRelation.UNCERTAIN,
                 tuple(item.id for item in related_custom[:5]),
@@ -166,7 +258,30 @@ def resolve_claim_relation(
         (),
         "local_unrelated",
         "The claim is independently useful and has no deterministic conflict.",
+        type_diagnostics,
     )
+
+
+def _partition_type_candidates(
+    candidate: MemoryCandidate,
+    active_memories: list[MemoryItem],
+) -> tuple[
+    list[MemoryItem],
+    list[tuple[MemoryItem, MemoryTypeCompatibility]],
+    list[tuple[MemoryItem, MemoryTypeCompatibility]],
+]:
+    semantic: list[MemoryItem] = []
+    evidence_only: list[tuple[MemoryItem, MemoryTypeCompatibility]] = []
+    incompatible: list[tuple[MemoryItem, MemoryTypeCompatibility]] = []
+    for item in active_memories:
+        compatibility = assess_memory_type_compatibility(candidate, item)
+        if compatibility.mode == MemoryComparisonMode.SEMANTIC:
+            semantic.append(item)
+        elif compatibility.mode == MemoryComparisonMode.EVIDENCE_ONLY:
+            evidence_only.append((item, compatibility))
+        else:
+            incompatible.append((item, compatibility))
+    return semantic, evidence_only, incompatible
 
 
 @dataclass(frozen=True)
@@ -316,7 +431,22 @@ def _resolve_canonical_predicate_relation(
         and incoming.value_key == view.value_key
     ]
     if same_value:
-        keeper = max(same_value, key=_keeper_rank)
+        same_eligible = [
+            item
+            for item in same_value
+            if assess_memory_type_compatibility(candidate, item).allows(
+                ClaimRelation.SAME
+            )
+        ]
+        if not same_eligible:
+            return ClaimRelationResolution(
+                ClaimRelation.COMPLEMENTARY,
+                tuple(item.id for item in same_value),
+                "epistemic_parallel_claim",
+                "Equivalent belief and factual propositions remain separate provenance records.",
+                {**diagnostics, "relation_stage": "epistemic_boundary"},
+            )
+        keeper = max(same_eligible, key=_keeper_rank)
         return ClaimRelationResolution(
             ClaimRelation.SAME,
             (keeper.id,),
@@ -370,6 +500,21 @@ def _resolve_canonical_predicate_relation(
             "canonical_update_policy_protected",
             "This canonical predicate does not authorize deterministic replacement.",
             {**diagnostics, "relation_stage": "update_policy_guard"},
+        )
+
+    if not all(
+        assess_memory_type_compatibility(
+            candidate,
+            item,
+        ).lifecycle_replace_allowed
+        for item in differing
+    ):
+        return ClaimRelationResolution(
+            ClaimRelation.CONTRADICTION,
+            tuple(item.id for item in differing),
+            "epistemic_value_conflict",
+            "Belief and factual values may conflict but cannot replace one another.",
+            {**diagnostics, "relation_stage": "type_compatibility_guard"},
         )
 
     confirmed = [item for item in differing if item.status == MemoryStatus.CONFIRMED]
@@ -498,6 +643,14 @@ def _event_pattern_boundary(
 
 
 def has_local_conflict(candidate: MemoryCandidate, active_memories: list[MemoryItem]) -> bool:
+    compatible_memories = [
+        item
+        for item in active_memories
+        if assess_memory_type_compatibility(
+            candidate,
+            item,
+        ).semantic_relation_allowed
+    ]
     state_identity = governed_state_identity(candidate)
     state_value = governed_state_value(candidate)
     if state_identity is not None and state_value is not None:
@@ -505,7 +658,7 @@ def has_local_conflict(candidate: MemoryCandidate, active_memories: list[MemoryI
             item.subject.casefold() == candidate.subject.casefold()
             and governed_state_identity(item) == state_identity
             and governed_state_value(item) not in {None, state_value}
-            for item in active_memories
+            for item in compatible_memories
         )
         if same_dimension_conflict:
             return True
@@ -519,10 +672,14 @@ def has_local_conflict(candidate: MemoryCandidate, active_memories: list[MemoryI
         return any(
             item.subject.casefold() == candidate.subject.casefold()
             and memory_concept(item) == opposite_concept
-            for item in active_memories
+            for item in compatible_memories
         )
     if candidate.kind == MemoryKind.PREFERENCE:
-        resolution = _resolve_preference(candidate, active_memories, MemoryStatus.PROPOSED)
+        resolution = _resolve_preference(
+            candidate,
+            compatible_memories,
+            MemoryStatus.PROPOSED,
+        )
         return resolution is not None and resolution.relation == ClaimRelation.CONTRADICTION
     return False
 

@@ -11,6 +11,7 @@ from loveapp.domain.memory import (
     MemoryStatus,
     utc_now,
 )
+from loveapp.domain.memory_epistemics import is_epistemically_confirmed
 from loveapp.domain.memory_lifecycle import (
     MemoryRole,
     memory_role,
@@ -158,7 +159,11 @@ def attach_memories(
             # Explicit history is visible in remembered_items, but it must not
             # be projected into any current-state or confirmed-fact field.
             continue
-        if item.status == MemoryStatus.PROPOSED:
+        epistemically_confirmed = is_epistemically_confirmed(item)
+        confirmed_fact = (
+            item.status == MemoryStatus.CONFIRMED and epistemically_confirmed
+        )
+        if item.status == MemoryStatus.PROPOSED or not epistemically_confirmed:
             result.uncertain_items.append(context_item)
         if item.claim_relation == "contradiction":
             result.conflicted_items.append(context_item)
@@ -172,7 +177,7 @@ def attach_memories(
         role = memory_role(item)
         if role == MemoryRole.PREFERENCE:
             values = _preference_values(item)
-            if item.status == MemoryStatus.CONFIRMED:
+            if confirmed_fact:
                 if item.subject.casefold() in {"partner", "对方", "伴侣", "她", "他"}:
                     result.partner_preferences.extend(values)
                 else:
@@ -181,7 +186,7 @@ def attach_memories(
             continue
         if role == MemoryRole.CURRENT_STATE:
             result.current_state.append(context_item)
-            if item.status == MemoryStatus.CONFIRMED:
+            if confirmed_fact:
                 result.confirmed_current_state.append(context_item)
         elif role == MemoryRole.PLANNED_EVENT:
             result.planned_events.append(context_item)
@@ -191,7 +196,7 @@ def attach_memories(
             continue
         elif role == MemoryRole.RECENT_EVENT:
             result.recent_events.append(context_item)
-        if item.status == MemoryStatus.CONFIRMED and role in {
+        if confirmed_fact and role in {
             MemoryRole.STABLE_PROFILE,
             MemoryRole.PREFERENCE,
         }:
@@ -231,7 +236,9 @@ def memory_attention_reason(
         return "action_intent"
     if role in {MemoryRole.STABLE_PROFILE, MemoryRole.PREFERENCE} and item.importance >= 4:
         return "high_importance"
-    if role == MemoryRole.RECENT_EVENT and item.importance >= 4:
+    if role == MemoryRole.RECENT_EVENT and (
+        item.importance >= 4 or (item.salience is not None and item.salience >= 0.65)
+    ):
         timestamp = item.occurred_at or item.period_end or item.updated_at
         if timestamp.tzinfo is None and now.tzinfo is not None:
             timestamp = timestamp.replace(tzinfo=now.tzinfo)
@@ -280,7 +287,7 @@ def _attention_rank(
 
 
 def _deduplicate_for_context(memories: list[MemoryItem]) -> list[MemoryItem]:
-    grouped: dict[tuple[str, str, str], list[MemoryItem]] = defaultdict(list)
+    grouped: dict[tuple[str, str, str, str], list[MemoryItem]] = defaultdict(list)
     ungrouped: list[MemoryItem] = []
     for item in memories:
         key = semantic_context_key(item)
@@ -313,7 +320,7 @@ def _context_rank(item: MemoryItem, query: str | None) -> tuple[int, int, int, f
     return (
         int(item.status == MemoryStatus.CONFIRMED),
         relevance,
-        item.importance,
+        _effective_importance(item),
         timestamp.timestamp(),
     )
 
@@ -349,7 +356,13 @@ def _preference_values(item: MemoryItem) -> list[str]:
 def _keeper_rank(item: MemoryItem) -> tuple[int, int, float, datetime]:
     return (
         int(item.status == MemoryStatus.CONFIRMED),
-        item.importance,
+        _effective_importance(item),
         item.confidence,
         item.updated_at,
     )
+
+
+def _effective_importance(item: MemoryItem) -> int:
+    if item.kind.value != "interaction_event" or item.salience is None:
+        return item.importance
+    return max(item.importance, round(item.salience * 5))

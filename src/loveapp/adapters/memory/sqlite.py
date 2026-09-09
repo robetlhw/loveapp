@@ -29,7 +29,9 @@ from loveapp.domain.memory import (
     MemorySaveResult,
     MemoryStatus,
     MessageRole,
+    PatternLifecycleState,
     StoredMessage,
+    TimeKind,
     memory_dedupe_key,
     normalize_candidate_predicate,
     utc_now,
@@ -2215,7 +2217,7 @@ async def _set_memory_status_in_transaction(
     row = await _fetchone(
         connection,
         """
-        SELECT id, kind, status FROM memory_items
+        SELECT id, kind, status, payload_json FROM memory_items
         WHERE id = ? AND user_id = ? AND relationship_id = ?
         """,
         (memory_id, user_id, relationship_id),
@@ -2226,9 +2228,12 @@ async def _set_memory_status_in_transaction(
         return []
     if row["status"] not in {MemoryStatus.PROPOSED.value, MemoryStatus.CONFIRMED.value}:
         raise ValueError("memory transition target is no longer active")
+    payload = json.loads(row["payload_json"])
+    if row["kind"] == MemoryKind.INTERACTION_PATTERN.value and status == MemoryStatus.SUPERSEDED:
+        payload["state"] = PatternLifecycleState.SUPERSEDED.value
     await connection.execute(
-        "UPDATE memory_items SET status = ?, updated_at = ? WHERE id = ?",
-        (status.value, _dump_datetime(now), memory_id),
+        "UPDATE memory_items SET status = ?, payload_json = ?, updated_at = ? WHERE id = ?",
+        (status.value, _dump_json(payload), _dump_datetime(now), memory_id),
     )
     if row["kind"] != MemoryKind.PLANNED_EVENT.value:
         return []
@@ -2575,21 +2580,37 @@ async def _save_memory_in_transaction(
             dict.fromkeys([*existing_evidence, *candidate.evidence_spans])
         )[:8]
         merged_payload = json.loads(duplicate["payload_json"])
+        merged_time_kind = str(duplicate["time_kind"])
+        merged_period_start = duplicate["period_start"]
+        merged_period_end = duplicate["period_end"]
         if candidate.kind == MemoryKind.INTERACTION_PATTERN:
             merged_payload = merge_interaction_pattern_provenance(
                 merged_payload,
                 candidate.payload,
             )
+            if candidate.time_kind != TimeKind.UNKNOWN:
+                merged_time_kind = candidate.time_kind.value
+            if candidate.period_start is not None:
+                merged_period_start = _dump_datetime(candidate.period_start)
+            if candidate.period_end is not None:
+                merged_period_end = _dump_datetime(candidate.period_end)
         explicitness = max(
             (str(duplicate["explicitness"]), candidate.explicitness.value),
             key=_explicitness_rank,
         )
+        merged_confidence = (
+            candidate.confidence
+            if candidate.kind == MemoryKind.INTERACTION_PATTERN
+            and candidate.payload.get("pattern_evolution_update") is True
+            else max(float(duplicate["confidence"]), candidate.confidence)
+        )
         await connection.execute(
             """
             UPDATE memory_items
-            SET status = ?, confidence = MAX(confidence, ?),
+            SET status = ?, confidence = ?,
                 importance = MAX(importance, ?), updated_at = ?, last_seen_at = ?,
                 evidence_spans_json = ?, payload_json = ?, dedupe_key = ?,
+                time_kind = ?, period_start = ?, period_end = ?,
                 canonical_predicate = COALESCE(canonical_predicate, ?),
                 raw_predicate = COALESCE(raw_predicate, ?),
                 predicate_type = CASE WHEN ? = 'canonical' THEN ? ELSE predicate_type END,
@@ -2608,13 +2629,16 @@ async def _save_memory_in_transaction(
             """,
             (
                 merged_status.value,
-                candidate.confidence,
+                merged_confidence,
                 candidate.importance,
                 _dump_datetime(now),
                 _dump_datetime(now),
                 _dump_json(merged_evidence),
                 _dump_json(merged_payload),
                 dedupe_key,
+                merged_time_kind,
+                merged_period_start,
+                merged_period_end,
                 candidate.canonical_predicate,
                 candidate.raw_predicate,
                 candidate.predicate_type.value,
@@ -2702,7 +2726,7 @@ async def _save_memory_in_transaction(
             id, user_id, relationship_id, kind, subject, summary, original_text,
             evidence_spans_json, time_kind, occurred_at, period_start, period_end,
             temporal_precision, valence, relationship_impact, intensity, emotions_json,
-            importance, perspective, confidence, status, payload_json,
+            importance, perspective, epistemic_status, confidence, status, payload_json,
             canonical_predicate, raw_predicate, predicate_type, custom_predicate,
             state_dimension, state_value, explicitness, requires_inference,
             admission_score, admission_decision, claim_relation,
@@ -2711,7 +2735,7 @@ async def _save_memory_in_transaction(
             created_at, updated_at, expires_at, last_used_at, supersedes_id, dedupe_key
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         """,
         _memory_values(
@@ -2784,6 +2808,7 @@ def _memory_values(
         _dump_json(candidate.emotions),
         candidate.importance,
         candidate.perspective.value,
+        candidate.epistemic_status.value,
         candidate.confidence,
         status.value,
         _dump_json(candidate.payload),
@@ -2876,6 +2901,19 @@ def _row_to_advice_generation_attempt(
     )
 
 
+def _row_epistemic_status(row: aiosqlite.Row) -> str:
+    try:
+        epistemic_status = row["epistemic_status"]
+    except (IndexError, KeyError):
+        epistemic_status = None
+    if epistemic_status:
+        return str(epistemic_status)
+    return {
+        "user_belief": "uncertain",
+        "model_inferred": "hypothesis",
+    }.get(str(row["perspective"]), "confirmed")
+
+
 def _row_to_memory(row: aiosqlite.Row) -> MemoryItem:
     item = MemoryItem(
         id=row["id"],
@@ -2897,6 +2935,7 @@ def _row_to_memory(row: aiosqlite.Row) -> MemoryItem:
         emotions=json.loads(row["emotions_json"]),
         importance=row["importance"],
         perspective=row["perspective"],
+        epistemic_status=_row_epistemic_status(row),
         confidence=row["confidence"],
         status=row["status"],
         payload=json.loads(row["payload_json"]),
@@ -3030,7 +3069,9 @@ async def _migrate_schema(connection: aiosqlite.Connection) -> None:
             "UPDATE memory_items SET evidence_spans_json = ? WHERE id = ?",
             [(_dump_json([row["original_text"]]), row["id"]) for row in rows],
         )
+    epistemic_identity_migration_required = "epistemic_status" not in columns
     memory_v2_columns = {
+        "epistemic_status": "TEXT NOT NULL DEFAULT 'confirmed'",
         "canonical_predicate": "TEXT",
         "raw_predicate": "TEXT",
         "predicate_type": "TEXT NOT NULL DEFAULT 'custom'",
@@ -3053,6 +3094,22 @@ async def _migrate_schema(connection: aiosqlite.Connection) -> None:
             await connection.execute(
                 f"ALTER TABLE memory_items ADD COLUMN {column} {declaration}"
             )
+    await connection.execute(
+        """
+        UPDATE memory_items
+        SET epistemic_status = 'uncertain'
+        WHERE perspective = 'user_belief'
+          AND epistemic_status = 'confirmed'
+        """
+    )
+    await connection.execute(
+        """
+        UPDATE memory_items
+        SET epistemic_status = 'hypothesis'
+        WHERE perspective = 'model_inferred'
+          AND epistemic_status IN ('confirmed', 'uncertain')
+        """
+    )
     cursor = await connection.execute(
         """
         SELECT id, kind, payload_json, raw_predicate, canonical_predicate,
@@ -3106,6 +3163,8 @@ async def _migrate_schema(connection: aiosqlite.Connection) -> None:
         "UPDATE memory_items SET kind = ? WHERE kind = ?",
         (MemoryKind.INTERACTION_PATTERN.value, "interaction_trend"),
     )
+    if epistemic_identity_migration_required:
+        await _migrate_epistemic_dedupe_keys(connection)
     cursor = await connection.execute("PRAGMA table_info(memory_extraction_runs)")
     run_columns = {row[1] for row in await cursor.fetchall()}
     await cursor.close()
@@ -3126,7 +3185,56 @@ async def _migrate_schema(connection: aiosqlite.Connection) -> None:
             await connection.execute(
                 f"ALTER TABLE memory_extraction_runs ADD COLUMN {column} {declaration}"
             )
-    await connection.execute("PRAGMA user_version = 8")
+    await connection.execute("PRAGMA user_version = 9")
+
+
+async def _migrate_epistemic_dedupe_keys(
+    connection: aiosqlite.Connection,
+) -> None:
+    cursor = await connection.execute(
+        """
+        SELECT * FROM memory_items
+        WHERE perspective != 'user_reported'
+           OR epistemic_status != 'confirmed'
+        """
+    )
+    rows = await cursor.fetchall()
+    await cursor.close()
+    if not rows:
+        return
+
+    rekeyed = [(row, memory_dedupe_key(_row_to_memory(row))) for row in rows]
+    active_by_key: dict[tuple[str, str, str], list[aiosqlite.Row]] = {}
+    for row, dedupe_key in rekeyed:
+        if row["status"] not in {
+            MemoryStatus.PROPOSED.value,
+            MemoryStatus.CONFIRMED.value,
+        }:
+            continue
+        scope_key = (row["user_id"], row["relationship_id"], dedupe_key)
+        active_by_key.setdefault(scope_key, []).append(row)
+
+    for duplicates in active_by_key.values():
+        if len(duplicates) < 2:
+            continue
+        keeper = max(duplicates, key=_memory_row_keeper_rank)
+        await connection.executemany(
+            "UPDATE memory_items SET status = ? WHERE id = ?",
+            [
+                (MemoryStatus.SUPERSEDED.value, row["id"])
+                for row in duplicates
+                if row["id"] != keeper["id"]
+            ],
+        )
+
+    await connection.executemany(
+        "UPDATE memory_items SET dedupe_key = ? WHERE id = ?",
+        [
+            (dedupe_key, row["id"])
+            for row, dedupe_key in rekeyed
+            if row["dedupe_key"] != dedupe_key
+        ],
+    )
 
 
 _SCHEMA = """
@@ -3230,6 +3338,7 @@ CREATE TABLE IF NOT EXISTS memory_items (
     emotions_json TEXT NOT NULL DEFAULT '[]',
     importance INTEGER NOT NULL,
     perspective TEXT NOT NULL,
+    epistemic_status TEXT NOT NULL DEFAULT 'confirmed',
     confidence REAL NOT NULL,
     status TEXT NOT NULL,
     payload_json TEXT NOT NULL DEFAULT '{}',
@@ -3372,5 +3481,5 @@ CREATE INDEX IF NOT EXISTS idx_memory_extraction_runs_scope
 CREATE INDEX IF NOT EXISTS idx_memory_transition_audit_scope
     ON memory_transition_audit(user_id, relationship_id, created_at);
 
-PRAGMA user_version = 8;
+PRAGMA user_version = 9;
 """

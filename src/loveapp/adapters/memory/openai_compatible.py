@@ -30,7 +30,7 @@ from loveapp.domain.runtime_context import PendingMemoryContext
 from loveapp.ports.memory import MemoryAttemptCallback
 from loveapp.ports.observability import TraceRecorder
 
-_MEMORY_PROMPT_VERSION = "memory-v2.7"
+_MEMORY_PROMPT_VERSION = "memory-v2.8"
 
 
 class OpenAICompatibleMemoryExtractor:
@@ -632,6 +632,7 @@ def _build_prompt(
                 "period_end": item.period_end.isoformat() if item.period_end else None,
                 "expires_at": item.expires_at.isoformat() if item.expires_at else None,
                 "perspective": item.perspective.value,
+                "epistemic_status": item.epistemic_status.value,
                 "status": item.status.value,
                 "predicate_type": item.predicate_type.value,
                 "canonical_predicate": item.canonical_predicate,
@@ -1006,17 +1007,20 @@ COMPOUND_MEMORY、CONTEXT_DEPENDENT_REPLY、TRANSIENT、SMALL_TALK、NO_MEMORY�
   relationship.interaction_reciprocity、partner.relationship_status、
   interaction.contact_frequency、interaction.topic_scope、interaction.channel、
   interaction.initiation_balance、interaction.response_engagement、
-  interaction.emotional_disclosure、profile.residence、profile.occupation、
+  interaction.emotional_disclosure、interaction.conflict_frequency、
+  profile.residence、profile.occupation、
   profile.contact_method、profile.birthday、preference.general、preference.food.cuisine、
   preference.food.spiciness、preference.environment.noise、preference.activity.type、
   preference.budget.range、preference.personal_interest.topic、preference.consumption.item、
-  preference.lifestyle.habit、preference.relationship.partner_trait、preference.communication.style、
-  preference.value.priority。
+  preference.lifestyle.habit、preference.relationship.partner_trait、
+  preference.relationship.interaction_style、preference.relationship.emotional_need、
+  preference.communication.style、preference.value.priority。
 - 无法可靠映射时必须使用 predicate_type=custom、custom_predicate=<英文 snake_case>，
   canonical_predicate 必须为 null；不得伪造新的 canonical 值。
 - V2.1 偏好分类优先使用已注册的 domain + dimension 组合：
   personal_interest/topic、consumption/item、lifestyle/habit、relationship/partner_trait、
-  communication/style、value/priority；只有无法可靠归类时才使用 preference.general 或 custom。
+  relationship/interaction_style、relationship/emotional_need、communication/style、
+  value/priority；只有无法可靠归类时才使用 preference.general 或 custom。
 - stable_fact 只有明确的现居地、职业、主要联系方式和生日可分别使用已注册的
   profile.residence、profile.occupation、profile.contact_method、profile.birthday，并将明确值写入
   object 或 payload.value。其他开放事实不得猜测为 profile predicate，继续使用 custom。
@@ -1026,10 +1030,14 @@ COMPOUND_MEMORY、CONTEXT_DEPENDENT_REPLY、TRANSIENT、SMALL_TALK、NO_MEMORY�
 - 状态型记忆将 state_dimension/state_value 直接放在 claim 中；payload 中也保留同名字段。
 - interaction_event 的 payload 在有信息时使用结构化字段 participants、action、time、location、
   emotion、outcome、source；source 只能是 user_reported 或 model_inferred。Event 只表示一次已经
-  发生的有边界行为，不要用事件字段表达长期频率或趋势。
+  发生的有边界行为，不要用事件字段表达长期频率或趋势。可选输出 salience（0 到 1）和
+  importance_reason，作为事件价值的模型提示；Python 会结合 novelty、relationship impact、
+  emotional intensity 和 user attention 重新评估，模型提示不能授权 mutation。
 - interaction_pattern 的 payload 必须保留 metric；用户直接陈述的趋势可使用 source=user_reported，
   系统从事件归纳的趋势必须使用 source=model_inferred，并提供 evidence_ids（或等价 evidence
-  数组）和可验证的 time_window。没有证据时不要伪造 model_inferred pattern。
+  数组）和可验证的 time_window。没有证据时不要伪造 model_inferred pattern。Pattern 只能描述
+  可观察的互动趋势（如主动性、联系频率、回应参与度、冲突频率），不得把“越来越喜欢我”、
+  “不在乎我”等心理结论当成 Pattern；若原文同时给出可观察行为，只抽取该行为趋势。
 - 不得决定数据库操作，不得输出或猜测 supersedes_id；Python 生命周期策略会选择目标。
 
 核心规则：
@@ -1115,6 +1123,13 @@ COMPOUND_MEMORY、CONTEXT_DEPENDENT_REPLY、TRANSIENT、SMALL_TALK、NO_MEMORY�
     并在 payload 中标记 source_type=hearsay、降低 confidence；“感觉那个男生也在追她”
     应使用 stable_fact 或 interaction_pattern + user_belief，不能写成对方确实在追求她。
     “我觉得他比我优秀”应记录为 user_belief，而不是客观的 partner 属性。
+11a. epistemic_status 只能是 confirmed、uncertain、hypothesis、prediction，且不能与 lifecycle
+    status 混用。明确转述或直接事实使用 confirmed；用户对 partner/relationship 的“我觉得、我感觉、
+    我怀疑、我猜、我认为、可能、似乎、好像”命题使用 user_belief + uncertain；明确猜测/推测使用
+    hypothesis；面向未来的可能状态使用 prediction；model_inferred 默认 hypothesis。不得输出
+    user_belief + confirmed。偏好表达（如“我觉得安静的餐厅更舒服”）仍是 user_reported preference；
+    咨询句（如“我应该怎么做”）不是 prediction；“她明确说她不喜欢我”是对表达行为的 confirmed
+    user_reported 事实，而不是用户 belief。
 12. relationship_impact 只能是 improving、damaging、unchanged、unclear。
 13. confidence 是 0 到 1，importance 和 intensity 是 1 到 5；无法判断 intensity 时为 null。
 14. payload 放可复用的规范值，例如偏好可写 {"preference": "安静", "preference_type": "like"}。

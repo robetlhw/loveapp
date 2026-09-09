@@ -16,6 +16,7 @@ from loveapp.domain.memory import (
     RelationshipImpact,
     utc_now,
 )
+from loveapp.domain.memory_epistemics import is_epistemically_confirmed
 
 
 class RelationshipEvidenceDimension(StrEnum):
@@ -260,6 +261,7 @@ def standardize_relationship_evidence(
         memory
         for memory in memories
         if memory.status in {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}
+        and is_epistemically_confirmed(memory)
         and (memory.expires_at is None or _as_aware(memory.expires_at) > now)
     ]
     signals.extend(_authoritative_state_signals(eligible))

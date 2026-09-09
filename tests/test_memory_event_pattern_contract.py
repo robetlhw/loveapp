@@ -223,6 +223,22 @@ def test_user_reported_pattern_gets_provenance_and_time_window() -> None:
     assert pattern.payload["time_window"] == {"label": "最近一周"}
 
 
+def test_optional_pattern_time_window_accepts_provider_null_as_absent() -> None:
+    pattern = _normalize(
+        _candidate(
+            kind=MemoryKind.INTERACTION_PATTERN,
+            payload={
+                "predicate": "shared_meal_frequency",
+                "metric": "contact_frequency",
+                "frequency": "rare",
+                "time_window": None,
+            },
+        )
+    )
+
+    assert "time_window" not in pattern.payload
+
+
 def test_model_inferred_pattern_requires_evidence_ids() -> None:
     pattern = _normalize(
         _candidate(
@@ -230,9 +246,10 @@ def test_model_inferred_pattern_requires_evidence_ids() -> None:
             perspective=MemoryPerspective.MODEL_INFERRED,
             payload={
                 "predicate": "engagement_increased",
-                "metric": "contact_frequency",
-                "current": "high",
-                "evidence_ids": "event-1",
+                    "metric": "contact_frequency",
+                    "current": "high",
+                    "evidence_ids": "event-1",
+                    "time_window": ["2026-09-01", "2026-09-08"],
             },
         )
     )
@@ -391,6 +408,68 @@ def test_model_inferred_pattern_links_only_to_active_event_memories() -> None:
     assert admission.score_breakdown["pattern_has_multiple_evidence"] is True
 
 
+def test_model_inferred_pattern_rejects_semantically_unrelated_event_ids() -> None:
+    matching = _event_item("event-1")
+    unrelated = _event_item("event-2").model_copy(
+        update={
+            "raw_predicate": "had_meal",
+            "custom_predicate": "had_meal",
+            "payload": {
+                "predicate": "had_meal",
+                "participants": ["user", "partner"],
+                "action": "had_meal",
+            },
+        }
+    )
+    pattern = _normalize(
+        _candidate(
+            kind=MemoryKind.INTERACTION_PATTERN,
+            perspective=MemoryPerspective.MODEL_INFERRED,
+            payload={
+                "predicate": "partner_initiative_increased",
+                "metric": "initiation_balance",
+                "current": "partner_to_user",
+                "participants": ["user", "partner"],
+                "evidence_ids": [matching.id, unrelated.id],
+                "time_window": ["2026-09-01", "2026-09-08"],
+            },
+        )
+    )
+
+    links = assess_pattern_evidence_links(pattern, [matching, unrelated])
+
+    assert links.valid is False
+    assert links.reason == "model_inferred_pattern_incompatible_event_evidence"
+    assert links.linked_event_ids == (matching.id,)
+    assert links.rejected_evidence_ids == (unrelated.id,)
+
+
+def test_model_inferred_pattern_rejects_event_outside_declared_window() -> None:
+    matching = _event_item("event-1")
+    historical = _event_item("event-2").model_copy(
+        update={"occurred_at": datetime(2026, 8, 1, tzinfo=UTC)}
+    )
+    pattern = _normalize(
+        _candidate(
+            kind=MemoryKind.INTERACTION_PATTERN,
+            perspective=MemoryPerspective.MODEL_INFERRED,
+            payload={
+                "predicate": "partner_initiative_increased",
+                "metric": "initiation_balance",
+                "current": "partner_to_user",
+                "evidence_ids": [matching.id, historical.id],
+                "time_window": ["2026-09-01", "2026-09-08"],
+            },
+        )
+    )
+
+    links = assess_pattern_evidence_links(pattern, [matching, historical])
+
+    assert links.valid is False
+    assert links.reason == "model_inferred_pattern_incompatible_event_evidence"
+    assert links.rejected_evidence_ids == (historical.id,)
+
+
 def test_model_inferred_pattern_with_unknown_event_id_is_rejected_at_admission() -> None:
     event = _event_item("event-1")
     pattern = _normalize(
@@ -402,6 +481,7 @@ def test_model_inferred_pattern_with_unknown_event_id_is_rejected_at_admission()
                 "metric": "initiation_balance",
                 "current": "partner_to_user",
                 "evidence_ids": [event.id, "invented-event"],
+                "time_window": ["2026-09-01", "2026-09-08"],
             },
         )
     )

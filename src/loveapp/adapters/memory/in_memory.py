@@ -22,7 +22,9 @@ from loveapp.domain.memory import (
     MemorySaveResult,
     MemoryStatus,
     MessageRole,
+    PatternLifecycleState,
     StoredMessage,
+    TimeKind,
     memory_dedupe_key,
     normalize_candidate_predicate,
     utc_now,
@@ -473,7 +475,13 @@ class InMemoryMemoryStore:
                 item.status = status
             item.updated_at = now
             item.last_seen_at = now
-            item.confidence = max(item.confidence, candidate.confidence)
+            if (
+                item.kind == MemoryKind.INTERACTION_PATTERN
+                and candidate.payload.get("pattern_evolution_update") is True
+            ):
+                item.confidence = candidate.confidence
+            else:
+                item.confidence = max(item.confidence, candidate.confidence)
             item.importance = max(item.importance, candidate.importance)
             item.evidence_spans = list(
                 dict.fromkeys([*item.evidence_spans, *candidate.evidence_spans])
@@ -504,6 +512,19 @@ class InMemoryMemoryStore:
                     item.payload,
                     candidate.payload,
                 )
+                item.pattern_state = PatternLifecycleState(item.payload.get("state", "active"))
+                item.positive_evidence_ids = list(
+                    item.payload.get("positive_evidence_ids") or []
+                )
+                item.negative_evidence_ids = list(
+                    item.payload.get("negative_evidence_ids") or []
+                )
+                if candidate.period_start is not None:
+                    item.period_start = candidate.period_start
+                if candidate.period_end is not None:
+                    item.period_end = candidate.period_end
+                if candidate.time_kind != TimeKind.UNKNOWN:
+                    item.time_kind = candidate.time_kind
             item.dedupe_key = key
             self._sync_plan_for_memory(item)
             return MemorySaveResult(item=item.model_copy(deep=True), created=False)
@@ -870,6 +891,12 @@ class InMemoryMemoryStore:
             raise ValueError("memory transition target is outside the current relationship scope")
         item.status = status
         item.updated_at = self._clock()
+        if item.kind == MemoryKind.INTERACTION_PATTERN and status == MemoryStatus.SUPERSEDED:
+            item.pattern_state = PatternLifecycleState.SUPERSEDED
+            item.payload = {
+                **item.payload,
+                "state": PatternLifecycleState.SUPERSEDED.value,
+            }
         if item.kind == MemoryKind.PLANNED_EVENT:
             if status == MemoryStatus.EXPIRED:
                 self._deactivate_plan_for_memory(

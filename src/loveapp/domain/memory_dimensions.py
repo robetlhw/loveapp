@@ -142,6 +142,9 @@ INTERACTION_METRIC_ALIASES: dict[str, str] = {
     "topic_initiation": "initiation_balance",
     "reply_engagement": "response_engagement",
     "conversation_engagement": "response_engagement",
+    "conflict_trend": "conflict_frequency",
+    "argument_frequency": "conflict_frequency",
+    "conflict_recurrence": "conflict_frequency",
 }
 
 INTERACTION_PATTERN_DIMENSIONS = frozenset(
@@ -152,6 +155,7 @@ INTERACTION_PATTERN_DIMENSIONS = frozenset(
         "initiation_balance",
         "response_engagement",
         "emotional_disclosure",
+        "conflict_frequency",
     }
 )
 
@@ -173,7 +177,15 @@ INTERACTION_EVENT_PAYLOAD_FIELDS = frozenset(
     }
 )
 INTERACTION_PATTERN_PAYLOAD_FIELDS = frozenset(
-    {"source", "evidence", "evidence_ids", "time_window"}
+    {
+        "source",
+        "evidence",
+        "evidence_ids",
+        "positive_evidence_ids",
+        "negative_evidence_ids",
+        "time_window",
+        "state",
+    }
 )
 
 _INTERACTION_SOURCE_ALIASES = {
@@ -375,6 +387,14 @@ DIMENSION_PREDICATE_ALIASES: dict[str, frozenset[str]] = {
             "shares_personal_feelings_with",
         }
     ),
+    "conflict_frequency": frozenset(
+        {
+            "argument_frequency",
+            "conflict_frequency",
+            "conflict_recurrence",
+            "conflict_trend",
+        }
+    ),
     "partner_relationship_status": frozenset(
         {
             "partner_relationship_status",
@@ -416,6 +436,9 @@ ATOMIC_CONTEXT_COMPANIONS: dict[str, frozenset[str]] = {
         {"social_relation", "shared_context", "interaction_channel"}
     ),
     "emotional_disclosure": frozenset(
+        {"social_relation", "shared_context", "interaction_channel"}
+    ),
+    "conflict_frequency": frozenset(
         {"social_relation", "shared_context", "interaction_channel"}
     ),
     "partner_relationship_status": frozenset({"social_relation"}),
@@ -502,6 +525,19 @@ EVIDENCE_DIMENSION_POLICIES: tuple[EvidenceDimensionPolicy, ...] = (
     EvidenceDimensionPolicy(
         dimension="emotional_disclosure",
         patterns=(re.compile(r"倾诉|心事|情绪|难过时.{0,8}(?:找|联系|告诉)"),),
+    ),
+    EvidenceDimensionPolicy(
+        dimension="conflict_frequency",
+        patterns=(
+            re.compile(
+                r"(?:经常|反复|频繁|多次|越来越多|每(?:天|周|月)).{0,12}"
+                r"(?:吵架|争吵|争执|矛盾|冲突)"
+            ),
+            re.compile(
+                r"(?:吵架|争吵|争执|矛盾|冲突).{0,10}"
+                r"(?:变多|增加|减少|变少|频繁|次数)"
+            ),
+        ),
     ),
     EvidenceDimensionPolicy(
         dimension="partner_relationship_status",
@@ -786,7 +822,14 @@ def normalize_interaction_pattern_provenance(
                 "label": normalized["temporal_expression"].strip()
             }
     else:
-        normalized["time_window"] = _normalize_time_window(normalized["time_window"])
+        time_window = _normalize_time_window(normalized["time_window"])
+        if time_window is None:
+            # Model providers commonly serialize omitted optional fields as
+            # JSON null. Treat that as absence without manufacturing temporal
+            # evidence; malformed non-null values still fail validation.
+            normalized.pop("time_window", None)
+        else:
+            normalized["time_window"] = time_window
     return normalized
 
 
@@ -797,14 +840,12 @@ def merge_interaction_pattern_provenance(
     """Preserve linked Event evidence when an equivalent Pattern is merged."""
 
     merged = dict(existing)
-    existing_ids = existing.get("evidence_ids")
-    incoming_ids = incoming.get("evidence_ids")
-    if isinstance(incoming_ids, (list, tuple)):
-        retained_ids = (
-            list(existing_ids)
-            if isinstance(existing_ids, (list, tuple))
-            else []
-        )
+    for field in ("evidence_ids", "positive_evidence_ids", "negative_evidence_ids"):
+        existing_ids = existing.get(field)
+        incoming_ids = incoming.get(field)
+        if not isinstance(incoming_ids, (list, tuple)):
+            continue
+        retained_ids = list(existing_ids) if isinstance(existing_ids, (list, tuple)) else []
         evidence_ids = list(
             dict.fromkeys(
                 str(value).strip()
@@ -812,15 +853,29 @@ def merge_interaction_pattern_provenance(
                 if isinstance(value, str) and value.strip()
             )
         )[-20:]
-        if evidence_ids:
-            merged["evidence_ids"] = evidence_ids
-            if "evidence" in existing or "evidence" in incoming:
-                merged["evidence"] = evidence_ids
+        merged[field] = evidence_ids
+        if field == "evidence_ids" and ("evidence" in existing or "evidence" in incoming):
+            merged["evidence"] = evidence_ids
     if incoming.get("time_window") is not None:
         # A SAME merge is a fresh observation of the same current Pattern.
         # Keep its latest declared observation window while retaining all
         # linked evidence IDs above.
         merged["time_window"] = incoming["time_window"]
+    state = incoming.get("state")
+    if isinstance(state, str) and state.casefold().strip() in {
+        "active",
+        "weakening",
+        "superseded",
+    }:
+        merged["state"] = state.casefold().strip()
+    for field in (
+        "pattern_evolution_update",
+        "pattern_evolution_rule",
+        "last_positive_evidence_id",
+        "last_negative_evidence_id",
+    ):
+        if incoming.get(field) is not None:
+            merged[field] = incoming[field]
     return merged
 
 
@@ -857,6 +912,22 @@ def validate_interaction_pattern_payload(
     # link to stored Event rows and therefore must not authorize inference.
     if source == "model_inferred" and not evidence_ids:
         raise ValueError("model_inferred interaction_pattern requires evidence IDs")
+
+    for field in ("positive_evidence_ids", "negative_evidence_ids"):
+        value = payload.get(field)
+        if value is not None:
+            _validate_identifier_list(value, field=field)
+    positive_ids = set(payload.get("positive_evidence_ids") or [])
+    negative_ids = set(payload.get("negative_evidence_ids") or [])
+    if positive_ids & negative_ids:
+        raise ValueError("interaction_pattern positive and negative evidence overlap")
+
+    state = payload.get("state")
+    if state is not None and (
+        not isinstance(state, str)
+        or state.casefold().strip() not in {"active", "weakening", "superseded"}
+    ):
+        raise ValueError("interaction_pattern state must be active, weakening, or superseded")
 
     if "time_window" in payload:
         _validate_time_window(payload["time_window"])

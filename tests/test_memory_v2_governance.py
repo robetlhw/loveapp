@@ -131,6 +131,45 @@ class SupportingPatternVerifier:
         )
 
 
+async def test_memory_service_rejects_invalid_normalized_candidate_without_crashing() -> None:
+    text = "她之前很少和我出去一起吃饭"
+    invalid = MemoryCandidate(
+        kind=MemoryKind.INTERACTION_PATTERN,
+        subject="relationship",
+        summary=text,
+        original_text=text,
+        evidence_spans=[text],
+        raw_predicate="shared_meal_frequency",
+        payload={
+            "metric": "contact_frequency",
+            "frequency": "rare",
+            "time_window": 7,
+        },
+        explicitness=EvidenceExplicitness.EXPLICIT,
+        confidence=1,
+    )
+    store = CapturingInMemoryMemoryStore()
+    service = MemoryService(store, StaticExtractor([_claim(invalid, "invalid-pattern")]))
+
+    result = await service.remember_text(
+        user_id=USER_ID,
+        relationship_id=RELATIONSHIP_ID,
+        text=text,
+        status=MemoryStatus.CONFIRMED,
+    )
+
+    assert result.saved == []
+    assert result.rejected_by_policy == 1
+    assert store.last_batch is not None
+    assert store.last_batch.operations == []
+    assert len(store.last_batch.audit_only) == 1
+    audit = store.last_batch.audit_only[0]
+    assert audit.rule_name == "normalization_contract_rejection"
+    assert audit.score_breakdown["normalization_contract_error"] == (
+        "INTERACTION_PATTERN_PAYLOAD_INVALID"
+    )
+
+
 def _candidate(
     *,
     kind: MemoryKind,
@@ -1548,6 +1587,7 @@ async def test_service_rejects_model_inferred_pattern_with_invented_event_link()
             "current": "partner_to_user",
             "source": "model_inferred",
             "evidence_ids": [saved_event.item.id, "invented-event-id"],
+            "time_window": ["2026-09-01", "2026-09-08"],
         },
     ).model_copy(update={"perspective": MemoryPerspective.MODEL_INFERRED})
     service = MemoryService(

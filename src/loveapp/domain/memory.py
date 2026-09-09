@@ -73,11 +73,40 @@ class MemoryPerspective(StrEnum):
     MODEL_INFERRED = "model_inferred"
 
 
+class EpistemicStatus(StrEnum):
+    """How strongly the proposition is presented as knowledge.
+
+    This is deliberately separate from ``MemoryStatus``.  Lifecycle status
+    describes whether a row is current; epistemic status describes whether
+    the proposition is a reported fact, an uncertainty, a hypothesis, or a
+    prediction.
+    """
+
+    CONFIRMED = "confirmed"
+    UNCERTAIN = "uncertain"
+    HYPOTHESIS = "hypothesis"
+    PREDICTION = "prediction"
+
+
 class MemoryStatus(StrEnum):
     PROPOSED = "proposed"
     CONFIRMED = "confirmed"
     REJECTED = "rejected"
     EXPIRED = "expired"
+    SUPERSEDED = "superseded"
+
+
+class PatternLifecycleState(StrEnum):
+    """Evidence-driven state of an Interaction Pattern.
+
+    ``MemoryStatus`` remains the row-level lifecycle authority.  This smaller
+    state describes whether the observation represented by an active Pattern
+    is still supported, is weakening, or has been superseded by a governed
+    opposite Pattern.
+    """
+
+    ACTIVE = "active"
+    WEAKENING = "weakening"
     SUPERSEDED = "superseded"
 
 
@@ -504,6 +533,122 @@ def _normalize_memory_kind_alias(value: object) -> object:
     return aliases.get(normalized, value)
 
 
+def _synchronize_memory_evolution_metadata(
+    memory: Any,
+    *,
+    mirror_payload: bool,
+) -> None:
+    """Keep typed V2.2 metadata round-trippable through the legacy payload.
+
+    The Store schema intentionally remains unchanged.  Mirroring the bounded
+    fields into ``payload`` lets SQLite and older adapters preserve them while
+    callers can use typed attributes on ``MemoryCandidate``/``MemoryItem``.
+    """
+
+    payload = dict(memory.payload)
+    salience = memory.salience
+    if salience is None and payload.get("salience") is not None:
+        raw_salience = payload["salience"]
+        if isinstance(raw_salience, bool):
+            raise ValueError("salience must be a number between 0 and 1")
+        try:
+            salience = float(raw_salience)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("salience must be a number between 0 and 1") from exc
+        if not 0 <= salience <= 1:
+            raise ValueError("salience must be a number between 0 and 1")
+        memory.salience = salience
+    if salience is not None and mirror_payload:
+        payload["salience"] = round(float(salience), 4)
+
+    importance_reason = memory.importance_reason
+    if importance_reason is None and payload.get("importance_reason") is not None:
+        raw_reason = payload["importance_reason"]
+        if not isinstance(raw_reason, str) or not raw_reason.strip():
+            raise ValueError("importance_reason must be non-empty text")
+        importance_reason = raw_reason.strip()
+        if len(importance_reason) > 500:
+            raise ValueError("importance_reason cannot exceed 500 characters")
+        memory.importance_reason = importance_reason
+    if importance_reason is not None and mirror_payload:
+        payload["importance_reason"] = importance_reason
+
+    if memory.kind != MemoryKind.INTERACTION_PATTERN:
+        memory.payload = payload
+        return
+
+    raw_state = memory.pattern_state or payload.get("state") or payload.get("pattern_state")
+    if getattr(memory, "status", None) == MemoryStatus.SUPERSEDED:
+        raw_state = PatternLifecycleState.SUPERSEDED
+    if raw_state is None:
+        raw_state = PatternLifecycleState.ACTIVE
+    try:
+        pattern_state = (
+            raw_state
+            if isinstance(raw_state, PatternLifecycleState)
+            else PatternLifecycleState(str(raw_state).casefold().strip())
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "interaction_pattern state must be active, weakening, or superseded"
+        ) from exc
+
+    positive_ids = _normalize_memory_evidence_ids(
+        [
+            *memory.positive_evidence_ids,
+            *_payload_evidence_ids(payload.get("positive_evidence_ids")),
+        ],
+        field="positive_evidence_ids",
+    )
+    if not positive_ids:
+        positive_ids = _normalize_memory_evidence_ids(
+            _payload_evidence_ids(payload.get("evidence_ids")),
+            field="positive_evidence_ids",
+        )
+    negative_ids = _normalize_memory_evidence_ids(
+        [
+            *memory.negative_evidence_ids,
+            *_payload_evidence_ids(payload.get("negative_evidence_ids")),
+        ],
+        field="negative_evidence_ids",
+    )
+    overlap = set(positive_ids) & set(negative_ids)
+    if overlap:
+        raise ValueError("pattern evidence cannot be both positive and negative")
+
+    memory.pattern_state = pattern_state
+    memory.positive_evidence_ids = positive_ids
+    memory.negative_evidence_ids = negative_ids
+    if mirror_payload:
+        payload["state"] = pattern_state.value
+        payload["positive_evidence_ids"] = positive_ids
+        payload["negative_evidence_ids"] = negative_ids
+        payload.pop("pattern_state", None)
+    memory.payload = payload
+
+
+def _payload_evidence_ids(value: object) -> list[object]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("pattern evidence IDs must be a list")
+    return list(value)
+
+
+def _normalize_memory_evidence_ids(values: list[object], *, field: str) -> list[str]:
+    normalized: list[str] = []
+    for value in values:
+        if not isinstance(value, str) or not value.strip() or len(value.strip()) > 160:
+            raise ValueError(f"{field} contains invalid IDs")
+        normalized.append(value.strip())
+    unique = list(dict.fromkeys(normalized))
+    if len(unique) > 20:
+        unique = unique[-20:]
+    return unique
+
+
 class MemoryCandidate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -523,7 +668,10 @@ class MemoryCandidate(BaseModel):
     intensity: int | None = Field(default=None, ge=1, le=5)
     emotions: list[str] = Field(default_factory=list, max_length=8)
     importance: int = Field(default=3, ge=1, le=5)
+    salience: float | None = Field(default=None, ge=0, le=1)
+    importance_reason: str | None = Field(default=None, max_length=500)
     perspective: MemoryPerspective = MemoryPerspective.USER_REPORTED
+    epistemic_status: EpistemicStatus = EpistemicStatus.CONFIRMED
     confidence: float = Field(default=0.8, ge=0, le=1)
     payload: dict[str, Any] = Field(default_factory=dict)
     supersedes_id: str | None = None
@@ -542,6 +690,9 @@ class MemoryCandidate(BaseModel):
     prompt_version: str | None = Field(default=None, max_length=80)
     extractor_model: str | None = Field(default=None, max_length=160)
     verifier_model: str | None = Field(default=None, max_length=160)
+    pattern_state: PatternLifecycleState | None = None
+    positive_evidence_ids: list[str] = Field(default_factory=list, max_length=20)
+    negative_evidence_ids: list[str] = Field(default_factory=list, max_length=20)
 
     @model_validator(mode="before")
     @classmethod
@@ -554,6 +705,18 @@ class MemoryCandidate(BaseModel):
             raise ValueError("period_start cannot be later than period_end")
         if not self.evidence_spans:
             self.evidence_spans = [self.original_text]
+        if (
+            self.perspective == MemoryPerspective.USER_BELIEF
+            and self.epistemic_status == EpistemicStatus.CONFIRMED
+        ):
+            self.epistemic_status = EpistemicStatus.UNCERTAIN
+        elif (
+            self.perspective == MemoryPerspective.MODEL_INFERRED
+            and self.epistemic_status
+            in {EpistemicStatus.CONFIRMED, EpistemicStatus.UNCERTAIN}
+        ):
+            self.epistemic_status = EpistemicStatus.HYPOTHESIS
+        _synchronize_memory_evolution_metadata(self, mirror_payload=True)
         return self
 
 
@@ -578,7 +741,10 @@ class AtomicClaim(BaseModel):
     intensity: int | None = Field(default=None, ge=1, le=5)
     emotions: list[str] = Field(default_factory=list, max_length=8)
     importance: int = Field(default=3, ge=1, le=5)
+    salience: float | None = Field(default=None, ge=0, le=1)
+    importance_reason: str | None = Field(default=None, max_length=500)
     perspective: MemoryPerspective = MemoryPerspective.USER_REPORTED
+    epistemic_status: EpistemicStatus = EpistemicStatus.CONFIRMED
     confidence: float = Field(default=0.8, ge=0, le=1)
     payload: dict[str, Any] = Field(default_factory=dict)
     supersedes_id: str | None = None
@@ -593,6 +759,9 @@ class AtomicClaim(BaseModel):
     prompt_version: str | None = Field(default=None, max_length=80)
     extractor_model: str | None = Field(default=None, max_length=160)
     verifier_model: str | None = Field(default=None, max_length=160)
+    pattern_state: PatternLifecycleState | None = None
+    positive_evidence_ids: list[str] = Field(default_factory=list, max_length=20)
+    negative_evidence_ids: list[str] = Field(default_factory=list, max_length=20)
 
     @model_validator(mode="before")
     @classmethod
@@ -610,6 +779,22 @@ class AtomicClaim(BaseModel):
             if not replacement:
                 raise ValueError("predicate or canonical/custom predicate is required")
             self.predicate = replacement
+        if (
+            self.perspective == MemoryPerspective.USER_BELIEF
+            and self.epistemic_status == EpistemicStatus.CONFIRMED
+        ):
+            self.epistemic_status = EpistemicStatus.UNCERTAIN
+        elif (
+            self.perspective == MemoryPerspective.MODEL_INFERRED
+            and self.epistemic_status
+            in {EpistemicStatus.CONFIRMED, EpistemicStatus.UNCERTAIN}
+        ):
+            self.epistemic_status = EpistemicStatus.HYPOTHESIS
+        # AtomicClaim is the raw extraction boundary.  Populate typed fields
+        # from provider payload aliases without adding deterministic defaults
+        # back into the raw payload; MemoryCandidate performs that persistence
+        # mirroring after claim conversion and normalization.
+        _synchronize_memory_evolution_metadata(self, mirror_payload=False)
         return self
 
     def to_candidate(self) -> MemoryCandidate:
@@ -634,7 +819,10 @@ class AtomicClaim(BaseModel):
             intensity=self.intensity,
             emotions=self.emotions,
             importance=self.importance,
+            salience=self.salience,
+            importance_reason=self.importance_reason,
             perspective=self.perspective,
+            epistemic_status=self.epistemic_status,
             confidence=self.confidence,
             payload=payload,
             supersedes_id=self.supersedes_id,
@@ -649,6 +837,9 @@ class AtomicClaim(BaseModel):
             prompt_version=self.prompt_version,
             extractor_model=self.extractor_model,
             verifier_model=self.verifier_model,
+            pattern_state=self.pattern_state,
+            positive_evidence_ids=self.positive_evidence_ids,
+            negative_evidence_ids=self.negative_evidence_ids,
         )
 
 
@@ -714,7 +905,10 @@ class MemoryContextItem(BaseModel):
     valence: MemoryValence
     relationship_impact: RelationshipImpact
     importance: int = Field(default=3, ge=1, le=5)
+    salience: float | None = Field(default=None, ge=0, le=1)
+    importance_reason: str | None = Field(default=None, max_length=500)
     perspective: MemoryPerspective
+    epistemic_status: EpistemicStatus
     confidence: float
     status: MemoryStatus
     payload: dict[str, Any] = Field(default_factory=dict)
@@ -729,6 +923,9 @@ class MemoryContextItem(BaseModel):
     admission_decision: AdmissionDecision | None = None
     claim_relation: ClaimRelation | None = None
     lifecycle_review_required: bool = False
+    pattern_state: PatternLifecycleState | None = None
+    positive_evidence_ids: list[str] = Field(default_factory=list, max_length=20)
+    negative_evidence_ids: list[str] = Field(default_factory=list, max_length=20)
 
     @classmethod
     def from_item(cls, item: MemoryItem) -> "MemoryContextItem":
@@ -748,7 +945,10 @@ class MemoryContextItem(BaseModel):
                     "valence",
                     "relationship_impact",
                     "importance",
+                    "salience",
+                    "importance_reason",
                     "perspective",
+                    "epistemic_status",
                     "confidence",
                     "status",
                     "payload",
@@ -762,6 +962,9 @@ class MemoryContextItem(BaseModel):
                     "admission_decision",
                     "claim_relation",
                     "lifecycle_review_required",
+                    "pattern_state",
+                    "positive_evidence_ids",
+                    "negative_evidence_ids",
                 }
             )
         )
@@ -880,8 +1083,29 @@ def memory_dedupe_identity(candidate: MemoryCandidate) -> str:
     return "|".join(_normalize_key_part(part) for part in parts)
 
 
+def memory_epistemic_identity_bucket(candidate: MemoryCandidate) -> str | None:
+    """Return a non-default identity suffix for belief/inference memories.
+
+    Confirmed user reports deliberately keep the legacy identity shape so
+    existing persisted facts continue to deduplicate after the V2.2 schema
+    migration.  Non-factual propositions receive their own stable namespace,
+    preventing an otherwise identical belief or inference from merging into a
+    reported fact before relation governance can run.
+    """
+
+    if (
+        candidate.perspective == MemoryPerspective.USER_REPORTED
+        and candidate.epistemic_status == EpistemicStatus.CONFIRMED
+    ):
+        return None
+    return f"{candidate.perspective.value}:{candidate.epistemic_status.value}"
+
+
 def _memory_identity_parts(candidate: MemoryCandidate) -> tuple[str, ...]:
     kind = candidate.kind.value
+    epistemic_bucket = memory_epistemic_identity_bucket(candidate)
+    if epistemic_bucket is not None:
+        kind = f"{kind}@{epistemic_bucket}"
     subject = candidate.subject
     payload = candidate.payload
     predicate = normalize_predicate(

@@ -30,6 +30,7 @@ from loveapp.domain.memory import (
     MemoryItem,
     MemoryKind,
     MemoryPerspective,
+    MemorySaveResult,
     MemoryStatus,
     MemoryValence,
     MessageRole,
@@ -46,6 +47,7 @@ from loveapp.domain.memory_dimensions import (
     normalize_state_dimension,
     normalize_state_value,
 )
+from loveapp.domain.memory_epistemics import is_epistemically_confirmed
 from loveapp.domain.memory_lifecycle import (
     governed_state_identity,
     governed_state_value,
@@ -54,8 +56,13 @@ from loveapp.domain.memory_lifecycle import (
     plan_memory_transitions,
     semantic_duplicate_ids,
 )
-from loveapp.domain.memory_normalization import normalize_memory_candidate_contract
+from loveapp.domain.memory_normalization import (
+    NormalizationContractError,
+    normalize_memory_candidate_contract,
+)
 from loveapp.domain.memory_predicates import CANONICAL_PREDICATES, normalize_predicate
+from loveapp.domain.memory_salience import apply_event_salience
+from loveapp.domain.memory_type_compatibility import assess_memory_type_compatibility
 from loveapp.domain.memory_verification import ClaimVerification
 from loveapp.domain.memory_write import (
     MemoryAuditDraft,
@@ -99,6 +106,10 @@ from .memory_admission import (
     interaction_pattern_has_multiple_evidence,
 )
 from .memory_gate import MemoryGate
+from .memory_pattern_consolidation import (
+    govern_interaction_pattern_consolidation,
+    govern_interaction_pattern_evolution,
+)
 from .memory_relations import (
     ClaimRelationResolution,
     has_local_conflict,
@@ -578,14 +589,59 @@ class MemoryService:
                 payload=candidate.payload,
             )
             had_explicit_expiration = candidate.expires_at is not None
-            candidate = add_plan_identity(
-                normalize_memory_candidate_contract(
-                    candidate,
-                    now,
-                    allow_legacy_open_world=True,
-                ),
-                identity_scope=message.id,
-            )
+            try:
+                candidate = add_plan_identity(
+                    normalize_memory_candidate_contract(
+                        candidate,
+                        now,
+                        allow_legacy_open_world=True,
+                    ),
+                    identity_scope=message.id,
+                )
+                candidate = apply_event_salience(candidate, active)
+            except NormalizationContractError as exc:
+                result.rejected_by_policy += 1
+                score_breakdown = {
+                    "normalization_contract_error": exc.code,
+                    "normalization_contract_detail": exc.detail,
+                }
+                reason = str(exc)
+                audit_only.append(
+                    MemoryAuditDraft(
+                        candidate_index=candidate_index,
+                        relation=ClaimRelation.UNCERTAIN,
+                        decision=AdmissionDecision.REJECT,
+                        target_memory_ids=[],
+                        rule_name="normalization_contract_rejection",
+                        score_breakdown=score_breakdown,
+                        raw_predicate=candidate.raw_predicate,
+                        canonical_predicate=candidate.canonical_predicate,
+                        extractor_model=candidate.extractor_model,
+                        verifier_model=candidate.verifier_model,
+                        prompt_version=candidate.prompt_version,
+                        evidence=candidate.evidence_spans,
+                        reason=reason,
+                    )
+                )
+                _record_candidate_observation(
+                    trace,
+                    candidate_index=candidate_index,
+                    candidate=candidate,
+                    alias_hit=predicate_normalization.alias_hit,
+                    admission_reason="normalization_contract_invalid",
+                    score_breakdown=score_breakdown,
+                    compared_memory_ids=[item.id for item in active],
+                    strong_called=False,
+                    strong_compared_memory_ids=[],
+                    relation=ClaimRelation.UNCERTAIN,
+                    relation_rule="normalization_contract_rejection",
+                    relation_reason=reason,
+                    relation_target_memory_ids=[],
+                    planned_action="reject",
+                    planned_target_memory_ids=[],
+                    target_operation_indexes=[],
+                )
+                continue
             admission_policy = self._admission_policies[candidate.kind]
             if not had_explicit_expiration and admission_policy.default_ttl_days is not None:
                 candidate = candidate.model_copy(
@@ -681,12 +737,19 @@ class MemoryService:
             if decision == AdmissionDecision.STRONG_REVIEW and self._verifier is not None:
                 strong_called = True
                 try:
-                    verification_memories = select_context_memories(
-                        active,
-                        query=text,
-                        limit=8,
-                        reference_time=now,
-                    )
+                    verification_memories = [
+                        item
+                        for item in select_context_memories(
+                            active,
+                            query=text,
+                            limit=8,
+                            reference_time=now,
+                        )
+                        if assess_memory_type_compatibility(
+                            candidate,
+                            item,
+                        ).semantic_relation_allowed
+                    ]
                     strong_compared_memory_ids = [item.id for item in verification_memories]
                     verifier_allowed_ids = {item.id for item in verification_memories}
                     verification = await self._verifier.verify_claim(
@@ -696,7 +759,11 @@ class MemoryService:
                         allowed_target_ids=verifier_allowed_ids,
                         trace=trace,
                     )
-                    _validate_claim_verification(verification, verifier_allowed_ids)
+                    _validate_claim_verification(
+                        verification,
+                        candidate=candidate,
+                        allowed_memories=verification_memories,
+                    )
                 except Exception as exc:
                     verification_error = f"{type(exc).__name__}: {exc}"[:500]
                     verification = None
@@ -799,6 +866,19 @@ class MemoryService:
                         target_memory_ids=(),
                         rule_name="explicit_memory_correction",
                         reason="Correction target is no longer active in the current scope.",
+                    )
+                elif not assess_memory_type_compatibility(
+                    candidate,
+                    correction_target,
+                ).lifecycle_replace_allowed:
+                    resolution = ClaimRelationResolution(
+                        relation=ClaimRelation.UNCERTAIN,
+                        target_memory_ids=(),
+                        rule_name="explicit_memory_correction_type_protection",
+                        reason=(
+                            "An explicit correction cannot replace a memory across the "
+                            "type or epistemic lifecycle boundary."
+                        ),
                     )
                 elif (
                     incoming_status == MemoryStatus.PROPOSED
@@ -1065,6 +1145,16 @@ class MemoryService:
                 )
                 prepared_saved = committed.saved
                 result.saved.extend(prepared_saved)
+                consolidated_saved = await self._consolidate_interaction_patterns(
+                    user_id=message.user_id,
+                    relationship_id=message.relationship_id,
+                    source_message_id=message.id,
+                    source_text=text,
+                    saved=prepared_saved,
+                    reference_time=now,
+                    trace=trace,
+                )
+                result.saved.extend(consolidated_saved)
                 result.contextual_updated_memory_ids.extend(committed.updated_memory_ids)
                 await self._project_relationship_stage(
                     message.user_id,
@@ -1099,6 +1189,121 @@ class MemoryService:
         if extraction_failure is not None and raise_on_extraction_error:
             raise extraction_failure
         return result
+
+    async def _consolidate_interaction_patterns(
+        self,
+        *,
+        user_id: str,
+        relationship_id: str,
+        source_message_id: str,
+        source_text: str,
+        saved: list[MemorySaveResult],
+        reference_time: datetime,
+        trace: TraceRecorder | None,
+    ) -> list[MemorySaveResult]:
+        triggers = [
+            result.item
+            for result in saved
+            if result.created and result.item.kind == MemoryKind.INTERACTION_EVENT
+        ]
+        if not triggers:
+            return []
+        consolidated: list[MemorySaveResult] = []
+        for trigger in triggers:
+            try:
+                memories = await self.store.list_memories(
+                    user_id=user_id,
+                    relationship_id=relationship_id,
+                    limit=200,
+                )
+                active = [
+                    item
+                    for item in memories
+                    if item.status in {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}
+                    and (item.expires_at is None or item.expires_at > reference_time)
+                ]
+                evolution = govern_interaction_pattern_evolution(
+                    trigger,
+                    active,
+                    source_text=source_text,
+                    reference_time=reference_time,
+                )
+                if evolution.handled:
+                    evolved = await self.store.commit_memory_batch(
+                        user_id=user_id,
+                        relationship_id=relationship_id,
+                        batch=MemoryWriteBatch(
+                            source_message_id=source_message_id,
+                            operations=list(evolution.operations),
+                            audit_only=list(evolution.audits),
+                        ),
+                    )
+                    consolidated.extend(evolved.saved)
+                    _record_event_pattern_consolidation_trace(
+                        trace,
+                        trigger_id=trigger.id,
+                        status=evolution.status,
+                        pattern_memory_ids=[
+                            *evolution.pattern_memory_ids,
+                            *(result.item.id for result in evolved.saved),
+                        ],
+                        evidence_ids=[
+                            *evolution.positive_evidence_ids,
+                            *evolution.negative_evidence_ids,
+                        ],
+                        positive_evidence_ids=list(evolution.positive_evidence_ids),
+                        negative_evidence_ids=list(evolution.negative_evidence_ids),
+                        phase="evolution",
+                    )
+                    continue
+                governed = govern_interaction_pattern_consolidation(
+                    trigger,
+                    active,
+                    source_text=source_text,
+                    reference_time=reference_time,
+                )
+                operations = [governed.operation] if governed.operation is not None else []
+                audits = [governed.audit] if governed.audit is not None else []
+                if not operations and not audits:
+                    _record_event_pattern_consolidation_trace(
+                        trace,
+                        trigger_id=trigger.id,
+                        status="insufficient_evidence",
+                    )
+                    continue
+                committed = await self.store.commit_memory_batch(
+                    user_id=user_id,
+                    relationship_id=relationship_id,
+                    batch=MemoryWriteBatch(
+                        source_message_id=source_message_id,
+                        operations=operations,
+                        audit_only=audits,
+                    ),
+                )
+                consolidated.extend(committed.saved)
+                _record_event_pattern_consolidation_trace(
+                    trace,
+                    trigger_id=trigger.id,
+                    status=("committed" if committed.saved else "rejected"),
+                    pattern_memory_ids=[item.item.id for item in committed.saved],
+                        evidence_ids=(
+                        list(governed.operation.candidate.payload.get("evidence_ids") or [])
+                        if governed.operation is not None
+                            else []
+                        ),
+                        phase="consolidation",
+                    )
+            except Exception as exc:
+                # Consolidation is a non-destructive secondary write.  A
+                # detector or persistence failure must never roll back the
+                # already governed Event.
+                _record_event_pattern_consolidation_trace(
+                    trace,
+                    trigger_id=trigger.id,
+                    status="failed_closed",
+                    error=f"{type(exc).__name__}: {exc}"[:500],
+                )
+        return consolidated
 
     def start_background_extraction(
         self,
@@ -1928,7 +2133,21 @@ def _record_candidate_observation(
                 "summary": candidate.summary,
                 "confidence": candidate.confidence,
                 "perspective": candidate.perspective.value,
+                "epistemic_status": candidate.epistemic_status.value,
                 "importance": candidate.importance,
+                "salience": candidate.salience,
+                "importance_reason": candidate.importance_reason,
+                "pattern_state": (
+                    candidate.pattern_state.value if candidate.pattern_state is not None else None
+                ),
+                "positive_evidence_ids_json": json.dumps(
+                    candidate.positive_evidence_ids,
+                    separators=(",", ":"),
+                ),
+                "negative_evidence_ids_json": json.dumps(
+                    candidate.negative_evidence_ids,
+                    separators=(",", ":"),
+                ),
                 "evidence_spans_json": json.dumps(
                     candidate.evidence_spans,
                     ensure_ascii=False,
@@ -2307,6 +2526,35 @@ def _record_explicit_correction_trace(
         )
 
 
+def _record_event_pattern_consolidation_trace(
+    trace: TraceRecorder | None,
+    *,
+    trigger_id: str,
+    status: str,
+    pattern_memory_ids: list[str] | None = None,
+    evidence_ids: list[str] | None = None,
+    positive_evidence_ids: list[str] | None = None,
+    negative_evidence_ids: list[str] | None = None,
+    phase: str = "consolidation",
+    error: str | None = None,
+) -> None:
+    if trace is None:
+        return
+    with trace.measure("memory_event_pattern_consolidation") as details:
+        details.update(
+            {
+                "trigger_event_id": trigger_id,
+                "consolidation_status": status,
+                "pattern_phase": phase,
+                "pattern_memory_ids_json": json.dumps(pattern_memory_ids or []),
+                "evidence_ids_json": json.dumps(evidence_ids or []),
+                "positive_evidence_ids_json": json.dumps(positive_evidence_ids or []),
+                "negative_evidence_ids_json": json.dumps(negative_evidence_ids or []),
+                "error": error,
+            }
+        )
+
+
 _RELATIONSHIP_STAGE_EVENT_PREDICATES = {
     "confession_succeeded",
     "confession_accepted",
@@ -2340,6 +2588,10 @@ def _plan_in_batch_state_transitions(
                 previous.subject.casefold() != candidate.subject.casefold()
                 or governed_state_identity(previous) != identity
                 or governed_state_value(previous) in {None, value}
+                or not assess_memory_type_compatibility(
+                    candidate,
+                    previous,
+                ).lifecycle_replace_allowed
             ):
                 continue
             if (
@@ -2367,6 +2619,10 @@ def _has_in_batch_state_conflict(
         and previous.subject.casefold() == candidate.subject.casefold()
         and governed_state_identity(previous) == identity
         and governed_state_value(previous) not in {None, value}
+        and assess_memory_type_compatibility(
+            candidate,
+            previous,
+        ).allows(ClaimRelation.CONTRADICTION)
         for previous_index, previous in enumerate(candidates[:index])
     )
 
@@ -2376,7 +2632,7 @@ def _verification_can_confirm(candidate: MemoryCandidate) -> bool:
         return False
     if candidate.explicitness == EvidenceExplicitness.SPECULATIVE:
         return False
-    if candidate.perspective != MemoryPerspective.USER_REPORTED:
+    if not is_epistemically_confirmed(candidate):
         return False
     if candidate.kind in {MemoryKind.RELATIONSHIP_STATE, MemoryKind.STABLE_FACT}:
         return candidate.explicitness == EvidenceExplicitness.EXPLICIT
@@ -2393,11 +2649,35 @@ def _verification_can_confirm(candidate: MemoryCandidate) -> bool:
 
 def _validate_claim_verification(
     verification: ClaimVerification,
-    allowed_target_ids: set[str],
+    *,
+    candidate: MemoryCandidate,
+    allowed_memories: list[MemoryItem],
 ) -> None:
+    allowed_by_id = {item.id: item for item in allowed_memories}
+    allowed_target_ids = set(allowed_by_id)
     invalid_targets = set(verification.target_memory_ids) - allowed_target_ids
     if invalid_targets:
         raise ValueError("claim verifier returned a target outside the candidate set")
+    if verification.relation == ClaimRelation.UPDATE and not verification.target_memory_ids:
+        raise ValueError("claim verifier returned an update without a target")
+    for memory_id in verification.target_memory_ids:
+        compatibility = assess_memory_type_compatibility(
+            candidate,
+            allowed_by_id[memory_id],
+        )
+        if not compatibility.semantic_relation_allowed:
+            raise ValueError("claim verifier returned a type-incompatible target")
+        if not compatibility.allows(verification.relation):
+            raise ValueError(
+                "claim verifier returned a relation forbidden by the memory type boundary"
+            )
+        if (
+            verification.relation == ClaimRelation.UPDATE
+            and not compatibility.lifecycle_replace_allowed
+        ):
+            raise ValueError(
+                "claim verifier returned an update forbidden by the lifecycle type boundary"
+            )
     canonical = verification.canonical_predicate
     if canonical is None:
         return

@@ -14,6 +14,7 @@ from loveapp.domain.memory import (
     MemoryStatus,
     PredicateType,
     TimeKind,
+    memory_epistemic_identity_bucket,
     normalize_candidate_predicate,
 )
 from loveapp.domain.memory_dimensions import (
@@ -27,6 +28,7 @@ from loveapp.domain.memory_dimensions import (
     normalize_state_value,
     relationship_state_ttl,
 )
+from loveapp.domain.memory_type_compatibility import assess_memory_type_compatibility
 from loveapp.domain.relationship_evidence import normalize_evidence_declarations
 
 
@@ -712,7 +714,7 @@ def legacy_transition_target_ids(active_memories: Sequence[MemoryItem]) -> set[s
 
 
 def semantic_duplicate_ids(active_memories: Sequence[MemoryItem]) -> set[str]:
-    groups: dict[tuple[str, str, str], list[MemoryItem]] = defaultdict(list)
+    groups: dict[tuple[str, str, str, str], list[MemoryItem]] = defaultdict(list)
     for item in active_memories:
         role = memory_role(item)
         concept = memory_concept(item)
@@ -726,7 +728,10 @@ def semantic_duplicate_ids(active_memories: Sequence[MemoryItem]) -> set[str]:
             MemoryRole.RECENT_EVENT,
         }:
             continue
-        groups[(role.value, item.subject.casefold(), concept)].append(item)
+        epistemic_bucket = memory_epistemic_identity_bucket(item) or "fact"
+        groups[(role.value, item.subject.casefold(), concept, epistemic_bucket)].append(
+            item
+        )
 
     redundant: set[str] = set()
     for items in groups.values():
@@ -737,18 +742,24 @@ def semantic_duplicate_ids(active_memories: Sequence[MemoryItem]) -> set[str]:
     return redundant
 
 
-def semantic_context_key(memory: MemoryItem) -> tuple[str, str, str] | None:
+def semantic_context_key(memory: MemoryItem) -> tuple[str, str, str, str] | None:
     role = memory_role(memory)
+    epistemic_bucket = memory_epistemic_identity_bucket(memory) or "fact"
     state_identity = governed_state_identity(memory)
     if state_identity is not None:
-        return role.value, memory.subject.casefold(), f"state:{state_identity[1]}"
+        return (
+            role.value,
+            memory.subject.casefold(),
+            f"state:{state_identity[1]}",
+            epistemic_bucket,
+        )
     concept = memory_concept(memory)
     if not concept or (
         role == MemoryRole.RECENT_EVENT
         and concept not in _COLLAPSIBLE_EVENT_CONCEPTS
     ):
         return None
-    return role.value, memory.subject.casefold(), concept
+    return role.value, memory.subject.casefold(), concept, epistemic_bucket
 
 
 def relationship_state_identity(memory: MemoryCandidate) -> tuple[str, str] | None:
@@ -930,6 +941,11 @@ def _trigger_can_close_target(
     *,
     trigger_status: MemoryStatus | None,
 ) -> bool:
+    if not assess_memory_type_compatibility(
+        trigger,
+        target,
+    ).lifecycle_replace_allowed:
+        return False
     status = trigger_status
     if status is None and isinstance(trigger, MemoryItem):
         status = trigger.status

@@ -287,6 +287,13 @@ CANONICAL_PREDICATES: dict[str, CanonicalPredicateSpec] = {
         temporal_behavior=PREDICATE_TEMPORAL_PATTERN,
         update_policy=PREDICATE_UPDATE_REPLACE,
     ),
+    "interaction.conflict_frequency": CanonicalPredicateSpec(
+        name="interaction.conflict_frequency",
+        state_dimension="interaction.conflict_frequency",
+        cardinality=PREDICATE_CARDINALITY_SINGLE,
+        temporal_behavior=PREDICATE_TEMPORAL_PATTERN,
+        update_policy=PREDICATE_UPDATE_REPLACE,
+    ),
     # Stable profile facts are deliberately finite and single-valued.  The
     # registry authorizes replacement of the current value while the existing
     # write batch keeps the superseded row as history.  Open-world facts do not
@@ -393,6 +400,20 @@ CANONICAL_PREDICATES: dict[str, CanonicalPredicateSpec] = {
     ),
     "preference.relationship.partner_trait": CanonicalPredicateSpec(
         name="preference.relationship.partner_trait",
+        semantic_domain="relationship",
+        cardinality=PREDICATE_CARDINALITY_MULTI,
+        temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
+        update_policy=PREDICATE_UPDATE_APPEND,
+    ),
+    "preference.relationship.interaction_style": CanonicalPredicateSpec(
+        name="preference.relationship.interaction_style",
+        semantic_domain="relationship",
+        cardinality=PREDICATE_CARDINALITY_MULTI,
+        temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
+        update_policy=PREDICATE_UPDATE_APPEND,
+    ),
+    "preference.relationship.emotional_need": CanonicalPredicateSpec(
+        name="preference.relationship.emotional_need",
         semantic_domain="relationship",
         cardinality=PREDICATE_CARDINALITY_MULTI,
         temporal_behavior=PREDICATE_TEMPORAL_TIMELESS,
@@ -690,6 +711,9 @@ _INTERACTION_METRIC_PREDICATES = {
     "response_engagement": "interaction.response_engagement",
     "reply_engagement": "interaction.response_engagement",
     "emotional_disclosure": "interaction.emotional_disclosure",
+    "conflict_frequency": "interaction.conflict_frequency",
+    "conflict_trend": "interaction.conflict_frequency",
+    "argument_frequency": "interaction.conflict_frequency",
 }
 
 _PREFERENCE_PREDICATES = {
@@ -713,8 +737,12 @@ _PREFERENCE_PREDICATES = {
     "lifestyle": "preference.lifestyle.habit",
     "relationship": "preference.relationship.partner_trait",
     "relationship_preference": "preference.relationship.partner_trait",
+    "partner_trait": "preference.relationship.partner_trait",
+    "interaction_style": "preference.relationship.interaction_style",
+    "emotional_need": "preference.relationship.emotional_need",
     "communication": "preference.communication.style",
     "communication_preference": "preference.communication.style",
+    "communication_style": "preference.communication.style",
     "value": "preference.value.priority",
     "value_preference": "preference.value.priority",
 }
@@ -732,7 +760,10 @@ _PREFERENCE_DOMAIN_DIMENSIONS = {
     ("consumption", "item"): "preference.consumption.item",
     ("lifestyle", "habit"): "preference.lifestyle.habit",
     ("relationship", "partner_trait"): "preference.relationship.partner_trait",
+    ("relationship", "interaction_style"): "preference.relationship.interaction_style",
+    ("relationship", "emotional_need"): "preference.relationship.emotional_need",
     ("communication", "style"): "preference.communication.style",
+    ("communication", "communication_style"): "preference.communication.style",
     ("value", "priority"): "preference.value.priority",
 }
 
@@ -779,8 +810,12 @@ _PREFERENCE_DOMAIN_BY_TYPE = {
     "lifestyle": "lifestyle",
     "relationship": "relationship",
     "relationship_preference": "relationship",
+    "partner_trait": "relationship",
+    "interaction_style": "relationship",
+    "emotional_need": "relationship",
     "communication": "communication",
     "communication_preference": "communication",
+    "communication_style": "communication",
     "value": "value",
     "value_preference": "value",
 }

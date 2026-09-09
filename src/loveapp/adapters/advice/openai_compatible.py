@@ -594,6 +594,7 @@ def _compact_memory_item(item) -> dict:
         "period_end": item.period_end.isoformat() if item.period_end else None,
         "expires_at": item.expires_at.isoformat() if item.expires_at else None,
         "perspective": item.perspective.value,
+        "epistemic_status": item.epistemic_status.value,
         "confidence": item.confidence,
         "importance": item.importance,
         "status": item.status.value,

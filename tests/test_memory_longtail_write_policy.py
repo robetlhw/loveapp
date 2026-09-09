@@ -218,7 +218,7 @@ def test_none_update_policy_fails_closed_instead_of_returning_update(monkeypatch
     assert resolution.rule_name == "canonical_update_policy_protected"
 
 
-def test_event_and_pattern_with_same_predicate_are_complementary() -> None:
+def test_event_and_pattern_with_same_predicate_use_evidence_only_boundary() -> None:
     target = _memory(
         "pattern",
         _canonical_candidate(
@@ -242,9 +242,9 @@ def test_event_and_pattern_with_same_predicate_are_complementary() -> None:
         incoming_status=MemoryStatus.CONFIRMED,
     )
 
-    assert resolution.relation.value == "complementary"
-    assert resolution.target_memory_ids == ("pattern",)
-    assert resolution.rule_name == "event_pattern_boundary"
+    assert resolution.relation.value == "unrelated"
+    assert resolution.target_memory_ids == ()
+    assert resolution.rule_name == "event_pattern_evidence_only"
 
 
 def test_relation_ranking_prefers_exact_predicate_before_embedding_score() -> None:

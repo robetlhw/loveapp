@@ -16,6 +16,7 @@ from loveapp.domain.memory import (
     AtomicClaim,
     AtomicExtraction,
     DiscardedSpan,
+    EpistemicStatus,
     EvidenceExplicitness,
     MemoryKind,
     MemoryPerspective,
@@ -718,6 +719,7 @@ def _normalize_enum_aliases(payload: dict[str, object]) -> bool:
         if kind_key in {"belief", "user_belief"}:
             claim["kind"] = "stable_fact"
             claim["perspective"] = "user_belief"
+            claim["epistemic_status"] = "uncertain"
             changed = True
         elif kind_key in kind_aliases:
             claim["kind"] = kind_aliases[kind_key]
@@ -744,6 +746,24 @@ def _normalize_enum_aliases(payload: dict[str, object]) -> bool:
         ):
             claim["perspective"] = perspective_key
             changed = True
+        epistemic_aliases = {
+            "fact": EpistemicStatus.CONFIRMED.value,
+            "certain": EpistemicStatus.CONFIRMED.value,
+            "belief": EpistemicStatus.UNCERTAIN.value,
+            "possible": EpistemicStatus.UNCERTAIN.value,
+            "speculation": EpistemicStatus.HYPOTHESIS.value,
+            "forecast": EpistemicStatus.PREDICTION.value,
+        }
+        epistemic_key = _enum_key(claim.get("epistemic_status"))
+        if epistemic_key in epistemic_aliases:
+            claim["epistemic_status"] = epistemic_aliases[epistemic_key]
+            changed = True
+        elif (
+            epistemic_key in {item.value for item in EpistemicStatus}
+            and claim.get("epistemic_status") != epistemic_key
+        ):
+            claim["epistemic_status"] = epistemic_key
+            changed = True
         relationship_impact_aliases = {
             "supportive": RelationshipImpact.IMPROVING.value,
             "positive": RelationshipImpact.IMPROVING.value,
@@ -761,6 +781,7 @@ def _normalize_enum_aliases(payload: dict[str, object]) -> bool:
             ("temporal_precision", TemporalPrecision),
             ("valence", MemoryValence),
             ("relationship_impact", RelationshipImpact),
+            ("epistemic_status", EpistemicStatus),
             ("predicate_type", PredicateType),
             ("explicitness", EvidenceExplicitness),
         ):

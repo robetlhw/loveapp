@@ -16,6 +16,7 @@ from loveapp.domain.memory import (
     PredicateType,
     utc_now,
 )
+from loveapp.domain.memory_epistemics import is_epistemically_confirmed
 from loveapp.domain.memory_lifecycle import MemoryRole, memory_role
 from loveapp.domain.memory_semantic_relation import (
     LongTailCandidateMatch,
@@ -23,6 +24,7 @@ from loveapp.domain.memory_semantic_relation import (
     LongTailRelationValidation,
     SemanticRelationProposal,
 )
+from loveapp.domain.memory_type_compatibility import assess_memory_type_compatibility
 from loveapp.ports.memory import SemanticRelationJudge
 from loveapp.ports.observability import TraceRecorder
 
@@ -90,6 +92,10 @@ class LongTailRelationCandidateRetriever:
             and item.relationship_id == relationship_id
             and item.status in _ACTIVE_STATUSES
             and item.predicate_type == PredicateType.CUSTOM
+            and assess_memory_type_compatibility(
+                incoming,
+                item,
+            ).semantic_relation_allowed
             and not _is_expired(item, reference_time)
         ]
         if not eligible:
@@ -144,6 +150,10 @@ class LongTailSemanticRelationValidator:
         all_targets_found = len(targets) == len(target_ids) and (
             bool(targets) or not relation_requires_target
         )
+        target_compatibilities = {
+            item.id: assess_memory_type_compatibility(incoming, item)
+            for item in targets
+        }
 
         def targets_satisfy(check) -> bool:
             if not all_targets_found:
@@ -177,6 +187,15 @@ class LongTailSemanticRelationValidator:
             "kind_compatible": targets_satisfy(
                 lambda item: item.kind == incoming.kind
             ),
+            "type_compatible": targets_satisfy(
+                lambda item: target_compatibilities[item.id].semantic_relation_allowed
+            ),
+            "relation_type_allowed": targets_satisfy(
+                lambda item: target_compatibilities[item.id].allows(proposal.relation)
+            ),
+            "lifecycle_replace_allowed": targets_satisfy(
+                lambda item: target_compatibilities[item.id].lifecycle_replace_allowed
+            ),
             "same_semantic_dimension": proposal.same_semantic_dimension,
             "proposal_confidence_sufficient": (
                 proposal.confidence >= self._proposal_confidence_threshold
@@ -188,7 +207,7 @@ class LongTailSemanticRelationValidator:
                 incoming.explicitness == EvidenceExplicitness.EXPLICIT
                 and bool(incoming.evidence_spans)
                 and not incoming.requires_inference
-                and incoming.perspective == MemoryPerspective.USER_REPORTED
+                and is_epistemically_confirmed(incoming)
             ),
             "admission_sufficient": (
                 incoming_status == MemoryStatus.CONFIRMED
@@ -243,6 +262,8 @@ class LongTailSemanticRelationValidator:
         }
         destructive_checks = base_checks | {
             "subject_compatible",
+            "type_compatible",
+            "relation_type_allowed",
             "kind_compatible",
             "same_semantic_dimension",
             "proposal_confidence_sufficient",
@@ -255,8 +276,13 @@ class LongTailSemanticRelationValidator:
             "event_pattern_state_protection",
             "destructive_role_eligible",
             "confirmed_protection",
+            "lifecycle_replace_allowed",
         }
-        targeted_checks = base_checks | {"subject_compatible"}
+        targeted_checks = base_checks | {
+            "subject_compatible",
+            "type_compatible",
+            "relation_type_allowed",
+        }
         same_checks = targeted_checks | {
             "kind_compatible",
             "same_semantic_dimension",

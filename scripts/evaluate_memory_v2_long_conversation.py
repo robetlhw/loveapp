@@ -21,6 +21,13 @@ from loveapp.bootstrap import build_memory_container
 from loveapp.core.config import get_settings
 from loveapp.domain.memory import MemoryStatus
 
+DEFAULT_DATASET_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "evals"
+    / "memory"
+    / "memory_v2_2_refinement_long_conversation.jsonl"
+)
+
 CASES: list[dict[str, Any]] = [
     {
         "case_id": "LC-001",
@@ -175,6 +182,17 @@ def _arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output", type=Path, help="JSON output path.")
     parser.add_argument("--markdown", type=Path, help="Markdown output path.")
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        default=DEFAULT_DATASET_PATH,
+        help="JSONL V2.2 conversation dataset path.",
+    )
+    parser.add_argument(
+        "--legacy-embedded",
+        action="store_true",
+        help="Run the original embedded V2 dataset instead of the V2.2 JSONL set.",
+    )
     return parser
 
 
@@ -191,10 +209,12 @@ def _short_memory(item: dict[str, Any]) -> dict[str, Any]:
         "state_dimension",
         "state_value",
         "perspective",
+        "epistemic_status",
         "importance",
         "confidence",
         "supersedes_id",
         "source_message_id",
+        "payload",
     )
     return {key: item.get(key) for key in keys}
 
@@ -209,7 +229,12 @@ def _case_result(
     gate_positive = 0
     claims = 0
     judge_called = 0
-    for report in reports:
+    single_event_expected = 0
+    single_event_pattern_errors = 0
+    belief_expected = 0
+    belief_as_fact_errors = 0
+    cluster_event_ids: set[str] = set()
+    for turn_definition, report in zip(case["turns"], reports, strict=True):
         gate = report.get("gate") or {}
         summary = report.get("summary") or {}
         if gate.get("should_extract"):
@@ -220,11 +245,63 @@ def _case_result(
         judge_called += int(
             bool((report.get("memory_pipeline") or {}).get("semantic_judge_called"))
         )
+        labels = _turn_labels(turn_definition)
+        changed = _changed_turn_memories(report)
+        if "single_event" in labels:
+            single_event_expected += 1
+            if any(
+                item.get("kind") == "interaction_pattern"
+                and not _is_evidence_backed_inferred_pattern(item)
+                for item in changed
+            ):
+                single_event_pattern_errors += 1
+        if "cluster_event" in labels:
+            cluster_event_ids.update(
+                str(item["id"])
+                for item in changed
+                if item.get("kind") == "interaction_event" and item.get("id")
+            )
+        if "belief" in labels:
+            belief_expected += 1
+            if any(
+                item.get("perspective") == "user_reported"
+                and item.get("epistemic_status", "confirmed") == "confirmed"
+                and item.get("kind") != "preference"
+                for item in changed
+            ):
+                belief_as_fact_errors += 1
     active = [
-        _short_memory(item)
-        for item in final_all
-        if item.get("status") in {"proposed", "confirmed"}
+        _short_memory(item) for item in final_all if item.get("status") in {"proposed", "confirmed"}
     ]
+    inferred_patterns = [
+        item
+        for item in final_all
+        if item.get("kind") == "interaction_pattern" and item.get("perspective") == "model_inferred"
+    ]
+    pattern_without_evidence = sum(
+        not isinstance((item.get("payload") or {}).get("evidence_ids"), list)
+        or len((item.get("payload") or {}).get("evidence_ids") or []) < 2
+        or not (item.get("payload") or {}).get("time_window")
+        for item in inferred_patterns
+    )
+    consolidation_expected = bool(case.get("expect_pattern_consolidation"))
+    final_event_ids = {
+        str(item["id"])
+        for item in final_all
+        if item.get("kind") == "interaction_event" and item.get("id")
+    }
+    consolidation_succeeded = bool(
+        consolidation_expected
+        and cluster_event_ids
+        and any(
+            _pattern_covers_event_cluster(
+                item,
+                cluster_event_ids=cluster_event_ids,
+                final_event_ids=final_event_ids,
+            )
+            for item in inferred_patterns
+        )
+    )
     return {
         "case_id": case["case_id"],
         "difficulty": case["difficulty"],
@@ -240,7 +317,140 @@ def _case_result(
         "final_active_memory_count": len(active),
         "final_active_memories": active,
         "final_all_memory_count": len(final_all),
+        "v22_metrics": {
+            "single_event_expected_count": single_event_expected,
+            "single_event_to_pattern_count": single_event_pattern_errors,
+            "belief_expected_count": belief_expected,
+            "belief_as_fact_count": belief_as_fact_errors,
+            "pattern_without_evidence": pattern_without_evidence,
+            "event_cluster_to_pattern_expected": int(consolidation_expected),
+            "event_cluster_to_pattern_succeeded": int(consolidation_succeeded),
+        },
         "turns": reports,
+    }
+
+
+def _turn_text(turn: object) -> str:
+    if isinstance(turn, str):
+        return turn
+    if isinstance(turn, dict) and isinstance(turn.get("text"), str):
+        return turn["text"]
+    raise ValueError("each conversation turn must be a string or contain text")
+
+
+def _turn_labels(turn: object) -> set[str]:
+    if not isinstance(turn, dict):
+        return set()
+    labels = turn.get("labels")
+    if not isinstance(labels, list):
+        return set()
+    return {str(value) for value in labels}
+
+
+def _changed_turn_memories(report: dict[str, Any]) -> list[dict[str, Any]]:
+    diff = report.get("diff") or {}
+    changed = [item for item in diff.get("added") or [] if isinstance(item, dict)]
+    for category in ("merged", "updated"):
+        for item in diff.get(category) or []:
+            memory = item.get("memory") if isinstance(item, dict) else None
+            if isinstance(memory, dict):
+                changed.append(memory)
+    return changed
+
+
+def _valid_time_window(item: dict[str, Any]) -> bool:
+    window = (item.get("payload") or {}).get("time_window")
+    return bool(
+        isinstance(window, dict)
+        and isinstance(window.get("start"), str)
+        and window["start"].strip()
+        and isinstance(window.get("end"), str)
+        and window["end"].strip()
+    )
+
+
+def _is_evidence_backed_inferred_pattern(item: dict[str, Any]) -> bool:
+    payload = item.get("payload") or {}
+    evidence_ids = payload.get("evidence_ids")
+    return bool(
+        item.get("kind") == "interaction_pattern"
+        and item.get("perspective") == "model_inferred"
+        and payload.get("source") == "model_inferred"
+        and isinstance(evidence_ids, list)
+        and len({str(value) for value in evidence_ids if value}) >= 3
+        and _valid_time_window(item)
+    )
+
+
+def _pattern_covers_event_cluster(
+    item: dict[str, Any],
+    *,
+    cluster_event_ids: set[str],
+    final_event_ids: set[str],
+) -> bool:
+    if not _is_evidence_backed_inferred_pattern(item):
+        return False
+    evidence_ids = {
+        str(value) for value in (item.get("payload") or {}).get("evidence_ids") or [] if value
+    }
+    return evidence_ids <= final_event_ids and cluster_event_ids <= evidence_ids
+
+
+def _load_dataset(path: Path) -> list[dict[str, Any]]:
+    cases: list[dict[str, Any]] = []
+    for line_number, raw_line in enumerate(
+        path.read_text(encoding="utf-8-sig").splitlines(),
+        start=1,
+    ):
+        line = raw_line.strip()
+        if not line:
+            continue
+        item = json.loads(line)
+        if not isinstance(item, dict):
+            raise ValueError(f"dataset line {line_number} is not an object")
+        turns = item.get("turns")
+        if not isinstance(turns, list) or not 5 <= len(turns) <= 10:
+            raise ValueError(f"dataset line {line_number} must contain 5-10 turns")
+        for turn in turns:
+            _turn_text(turn)
+        cases.append(item)
+    if len(cases) != 10:
+        raise ValueError(f"V2.2 dataset must contain exactly 10 conversations, got {len(cases)}")
+    return cases
+
+
+def _select_cases(
+    cases: list[dict[str, Any]],
+    case_ids: list[str] | None,
+) -> list[dict[str, Any]]:
+    if not case_ids:
+        return cases
+    wanted = {item.casefold() for item in case_ids}
+    selected = [item for item in cases if item["case_id"].casefold() in wanted]
+    missing = wanted - {item["case_id"].casefold() for item in selected}
+    if missing:
+        raise ValueError(f"Unknown case id(s): {', '.join(sorted(missing))}")
+    return selected
+
+
+def _aggregate_v22_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
+    counts = Counter()
+    for result in results:
+        counts.update(result.get("v22_metrics") or {})
+    single_total = counts["single_event_expected_count"]
+    belief_total = counts["belief_expected_count"]
+    cluster_total = counts["event_cluster_to_pattern_expected"]
+    return {
+        **dict(counts),
+        "single_event_to_pattern_rate": (
+            counts["single_event_to_pattern_count"] / single_total if single_total else 0.0
+        ),
+        "belief_as_fact_rate": (
+            counts["belief_as_fact_count"] / belief_total if belief_total else 0.0
+        ),
+        "event_cluster_to_pattern_success": (
+            counts["event_cluster_to_pattern_succeeded"] / cluster_total if cluster_total else 0.0
+        ),
     }
 
 
@@ -267,6 +477,12 @@ def _render_markdown(payload: dict[str, Any], json_path: Path) -> str:
         f"- Extracted claims: {payload['totals']['extracted_claim_count']}",
         f"- Final active memories: {payload['totals']['final_active_memory_count']}",
         f"- Semantic Judge called turns: {payload['totals']['semantic_judge_called_turns']}",
+        f"- single_event_to_pattern_rate: "
+        f"{payload['v22_metrics']['single_event_to_pattern_rate']:.4f}",
+        f"- pattern_without_evidence: {payload['v22_metrics']['pattern_without_evidence']}",
+        f"- belief_as_fact_rate: {payload['v22_metrics']['belief_as_fact_rate']:.4f}",
+        f"- event_cluster_to_pattern_success: "
+        f"{payload['v22_metrics']['event_cluster_to_pattern_success']:.4f}",
         "",
         "| Case | Level | Turns | Gate true | Claims | Active final | Effects |",
         "|---|---|---:|---:|---:|---:|---|",
@@ -361,7 +577,8 @@ async def _run(selected: list[dict[str, Any]]) -> dict[str, Any]:
                 limit=200,
             )
             reports: list[dict[str, Any]] = []
-            for text in case["turns"]:
+            for turn_definition in case["turns"]:
+                text = _turn_text(turn_definition)
                 reports.append(await inspector.execute_turn(text))
             final_all = await inspector.list_memories(include_all=True)
             result = _case_result(case, reports, final_all)
@@ -375,7 +592,7 @@ async def _run(selected: list[dict[str, Any]]) -> dict[str, Any]:
     finally:
         await container.aclose()
     return {
-        "dataset": "Memory V2 Long Conversation Evaluation Dataset v2",
+        "dataset": "Memory V2.2 Refinement Long Conversation Evaluation",
         "generated_at": datetime.now(UTC).isoformat(),
         "mode": "live_v2",
         "route_enabled": False,
@@ -398,24 +615,21 @@ async def _run(selected: list[dict[str, Any]]) -> dict[str, Any]:
                 item["semantic_judge_called_turns"] for item in results
             ),
         },
+        "v22_metrics": _aggregate_v22_metrics(results),
         "cases": results,
     }
 
 
 def main() -> int:
     args = _arg_parser().parse_args()
-    selected = CASES
-    if args.case_ids:
-        wanted = {item.casefold() for item in args.case_ids}
-        selected = [item for item in CASES if item["case_id"].casefold() in wanted]
-        missing = wanted - {item["case_id"].casefold() for item in selected}
-        if missing:
-            raise SystemExit(f"Unknown case id(s): {', '.join(sorted(missing))}")
+    selected = CASES if args.legacy_embedded else _load_dataset(args.dataset)
+    try:
+        selected = _select_cases(selected, args.case_ids)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     payload = asyncio.run(_run(selected))
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    json_path = args.output or Path(
-        f".data/evals/memory_v2_long_conversation_eval_v2_{stamp}.json"
-    )
+    json_path = args.output or Path(f".data/evals/memory_v2_long_conversation_eval_v2_{stamp}.json")
     markdown_path = args.markdown or Path(
         f".data/evals/memory_v2_long_conversation_eval_v2_{stamp}.md"
     )
