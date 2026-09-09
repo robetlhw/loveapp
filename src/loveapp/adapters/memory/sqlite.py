@@ -1250,6 +1250,7 @@ class SQLiteMemoryStore:
                     source_message_id=batch.source_message_id,
                     target_memory_ids=draft.target_memory_ids,
                     relation=draft.relation,
+                    mutation_action=draft.mutation_action,
                     decision=draft.decision,
                     rule_name=draft.rule_name,
                     admission_score=draft.admission_score,

@@ -159,7 +159,7 @@ def resolve_operation_target_ids(
     return list(dict.fromkeys(resolved))
 
 
-def infer_mutation_action(
+def plan_mutation_action(
     relation: ClaimRelation,
     *,
     rule_name: str = "",
@@ -181,3 +181,18 @@ def infer_mutation_action(
     if relation == ClaimRelation.COMPLEMENTARY:
         return MutationAction.LINK if target_memory_ids else MutationAction.CREATE
     return MutationAction.CREATE
+
+
+def infer_mutation_action(
+    relation: ClaimRelation,
+    *,
+    rule_name: str = "",
+    target_memory_ids: list[str] | tuple[str, ...] = (),
+) -> MutationAction:
+    """Backward-compatible name for the governed mutation planner."""
+
+    return plan_mutation_action(
+        relation,
+        rule_name=rule_name,
+        target_memory_ids=target_memory_ids,
+    )
