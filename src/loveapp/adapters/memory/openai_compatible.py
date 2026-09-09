@@ -789,6 +789,9 @@ def _build_attempt(
         repair_result=(
             str(details.get("repair_result"))[:500] if details.get("repair_result") else None
         ),
+        extraction_strategy="single_stage",
+        stage="single",
+        fallback_used=False,
         upgrade_reason=(
             str(details.get("upgrade_reason")) if details.get("upgrade_reason") else None
         ),

@@ -139,6 +139,7 @@ class TwoStageMemoryExtractor:
             return extraction
         except Exception as exc:
             _flush_attempts(attempts, attempt_callback)
+            fallback_attempts: list[MemoryExtractionAttempt] = []
             fallback = await self._fallback_extract(
                 text,
                 reference_time=reference_time,
@@ -146,8 +147,19 @@ class TwoStageMemoryExtractor:
                 conversation_history=conversation_history,
                 pending_memory_context=pending_memory_context,
                 trace=trace,
-                attempt_callback=attempt_callback,
+                attempt_callback=fallback_attempts.append,
             )
+            for attempt in fallback_attempts:
+                if attempt_callback is not None:
+                    attempt_callback(
+                        attempt.model_copy(
+                            update={
+                                "extraction_strategy": "single_stage",
+                                "stage": "fallback",
+                                "fallback_used": True,
+                            }
+                        )
+                    )
             if fallback is not None:
                 return fallback
             if trace is not None:
@@ -485,6 +497,9 @@ def _build_attempt(
         extraction_status=details.get("failure_category"),
         failure_category=details.get("failure_category"),
         raw_model_response=details.get("raw_model_response"),
+        extraction_strategy="two_stage",
+        stage=str(details.get("stage")) if details.get("stage") else None,
+        fallback_used=False,
         error=error,
     )
 

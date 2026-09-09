@@ -434,6 +434,12 @@ class MemoryExtractionAttempt(BaseModel):
     upgrade_reason: str | None = None
     discard_reason: str | None = None
     retry_reason: str | None = None
+    # Optional strategy/stage metadata used by shadow evaluations.  These
+    # fields are intentionally additive so existing persisted extraction-run
+    # JSON remains readable without a Store migration.
+    extraction_strategy: str | None = None
+    stage: str | None = None
+    fallback_used: bool = False
     error: str | None = None
 
 
