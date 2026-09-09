@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from loveapp.adapters.memory import InMemoryMemoryStore, SQLiteMemoryStore
-from loveapp.application.memory import MemoryService
+from loveapp.application.memory import MemoryService, _event_can_support_state
 from loveapp.domain.advice import RelationshipContext
 from loveapp.domain.memory import (
     AdmissionDecision,
@@ -239,3 +239,17 @@ def test_mutation_action_is_separate_from_claim_relation() -> None:
     operation = _operation(candidate, action=MutationAction.SUPERSEDE)
     assert operation.relation == ClaimRelation.UNRELATED
     assert operation.mutation_action == MutationAction.SUPERSEDE
+
+
+def test_unrelated_event_is_not_semantically_compatible_with_contact_state() -> None:
+    unrelated = _event("我今天买了一杯咖啡").model_copy(
+        update={"payload": {"event_type": "unknown_activity"}}
+    ).to_candidate()
+    contact_state = _active_state("她最近回复越来越慢").to_candidate().model_copy(
+        update={
+            "canonical_predicate": "interaction.response_engagement",
+            "state_dimension": "interaction.response_engagement",
+            "state_value": "slow",
+        }
+    )
+    assert _event_can_support_state(unrelated, contact_state) is False

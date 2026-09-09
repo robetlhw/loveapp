@@ -45,6 +45,7 @@ from loveapp.domain.memory import (
 )
 from loveapp.domain.memory_context import select_context_memories
 from loveapp.domain.memory_dimensions import (
+    is_relationship_interaction_subject,
     normalize_state_dimension,
     normalize_state_value,
 )
@@ -2812,7 +2813,12 @@ def _event_can_support_state(
     event: MemoryCandidate,
     state: MemoryCandidate,
 ) -> bool:
-    if event.subject.casefold() != state.subject.casefold():
+    same_subject = event.subject.casefold() == state.subject.casefold()
+    interaction_scope = (
+        is_relationship_interaction_subject(event.subject)
+        and is_relationship_interaction_subject(state.subject)
+    )
+    if not same_subject and not interaction_scope:
         return False
     dimension = (state.state_dimension or "").casefold()
     event_type = str(event.payload.get("event_type") or "").casefold()
@@ -2824,7 +2830,30 @@ def _event_can_support_state(
             token in event_text for token in ("conflict", "argument", "quarrel", "cold_war")
         )
     if "contact" in dimension or "response" in dimension or "engagement" in dimension:
-        return True
+        return event_type in {
+            "conversation",
+            "shared_activity",
+            "date",
+            "conflict",
+            "reconciliation",
+            "affection_expression",
+            "support",
+        } or any(
+            token in event_text
+            for token in (
+                "contact",
+                "reply",
+                "response",
+                "message",
+                "chat",
+                "conversation",
+                "联系",
+                "回复",
+                "消息",
+                "聊天",
+                "见面",
+            )
+        )
     if "stage" in dimension:
         return event_type in {
             "date",
