@@ -39,11 +39,12 @@ class _PendingMemoryQuestion:
 
 @dataclass(frozen=True)
 class _L0RouteMatch:
-    semantic_reason: MemorySemanticGateReason
+    semantic_reason: MemorySemanticGateReason | None
     signal: str
     rule: str
     span: str
     legacy_reason: MemoryGateReason = MemoryGateReason.DURABLE_SIGNAL
+    category: str | None = None
 
 
 class MemoryGate:
@@ -413,20 +414,25 @@ class MemoryGate:
             existing_memories=existing_memories,
             active_task=active_task,
         )
-        if legacy.contextual_probe and (
-            legacy.reason == MemoryGateReason.CONTEXTUAL_UPDATE
-            or legacy.target_guard_result is not None
-        ):
-            # Keep the existing antecedent resolver's authorization result.
-            # V2 may send an unresolved contextual turn to Flash for semantic
-            # review, but Flash must never turn a denied target guard into a
-            # write authorization.
+        if legacy.contextual_probe:
+            # Preserve every contextual signal discovered by the legacy gate,
+            # including history-derived frequency/correction/restoration cues.
+            # V2 only changes the L0 route; antecedent/lifecycle authorization
+            # remains owned by the resolver and any denied target guard stays
+            # observable on the decision.
             return legacy.model_copy(
                 update={
                     "should_extract": True,
-                    "l0_route": MemoryL0Route.SEMANTIC_REVIEW,
+                    "l0_route": MemoryL0Route.POSSIBLE_MEMORY,
+                    "l0_route_label": "POSSIBLE_MEMORY",
                     "l0_semantic_hint": None,
                     "semantic_gate_reason": None,
+                    "contextual_signal_category": _contextual_signal_category(
+                        legacy
+                    ),
+                    "signals": list(
+                        dict.fromkeys(["l0_POSSIBLE_MEMORY", *legacy.signals])
+                    ),
                     "history_loaded_for_gate": bool(history),
                 }
             )
@@ -440,6 +446,8 @@ class MemoryGate:
                 matched_span=hard_drop.span,
                 history_loaded=bool(history),
                 legacy_reason=hard_drop.legacy_reason,
+                route_label="HARD_DROP",
+                durable_signal_category=hard_drop.category,
             )
 
         hard_pass = _l0_hard_pass(normalized)
@@ -451,16 +459,36 @@ class MemoryGate:
                 matched_rule=hard_pass.rule,
                 matched_span=hard_pass.span,
                 history_loaded=bool(history),
+                route_label="HARD_PASS",
+                durable_signal_category=hard_pass.category,
             )
 
+        possible = _l0_possible_memory(normalized, legacy)
+        if possible is not None:
+            return _v2_decision(
+                MemoryL0Route.POSSIBLE_MEMORY,
+                semantic_reason=possible.semantic_reason,
+                signal=possible.signal,
+                matched_rule=possible.rule,
+                matched_span=possible.span,
+                history_loaded=bool(history),
+                legacy_decision=legacy,
+                route_label="POSSIBLE_MEMORY",
+                durable_signal_category=possible.category,
+            )
+
+        # A non-hard-dropped turn is still intentionally delegated to the
+        # semantic extractor.  Mark it with the new semantic route label while
+        # preserving the legacy enum value used by frozen reports.
         return _v2_decision(
-            MemoryL0Route.SEMANTIC_REVIEW,
+            MemoryL0Route.POSSIBLE_MEMORY,
             semantic_reason=None,
             signal=(legacy.signals[0] if legacy.signals else "semantic_review"),
             matched_rule=legacy.matched_rule or "semantic_review_default",
             matched_span=legacy.matched_span,
             history_loaded=bool(history),
             legacy_decision=legacy,
+            route_label="POSSIBLE_MEMORY",
         )
 
 
@@ -476,10 +504,14 @@ def _v2_decision(
     legacy_decision: MemoryGateDecision | None = None,
     pending_memory_context: PendingMemoryContext | None = None,
     pending_memory_context_source: str | None = None,
+    route_label: str | None = None,
+    durable_signal_category: str | None = None,
+    contextual_signal_category: str | None = None,
 ) -> MemoryGateDecision:
-    signals = [f"l0_{route.value}", signal]
+    effective_route_label = route_label or route.value
+    signals = [f"l0_{effective_route_label}", signal]
     if legacy_decision is not None:
-        signals = list(dict.fromkeys([f"l0_{route.value}", *legacy_decision.signals]))
+        signals = list(dict.fromkeys([f"l0_{effective_route_label}", *legacy_decision.signals]))
     return MemoryGateDecision(
         should_extract=route != MemoryL0Route.HARD_DROP,
         reason=(
@@ -492,7 +524,10 @@ def _v2_decision(
         matched_span=matched_span,
         history_loaded_for_gate=history_loaded,
         l0_route=route,
+        l0_route_label=effective_route_label,
         l0_semantic_hint=semantic_reason,
+        durable_signal_category=durable_signal_category,
+        contextual_signal_category=contextual_signal_category,
         pending_memory_context=pending_memory_context,
         pending_memory_context_source=pending_memory_context_source,
     )
@@ -700,6 +735,7 @@ def _l0_hard_drop(
             rule="l0_acknowledgement",
             span=text,
             legacy_reason=MemoryGateReason.CASUAL,
+            category="acknowledgement",
         )
     if (
         legacy.reason == MemoryGateReason.CONSULTATION_ONLY
@@ -713,6 +749,7 @@ def _l0_hard_drop(
             rule=legacy.matched_rule or "l0_relationship_action_consultation",
             span=legacy.matched_span or text,
             legacy_reason=legacy.reason,
+            category="consultation",
         )
     casual = _first_match(text, _L0_SMALL_TALK_PATTERNS, "l0_small_talk")
     if casual is not None:
@@ -722,6 +759,30 @@ def _l0_hard_drop(
             rule=casual.rule,
             span=casual.span,
             legacy_reason=MemoryGateReason.CASUAL,
+            category="small_talk",
+        )
+    clear_transient = _first_match(
+        text,
+        _L0_CLEAR_TRANSIENT_PATTERNS,
+        "l0_clear_transient",
+    )
+    if clear_transient is not None:
+        consultation_like = clear_transient.rule.endswith("_2")
+        return _L0RouteMatch(
+            semantic_reason=(
+                MemorySemanticGateReason.NO_MEMORY
+                if consultation_like
+                else MemorySemanticGateReason.TRANSIENT
+            ),
+            signal="pure_consultation" if consultation_like else "clear_transient",
+            rule=clear_transient.rule,
+            span=clear_transient.span,
+            legacy_reason=(
+                MemoryGateReason.CONSULTATION_ONLY
+                if consultation_like
+                else MemoryGateReason.NO_DURABLE_SIGNAL
+            ),
+            category="consultation" if consultation_like else "transient",
         )
     if legacy.reason in {
         MemoryGateReason.CASUAL,
@@ -740,6 +801,11 @@ def _l0_hard_drop(
             rule=legacy.matched_rule or f"l0_{legacy.reason.value}",
             span=legacy.matched_span or text,
             legacy_reason=legacy.reason,
+            category=(
+                "small_talk"
+                if legacy.reason == MemoryGateReason.CASUAL
+                else "no_memory"
+            ),
         )
     if not legacy.should_extract:
         consultation = _first_match(
@@ -754,6 +820,7 @@ def _l0_hard_drop(
                 rule=consultation.rule,
                 span=consultation.span,
                 legacy_reason=MemoryGateReason.CONSULTATION_ONLY,
+                category="consultation",
             )
     unrelated = _first_match(
         text,
@@ -767,6 +834,7 @@ def _l0_hard_drop(
             rule=unrelated.rule,
             span=unrelated.span,
             legacy_reason=MemoryGateReason.NO_DURABLE_SIGNAL,
+            category="unrelated_transient",
         )
     return None
 
@@ -779,6 +847,7 @@ def _l0_hard_pass(text: str) -> _L0RouteMatch | None:
             signal="explicit_remember",
             rule="l0_explicit_remember",
             span=explicit_remember.group(0),
+            category="explicit_fact",
         )
     if _L0_SEMANTIC_REVIEW_CUE_PATTERN.search(text) is not None:
         return None
@@ -790,8 +859,80 @@ def _l0_hard_pass(text: str) -> _L0RouteMatch | None:
                 signal=signal,
                 rule=rule,
                 span=match.group(0),
+                category=_hard_pass_category(semantic_reason),
             )
     return None
+
+
+def _l0_possible_memory(
+    text: str,
+    legacy: MemoryGateDecision,
+) -> _L0RouteMatch | None:
+    """Classify a possible-memory hand-off without authorizing a write.
+
+    L0 is deliberately conservative about *dropping* but does not attempt to
+    normalize claims or choose a lifecycle target.  The bounded rules below
+    exist for observability and semantic hints; Extraction/Admission remains
+    the authority for the final memory decision.
+    """
+
+    for semantic_reason, category, rule, pattern in _L0_POSSIBLE_MEMORY_RULES:
+        match = pattern.search(text)
+        if match is not None:
+            return _L0RouteMatch(
+                semantic_reason=semantic_reason,
+                signal=category,
+                rule=rule,
+                span=match.group(0),
+                category=category,
+            )
+
+    for signal, (_semantic_reason, category) in _LEGACY_SIGNAL_CATEGORIES.items():
+        if signal not in legacy.signals:
+            continue
+        match = _first_signal_match(text, [signal])
+        if match is None:
+            if signal == "interaction_decline":
+                match = _find_interaction_decline(text)
+            elif signal == "interaction_qualifier":
+                match = _find_interaction_qualifier(text)
+        if match is not None:
+            return _L0RouteMatch(
+                # Legacy signal names are intentionally not promoted to a
+                # semantic hint: older callers rely on ambiguous turns being
+                # reviewed by Flash rather than being pre-labelled by L0.
+                semantic_reason=None,
+                signal=signal,
+                # Preserve the existing matched-rule contract for callers and
+                # frozen traces; the semantic route/category already exposes
+                # that this is a POSSIBLE_MEMORY hand-off.
+                rule=match.rule,
+                span=match.span,
+                category=category,
+            )
+    return None
+
+
+def _contextual_signal_category(decision: MemoryGateDecision) -> str | None:
+    if decision.contextual_update_type:
+        return decision.contextual_update_type
+    for signal in decision.signals:
+        if not signal.startswith("contextual_"):
+            continue
+        category = signal.removeprefix("contextual_")
+        if category not in {"history_derived", "signal", "memory_update"}:
+            return category
+    return None
+
+
+def _hard_pass_category(reason: MemorySemanticGateReason) -> str:
+    return {
+        MemorySemanticGateReason.STABLE_FACT: "explicit_fact",
+        MemorySemanticGateReason.PREFERENCE: "explicit_preference",
+        MemorySemanticGateReason.RELATIONSHIP_STATE: "relationship_state",
+        MemorySemanticGateReason.PLANNED_EVENT: "planned_event",
+        MemorySemanticGateReason.ACTION_INTENT: "action_intent",
+    }.get(reason, reason.value.casefold())
 
 
 def _normalize(value: str) -> str:
@@ -957,6 +1098,18 @@ _L0_SMALL_TALK_PATTERNS = (
         r"联系|回复|见面))(?:哈){2,}.{0,16}[。.!！~～]*$"
     ),
 )
+# A very small explicit transient set is safer than treating every emotional
+# sentence as disposable.  More ambiguous feelings remain on the possible-
+# memory path so the semantic extractor can decide whether they are durable.
+_L0_CLEAR_TRANSIENT_PATTERNS = (
+    re.compile(
+        r"^(?:我)?今天(?:有点|比较|特别|太)?(?:好累|很累|累了|累)(?:啊|呀|呢)?[。.!！~～]*$"
+    ),
+    re.compile(r"^(?:今天|现在|今晚)(?:吃什么|做什么|干什么|去哪(?:里)?)[?？。.!！]*$"),
+    re.compile(
+        r"^(?:今天)?天气(?:挺|很|真)?(?:不错|好|一般|不太好|晴朗|很热|很冷|下雨)[。.!！~～]*$"
+    ),
+)
 _L0_PURE_CONSULTATION_PATTERNS = (
     re.compile(r"^(?:那)?我(?:现在)?(?:应该|该|要)?怎么(?:回|回复|说|做|处理).*[?？]?$"),
     re.compile(r"^你觉得.{0,24}(?:正常|合适|合理)吗[?？]?$"),
@@ -985,6 +1138,120 @@ _L0_SEMANTIC_REVIEW_CUE_PATTERN = re.compile(
     r"不确定|突然|最近|近来|这段时间|随口|没认真|还没|以前|之前)"
 )
 _L0_EXPLICIT_REMEMBER_PATTERN = re.compile(r"(?:请)?记住[：:]?|记一下[：:]?")
+
+# Reusable semantic categories for the extraction hand-off.  These patterns
+# intentionally require relationship/interaction language; a time word,
+# number, or generic "越来越" by itself is never enough to enter this path.
+_L0_POSSIBLE_MEMORY_RULES: tuple[
+    tuple[MemorySemanticGateReason, str, str, re.Pattern[str]],
+    ...,
+] = (
+    (
+        MemorySemanticGateReason.INTERACTION_PATTERN,
+        "historical_interaction_pattern",
+        "l0_possible_historical_interaction_pattern",
+        re.compile(
+            r"(?:刚认识|认识初期|以前|之前|曾经|当初|那时候|过去).{0,30}"
+            r"(?:我和她|我和他|我俩|我们|她|他|对方).{0,30}"
+            r"(?:经常|总是|每天|常常|通常|频繁|比较主动|主动.{0,10}"
+            r"(?:找我|联系|发消息|聊天|回复|约我))"
+        ),
+    ),
+    (
+        MemorySemanticGateReason.RELATIONSHIP_CHANGE,
+        "relationship_trend",
+        "l0_possible_relationship_trend",
+        re.compile(
+            r"(?:最近|近来|这段时间|这几天|过去(?:一段时间)?|前阵子).{0,24}"
+            r"(?:我和她|我和他|我俩|我们|她|他|对方|关系|矛盾|冲突|"
+            r"回复|联系|聊天|交流|沟通|见面|互动).{0,24}"
+            r"(?:越来越|变得|明显(?:变|减少|变慢|变少|变多|好|差)|"
+            r"减少|变慢|变少|变多|恶化|改善|恢复)"
+        ),
+    ),
+    (
+        MemorySemanticGateReason.PREFERENCE,
+        "emotional_reflection",
+        "l0_possible_emotional_reflection",
+        re.compile(
+            r"(?:我发现|我意识到|我慢慢发现|我开始发现|我越来越觉得).{0,24}"
+            r"(?:自己)?.{0,8}(?:更喜欢|喜欢|不喜欢|更愿意|倾向于|需要).{0,20}"
+            r"(?:安静|热闹|相处|沟通|交流|聊天|约会|陪伴|独处|空间|方式|节奏)"
+        ),
+    ),
+    (
+        MemorySemanticGateReason.RELATIONSHIP_STATE,
+        "relationship_current_state",
+        "l0_possible_relationship_current_state",
+        re.compile(
+            r"(?:我和她|我和他|我俩|我们).{0,20}"
+            r"(?:暧昧(?:关系)?|冷战|闹矛盾|有冲突|分手|复合|正式在一起|"
+            r"重新在一起)"
+        ),
+    ),
+    (
+        MemorySemanticGateReason.INTERACTION_PATTERN,
+        "quantified_interaction",
+        "l0_possible_quantified_interaction",
+        re.compile(
+            r"(?:我和她|我和他|我俩|我们|她|他|对方).{0,20}"
+            r"(?:每天|每周|一天|一周|每月).{0,14}"
+            r"(?:联系|回复|聊天|见面|互动|吵架).{0,14}"
+            r"(?:\d|[一二三四五六七八九十两]+).{0,6}(?:次|条|回)"
+        ),
+    ),
+)
+
+_LEGACY_SIGNAL_CATEGORIES: dict[
+    str, tuple[MemorySemanticGateReason, str]
+] = {
+    "preference": (MemorySemanticGateReason.PREFERENCE, "durable_preference"),
+    "stable_fact": (MemorySemanticGateReason.STABLE_FACT, "stable_fact"),
+    "profile_fact": (MemorySemanticGateReason.STABLE_FACT, "profile_fact"),
+    "relationship_state": (
+        MemorySemanticGateReason.RELATIONSHIP_STATE,
+        "relationship_state",
+    ),
+    "relationship_event": (
+        MemorySemanticGateReason.RELATIONSHIP_CHANGE,
+        "relationship_event",
+    ),
+    "relationship_transition": (
+        MemorySemanticGateReason.RELATIONSHIP_CHANGE,
+        "relationship_transition",
+    ),
+    "interaction_trend": (
+        MemorySemanticGateReason.INTERACTION_PATTERN,
+        "interaction_trend",
+    ),
+    "interaction_decline": (
+        MemorySemanticGateReason.INTERACTION_PATTERN,
+        "interaction_decline",
+    ),
+    "interaction_qualifier": (
+        MemorySemanticGateReason.INTERACTION_PATTERN,
+        "interaction_qualifier",
+    ),
+    "temporal_interaction": (
+        MemorySemanticGateReason.INTERACTION_PATTERN,
+        "temporal_interaction",
+    ),
+    "social_integration": (
+        MemorySemanticGateReason.INTERACTION_PATTERN,
+        "social_integration",
+    ),
+    "self_belief": (MemorySemanticGateReason.USER_BELIEF, "emotional_reflection"),
+    "partner_attribute": (
+        MemorySemanticGateReason.USER_BELIEF,
+        "partner_attribute",
+    ),
+    "belief_or_competition": (
+        MemorySemanticGateReason.USER_BELIEF,
+        "emotional_reflection",
+    ),
+    "advice_outcome": (MemorySemanticGateReason.ADVICE_OUTCOME, "advice_outcome"),
+}
+
 _L0_HARD_PASS_RULES: tuple[
     tuple[MemorySemanticGateReason, str, str, re.Pattern[str]],
     ...,
@@ -1000,7 +1267,7 @@ _L0_HARD_PASS_RULES: tuple[
         "stable_birthday",
         "l0_stable_birthday",
         re.compile(
-            r"(?:她|他|对象|伴侣).{0,8}(?:生日|出生日期)"
+            r"(?:我(?:的)?|她|他|对象|伴侣).{0,8}(?:生日|出生日期)"
             r".{0,10}(?:\d{1,2}月\d{1,2}[日号]?|[一二三四五六七八九十]+月)"
         ),
     ),
@@ -1009,8 +1276,17 @@ _L0_HARD_PASS_RULES: tuple[
         "stable_work_or_residence",
         "l0_stable_work_or_residence",
         re.compile(
-            r"(?:她|他|对象|伴侣).{0,16}"
+            r"(?:我(?:现在|目前)?|她|他|对象|伴侣).{0,16}"
             r"(?:(?:在|于).{1,12}工作|工作在.{1,12}|住在.{1,12}|居住在.{1,12})"
+        ),
+    ),
+    (
+        MemorySemanticGateReason.STABLE_FACT,
+        "stable_residence",
+        "l0_stable_residence",
+        re.compile(
+            r"(?:^|[，。；])(?:我|她|他|对象|伴侣)(?:现在|目前)?住"
+            r"(?:在|于)?(?!一晚|一天|几天|得)[^，。！？?]{1,12}"
         ),
     ),
     (
@@ -1028,9 +1304,9 @@ _L0_HARD_PASS_RULES: tuple[
         "explicit_preference",
         "l0_explicit_preference",
         re.compile(
-            r"(?:她|他|对象|伴侣).{0,36}"
+            r"(?:我|她|他|对象|伴侣|我们).{0,36}"
             r"(?:特别能吃辣|很能吃辣|能吃辣|特别喜欢|很喜欢|更喜欢|不喜欢|"
-            r"偏好|爱吃|不吃|不怎么喝|更愿意)"
+            r"喜欢(?!的)|偏好|爱吃|不吃|不怎么喝|更愿意)"
         ),
     ),
     (

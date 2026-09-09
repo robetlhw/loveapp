@@ -163,7 +163,15 @@ INTERACTION_PATTERN_DIMENSIONS = frozenset(
 # boundary for backwards compatibility.  These bounded vocabularies and
 # helpers provide a small, deterministic contract without introducing a
 # second Memory model or changing the Store schema.
-INTERACTION_MEMORY_SOURCES = frozenset({"user_reported", "model_inferred"})
+# ``model_inferred`` is the historical persisted spelling.  New Pattern
+# producers may use the more precise ``derived_from_events`` provenance while
+# old Event/Pattern rows continue to round-trip unchanged.
+INTERACTION_MEMORY_SOURCES = frozenset(
+    {"user_reported", "model_inferred", "derived_from_events"}
+)
+INTERACTION_PATTERN_SOURCES = frozenset(
+    {"user_reported", "model_inferred", "derived_from_events"}
+)
 INTERACTION_EVENT_PAYLOAD_FIELDS = frozenset(
     {
         "participants",
@@ -197,6 +205,10 @@ _INTERACTION_SOURCE_ALIASES = {
     "model": "model_inferred",
     "model_inferred": "model_inferred",
     "system_inferred": "model_inferred",
+    "derived": "derived_from_events",
+    "event_derived": "derived_from_events",
+    "derived_from_events": "derived_from_events",
+    "event_inferred": "derived_from_events",
 }
 _EVENT_PARTICIPANT_ALIASES = {
     "i": "user",
@@ -746,9 +758,16 @@ def validate_interaction_event_payload(
             raise ValueError("interaction_event emotion must be a string or list")
 
     source = payload.get("source")
-    if source is not None and normalize_interaction_source(source) is None:
+    normalized_source = (
+        normalize_interaction_source(source) if source is not None else None
+    )
+    if source is not None and normalized_source is None:
         raise ValueError(
             "interaction_event source must be user_reported or model_inferred"
+        )
+    if normalized_source == "derived_from_events":
+        raise ValueError(
+            "interaction_event source cannot be derived_from_events"
         )
     _validate_interaction_source_alignment(source, perspective, kind="event")
 
@@ -889,11 +908,21 @@ def validate_interaction_pattern_payload(
     if not isinstance(payload, Mapping):
         raise ValueError("interaction_pattern payload must be an object")
     source = payload.get("source")
-    if source is not None and normalize_interaction_source(source) is None:
+    normalized_source = normalize_interaction_source(source) if source is not None else None
+    if source is not None and normalized_source is None:
         raise ValueError(
-            "interaction_pattern source must be user_reported or model_inferred"
+            "interaction_pattern source must be user_reported, model_inferred, "
+            "or derived_from_events"
         )
     _validate_interaction_source_alignment(source, perspective, kind="pattern")
+    if (
+        normalized_source == "derived_from_events"
+        and perspective is not None
+        and _normalize_identifier(str(perspective)) != "model_inferred"
+    ):
+        raise ValueError(
+            "interaction_pattern derived_from_events source requires model_inferred perspective"
+        )
 
     evidence_ids = payload.get("evidence_ids")
     evidence = payload.get("evidence")
@@ -910,8 +939,10 @@ def validate_interaction_pattern_payload(
     # Inferred patterns must cite stable event identifiers.  Free-form
     # evidence text is useful for user-reported claims, but it cannot prove a
     # link to stored Event rows and therefore must not authorize inference.
-    if source == "model_inferred" and not evidence_ids:
-        raise ValueError("model_inferred interaction_pattern requires evidence IDs")
+    if normalized_source in {"model_inferred", "derived_from_events"} and not evidence_ids:
+        raise ValueError(
+            "inferred interaction_pattern requires evidence IDs"
+        )
 
     for field in ("positive_evidence_ids", "negative_evidence_ids"):
         value = payload.get(field)
@@ -1056,7 +1087,12 @@ def _validate_interaction_source_alignment(
         return
     normalized_source = normalize_interaction_source(source)
     expected_source = interaction_source_for_perspective(perspective)
-    if normalized_source is not None and normalized_source != expected_source:
+    compatible_inferred_sources = {"model_inferred", "derived_from_events"}
+    aligned = normalized_source == expected_source or (
+        expected_source == "model_inferred"
+        and normalized_source in compatible_inferred_sources
+    )
+    if normalized_source is not None and not aligned:
         raise ValueError(
             f"interaction_{kind} source conflicts with claim perspective"
         )

@@ -18,6 +18,7 @@ from loveapp.domain.memory_dimensions import (
     infer_initiation_balance,
     interaction_pattern_state,
     normalize_interaction_metric,
+    normalize_interaction_source,
 )
 from loveapp.domain.memory_epistemics import is_epistemically_confirmed
 from loveapp.domain.memory_lifecycle import (
@@ -509,8 +510,9 @@ def assess_pattern_evidence_links(
     if candidate.kind != MemoryKind.INTERACTION_PATTERN:
         return PatternEvidenceLinkAssessment(required=False, valid=True)
     source = candidate.payload.get("source")
+    normalized_source = normalize_interaction_source(source)
     if (
-        source != MemoryPerspective.MODEL_INFERRED.value
+        normalized_source not in {"model_inferred", "derived_from_events"}
         and candidate.perspective != MemoryPerspective.MODEL_INFERRED
     ):
         return PatternEvidenceLinkAssessment(required=False, valid=True)

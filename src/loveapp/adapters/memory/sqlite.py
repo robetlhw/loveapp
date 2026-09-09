@@ -1773,6 +1773,7 @@ class SQLiteMemoryStore:
                                 if run.gate_decision.l0_route is not None
                                 else None
                             ),
+                            "l0_route_label": run.gate_decision.route_label,
                             "l0_semantic_hint": (
                                 run.gate_decision.l0_semantic_hint.value
                                 if run.gate_decision.l0_semantic_hint is not None
@@ -1796,6 +1797,12 @@ class SQLiteMemoryStore:
                                 run.gate_decision.extraction_warning
                             ),
                             "contextual_probe": run.gate_decision.contextual_probe,
+                            "durable_signal_category": (
+                                run.gate_decision.durable_signal_category
+                            ),
+                            "contextual_signal_category": (
+                                run.gate_decision.contextual_signal_category
+                            ),
                             "history_loaded_for_gate": run.gate_decision.history_loaded_for_gate,
                             "antecedent_candidate_ids": run.gate_decision.antecedent_candidate_ids,
                             "selected_target_memory_id": (

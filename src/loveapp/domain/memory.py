@@ -177,7 +177,21 @@ class MemoryGateRoute(StrEnum):
     HARD_DROP = "HARD_DROP"
     HARD_PASS = "HARD_PASS"
     SEMANTIC_REVIEW = "SEMANTIC_REVIEW"
+    # ``SEMANTIC_REVIEW`` was the persisted/fixture name used by the first
+    # Gate V2 contract.  ``POSSIBLE_MEMORY`` is the clearer semantic name for
+    # the same extraction hand-off: the L0 gate believes the turn may contain
+    # durable information, but it does not authorize a write.  Keep the enum
+    # value aliased so old reports and stored extraction runs remain readable.
+    POSSIBLE_MEMORY = "SEMANTIC_REVIEW"
     CONTEXT_PASS = "CONTEXT_PASS"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "MemoryGateRoute | None":
+        """Accept the new public spelling while reading old/new fixtures."""
+
+        if isinstance(value, str) and value.strip().upper() == "POSSIBLE_MEMORY":
+            return cls.SEMANTIC_REVIEW
+        return None
 
 
 class MemorySemanticGateReason(StrEnum):
@@ -211,6 +225,11 @@ class MemoryGateDecision(BaseModel):
     should_extract: bool
     reason: MemoryGateReason
     l0_route: MemoryGateRoute | None = None
+    # Human-readable route spelling.  ``l0_route`` intentionally retains the
+    # legacy enum value for persisted compatibility; new callers can use this
+    # field (or ``route_label`` below) to distinguish POSSIBLE_MEMORY from a
+    # legacy SEMANTIC_REVIEW payload.
+    l0_route_label: str | None = None
     l0_semantic_hint: MemorySemanticGateReason | None = None
     semantic_gate_should_extract: bool | None = None
     semantic_gate_reason: MemorySemanticGateReason | None = None
@@ -223,11 +242,21 @@ class MemoryGateDecision(BaseModel):
     matched_rule: str | None = None
     matched_span: str | None = None
     contextual_probe: bool = False
+    durable_signal_category: str | None = None
+    contextual_signal_category: str | None = None
     history_loaded_for_gate: bool = False
     antecedent_candidate_ids: list[str] = Field(default_factory=list)
     selected_target_memory_id: str | None = None
     target_guard_result: str | None = None
     contextual_update_type: str | None = None
+
+    @property
+    def route_label(self) -> str | None:
+        """Return the semantic route label without changing old enum values."""
+
+        if self.l0_route_label:
+            return self.l0_route_label
+        return self.l0_route.value if self.l0_route is not None else None
 
 
 class ContextualUpdateType(StrEnum):

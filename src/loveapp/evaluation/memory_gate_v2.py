@@ -31,6 +31,20 @@ def _ratio(numerator: int, denominator: int) -> float:
     return round(numerator / denominator, 4) if denominator else 0.0
 
 
+def _route_matches(actual: MemoryGateRoute | None, expected: object) -> bool:
+    """Compare route labels across the legacy/new spelling boundary."""
+
+    if actual is None or not isinstance(expected, str):
+        return False
+    expected_value = expected.strip().upper()
+    if expected_value == "POSSIBLE_MEMORY":
+        return actual in {
+            MemoryGateRoute.POSSIBLE_MEMORY,
+            MemoryGateRoute.SEMANTIC_REVIEW,
+        }
+    return actual.value == expected_value
+
+
 def _percentile(values: list[float], percentile: float) -> float:
     if not values:
         return 0.0
@@ -372,10 +386,16 @@ async def evaluate_memory_gate_v2(
                 },
                 "hybrid": {
                     "l0_route": l0.l0_route.value if l0.l0_route else None,
+                    "l0_route_label": l0.route_label,
                     "matched_rule": l0.matched_rule,
+                    "matched_span": l0.matched_span,
+                    "durable_signal_category": l0.durable_signal_category,
+                    "contextual_signal_category": l0.contextual_signal_category,
                     "history_derived_context": (
                         l0.pending_memory_context_source == "history_fallback"
+                        or "contextual_history_derived" in l0.signals
                     ),
+                    "history_loaded_for_gate": l0.history_loaded_for_gate,
                     "pending_memory_context_source": (
                         l0.pending_memory_context_source
                     ),
@@ -415,7 +435,7 @@ async def evaluate_memory_gate_v2(
                     "attempts": [_attempt_telemetry(a) for a in attempts],
                     "error": extraction_error,
                 },
-                "l0_pass": (l0.l0_route is not None and l0.l0_route.value == expected["l0_route"]),
+                "l0_pass": _route_matches(l0.l0_route, expected["l0_route"]),
                 "semantic_gate_pass": (
                     semantic_should_extract is not None
                     and semantic_should_extract == bool(expected["should_extract"])
@@ -487,6 +507,22 @@ async def evaluate_memory_gate_v2(
     completion_tokens = sum(attempt.completion_tokens or 0 for attempt in all_attempts)
     total_tokens = sum(attempt.total_tokens or 0 for attempt in all_attempts)
     model_counts = Counter(attempt.model for attempt in all_attempts if attempt.model is not None)
+    route_label_counts = Counter(
+        row["hybrid"]["l0_route_label"]
+        for row in results
+        if row["hybrid"].get("l0_route_label") is not None
+    )
+    durable_signal_category_counts = Counter(
+        row["hybrid"]["durable_signal_category"]
+        for row in results
+        if row["hybrid"].get("durable_signal_category") is not None
+        and row["hybrid"].get("l0_route_label") != "HARD_DROP"
+    )
+    contextual_signal_category_counts = Counter(
+        row["hybrid"]["contextual_signal_category"]
+        for row in results
+        if row["hybrid"].get("contextual_signal_category") is not None
+    )
     attempt_failure_count = sum(
         attempt.status == MemoryAttemptStatus.FAILED for attempt in all_attempts
     )
@@ -619,6 +655,9 @@ async def evaluate_memory_gate_v2(
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
         "model_call_counts": dict(model_counts),
+        "route_label_counts": dict(route_label_counts),
+        "durable_signal_category_counts": dict(durable_signal_category_counts),
+        "contextual_signal_category_counts": dict(contextual_signal_category_counts),
     }
     return {
         "evaluation": "memory_gate_v2",

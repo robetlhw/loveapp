@@ -2393,6 +2393,7 @@ def _record_gate_trace(
                 "gate_reason": decision.reason.value,
                 "gate_should_extract": decision.should_extract,
                 "l0_route": (decision.l0_route.value if decision.l0_route is not None else None),
+                "l0_route_label": decision.route_label,
                 "l0_semantic_hint": (
                     decision.l0_semantic_hint.value
                     if decision.l0_semantic_hint is not None
@@ -2401,6 +2402,8 @@ def _record_gate_trace(
                 "matched_rule": decision.matched_rule,
                 "matched_span": decision.matched_span,
                 "contextual_probe": decision.contextual_probe,
+                "durable_signal_category": decision.durable_signal_category,
+                "contextual_signal_category": decision.contextual_signal_category,
                 "history_loaded_for_gate": decision.history_loaded_for_gate,
                 "antecedent_candidate_ids_json": json.dumps(decision.antecedent_candidate_ids),
                 "selected_target_memory_id": decision.selected_target_memory_id,
@@ -2421,6 +2424,7 @@ def _record_semantic_gate_trace(
         details.update(
             {
                 "l0_route": (decision.l0_route.value if decision.l0_route is not None else None),
+                "l0_route_label": decision.route_label,
                 "semantic_gate_should_extract": (decision.semantic_gate_should_extract),
                 "semantic_gate_reason": (
                     decision.semantic_gate_reason.value
