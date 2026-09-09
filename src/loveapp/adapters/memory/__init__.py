@@ -7,6 +7,7 @@ from loveapp.adapters.memory.semantic_relations import (
     OpenAICompatibleSemanticRelationJudge,
 )
 from loveapp.adapters.memory.sqlite import SQLiteMemoryStore
+from loveapp.adapters.memory.two_stage import TwoStageExtractor, TwoStageMemoryExtractor
 
 __all__ = [
     "InMemoryMemoryStore",
@@ -14,4 +15,6 @@ __all__ = [
     "OpenAICompatibleSemanticRelationJudge",
     "SQLiteMemoryStore",
     "TieredMemoryExtractor",
+    "TwoStageExtractor",
+    "TwoStageMemoryExtractor",
 ]

@@ -235,16 +235,6 @@ class DiscardedSpan(BaseModel):
     reason: DiscardReason
 
 
-class CoarseExtraction(BaseModel):
-    """Stage 1 output; never an authorization to write memory."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    should_extract: bool
-    propositions: list[CoarseProposition] = Field(default_factory=list, max_length=12)
-    discarded_spans: list[DiscardedSpan] = Field(default_factory=list, max_length=12)
-
-
 class MemoryGateReason(StrEnum):
     DURABLE_SIGNAL = "durable_signal"
     CONTEXTUAL_UPDATE = "contextual_update"
@@ -299,6 +289,27 @@ class MemorySemanticGateReason(StrEnum):
     TRANSIENT = "TRANSIENT"
     SMALL_TALK = "SMALL_TALK"
     NO_MEMORY = "NO_MEMORY"
+
+
+class CoarseExtraction(BaseModel):
+    """Stage 1 output; never an authorization to write memory."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    should_extract: bool
+    gate_reason: MemorySemanticGateReason | None = None
+    propositions: list[CoarseProposition] = Field(default_factory=list, max_length=12)
+    discarded_spans: list[DiscardedSpan] = Field(default_factory=list, max_length=12)
+
+    @model_validator(mode="after")
+    def fill_safe_gate_reason(self) -> "CoarseExtraction":
+        if self.gate_reason is None:
+            self.gate_reason = (
+                MemorySemanticGateReason.COMPOUND_MEMORY
+                if self.should_extract
+                else MemorySemanticGateReason.NO_MEMORY
+            )
+        return self
 
 
 # Transitional aliases keep the contract easy to consume without creating a

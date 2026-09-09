@@ -34,6 +34,7 @@ from loveapp.adapters.memory import (
     OpenAICompatibleSemanticRelationJudge,
     SQLiteMemoryStore,
     TieredMemoryExtractor,
+    TwoStageMemoryExtractor,
 )
 from loveapp.adapters.routing import OpenAICompatibleRouteCorrector
 from loveapp.adapters.weather import (
@@ -463,11 +464,24 @@ def _build_memory_extractor(settings: Settings):
             thinking=settings.memory_extraction_strong_thinking,
             validation_mode="raw",
         )
-    return TieredMemoryExtractor(
+    single_stage = TieredMemoryExtractor(
         flash,
         strong,
         upgrade_min_importance=settings.memory_extraction_upgrade_min_importance,
     )
+    if settings.memory_extraction_mode == "two_stage":
+        return TwoStageMemoryExtractor(
+            api_key=settings.llm_api_key,
+            base_url=settings.llm_base_url,
+            model=flash_model,
+            timeout_seconds=settings.memory_extraction_timeout_seconds,
+            max_retries=settings.memory_extraction_max_retries,
+            max_tokens=settings.memory_extraction_max_tokens,
+            tier="flash",
+            thinking=settings.memory_extraction_thinking,
+            fallback=single_stage,
+        )
+    return single_stage
 
 
 def _build_semantic_relation_judge(

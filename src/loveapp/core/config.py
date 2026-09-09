@@ -119,6 +119,10 @@ class Settings(BaseSettings):
     memory_backend: Literal["memory", "sqlite"] = "sqlite"
     memory_database_path: Path = Path(".data/loveapp.db")
     memory_extraction_provider: Literal["auto", "llm", "disabled"] = "auto"
+    # Keep the established Flash -> Strong single-stage extractor as the
+    # production default.  Two-stage is opt-in until shadow evaluation proves
+    # parity with the frozen contract.
+    memory_extraction_mode: Literal["single_stage", "two_stage"] = "single_stage"
     memory_extraction_model: str = ""
     # Memory extraction is an auxiliary task. Keep its network budget
     # independent from the final answer generation budget.
