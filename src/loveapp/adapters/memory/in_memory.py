@@ -35,6 +35,10 @@ from loveapp.domain.memory_event_enrichment import (
     apply_conflict_event_enrichment,
     apply_event_enrichment,
 )
+from loveapp.domain.memory_event_links import (
+    attach_source_event_ids,
+    resolve_operation_source_event_ids,
+)
 from loveapp.domain.memory_write import (
     MemoryTransitionAudit,
     MemoryWriteBatch,
@@ -626,6 +630,31 @@ class InMemoryMemoryStore:
                 )
                 saved.append(result)
 
+            saved_memory_ids = [result.item.id for result in saved]
+            for index, operation in enumerate(batch.operations):
+                source_event_ids = resolve_operation_source_event_ids(
+                    operation,
+                    saved_memory_ids,
+                    operation_index=index,
+                )
+                if not source_event_ids:
+                    continue
+                source_events = [self._memories.get(memory_id) for memory_id in source_event_ids]
+                if any(
+                    item is None
+                    or item.kind != MemoryKind.INTERACTION_EVENT
+                    or item.status not in {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}
+                    for item in source_events
+                ):
+                    raise ValueError("memory batch source link must target an active Event")
+                result = saved[index]
+                updated = attach_source_event_ids(
+                    self._memories[result.item.id],
+                    source_event_ids,
+                )
+                self._memories[result.item.id] = updated
+                result.item = updated.model_copy(deep=True)
+
             for contextual_update in batch.contextual_updates:
                 target = self._memories.get(contextual_update.target_memory_id)
                 if (
@@ -835,6 +864,7 @@ class InMemoryMemoryStore:
                     incoming_memory_id=saved[index].item.id,
                     target_memory_ids=resolved_targets[index],
                     relation=operation.relation,
+                    mutation_action=operation.mutation_action,
                     decision=(
                         candidate.admission_decision or AdmissionDecision.PROPOSE
                     ),

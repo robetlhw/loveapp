@@ -34,6 +34,7 @@ from loveapp.domain.memory import (
     MemoryStatus,
     MemoryValence,
     MessageRole,
+    MutationAction,
     PredicateType,
     RelationshipImpact,
     RememberResult,
@@ -71,6 +72,7 @@ from loveapp.domain.memory_write import (
     MemoryWriteBatch,
     MemoryWriteOperation,
     RelationshipPlanStatusUpdate,
+    infer_mutation_action,
 )
 from loveapp.domain.relationship_evidence import (
     project_standardized_relationship_evidence,
@@ -1108,6 +1110,7 @@ class MemoryService:
             prepared,
             prepared_statuses,
         )
+        in_batch_event_links = _infer_in_batch_event_links(prepared)
         active_by_id = {item.id: item for item in active}
         operations: list[MemoryWriteOperation] = []
         for index, candidate in enumerate(prepared):
@@ -1166,6 +1169,17 @@ class MemoryService:
                     relation=relation,
                     target_memory_ids=target_ids,
                     target_operation_indexes=target_operation_indexes,
+                    source_event_operation_indexes=in_batch_event_links.get(index, []),
+                    mutation_action=(
+                        MutationAction.LINK
+                        if in_batch_event_links.get(index)
+                        and relation != ClaimRelation.UPDATE
+                        else infer_mutation_action(
+                            relation,
+                            rule_name=rule_name,
+                            target_memory_ids=target_ids,
+                        )
+                    ),
                     rule_name=rule_name,
                     reason=reason,
                     score_breakdown=admission_breakdowns[index],
@@ -2744,6 +2758,64 @@ def _plan_in_batch_state_transitions(
         if eligible:
             targets[index] = eligible
     return targets
+
+
+def _infer_in_batch_event_links(
+    candidates: list[MemoryCandidate],
+) -> dict[int, list[int]]:
+    """Link an unlinked State to one unambiguous Event from the same turn.
+
+    IDs are allocated by the Store, so the planner records operation indexes
+    and lets the atomic batch resolve them.  Ambiguous or semantically
+    unrelated Events are deliberately left unlinked.
+    """
+
+    event_indexes = [
+        index
+        for index, candidate in enumerate(candidates)
+        if candidate.kind == MemoryKind.INTERACTION_EVENT
+    ]
+    links: dict[int, list[int]] = {}
+    for state_index, state in enumerate(candidates):
+        if state.kind != MemoryKind.RELATIONSHIP_STATE or state.source_event_ids:
+            continue
+        compatible = [
+            event_index
+            for event_index in event_indexes
+            if event_index != state_index
+            and _event_can_support_state(candidates[event_index], state)
+        ]
+        if len(compatible) == 1:
+            links[state_index] = compatible
+    return links
+
+
+def _event_can_support_state(
+    event: MemoryCandidate,
+    state: MemoryCandidate,
+) -> bool:
+    if event.subject.casefold() != state.subject.casefold():
+        return False
+    dimension = (state.state_dimension or "").casefold()
+    event_type = str(event.payload.get("event_type") or "").casefold()
+    event_text = " ".join(
+        [event.summary, event.original_text, event.raw_predicate or ""]
+    ).casefold()
+    if "conflict" in dimension:
+        return event_type in {"conflict", "argument", "quarrel"} or any(
+            token in event_text for token in ("conflict", "argument", "quarrel", "cold_war")
+        )
+    if "contact" in dimension or "response" in dimension or "engagement" in dimension:
+        return True
+    if "stage" in dimension:
+        return event_type in {
+            "date",
+            "relationship_started",
+            "relationship_confirmed",
+            "reconciliation",
+            "confession",
+        }
+    return False
 
 
 def _has_in_batch_state_conflict(

@@ -29,6 +29,7 @@ from loveapp.domain.memory import (
     MemorySaveResult,
     MemoryStatus,
     MessageRole,
+    MutationAction,
     PatternLifecycleState,
     StoredMessage,
     TimeKind,
@@ -41,6 +42,10 @@ from loveapp.domain.memory_dimensions import merge_interaction_pattern_provenanc
 from loveapp.domain.memory_event_enrichment import (
     apply_conflict_event_enrichment,
     apply_event_enrichment,
+)
+from loveapp.domain.memory_event_links import (
+    attach_source_event_ids,
+    resolve_operation_source_event_ids,
 )
 from loveapp.domain.memory_predicates import normalize_predicate
 from loveapp.domain.memory_write import (
@@ -875,6 +880,59 @@ class SQLiteMemoryStore:
                 if result.item.kind == MemoryKind.PLANNED_EVENT:
                     await _ensure_plan_for_memory_in_transaction(connection, result.item)
 
+            saved_memory_ids = [result.item.id for result in results]
+            for index, operation in enumerate(batch.operations):
+                source_event_ids = resolve_operation_source_event_ids(
+                    operation,
+                    saved_memory_ids,
+                    operation_index=index,
+                )
+                if not source_event_ids:
+                    continue
+                placeholders = ",".join("?" for _ in source_event_ids)
+                cursor = await connection.execute(
+                    f"SELECT * FROM memory_items WHERE id IN ({placeholders}) "
+                    "AND user_id = ? AND relationship_id = ?",
+                    [*source_event_ids, user_id, relationship_id],
+                )
+                source_rows = await cursor.fetchall()
+                await cursor.close()
+                source_by_id = {row["id"]: row for row in source_rows}
+                if any(
+                    memory_id not in source_by_id
+                    or source_by_id[memory_id]["kind"] != MemoryKind.INTERACTION_EVENT.value
+                    or source_by_id[memory_id]["status"]
+                    not in {MemoryStatus.PROPOSED.value, MemoryStatus.CONFIRMED.value}
+                    for memory_id in source_event_ids
+                ):
+                    raise ValueError("memory batch source link must target an active Event")
+                result = results[index]
+                target_row = await _fetchone(
+                    connection,
+                    "SELECT * FROM memory_items "
+                    "WHERE id = ? AND user_id = ? AND relationship_id = ?",
+                    (result.item.id, user_id, relationship_id),
+                )
+                if target_row is None:
+                    raise ValueError("memory batch Event-State target is outside the current scope")
+                updated = attach_source_event_ids(
+                    _row_to_memory(target_row),
+                    source_event_ids,
+                )
+                await connection.execute(
+                    "UPDATE memory_items SET payload_json = ?, updated_at = ?, last_seen_at = ? "
+                    "WHERE id = ? AND user_id = ? AND relationship_id = ?",
+                    (
+                        _dump_json(updated.payload),
+                        _dump_datetime(now),
+                        _dump_datetime(now),
+                        updated.id,
+                        user_id,
+                        relationship_id,
+                    ),
+                )
+                results[index] = result.model_copy(update={"item": updated})
+
             for contextual_update in batch.contextual_updates:
                 target_row = await _fetchone(
                     connection,
@@ -1167,6 +1225,7 @@ class SQLiteMemoryStore:
                     incoming_memory_id=results[index].item.id,
                     target_memory_ids=resolved_targets[index],
                     relation=operation.relation,
+                    mutation_action=operation.mutation_action,
                     decision=(
                         candidate.admission_decision or AdmissionDecision.PROPOSE
                     ),
@@ -2518,8 +2577,9 @@ async def _insert_transition_audit(
             id, user_id, relationship_id, source_message_id, incoming_memory_id,
             target_memory_ids_json, relation, decision, rule_name, admission_score,
             score_breakdown_json, raw_predicate, canonical_predicate, extractor_model,
-            verifier_model, prompt_version, evidence_json, reason, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            verifier_model, prompt_version, evidence_json, reason, mutation_action,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             audit.id,
@@ -2540,6 +2600,7 @@ async def _insert_transition_audit(
             audit.prompt_version,
             _dump_json(audit.evidence),
             audit.reason,
+            audit.mutation_action.value if audit.mutation_action is not None else None,
             _dump_datetime(audit.created_at),
         ),
     )
@@ -3179,6 +3240,11 @@ def _row_to_transition_audit(row: aiosqlite.Row) -> MemoryTransitionAudit:
         prompt_version=row["prompt_version"],
         evidence=json.loads(row["evidence_json"]),
         reason=row["reason"],
+        mutation_action=(
+            MutationAction(row["mutation_action"])
+            if row["mutation_action"]
+            else None
+        ),
         created_at=_load_datetime(row["created_at"]),
     )
 
@@ -3318,6 +3384,13 @@ async def _migrate_schema(connection: aiosqlite.Connection) -> None:
             ALTER TABLE memory_extraction_runs
             ADD COLUMN discarded_spans_json TEXT NOT NULL DEFAULT '[]'
             """
+        )
+    cursor = await connection.execute("PRAGMA table_info(memory_transition_audit)")
+    audit_columns = {row[1] for row in await cursor.fetchall()}
+    await cursor.close()
+    if "mutation_action" not in audit_columns:
+        await connection.execute(
+            "ALTER TABLE memory_transition_audit ADD COLUMN mutation_action TEXT"
         )
     run_columns_to_add = {
         "gate_matched_rule": "TEXT",
@@ -3587,6 +3660,7 @@ CREATE TABLE IF NOT EXISTS memory_transition_audit (
     prompt_version TEXT,
     evidence_json TEXT NOT NULL DEFAULT '[]',
     reason TEXT NOT NULL,
+    mutation_action TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY (user_id, relationship_id)
         REFERENCES relationships(user_id, id) ON DELETE CASCADE,
