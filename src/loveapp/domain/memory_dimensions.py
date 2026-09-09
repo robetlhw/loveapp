@@ -27,6 +27,39 @@ def _normalize_identifier(value: str) -> str:
 
 RELATIONSHIP_STATE_POLICIES: tuple[RelationshipStatePolicy, ...] = (
     RelationshipStatePolicy(
+        # Preserve the persisted dotted namespace used by the existing
+        # canonical predicate while accepting the v3.1 underscore spelling at
+        # the input boundary.
+        dimension="relationship.stage",
+        aliases=frozenset({"relationship_stage", "relationship_stage_status"}),
+        allowed_values=frozenset(
+            {
+                "unknown",
+                "acquaintance",
+                "romantic_interest",
+                "pursuing",
+                "dating",
+                "committed",
+                "cooling_off",
+                "separated",
+                "ended",
+                "reconciled",
+            }
+        ),
+        value_aliases=(
+            ("friend", "acquaintance"),
+            ("friends", "acquaintance"),
+            ("ordinary_friends", "acquaintance"),
+            ("partnered", "dating"),
+            ("romantic_relationship", "dating"),
+            ("stable_relationship", "committed"),
+            ("long_distance", "committed"),
+            ("breakup", "separated"),
+            ("ended", "separated"),
+        ),
+        default_ttl=timedelta(days=90),
+    ),
+    RelationshipStatePolicy(
         dimension="relationship_familiarity",
         aliases=frozenset({"familiarity", "relationship_closeness"}),
         allowed_values=frozenset({"unfamiliar", "low", "moderate", "high"}),
@@ -184,6 +217,7 @@ INTERACTION_EVENT_TYPES = frozenset(
         "milestone",
     }
 )
+INTERACTION_EVENT_MARKERS = frozenset({"first_occurrence"})
 INTERACTION_EVENT_PAYLOAD_FIELDS = frozenset(
     {
         "event_type",
@@ -201,6 +235,7 @@ INTERACTION_EVENT_PAYLOAD_FIELDS = frozenset(
         "salience",
         "novelty",
         "relationship_impact",
+        "event_markers",
     }
 )
 INTERACTION_PATTERN_PAYLOAD_FIELDS = frozenset(
@@ -770,8 +805,25 @@ def normalize_interaction_event_payload(
     _copy_payload_alias(normalized, "outcome", _EVENT_OUTCOME_ALIASES)
 
     event_type = normalize_interaction_event_type(normalized.get("event_type"))
+    first_occurrence = _has_first_occurrence_signal(normalized, evidence_text)
+    if first_occurrence:
+        markers = normalized.get("event_markers")
+        if isinstance(markers, str):
+            markers = [markers]
+        if not isinstance(markers, list):
+            markers = []
+        normalized["event_markers"] = list(
+            dict.fromkeys([*markers, "first_occurrence"])
+        )
     if event_type is None:
         event_type = infer_interaction_event_type(normalized, evidence_text=evidence_text)
+    elif event_type == "milestone" and first_occurrence:
+        inferred = infer_interaction_event_type(
+            {**normalized, "event_type": None},
+            evidence_text=evidence_text,
+        )
+        if inferred and inferred != "milestone":
+            event_type = inferred
     if event_type is not None:
         normalized["event_type"] = event_type
 
@@ -866,6 +918,18 @@ def validate_interaction_event_payload(
     event_type = payload.get("event_type")
     if event_type is not None and normalize_interaction_event_type(event_type) is None:
         raise ValueError("interaction_event event_type is not in the reviewed ontology")
+
+    markers = payload.get("event_markers")
+    if markers is not None:
+        if not isinstance(markers, (list, tuple)) or len(markers) > 8:
+            raise ValueError("interaction_event event_markers must be a short list")
+        if any(
+            not isinstance(marker, str)
+            or not marker.strip()
+            or _normalize_identifier(marker) not in INTERACTION_EVENT_MARKERS
+            for marker in markers
+        ):
+            raise ValueError("interaction_event event_markers contains an unknown marker")
 
     participants = payload.get("participants")
     if participants is not None:
@@ -997,13 +1061,33 @@ def infer_interaction_event_type(
     text = " ".join(
         str(value) for value in values if isinstance(value, str) and value.strip()
     )
-    return next(
-        (
-            event_type
-            for event_type, pattern in _EVENT_TYPE_PATTERNS
-            if pattern.search(text) is not None
-        ),
-        None,
+    matches = [
+        event_type
+        for event_type, pattern in _EVENT_TYPE_PATTERNS
+        if pattern.search(text) is not None
+    ]
+    if len(matches) > 1 and "milestone" in matches:
+        matches.remove("milestone")
+    return matches[0] if matches else None
+
+
+def _has_first_occurrence_signal(
+    payload: Mapping[str, object],
+    evidence_text: str,
+) -> bool:
+    markers = payload.get("event_markers")
+    if isinstance(markers, (list, tuple)) and any(
+        isinstance(marker, str)
+        and _normalize_identifier(marker) == "first_occurrence"
+        for marker in markers
+    ):
+        return True
+    return bool(
+        re.search(
+            r"(?:第一次|初次|头一次|首次)|\bfirst\s+(?:time|date|meeting)\b",
+            evidence_text,
+            re.I,
+        )
     )
 
 

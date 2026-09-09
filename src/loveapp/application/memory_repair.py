@@ -1026,6 +1026,10 @@ def _normalize_claim_semantics(
             dimension = state_dimension or predicate_normalization.state_dimension
             value = state_value or predicate_normalization.state_value
             if dimension is not None and value is not None:
+                top_level_alignment_needed = (
+                    claim.get("state_dimension") != dimension
+                    or claim.get("state_value") != value
+                )
                 if (
                     claim_payload.get("state_dimension") != dimension
                     or claim_payload.get("state_value") != value
@@ -1033,10 +1037,7 @@ def _normalize_claim_semantics(
                     steps.append("relationship_state_aliases")
                 claim_payload["state_dimension"] = dimension
                 claim_payload["state_value"] = value
-                if (
-                    state_dimension is None
-                    and predicate_normalization.canonical_predicate is not None
-                ):
+                if predicate_normalization.canonical_predicate is not None:
                     claim["predicate_type"] = PredicateType.CANONICAL.value
                     claim["canonical_predicate"] = (
                         predicate_normalization.canonical_predicate
@@ -1044,7 +1045,8 @@ def _normalize_claim_semantics(
                     claim.pop("custom_predicate", None)
                     claim["state_dimension"] = dimension
                     claim["state_value"] = value
-                    steps.append("canonical_state_alignment")
+                    if state_dimension is None or top_level_alignment_needed:
+                        steps.append("canonical_state_alignment")
                 if value == "unknown":
                     claim_payload.setdefault("attention_status", "unresolved")
                 claim["payload"] = claim_payload
@@ -1229,6 +1231,10 @@ def _normalize_relationship_stage_claim(
         return []
 
     raw_value = claim_payload.get("state_value", claim.get("state_value"))
+    original_raw_dimension = claim_payload.get(
+        "state_dimension", claim.get("state_dimension")
+    )
+    original_raw_value = raw_value
     declared_value = _canonical_relationship_stage_value(raw_value)
     if evidence_value is None:
         if declared_value not in {None, "unknown"}:
@@ -1255,11 +1261,21 @@ def _normalize_relationship_stage_claim(
     claim["state_dimension"] = "relationship.stage"
     claim["state_value"] = evidence_value
 
+    steps: list[str] = []
     if missing_shape:
-        return ["relationship_stage_shape_repair"]
+        steps.append("relationship_stage_shape_repair")
     if semantic_change:
-        return ["relationship_stage_semantic_normalization"]
-    return []
+        steps.append("relationship_stage_semantic_normalization")
+    # Keep repair observability even when the incoming claim already declares
+    # the canonical predicate but uses an accepted alias/value.  The stored
+    # state is correct either way; this records that the parser aligned the
+    # model's representation to the canonical contract.
+    if (
+        original_raw_dimension != "relationship.stage"
+        or original_raw_value != evidence_value
+    ):
+        steps.append("canonical_state_alignment")
+    return steps
 
 
 def _relationship_stage_from_evidence(text: str) -> tuple[str | None, str]:

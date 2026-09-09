@@ -141,6 +141,80 @@ class ClaimRelation(StrEnum):
     UNCERTAIN = "uncertain"
 
 
+class MemoryExtractionMode(StrEnum):
+    """Extraction strategy selected before the shared governance pipeline."""
+
+    SINGLE_STAGE = "single_stage"
+    TWO_STAGE = "two_stage"
+
+
+class SemanticRole(StrEnum):
+    """Semantic role produced by coarse extraction.
+
+    These values describe meaning only.  They are deliberately not database
+    mutation commands; relation/lifecycle governance remains the authority for
+    writes.
+    """
+
+    STANDALONE_PROPOSITION = "standalone_proposition"
+    ATTRIBUTE_UPDATE = "attribute_update"
+    REFINEMENT_CANDIDATE = "refinement_candidate"
+    STATE_ASSERTION = "state_assertion"
+    CONTEXTUAL_COMPLETION = "contextual_completion"
+
+
+class CoarseProposition(BaseModel):
+    """A recall-oriented proposition hint emitted by Stage 1 extraction.
+
+    The object intentionally contains no canonical predicate, database id, or
+    mutation command.  It is a semantic hand-off to the detailed extractor.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    proposition_id: str = Field(min_length=1, max_length=80)
+    evidence_span: str = Field(min_length=1, max_length=1000)
+    candidate_kinds: list[MemoryKind] = Field(min_length=1, max_length=5)
+    semantic_role: SemanticRole = SemanticRole.STANDALONE_PROPOSITION
+    target_field_hint: str | None = Field(default=None, max_length=80)
+    subject_hint: str | None = Field(default=None, max_length=80)
+    temporal_hint: str | None = Field(default=None, max_length=160)
+    target_semantic_hint: dict[str, Any] | None = None
+    confidence: float = Field(default=0.7, ge=0, le=1)
+    reason: str | None = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_kinds(self) -> "CoarseProposition":
+        # Preserve order while preventing duplicate routing branches.  A
+        # top-k hint is useful for ambiguous Event/Pattern/State boundaries.
+        self.candidate_kinds = list(dict.fromkeys(self.candidate_kinds))
+        forbidden_keys = {
+            "target_memory_id",
+            "target_memory_ids",
+            "mutation",
+            "mutation_action",
+            "db_action",
+            "write_action",
+        }
+
+        def contains_forbidden(value: object) -> bool:
+            if isinstance(value, dict):
+                return any(
+                    str(key).casefold() in forbidden_keys
+                    or contains_forbidden(item)
+                    for key, item in value.items()
+                )
+            if isinstance(value, (list, tuple)):
+                return any(contains_forbidden(item) for item in value)
+            return False
+
+        if contains_forbidden(self.target_semantic_hint):
+            raise ValueError(
+                "coarse semantic hints cannot contain database targets or mutation commands"
+            )
+        return self
+
+
 class MessageRole(StrEnum):
     USER = "user"
     ASSISTANT = "assistant"
@@ -159,6 +233,16 @@ class DiscardedSpan(BaseModel):
 
     text: str = Field(min_length=1, max_length=1000)
     reason: DiscardReason
+
+
+class CoarseExtraction(BaseModel):
+    """Stage 1 output; never an authorization to write memory."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    should_extract: bool
+    propositions: list[CoarseProposition] = Field(default_factory=list, max_length=12)
+    discarded_spans: list[DiscardedSpan] = Field(default_factory=list, max_length=12)
 
 
 class MemoryGateReason(StrEnum):
@@ -497,6 +581,8 @@ def _normalize_memory_input(value: object) -> object:
         "event_ids",
         "source_event_ids",
         "supporting_event_ids",
+        "event_markers",
+        "milestone_type",
         "time_window",
         "time_range",
         "window",
@@ -510,7 +596,13 @@ def _normalize_memory_input(value: object) -> object:
     ):
         if key in normalized:
             payload.setdefault(key, normalized[key])
-            if key not in {"state_dimension", "state_value"}:
+            if key not in {
+                "state_dimension",
+                "state_value",
+                "source_event_ids",
+                "supporting_event_ids",
+                "event_markers",
+            }:
                 normalized.pop(key)
     if temporal_expression_alias:
         payload.setdefault("temporal_expression", temporal_expression_alias)
@@ -585,6 +677,19 @@ def _synchronize_memory_evolution_metadata(
     """
 
     payload = dict(memory.payload)
+    for field in ("source_event_ids", "supporting_event_ids", "event_markers"):
+        values = getattr(memory, field, None)
+        if values:
+            payload[field] = list(dict.fromkeys(values))
+        elif field in payload:
+            raw_values = payload[field]
+            if isinstance(raw_values, str):
+                raw_values = [raw_values]
+            if not isinstance(raw_values, list) or any(
+                not isinstance(value, str) or not value.strip() for value in raw_values
+            ):
+                raise ValueError(f"{field} must be a list of non-empty strings")
+            setattr(memory, field, list(dict.fromkeys(raw_values)))
     salience = memory.salience
     if salience is None and payload.get("salience") is not None:
         raw_salience = payload["salience"]
@@ -729,6 +834,9 @@ class MemoryCandidate(BaseModel):
     epistemic_status: EpistemicStatus = EpistemicStatus.CONFIRMED
     confidence: float = Field(default=0.8, ge=0, le=1)
     payload: dict[str, Any] = Field(default_factory=dict)
+    source_event_ids: list[str] = Field(default_factory=list, max_length=20)
+    supporting_event_ids: list[str] = Field(default_factory=list, max_length=20)
+    event_markers: list[str] = Field(default_factory=list, max_length=8)
     supersedes_id: str | None = None
     raw_predicate: str | None = Field(default=None, max_length=120)
     predicate_type: PredicateType = PredicateType.CUSTOM
@@ -803,6 +911,9 @@ class AtomicClaim(BaseModel):
     epistemic_status: EpistemicStatus = EpistemicStatus.CONFIRMED
     confidence: float = Field(default=0.8, ge=0, le=1)
     payload: dict[str, Any] = Field(default_factory=dict)
+    source_event_ids: list[str] = Field(default_factory=list, max_length=20)
+    supporting_event_ids: list[str] = Field(default_factory=list, max_length=20)
+    event_markers: list[str] = Field(default_factory=list, max_length=8)
     supersedes_id: str | None = None
     raw_predicate: str | None = Field(default=None, max_length=120)
     predicate_type: PredicateType = PredicateType.CUSTOM
@@ -882,6 +993,9 @@ class AtomicClaim(BaseModel):
             epistemic_status=self.epistemic_status,
             confidence=self.confidence,
             payload=payload,
+            source_event_ids=self.source_event_ids,
+            supporting_event_ids=self.supporting_event_ids,
+            event_markers=self.event_markers,
             supersedes_id=self.supersedes_id,
             raw_predicate=self.raw_predicate or self.predicate,
             predicate_type=self.predicate_type,
@@ -970,6 +1084,9 @@ class MemoryContextItem(BaseModel):
     confidence: float
     status: MemoryStatus
     payload: dict[str, Any] = Field(default_factory=dict)
+    source_event_ids: list[str] = Field(default_factory=list, max_length=20)
+    supporting_event_ids: list[str] = Field(default_factory=list, max_length=20)
+    event_markers: list[str] = Field(default_factory=list, max_length=8)
     attention_reason: str | None = None
     predicate_type: PredicateType = PredicateType.CUSTOM
     canonical_predicate: str | None = None
@@ -1011,6 +1128,9 @@ class MemoryContextItem(BaseModel):
                     "confidence",
                     "status",
                     "payload",
+                    "source_event_ids",
+                    "supporting_event_ids",
+                    "event_markers",
                     "predicate_type",
                     "canonical_predicate",
                     "custom_predicate",
