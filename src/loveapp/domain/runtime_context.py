@@ -22,6 +22,11 @@ class PendingMemoryContext(BaseModel):
     memory_relevant: bool = True
     expected_slot: str | None = Field(default=None, max_length=80)
     topic: str | None = Field(default=None, max_length=80)
+    pending_slot_id: str | None = Field(default=None, max_length=160)
+    target_kind: str | None = Field(default=None, max_length=80)
+    event_type: str | None = Field(default=None, max_length=80)
+    target_field: str | None = Field(default=None, max_length=80)
+    status: str = Field(default="open", max_length=40)
     created_turn: str = Field(min_length=1, max_length=160)
     expires_after_turns: int = Field(default=2, ge=1, le=4)
 

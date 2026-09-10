@@ -1,0 +1,408 @@
+{
+  "evaluation": "event_enrichment_mvp_v0_1",
+  "mode": "semantic_draft_fixture_shadow",
+  "store_mutation_permitted": false,
+  "case_count": 32,
+  "passed_case_count": 32,
+  "metrics": {
+    "enrichment_target_accuracy": 1.0,
+    "ambiguous_target_rejection_rate": 1.0,
+    "false_enrichment_count": 0,
+    "false_enrichment_rate": 0.0,
+    "canonical_field_pass_count": 13,
+    "custom_attribute_pass_count": 3
+  },
+  "cases": [
+    {
+      "case_id": "EE-001",
+      "category": "canonical",
+      "expected": "resolved",
+      "actual": "resolved",
+      "passed": true,
+      "semantic_candidate_ids": [
+        "target-1"
+      ],
+      "compatible_candidate_ids": [
+        "target-1"
+      ],
+      "selected_target_memory_id": "target-1"
+    },
+    {
+      "case_id": "EE-002",
+      "category": "canonical",
+      "expected": "resolved",
+      "actual": "resolved",
+      "passed": true,
+      "semantic_candidate_ids": [
+        "target-1"
+      ],
+      "compatible_candidate_ids": [
+        "target-1"
+      ],
+      "selected_target_memory_id": "target-1"
+    },
+    {
+      "case_id": "EE-003",
+      "category": "canonical",
+      "expected": "resolved",
+      "actual": "resolved",
+      "passed": true,
+      "semantic_candidate_ids": [
+        "target-1"
+      ],
+      "compatible_candidate_ids": [
+        "target-1"
+      ],
+      "selected_target_memory_id": "target-1"
+    },
+    {
+      "case_id": "EE-004",
+      "category": "canonical",
+      "expected": "resolved",
+      "actual": "resolved",
+      "passed": true,
+      "semantic_candidate_ids": [
+        "target-1"
+      ],
+      "compatible_candidate_ids": [
+        "target-1"
+      ],
+      "selected_target_memory_id": "target-1"
+    },
+    {
+      "case_id": "EE-005",
+      "category": "canonical",
+      "expected": "resolved",
+      "actual": "resolved",
+      "passed": true,
+      "semantic_candidate_ids": [
+        "target-1"
+      ],
+      "compatible_candidate_ids": [
+        "target-1"
+      ],
+      "selected_target_memory_id": "target-1"
+    },
+    {
+      "case_id": "EE-006",
+      "category": "canonical",
+      "expected": "resolved",
+      "actual": "resolved",
+      "passed": true,
+      "semantic_candidate_ids": [
+        "target-1"
+      ],
+      "compatible_candidate_ids": [
+        "target-1"
+      ],
+      "selected_target_memory_id": "target-1"
+    },
+    {
+      "case_id": "EE-007",
+      "category": "canonical",
+      "expected": "resolved",
+      "actual": "resolved",
+      "passed": true,
+      "semantic_candidate_ids": [
+        "target-1"
+      ],
+      "compatible_candidate_ids": [
+        "target-1"
+      ],
+      "selected_target_memory_id": "target-1"
+    },
+    {
+      "case_id": "EE-008",
+      "category": "canonical",
+      "expected": "resolved",
+      "actual": "resolved",
+      "passed": true,
+      "semantic_candidate_ids": [
+        "target-1"
+      ],
+      "compatible_candidate_ids": [
+        "target-1"
+      ],
+      "selected_target_memory_id": "target-1"
+    },
+    {
+      "case_id": "EE-009",
+      "category": "canonical",
+      "expected": "resolved",
+      "actual": "resolved",
+      "passed": true,
+      "semantic_candidate_ids": [
+        "target-1"
+      ],
+      "compatible_candidate_ids": [
+        "target-1"
+      ],
+      "selected_target_memory_id": "target-1"
+    },
+    {
+      "case_id": "EE-010",
+      "category": "canonical",
+      "expected": "resolved",
+      "actual": "resolved",
+      "passed": true,
+      "semantic_candidate_ids": [
+        "target-1"
+      ],
+      "compatible_candidate_ids": [
+        "target-1"
+      ],
+      "selected_target_memory_id": "target-1"
+    },
+    {
+      "case_id": "EE-011",
+      "category": "canonical",
+      "expected": "resolved",
+      "actual": "resolved",
+      "passed": true,
+      "semantic_candidate_ids": [
+        "target-1"
+      ],
+      "compatible_candidate_ids": [
+        "target-1"
+      ],
+      "selected_target_memory_id": "target-1"
+    },
+    {
+      "case_id": "EE-012",
+      "category": "canonical",
+      "expected": "resolved",
+      "actual": "resolved",
+      "passed": true,
+      "semantic_candidate_ids": [
+        "target-1"
+      ],
+      "compatible_candidate_ids": [
+        "target-1"
+      ],
+      "selected_target_memory_id": "target-1"
+    },
+    {
+      "case_id": "EE-013",
+      "category": "canonical",
+      "expected": "resolved",
+      "actual": "resolved",
+      "passed": true,
+      "semantic_candidate_ids": [
+        "target-1"
+      ],
+      "compatible_candidate_ids": [
+        "target-1"
+      ],
+      "selected_target_memory_id": "target-1"
+    },
+    {
+      "case_id": "EE-014",
+      "category": "custom",
+      "expected": "resolved",
+      "actual": "resolved",
+      "passed": true,
+      "semantic_candidate_ids": [
+        "target-1"
+      ],
+      "compatible_candidate_ids": [
+        "target-1"
+      ],
+      "selected_target_memory_id": "target-1"
+    },
+    {
+      "case_id": "EE-015",
+      "category": "target_safety",
+      "expected": "no_source_or_context_linked_event",
+      "actual": "no_source_or_context_linked_event",
+      "passed": true,
+      "semantic_candidate_ids": [],
+      "compatible_candidate_ids": [],
+      "selected_target_memory_id": null
+    },
+    {
+      "case_id": "EE-016",
+      "category": "target_safety",
+      "expected": "ambiguous_semantic_event_antecedent",
+      "actual": "ambiguous_semantic_event_antecedent",
+      "passed": true,
+      "semantic_candidate_ids": [
+        "target-1",
+        "target-2"
+      ],
+      "compatible_candidate_ids": [],
+      "selected_target_memory_id": null
+    },
+    {
+      "case_id": "EE-017",
+      "category": "target_safety",
+      "expected": "event_target_not_active",
+      "actual": "event_target_not_active",
+      "passed": true,
+      "semantic_candidate_ids": [
+        "target-1"
+      ],
+      "compatible_candidate_ids": [],
+      "selected_target_memory_id": null
+    },
+    {
+      "case_id": "EE-018",
+      "category": "target_safety",
+      "expected": "event_subject_mismatch",
+      "actual": "event_subject_mismatch",
+      "passed": true,
+      "semantic_candidate_ids": [
+        "target-1"
+      ],
+      "compatible_candidate_ids": [],
+      "selected_target_memory_id": null
+    },
+    {
+      "case_id": "EE-019",
+      "category": "compatibility",
+      "expected": "event_type_mismatch",
+      "actual": "event_type_mismatch",
+      "passed": true,
+      "semantic_candidate_ids": [
+        "target-1"
+      ],
+      "compatible_candidate_ids": [],
+      "selected_target_memory_id": null
+    },
+    {
+      "case_id": "EE-020",
+      "category": "compatibility",
+      "expected": "event_field_incompatible",
+      "actual": "event_field_incompatible",
+      "passed": true,
+      "semantic_candidate_ids": [
+        "target-1"
+      ],
+      "compatible_candidate_ids": [],
+      "selected_target_memory_id": null
+    },
+    {
+      "case_id": "EE-021",
+      "category": "overwrite",
+      "expected": "existing_event_field_conflict",
+      "actual": "existing_event_field_conflict",
+      "passed": true,
+      "semantic_candidate_ids": [
+        "target-1"
+      ],
+      "compatible_candidate_ids": [],
+      "selected_target_memory_id": null
+    },
+    {
+      "case_id": "EE-022",
+      "category": "custom",
+      "expected": "custom_attribute_event_type_mismatch",
+      "actual": "custom_attribute_event_type_mismatch",
+      "passed": true,
+      "semantic_candidate_ids": [
+        "target-1"
+      ],
+      "compatible_candidate_ids": [],
+      "selected_target_memory_id": null
+    },
+    {
+      "case_id": "EE-023",
+      "category": "custom",
+      "expected": "unsupported_custom_event_attribute",
+      "actual": "unsupported_custom_event_attribute",
+      "passed": true,
+      "semantic_candidate_ids": [],
+      "compatible_candidate_ids": [],
+      "selected_target_memory_id": null
+    },
+    {
+      "case_id": "EE-024",
+      "category": "false_enrichment",
+      "expected": "new_event_occurrence_requires_create",
+      "actual": "new_event_occurrence_requires_create",
+      "passed": true,
+      "semantic_candidate_ids": [],
+      "compatible_candidate_ids": [],
+      "selected_target_memory_id": null
+    },
+    {
+      "case_id": "EE-025",
+      "category": "false_enrichment",
+      "expected": "new_event_occurrence_requires_create",
+      "actual": "new_event_occurrence_requires_create",
+      "passed": true,
+      "semantic_candidate_ids": [],
+      "compatible_candidate_ids": [],
+      "selected_target_memory_id": null
+    },
+    {
+      "case_id": "EE-026",
+      "category": "false_enrichment",
+      "expected": "new_event_occurrence_requires_create",
+      "actual": "new_event_occurrence_requires_create",
+      "passed": true,
+      "semantic_candidate_ids": [],
+      "compatible_candidate_ids": [],
+      "selected_target_memory_id": null
+    },
+    {
+      "case_id": "EE-027",
+      "category": "false_enrichment",
+      "expected": "new_event_occurrence_requires_create",
+      "actual": "new_event_occurrence_requires_create",
+      "passed": true,
+      "semantic_candidate_ids": [],
+      "compatible_candidate_ids": [],
+      "selected_target_memory_id": null
+    },
+    {
+      "case_id": "EE-028",
+      "category": "evidence",
+      "expected": "enrichment_confidence_below_threshold",
+      "actual": "enrichment_confidence_below_threshold",
+      "passed": true,
+      "semantic_candidate_ids": [],
+      "compatible_candidate_ids": [],
+      "selected_target_memory_id": null
+    },
+    {
+      "case_id": "EE-029",
+      "category": "evidence",
+      "expected": "enrichment_evidence_not_in_source",
+      "actual": "enrichment_evidence_not_in_source",
+      "passed": true,
+      "semantic_candidate_ids": [],
+      "compatible_candidate_ids": [],
+      "selected_target_memory_id": null
+    },
+    {
+      "case_id": "EE-030",
+      "category": "scope",
+      "expected": "no_source_or_context_linked_event",
+      "actual": "no_source_or_context_linked_event",
+      "passed": true,
+      "semantic_candidate_ids": [],
+      "compatible_candidate_ids": [],
+      "selected_target_memory_id": null
+    },
+    {
+      "case_id": "EE-031",
+      "category": "non_event",
+      "expected": "no_source_or_context_linked_event",
+      "actual": "no_source_or_context_linked_event",
+      "passed": true,
+      "semantic_candidate_ids": [],
+      "compatible_candidate_ids": [],
+      "selected_target_memory_id": null
+    },
+    {
+      "case_id": "EE-032",
+      "category": "non_event",
+      "expected": "no_source_or_context_linked_event",
+      "actual": "no_source_or_context_linked_event",
+      "passed": true,
+      "semantic_candidate_ids": [],
+      "compatible_candidate_ids": [],
+      "selected_target_memory_id": null
+    }
+  ]
+}

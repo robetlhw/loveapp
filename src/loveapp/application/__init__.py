@@ -1,3 +1,7 @@
+from loveapp.application.event_enrichment import (
+    EventEnrichmentResolution,
+    resolve_event_enrichment,
+)
 from loveapp.application.memory import MemoryService
 from loveapp.application.memory_retrieval import (
     HybridMemoryRetriever,
@@ -26,6 +30,7 @@ from loveapp.application.retrieval_query_planner import (
 
 __all__ = [
     "ContextualQueryResult",
+    "EventEnrichmentResolution",
     "HybridMemoryRetriever",
     "LongTailRelationCandidateRetriever",
     "LongTailRelationShadowEvaluator",
@@ -42,6 +47,7 @@ __all__ = [
     "RetrievedMemory",
     "contextual_trigger_reason",
     "normalize_history",
+    "resolve_event_enrichment",
     "resolve_memory_retrieval_mode",
     "split_information_needs",
 ]

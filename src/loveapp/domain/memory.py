@@ -174,11 +174,18 @@ class SemanticRole(StrEnum):
     writes.
     """
 
+    NEW_PROPOSITION = "new_proposition"
+    ATTRIBUTE_COMPLETION = "attribute_completion"
+    REFINEMENT = "refinement"
+    CONTEXTUAL_COMPLETION = "contextual_completion"
+    UNCERTAIN = "uncertain"
+
+    # Legacy Stage-1 values remain parseable for stored diagnostics and model
+    # responses produced by the previous prompt contract.
     STANDALONE_PROPOSITION = "standalone_proposition"
     ATTRIBUTE_UPDATE = "attribute_update"
     REFINEMENT_CANDIDATE = "refinement_candidate"
     STATE_ASSERTION = "state_assertion"
-    CONTEXTUAL_COMPLETION = "contextual_completion"
 
 
 class CoarseProposition(BaseModel):
@@ -193,7 +200,7 @@ class CoarseProposition(BaseModel):
     proposition_id: str = Field(min_length=1, max_length=80)
     evidence_span: str = Field(min_length=1, max_length=1000)
     candidate_kinds: list[MemoryKind] = Field(min_length=1, max_length=5)
-    semantic_role: SemanticRole = SemanticRole.STANDALONE_PROPOSITION
+    semantic_role: SemanticRole = SemanticRole.NEW_PROPOSITION
     target_field_hint: str | None = Field(default=None, max_length=80)
     subject_hint: str | None = Field(default=None, max_length=80)
     temporal_hint: str | None = Field(default=None, max_length=160)

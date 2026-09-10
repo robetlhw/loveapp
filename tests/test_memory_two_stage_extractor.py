@@ -7,6 +7,7 @@ from pydantic import SecretStr
 
 from loveapp.adapters.memory.two_stage import TwoStageMemoryExtractor
 from loveapp.domain.memory import MemoryKind, MemorySemanticGateReason
+from loveapp.domain.memory_semantic_units import EnrichmentDraft, NewMemoryDraft
 
 
 class _FakeCompletions:
@@ -309,4 +310,125 @@ async def test_two_stage_normalizes_negative_gate_reason_to_safe_no_memory() -> 
     assert result.should_extract is False
     assert result.gate_reason == MemorySemanticGateReason.NO_MEMORY
     assert extractor.last_diagnostic["final_extractor_used"] == "two_stage_native"
+    await extractor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_two_stage_native_semantic_units_preserve_new_memory_and_enrichment() -> None:
+    extractor, completions = _fake_extractor(
+        [
+            {
+                "should_extract": True,
+                "gate_reason": "COMPOUND_MEMORY",
+                "propositions": [
+                    {
+                        "proposition_id": "p1",
+                        "evidence_span": "因为我迟到了",
+                        "candidate_kinds": ["interaction_event"],
+                        "semantic_role": "attribute_completion",
+                        "target_field_hint": "cause",
+                    },
+                    {
+                        "proposition_id": "p2",
+                        "evidence_span": "现在已经不理我了",
+                        "candidate_kinds": ["relationship_state"],
+                        "semantic_role": "new_proposition",
+                    },
+                ],
+                "discarded_spans": [],
+            },
+            {
+                "semantic_units": [
+                    {
+                        "semantic_type": "new_memory",
+                        "claim_id": "c1",
+                        "kind": "relationship_state",
+                        "subject": "relationship",
+                        "raw_predicate": "contact_unavailable",
+                        "predicate": "contact_unavailable",
+                        "summary": "对方现在不联系用户",
+                        "evidence_spans": ["现在已经不理我了"],
+                        "semantic_payload": {
+                            "state_dimension": "contact_availability",
+                            "state_value": "unavailable",
+                        },
+                    },
+                    {
+                        "semantic_type": "enrichment",
+                        "unit_id": "e1",
+                        "target_kind": "interaction_event",
+                        "target_semantic_hint": {"event_type": "conflict"},
+                        "attribute_namespace": "canonical",
+                        "attribute_name": "cause",
+                        "value": {"category": "lateness"},
+                        "evidence_span": "因为我迟到了",
+                        "confidence": 0.95,
+                    },
+                ],
+                "discarded_spans": [],
+            },
+        ]
+    )
+
+    result = await extractor.extract(
+        "因为我迟到了，她现在已经不理我了。",
+        reference_time=datetime(2026, 9, 10, tzinfo=UTC),
+        existing_memories=[],
+        conversation_history=[],
+    )
+
+    assert len(result.claims) == 1
+    assert isinstance(result.semantic_units[0], NewMemoryDraft)  # type: ignore[attr-defined]
+    assert isinstance(result.semantic_units[1], EnrichmentDraft)  # type: ignore[attr-defined]
+    assert result.claims[0].payload["state_value"] == "unavailable"
+    assert extractor.last_diagnostic["stage2"]["semantic_units"][1][
+        "attribute_name"
+    ] == "cause"
+    assert len(completions.calls) == 2
+    await extractor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_two_stage_legacy_claim_is_exposed_as_new_memory_draft() -> None:
+    extractor, _ = _fake_extractor(
+        [
+            {
+                "should_extract": True,
+                "gate_reason": "STABLE_FACT",
+                "propositions": [
+                    {
+                        "proposition_id": "p1",
+                        "evidence_span": "我住上海",
+                        "candidate_kinds": ["stable_fact"],
+                        "semantic_role": "standalone_proposition",
+                    }
+                ],
+                "discarded_spans": [],
+            },
+            {
+                "claims": [
+                    {
+                        "claim_id": "c1",
+                        "kind": "stable_fact",
+                        "subject": "user",
+                        "predicate": "resides_in",
+                        "object": "上海",
+                        "summary": "用户住在上海",
+                        "evidence_spans": ["我住上海"],
+                    }
+                ],
+                "discarded_spans": [],
+            },
+        ]
+    )
+
+    result = await extractor.extract(
+        "我住上海。",
+        reference_time=datetime(2026, 9, 10, tzinfo=UTC),
+        existing_memories=[],
+        conversation_history=[],
+    )
+
+    assert isinstance(result.semantic_units[0], NewMemoryDraft)  # type: ignore[attr-defined]
+    assert result.semantic_units[0].to_atomic_claim() == result.claims[0]  # type: ignore[attr-defined]
     await extractor.aclose()

@@ -115,6 +115,19 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             claim_count = len(extraction.claims)
             min_props = int(expected.get("min_propositions", 0))
             expected_claim_count = int(expected.get("claims", 0))
+            semantic_units = list(getattr(extraction, "semantic_units", []))
+            semantic_rows = [unit.model_dump(mode="json") for unit in semantic_units]
+            semantic_types = {str(unit.get("semantic_type")) for unit in semantic_rows}
+            attribute_names = {
+                str(unit.get("attribute_name"))
+                for unit in semantic_rows
+                if unit.get("attribute_name")
+            }
+            expected_semantic_types = set(expected.get("semantic_types", []))
+            forbidden_semantic_types = set(expected.get("forbidden_semantic_types", []))
+            expected_attributes = set(expected.get("attribute_names", []))
+            expected_coverage = set(expected.get("semantic_coverage", []))
+            semantic_snapshot = json.dumps(semantic_rows, ensure_ascii=False)
             rows.append(
                 {
                     "case_id": case["case_id"],
@@ -145,6 +158,15 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                     "stage1_kind_coverage_ok": expected_kinds <= candidate_kinds,
                     "claim_count_ok": claim_count >= expected_claim_count,
                     "final_claims": [claim.model_dump(mode="json") for claim in extraction.claims],
+                    "final_semantic_units": semantic_rows,
+                    "semantic_types_ok": (
+                        expected_semantic_types <= semantic_types
+                        and not (forbidden_semantic_types & semantic_types)
+                    ),
+                    "attribute_coverage_ok": expected_attributes <= attribute_names,
+                    "semantic_coverage_ok": all(
+                        marker in semantic_snapshot for marker in expected_coverage
+                    ),
                     "semantic_gate": {
                         "should_extract": extraction.should_extract,
                         "gate_reason": (
@@ -168,7 +190,12 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     fallback_reasons = Counter(
         row["fallback"]["fallback_reason"] for row in rows if row["fallback"]["fallback_reason"]
     )
-    multi_rows = [row for row in rows if row["expected"].get("min_propositions", 0) > 1]
+    multi_rows = [
+        row
+        for row in rows
+        if row["expected"].get("min_propositions", 0) > 1
+        and not row["expected"].get("semantic_types")
+    ]
     summary = {
         "evaluation": "two_stage_extraction_diagnostic_v0_1",
         "dataset": str(args.dataset),
@@ -188,6 +215,16 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "multi_claim_preservation_count": sum(
             row["claim_count_ok"] for row in multi_rows
+        ),
+        "semantic_operation_expected_count": sum(
+            bool(row["expected"].get("semantic_types")) for row in rows
+        ),
+        "semantic_operation_pass_count": sum(
+            row["semantic_types_ok"]
+            and row["attribute_coverage_ok"]
+            and row["semantic_coverage_ok"]
+            for row in rows
+            if row["expected"].get("semantic_types")
         ),
         "store_mutation_permitted": False,
         "pre_fix_baseline": _PRE_FIX_BASELINE,
@@ -246,6 +283,8 @@ def _render_summary(report: dict[str, Any]) -> str:
         f"Stage2 multi-claim preservation: `"
         f"{report['multi_claim_preservation_count']}/"
         f"{report['multi_proposition_case_count']}`",
+        f"Semantic operation contract: `{report['semantic_operation_pass_count']}/"
+        f"{report['semantic_operation_expected_count']}`",
         "",
         "## Fallback reasons",
         "",

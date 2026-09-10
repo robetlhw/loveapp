@@ -236,6 +236,8 @@ INTERACTION_EVENT_PAYLOAD_FIELDS = frozenset(
         "novelty",
         "relationship_impact",
         "event_markers",
+        "custom_attributes",
+        "enrichment_history",
     }
 )
 INTERACTION_PATTERN_PAYLOAD_FIELDS = frozenset(
@@ -1004,6 +1006,42 @@ def validate_interaction_event_payload(
         }
         if not valid_numeric and not valid_text:
             raise ValueError("interaction_event severity must be 1..5 or a bounded label")
+
+    custom_attributes = payload.get("custom_attributes")
+    if custom_attributes is not None:
+        if not isinstance(custom_attributes, (list, tuple)) or len(custom_attributes) > 20:
+            raise ValueError("interaction_event custom_attributes must be a short list")
+        required = {
+            "attribute",
+            "value",
+            "evidence_span",
+            "source_message_id",
+            "confidence",
+            "created_at",
+        }
+        for attribute in custom_attributes:
+            if not isinstance(attribute, Mapping) or set(attribute) != required:
+                raise ValueError("interaction_event custom attribute has an invalid shape")
+            name = attribute.get("attribute")
+            value = attribute.get("value")
+            confidence = attribute.get("confidence")
+            if (
+                not isinstance(name, str)
+                or re.fullmatch(r"[a-z][a-z0-9_]*", name) is None
+                or isinstance(value, bool)
+                or not isinstance(value, (str, int))
+                or (isinstance(value, str) and not value.strip())
+                or isinstance(confidence, bool)
+                or not isinstance(confidence, (int, float))
+                or not 0 <= float(confidence) <= 1
+            ):
+                raise ValueError("interaction_event custom attribute is invalid")
+            for field in ("evidence_span", "source_message_id", "created_at"):
+                item = attribute.get(field)
+                if not isinstance(item, str) or not item.strip():
+                    raise ValueError(
+                        f"interaction_event custom attribute {field} is invalid"
+                    )
 
     for field in ("salience", "novelty"):
         value = payload.get(field)

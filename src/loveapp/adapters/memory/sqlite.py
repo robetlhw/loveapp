@@ -1126,6 +1126,11 @@ class SQLiteMemoryStore:
                     score_breakdown={
                         "enrichment_type": "event_attribute",
                         "field": enrichment.field.value,
+                        "attribute_name": (
+                            enrichment.value.attribute
+                            if enrichment.field.value == "custom_attribute"
+                            else enrichment.field.value
+                        ),
                         "antecedent_message_id": enrichment.antecedent_message_id,
                     },
                     raw_predicate=updated.raw_predicate,
