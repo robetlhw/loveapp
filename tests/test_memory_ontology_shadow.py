@@ -86,6 +86,18 @@ async def test_shadow_runs_same_gold_without_store_and_reports_strategy(tmp_path
     assert report["dataset_sha256"]
     assert report["comparison"]["cases"][0]["two_stage"]["stage_used"] == "two_stage"
     assert report["comparison"]["cases"][0]["two_stage"]["fallback_used"] is False
+    assert report["comparison"]["execution"]["native_completion_rate"] == 1.0
+    assert report["comparison"]["execution"]["fallback_reasons"] == {}
+    assert report["comparison"]["two_stage_native_metrics"]["case_count"] == 1
+    assert report["comparison"]["cost"]["two_stage_native_only"] == {
+        "case_count": 1,
+        "call_count": 1,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "avg_calls_per_case": 1.0,
+        "avg_tokens_per_case": 0.0,
+    }
     assert single.calls == two.calls == 1
 
 
@@ -100,6 +112,16 @@ def test_shadow_artifacts_are_machine_and_human_readable(tmp_path: Path) -> None
             "single_stage_telemetry": {"call_count": 0, "total_tokens": 0},
             "two_stage_telemetry": {"call_count": 0, "total_tokens": 0},
             "telemetry_delta": {"call_count": 0},
+            "execution": {
+                "case_count": 0,
+                "native_completion_count": 0,
+                "native_completion_rate": None,
+                "fallback_count": 0,
+                "fallback_rate": None,
+                "fallback_reasons": {},
+            },
+            "two_stage_native_metrics": {},
+            "cost": {},
         },
     }
     results, summary = write_ontology_shadow_artifacts(report, tmp_path)

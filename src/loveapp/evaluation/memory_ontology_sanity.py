@@ -295,7 +295,12 @@ async def _evaluate_case(
             attempt_callback=attempts.append,
         )
     except Exception as exc:
-        return _failed_case(case, exc, attempts=attempts)
+        return _failed_case(
+            case,
+            exc,
+            attempts=attempts,
+            extractor_diagnostic=getattr(extractor, "last_diagnostic", None),
+        )
     extracted_candidates = [
         claim.to_candidate().model_copy(update={"original_text": case.text})
         for claim in extraction.claims
@@ -395,6 +400,7 @@ async def _evaluate_case(
         "gold_notes": case.notes,
         "annotation": case.annotation.model_dump(mode="json"),
         "high_risk": case.case_id in HIGH_RISK_CASE_IDS,
+        "extractor_diagnostic": getattr(extractor, "last_diagnostic", None),
     }
 
 
@@ -1040,6 +1046,7 @@ def _failed_case(
     exc: Exception,
     *,
     attempts: list[MemoryExtractionAttempt] | None = None,
+    extractor_diagnostic: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     expected = [claim.fields() for claim in case.expected_claims]
     attempts = attempts or []
@@ -1079,6 +1086,7 @@ def _failed_case(
         "gold_notes": case.notes,
         "annotation": case.annotation.model_dump(mode="json"),
         "high_risk": case.case_id in HIGH_RISK_CASE_IDS,
+        "extractor_diagnostic": extractor_diagnostic,
     }
 
 

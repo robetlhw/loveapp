@@ -21,9 +21,7 @@ class _FakeCompletions:
             choices=[
                 SimpleNamespace(
                     finish_reason="stop",
-                    message=SimpleNamespace(
-                        content=json.dumps(response, ensure_ascii=False)
-                    ),
+                    message=SimpleNamespace(content=json.dumps(response, ensure_ascii=False)),
                 )
             ],
             usage=SimpleNamespace(prompt_tokens=10, completion_tokens=20, total_tokens=30),
@@ -144,6 +142,67 @@ async def test_two_stage_rejects_forbidden_target_and_falls_back_safely() -> Non
 
     assert len(completions.calls) == 2
     assert result.claims == []
+    assert extractor.last_diagnostic["fallback"]["reason_code"] == "UNSUPPORTED_OUTPUT"
+    await extractor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_two_stage_unknown_claim_kind_fails_closed_instead_of_becoming_partial() -> None:
+    extractor, completions = _fake_extractor(
+        [
+            {
+                "should_extract": True,
+                "gate_reason": "COMPOUND_MEMORY",
+                "propositions": [
+                    {
+                        "proposition_id": "p1",
+                        "evidence_span": "昨天吵架了",
+                        "candidate_kinds": ["interaction_event"],
+                    },
+                    {
+                        "proposition_id": "p2",
+                        "evidence_span": "现在还在冷战",
+                        "candidate_kinds": ["relationship_state"],
+                    },
+                ],
+                "discarded_spans": [],
+            },
+            {
+                "claims": [
+                    {
+                        "claim_id": "c1",
+                        "kind": "interaction_event",
+                        "subject": "relationship",
+                        "predicate": "had_argument",
+                        "summary": "昨天双方吵架了",
+                        "evidence_spans": ["昨天吵架了"],
+                    },
+                    {
+                        "claim_id": "c2",
+                        "kind": "unknown_state_kind",
+                        "subject": "relationship",
+                        "predicate": "cold_war",
+                        "summary": "双方仍在冷战",
+                        "evidence_spans": ["现在还在冷战"],
+                    },
+                ],
+                "discarded_spans": [],
+            },
+        ]
+    )
+
+    result = await extractor.extract(
+        "昨天吵架了，现在还在冷战。",
+        reference_time=datetime(2026, 9, 10, tzinfo=UTC),
+        existing_memories=[],
+        conversation_history=[],
+    )
+
+    assert len(completions.calls) == 2
+    assert result.claims == []
+    assert extractor.last_diagnostic["stage2"]["parse_success"] is True
+    assert extractor.last_diagnostic["stage2"]["validation_success"] is False
+    assert extractor.last_diagnostic["fallback"]["reason_code"] == "STAGE2_SCHEMA_ERROR"
     await extractor.aclose()
 
 
@@ -170,4 +229,84 @@ async def test_two_stage_gate_negative_skips_detailed_call() -> None:
     assert len(completions.calls) == 1
     assert result.should_extract is False
     assert result.gate_reason == MemorySemanticGateReason.NO_MEMORY
+    await extractor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_two_stage_repairs_bounded_stage_contract_aliases_without_fallback() -> None:
+    extractor, completions = _fake_extractor(
+        [
+            {
+                "should_extract": True,
+                "gate_reason": "用户陈述了居住地，属于可记忆事实",
+                "propositions": [
+                    {
+                        "text": "我现在住在上海。",
+                        "source_span": "我现在住在上海。",
+                        "candidate_kinds": ["residence", "personal_fact"],
+                        "semantic_role": "state",
+                    }
+                ],
+                "discarded_spans": [],
+            },
+            {
+                "type": "json_object",
+                "atomic_extractions": [
+                    {
+                        "proposition_id": "p1",
+                        "claims": [
+                            {
+                                "subject": "user",
+                                "predicate": "resides_in",
+                                "object": "上海",
+                                "evidence_span": "我现在住在上海。",
+                                "kind": "stable_fact",
+                            }
+                        ],
+                    }
+                ],
+            },
+        ]
+    )
+
+    result = await extractor.extract(
+        "我现在住在上海。",
+        reference_time=datetime(2026, 9, 10, tzinfo=UTC),
+        existing_memories=[],
+        conversation_history=[],
+    )
+
+    assert len(completions.calls) == 2
+    assert result.claims[0].kind == MemoryKind.STABLE_FACT
+    assert extractor.last_diagnostic["final_extractor_used"] == "two_stage_native"
+    assert extractor.last_diagnostic["stage1"]["validation_success"] is True
+    assert extractor.last_diagnostic["stage2"]["validation_success"] is True
+    assert extractor.last_diagnostic["fallback"]["triggered"] is False
+    await extractor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_two_stage_normalizes_negative_gate_reason_to_safe_no_memory() -> None:
+    extractor, completions = _fake_extractor(
+        [
+            {
+                "should_extract": False,
+                "gate_reason": "CONTEXT_DEPENDENT_REPLY",
+                "propositions": [],
+                "discarded_spans": ["那我现在应该怎么办？"],
+            }
+        ]
+    )
+
+    result = await extractor.extract(
+        "那我现在应该怎么办？",
+        reference_time=datetime(2026, 9, 10, tzinfo=UTC),
+        existing_memories=[],
+        conversation_history=[],
+    )
+
+    assert len(completions.calls) == 1
+    assert result.should_extract is False
+    assert result.gate_reason == MemorySemanticGateReason.NO_MEMORY
+    assert extractor.last_diagnostic["final_extractor_used"] == "two_stage_native"
     await extractor.aclose()
