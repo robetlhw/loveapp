@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 from loveapp.domain.memory import (
     EpistemicStatus,
@@ -59,6 +59,8 @@ class EventEnrichmentResolution:
     semantic_candidate_ids: tuple[str, ...] = ()
     compatible_candidate_ids: tuple[str, ...] = ()
     rejected_candidates: tuple[tuple[str, str], ...] = ()
+    candidate_scores: tuple[tuple[str, float], ...] = ()
+    temporal_disambiguation_applied: bool = False
 
     @property
     def resolved(self) -> bool:
@@ -174,6 +176,12 @@ def resolve_event_enrichment(
         if pending_linked
         else []
     )
+    semantic_candidates, temporal_scores, temporal_applied = _apply_temporal_disambiguation(
+        semantic_candidates,
+        draft=draft,
+        current_text=current_text,
+        antecedent=antecedent,
+    )
     semantic_ids = tuple(item.id for item in semantic_candidates[:8])
     if not semantic_candidates:
         return EventEnrichmentResolution(
@@ -181,6 +189,8 @@ def resolve_event_enrichment(
             antecedent_message_id=antecedent_id,
             field=field,
             reason="no_source_or_context_linked_event",
+            candidate_scores=temporal_scores,
+            temporal_disambiguation_applied=temporal_applied,
         )
     if len(semantic_candidates) != 1:
         return EventEnrichmentResolution(
@@ -193,6 +203,8 @@ def resolve_event_enrichment(
                 (item.id, "ambiguous_semantic_event_antecedent")
                 for item in semantic_candidates[:8]
             ),
+            candidate_scores=temporal_scores,
+            temporal_disambiguation_applied=temporal_applied,
         )
 
     target = semantic_candidates[0]
@@ -210,6 +222,8 @@ def resolve_event_enrichment(
             reason=rejection,
             semantic_candidate_ids=semantic_ids,
             rejected_candidates=((target.id, rejection),),
+            candidate_scores=temporal_scores,
+            temporal_disambiguation_applied=temporal_applied,
         )
     return EventEnrichmentResolution(
         **base,
@@ -223,6 +237,8 @@ def resolve_event_enrichment(
         ),
         semantic_candidate_ids=semantic_ids,
         compatible_candidate_ids=(target.id,),
+        candidate_scores=temporal_scores,
+        temporal_disambiguation_applied=temporal_applied,
     )
 
 
@@ -353,6 +369,94 @@ def _latest_user_message(history: Iterable) -> object | None:
         and str(getattr(message, "content", "")).strip()
     ]
     return messages[-1] if messages else None
+
+
+def _apply_temporal_disambiguation(
+    candidates: list[MemoryItem],
+    *,
+    draft: EnrichmentDraft,
+    current_text: str,
+    antecedent: object,
+) -> tuple[list[MemoryItem], tuple[tuple[str, float], ...], bool]:
+    """Use an explicit temporal cue only when it uniquely separates targets.
+
+    This is deliberately not a nearest-memory selector.  A candidate is
+    filtered only when one target is strongly compatible and every other
+    target is explicitly incompatible; ties and weak evidence remain
+    ambiguous and therefore fail closed.
+    """
+
+    if len(candidates) <= 1:
+        return candidates, tuple((item.id, 1.0) for item in candidates), False
+    hint = (draft.temporal_hint or _temporal_hint_from_text(current_text) or "").strip()
+    if not hint:
+        return candidates, tuple((item.id, 0.5) for item in candidates), False
+    anchor = getattr(antecedent, "created_at", None)
+    if not isinstance(anchor, datetime):
+        anchor = datetime.now()
+    scores = tuple(
+        (item.id, round(_temporal_compatibility_score(item, hint, anchor), 4))
+        for item in candidates[:8]
+    )
+    strong = [item for item in candidates if dict(scores).get(item.id, 0.0) >= 0.9]
+    incompatible = [
+        item for item in candidates if dict(scores).get(item.id, 0.0) <= 0.1
+    ]
+    if len(strong) == 1 and len(incompatible) == len(candidates) - 1:
+        return [strong[0]], scores, True
+    return candidates, scores, False
+
+
+def _temporal_hint_from_text(text: str) -> str | None:
+    for pattern, hint in (
+        (r"昨天|昨日|yesterday", "yesterday"),
+        (r"今天|今日|today", "today"),
+        (
+            r"前天|the\s+day\s+before\s+yesterday|day\s+before\s+yesterday",
+            "day_before_yesterday",
+        ),
+        (r"刚才|刚刚|just\s+now", "recent"),
+    ):
+        if re.search(pattern, text, re.IGNORECASE):
+            return hint
+    return None
+
+
+def _temporal_compatibility_score(
+    item: MemoryItem,
+    hint: str,
+    anchor: datetime,
+) -> float:
+    target_time = item.occurred_at or item.period_end or item.period_start
+    if not isinstance(target_time, datetime):
+        return 0.5
+    try:
+        target_date = target_time.date()
+        anchor_date = anchor.date()
+    except (AttributeError, ValueError):
+        return 0.5
+    normalized = hint.casefold().strip()
+    if normalized in {"yesterday", "昨日", "昨天"}:
+        return 1.0 if target_date == anchor_date - timedelta(days=1) else 0.0
+    if normalized in {"today", "今日", "今天"}:
+        return 1.0 if target_date == anchor_date else 0.0
+    if normalized in {"day_before_yesterday", "前天"}:
+        return 1.0 if target_date == anchor_date - timedelta(days=2) else 0.0
+    if normalized in {"recent", "刚才", "刚刚"}:
+        return 1.0 if target_date == anchor_date else 0.4
+    parsed = _parse_temporal_date_hint(hint)
+    if parsed is not None:
+        return 1.0 if target_date == parsed else 0.0
+    return 0.5
+
+
+def _parse_temporal_date_hint(value: str) -> date | None:
+    candidate = value.strip().replace("年", "-").replace("月", "-").replace("日", "")
+    candidate = candidate.replace("/", "-")
+    try:
+        return date.fromisoformat(candidate)
+    except ValueError:
+        return None
 
 
 def _is_context_linked(item: MemoryItem, antecedent_message_id: str) -> bool:

@@ -5,7 +5,7 @@ from enum import StrEnum
 from hashlib import sha256
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 from loveapp.domain.memory_dimensions import normalize_state_dimension, normalize_state_value
 from loveapp.domain.memory_predicates import (
@@ -177,6 +177,9 @@ class SemanticRole(StrEnum):
     NEW_PROPOSITION = "new_proposition"
     ATTRIBUTE_COMPLETION = "attribute_completion"
     REFINEMENT = "refinement"
+    STATE_UPDATE = "state_update"
+    PATTERN_EXTRACTION = "pattern_extraction"
+    BELIEF_EXTRACTION = "belief_extraction"
     CONTEXTUAL_COMPLETION = "contextual_completion"
     UNCERTAIN = "uncertain"
 
@@ -201,6 +204,19 @@ class CoarseProposition(BaseModel):
     evidence_span: str = Field(min_length=1, max_length=1000)
     candidate_kinds: list[MemoryKind] = Field(min_length=1, max_length=5)
     semantic_role: SemanticRole = SemanticRole.NEW_PROPOSITION
+    # Stage 1 may retain more than one semantic hypothesis.  The singular
+    # ``semantic_role`` remains the backwards-compatible primary hint; this
+    # additive field lets Stage 2 see ambiguity instead of inheriting a
+    # premature mutation decision.
+    semantic_role_candidates: list[SemanticRole] = Field(
+        default_factory=list,
+        max_length=7,
+        validation_alias=AliasChoices(
+            "semantic_role_candidates",
+            "semantic_roles",
+            "role_candidates",
+        ),
+    )
     target_field_hint: str | None = Field(default=None, max_length=80)
     subject_hint: str | None = Field(default=None, max_length=80)
     temporal_hint: str | None = Field(default=None, max_length=160)
@@ -213,6 +229,15 @@ class CoarseProposition(BaseModel):
         # Preserve order while preventing duplicate routing branches.  A
         # top-k hint is useful for ambiguous Event/Pattern/State boundaries.
         self.candidate_kinds = list(dict.fromkeys(self.candidate_kinds))
+        roles = list(dict.fromkeys(self.semantic_role_candidates))
+        # When a provider sends only the plural field, use its first bounded
+        # hypothesis as the legacy primary hint.  An explicitly supplied
+        # singular role always wins and is retained at the front.
+        if "semantic_role" not in self.model_fields_set and roles:
+            self.semantic_role = roles[0]
+        if self.semantic_role not in roles:
+            roles.insert(0, self.semantic_role)
+        self.semantic_role_candidates = roles[:7]
         forbidden_keys = {
             "target_memory_id",
             "target_memory_ids",
@@ -238,6 +263,12 @@ class CoarseProposition(BaseModel):
                 "coarse semantic hints cannot contain database targets or mutation commands"
             )
         return self
+
+    @property
+    def semantic_roles(self) -> list[SemanticRole]:
+        """Compatibility accessor for the Stage 1 multi-role vocabulary."""
+
+        return list(self.semantic_role_candidates)
 
 
 class MessageRole(StrEnum):

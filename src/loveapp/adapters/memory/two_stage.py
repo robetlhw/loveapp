@@ -30,9 +30,17 @@ from loveapp.domain.memory import (
     MemoryExtractionAttempt,
     MemoryItem,
     MemoryKind,
+    MemoryPerspective,
     MemorySemanticGateReason,
     SemanticRole,
     StoredMessage,
+)
+from loveapp.domain.memory_dimensions import (
+    INTERACTION_PATTERN_DIMENSIONS,
+    detect_evidence_dimensions,
+    normalize_interaction_metric,
+    normalize_state_dimension,
+    normalize_state_value,
 )
 from loveapp.domain.memory_semantic_units import (
     EnrichmentDraft,
@@ -49,6 +57,13 @@ from .openai_compatible import (
     _capture_usage,
     _flush_attempts,
     _safe_model_response_snapshot,
+)
+from .stage2_routing import (
+    SemanticRoleRouter,
+    Stage2ExtractorRoute,
+    Stage2PromptRoute,
+    is_new_event_occurrence,
+    route_instruction,
 )
 
 _TWO_STAGE_PROMPT_VERSION = "memory-event-enrichment-mvp-v1"
@@ -84,6 +99,7 @@ class TwoStageMemoryExtractor:
         self._sdk_max_retries = max_retries
         self._thinking = thinking
         self._fallback = fallback
+        self._role_router = SemanticRoleRouter()
         # The diagnostic snapshot is intentionally kept on the opt-in
         # extractor rather than persisted in the Memory domain.  Evaluation
         # harnesses can inspect it after each call without changing the Store
@@ -147,6 +163,7 @@ class TwoStageMemoryExtractor:
                 "validation_success": False,
                 "claims": [],
                 "semantic_units": [],
+                "routes": [],
             },
             "fallback": {
                 "triggered": False,
@@ -341,6 +358,12 @@ class TwoStageMemoryExtractor:
         trace: TraceRecorder | None,
         attempts: list[MemoryExtractionAttempt],
     ) -> AtomicExtraction:
+        routes = self._role_router.route_many(coarse.propositions)
+        route_payload = [
+            _route_prompt_payload(route, proposition)
+            for route, proposition in zip(routes, coarse.propositions, strict=False)
+        ]
+        self._last_diagnostic["stage2"]["routes"] = route_payload
         prompt = _build_detailed_prompt(
             text,
             reference_time=reference_time,
@@ -354,11 +377,18 @@ class TwoStageMemoryExtractor:
             "tier": self._tier,
             "stage": "detailed",
             "prompt_version": _TWO_STAGE_PROMPT_VERSION,
+            "route_count": len(routes),
+            "routes": [route.model_dump() for route in routes],
         }
         started = perf_counter()
         self._last_diagnostic["stage2"]["called"] = True
         try:
-            content, usage = await self._call(prompt, _DETAILED_SYSTEM_PROMPT, trace, details)
+            content, usage = await self._call(
+                prompt,
+                _build_detailed_system_prompt(routes),
+                trace,
+                details,
+            )
             self._last_diagnostic["stage2"]["raw_output"] = _safe_model_response_snapshot(content)
             _capture_usage(details, usage)
             self._last_diagnostic["stage2"].update(
@@ -380,6 +410,11 @@ class TwoStageMemoryExtractor:
             raw = _coerce_detailed_payload(raw_model_payload)
             extraction, repair_steps = _parse_detailed_extraction(
                 raw,
+                source_text=text,
+                coarse=coarse,
+            )
+            _validate_stage2_role_contract(
+                extraction,
                 source_text=text,
                 coarse=coarse,
             )
@@ -488,14 +523,30 @@ def _build_coarse_prompt(
         item.pop("id", None)
     context["stage"] = "coarse_proposition_extraction"
     context["contract"] = {
+        "stage1_responsibilities": [
+            "proposition_decomposition",
+            "semantic_role_routing",
+            "candidate_memory_kind_hint",
+        ],
+        "stage1_must_not_decide": [
+            "CREATE",
+            "ENRICH",
+            "UPDATE",
+            "target_memory_id",
+            "mutation_action",
+        ],
         "candidate_kinds_are_hints": True,
         "semantic_roles": [
             "new_proposition",
             "attribute_completion",
             "refinement",
+            "state_update",
+            "pattern_extraction",
+            "belief_extraction",
             "contextual_completion",
             "uncertain",
         ],
+        "semantic_role_candidates_allowed": True,
         "forbidden_outputs": [
             "canonical_predicate",
             "target_memory_id",
@@ -531,9 +582,11 @@ def _build_detailed_prompt(
         {
             "stage": "batched_kind_aware_detailed_extraction",
             "coarse_extraction": coarse.model_dump(mode="json"),
+            "stage2_route_plan": _build_route_plan(coarse),
             "contract": {
                 "output": "SemanticAtomicExtraction",
                 "one_response_for_all_propositions": True,
+                "stage2_routes": [route.value for route in Stage2ExtractorRoute],
                 "semantic_unit_types": [
                     "new_memory",
                     "enrichment",
@@ -552,6 +605,205 @@ def _build_detailed_prompt(
     return json.dumps(context, ensure_ascii=False)
 
 
+def _route_prompt_payload(
+    route: Stage2PromptRoute,
+    proposition: Any,
+) -> dict[str, Any]:
+    """Serialize one role route without exposing storage authority."""
+
+    return {
+        **route.model_dump(),
+        "evidence_span": proposition.evidence_span,
+        "candidate_kinds": [
+            kind.value if isinstance(kind, MemoryKind) else str(kind)
+            for kind in proposition.candidate_kinds
+        ],
+        "subject_hint": proposition.subject_hint,
+        "temporal_hint": proposition.temporal_hint,
+        "target_field_hint": proposition.target_field_hint,
+        "instruction": route_instruction(route.selected_route),
+    }
+
+
+def _build_route_plan(coarse: CoarseExtraction) -> list[dict[str, Any]]:
+    router = SemanticRoleRouter()
+    routes = router.route_many(coarse.propositions)
+    return [
+        _route_prompt_payload(route, proposition)
+        for route, proposition in zip(routes, coarse.propositions, strict=False)
+    ]
+
+
+def _build_detailed_system_prompt(
+    routes: list[Stage2PromptRoute],
+) -> str:
+    """Add only the active role instructions to the shared Stage 2 contract.
+
+    The network shape intentionally remains one batched detailed call.  The
+    route block makes the reasoning task explicit without introducing a
+    second extractor pipeline or granting write authority to the model.
+    """
+
+    active = list(dict.fromkeys(route.selected_route for route in routes))
+    if not active:
+        return _DETAILED_SYSTEM_PROMPT
+    instructions = "\n".join(
+        f"- {route.value}: {route_instruction(route)}" for route in active
+    )
+    return (
+        f"{_DETAILED_SYSTEM_PROMPT}\n\n"
+        "本次批次启用的 Stage2 semantic routes（仅用于选择语义草稿）：\n"
+        f"{instructions}"
+    )
+
+
+def _proposition_for_unit(
+    unit: NewMemoryDraft | EnrichmentDraft | RefinementDraft,
+    coarse: CoarseExtraction,
+) -> Any | None:
+    """Match a detailed unit to its Stage 1 proposition by id or evidence."""
+
+    unit_id = getattr(unit, "unit_id", None) or getattr(unit, "claim_id", None)
+    propositions = list(coarse.propositions)
+    if unit_id:
+        exact = next(
+            (item for item in propositions if item.proposition_id == str(unit_id)),
+            None,
+        )
+        if exact is not None:
+            return exact
+    if isinstance(unit, NewMemoryDraft):
+        evidence = list(unit.evidence_spans)
+    else:
+        evidence = [unit.evidence_span]
+    for proposition in propositions:
+        if any(
+            span
+            and (span in proposition.evidence_span or proposition.evidence_span in span)
+            for span in evidence
+        ):
+            return proposition
+    return None
+
+
+def _validate_stage2_role_contract(
+    extraction: SemanticAtomicExtraction,
+    *,
+    source_text: str,
+    coarse: CoarseExtraction,
+) -> None:
+    """Apply bounded, safety-critical role checks after model parsing.
+
+    Most role guidance remains advisory so a provider can recover from a
+    coarse hint.  The new-event/enrichment boundary is different: accepting a
+    clearly new occurrence as an enrichment could authorize a destructive
+    downstream write, so that direction fails closed.
+    """
+
+    router = SemanticRoleRouter()
+    for unit in extraction.semantic_units:
+        proposition = _proposition_for_unit(unit, coarse)
+        route = router.route(proposition) if proposition is not None else None
+        selected = route.selected_route if route is not None else None
+        evidence = (
+            " ".join(unit.evidence_spans)
+            if isinstance(unit, NewMemoryDraft)
+            else getattr(unit, "evidence_span", "")
+        )
+        if isinstance(unit, EnrichmentDraft):
+            # Use the proposition span first.  Looking at the entire compound
+            # message would incorrectly reject a legitimate old-event
+            # enrichment that happens to share a turn with a new proposition.
+            occurrence_text = (
+                proposition.evidence_span if proposition is not None else evidence
+            )
+            if is_new_event_occurrence(occurrence_text, evidence):
+                raise MemoryResponseError(
+                    "new bounded Event occurrence cannot be an enrichment",
+                    category="semantic_role_mismatch",
+                )
+            if selected in {
+                Stage2ExtractorRoute.STATE,
+                Stage2ExtractorRoute.PATTERN,
+                Stage2ExtractorRoute.BELIEF,
+                Stage2ExtractorRoute.REFINEMENT,
+            }:
+                raise MemoryResponseError(
+                    "detailed semantic unit does not match its Stage 1 role",
+                    category="semantic_role_mismatch",
+                )
+            if (
+                selected == Stage2ExtractorRoute.EVENT_ENRICHMENT
+                and route is not None
+                and unit.target_kind != MemoryKind.INTERACTION_EVENT
+            ):
+                raise MemoryResponseError(
+                    "event enrichment route must target an interaction_event hint",
+                    category="semantic_role_mismatch",
+                )
+        if isinstance(unit, RefinementDraft) and selected not in {
+            Stage2ExtractorRoute.REFINEMENT,
+            Stage2ExtractorRoute.UNCERTAIN,
+            None,
+        }:
+            raise MemoryResponseError(
+                "detailed refinement unit does not match its Stage 1 role",
+                category="semantic_role_mismatch",
+            )
+        if isinstance(unit, NewMemoryDraft) and proposition is not None:
+            # ``state_assertion`` is the legacy Stage-1 spelling.  It routes
+            # to the State prompt for compatibility, but older providers used
+            # it as a broad hint for ordinary stable facts (for example a
+            # residence claim).  Keep that bounded legacy behavior parseable;
+            # the stricter relationship_state requirement applies to the new
+            # explicit ``state_update`` role.
+            legacy_state_hint = SemanticRole.STATE_ASSERTION in {
+                role
+                for role in (
+                    getattr(proposition, "semantic_role", None),
+                    *(getattr(proposition, "semantic_role_candidates", []) or []),
+                )
+                if isinstance(role, SemanticRole)
+            }
+            if (
+                selected == Stage2ExtractorRoute.STATE
+                and unit.kind != MemoryKind.RELATIONSHIP_STATE
+                and not legacy_state_hint
+            ):
+                raise MemoryResponseError(
+                    "state route must emit a relationship_state draft",
+                    category="semantic_role_mismatch",
+                )
+            if (
+                selected == Stage2ExtractorRoute.PATTERN
+                and unit.kind != MemoryKind.INTERACTION_PATTERN
+            ):
+                raise MemoryResponseError(
+                    "pattern route must emit an interaction_pattern draft",
+                    category="semantic_role_mismatch",
+                )
+            if selected == Stage2ExtractorRoute.PATTERN:
+                metric = normalize_interaction_metric(unit.payload.get("metric"))
+                if metric not in INTERACTION_PATTERN_DIMENSIONS:
+                    raise MemoryResponseError(
+                        "pattern route requires a registered metric",
+                        category="semantic_validation",
+                    )
+            if (
+                selected == Stage2ExtractorRoute.BELIEF
+                and unit.perspective != MemoryPerspective.USER_BELIEF
+            ):
+                raise MemoryResponseError(
+                    "belief route must retain user_belief perspective",
+                    category="semantic_role_mismatch",
+                )
+            if selected == Stage2ExtractorRoute.EVENT_ENRICHMENT:
+                raise MemoryResponseError(
+                    "event enrichment route must emit an enrichment draft",
+                    category="semantic_role_mismatch",
+                )
+
+
 _COARSE_SYSTEM_PROMPT = """
 你是 LoveApp Memory Event Enrichment MVP 的 Stage 1 语义拆分器。只输出一个 JSON 对象：
 {"should_extract": true, "gate_reason": "STABLE_FACT", "propositions": [], "discarded_spans": []}
@@ -562,8 +814,10 @@ SMALL_TALK、NO_MEMORY；不要填写解释句。
 每个 proposition 必须严格包含 proposition_id、evidence_span、candidate_kinds、semantic_role；
 candidate_kinds 只能使用 stable_fact、preference、interaction_event、interaction_pattern、
 advice_outcome、planned_event、action_intent、relationship_state；允许多个候选。
-semantic_role 只能是 new_proposition、attribute_completion、refinement、
-contextual_completion、uncertain。
+semantic_role 只能是 new_proposition、attribute_completion、refinement、state_update、
+pattern_extraction、belief_extraction、contextual_completion、uncertain。可选填写
+semantic_role_candidates/semantic_roles 保留多个语义假设；Stage 1 绝不输出 CREATE、ENRICH、UPDATE、
+target_memory_id 或任何数据库写入指令。
 先判断当前文本是否描述新的、有边界的 occurrence；“今天/又/再次/这次”出现时仍需结合
 完整事件语义判断，新的 occurrence 必须是 new_proposition。只有对已有事件属性的省略式补充才是
 attribute_completion/contextual_completion。看到“因为”不能直接判为 completion。
@@ -606,6 +860,14 @@ semantic_payload.state_dimension=contact_availability 和 state_value=unavailabl
 你只提供语义事实，不决定关系目标、生命周期或数据库操作。
 严禁输出 target_memory_id、target_memory_ids、mutation_action、supersedes_id 或任意 DB patch；
 canonical predicate 由后续 deterministic normalizer 治理，不能伪造未注册 canonical。
+Stage 2 必须先遵循 user prompt 中的 stage2_route_plan，再选择 semantic unit。
+NewMemoryExtractor 只产出 new_memory；EventEnrichmentExtractor 只产出 enrichment；StateExtractor
+产出 relationship_state；PatternExtractor 产出带 metric 的 interaction_pattern；RefinementExtractor
+只产出 refinement；BeliefExtractor 使用 user_belief/uncertain。候选 route 冲突时宁可不产出单位。
+新时间标记 + 新 occurrence + event predicate 始终遵循 New Event Dominance，禁止 enrichment；
+已有 active conflict 语境中的“说开/和解/解决”优先输出
+enrichment(attribute_name=resolution,value=reconciled)，不要凭空创建 reconciliation event。
+所有 route 都不得输出 target_memory_id、mutation_action 或数据库 patch。
 """.strip()
 
 
@@ -697,6 +959,16 @@ def _coerce_coarse_payload(value: dict[str, Any]) -> tuple[dict[str, Any], list[
             if isinstance(evidence, str) and evidence.strip():
                 item["evidence_span"] = evidence.strip()
                 repairs.append("evidence_span_alias")
+        # Providers use both candidate_kinds and the Stage-1 contract's
+        # singular candidate_memory_kind spelling. Normalize only the
+        # bounded hint; it never authorizes a write.
+        if "candidate_kinds" not in item:
+            kind_hint = item.pop("candidate_memory_kind", None)
+            if kind_hint is not None:
+                item["candidate_kinds"] = (
+                    kind_hint if isinstance(kind_hint, list) else [kind_hint]
+                )
+                repairs.append("candidate_memory_kind_alias")
         if "candidate_kinds" in item and isinstance(item["candidate_kinds"], list):
             kinds: list[str] = []
             for raw_kind in item["candidate_kinds"]:
@@ -713,6 +985,33 @@ def _coerce_coarse_payload(value: dict[str, Any]) -> tuple[dict[str, Any], list[
                 valid_kind_values = {member.value for member in MemoryKind}
                 if any(str(kind) not in valid_kind_values for kind in raw["candidate_kinds"]):
                     repairs.append("candidate_kind_alias")
+        raw_role_candidates = None
+        for alias in ("semantic_role_candidates", "semantic_roles", "role_candidates"):
+            if alias in item:
+                raw_role_candidates = item.pop(alias)
+                if alias != "semantic_role_candidates":
+                    repairs.append("semantic_role_candidates_alias")
+                break
+        if raw_role_candidates is not None:
+            if not isinstance(raw_role_candidates, list):
+                raise MemoryResponseError(
+                    "two-stage semantic role candidates must be a list",
+                    category="schema_validation",
+                )
+            normalized_roles: list[str] = []
+            for raw_role in raw_role_candidates:
+                normalized_role = _normalize_semantic_role(raw_role)
+                if normalized_role is None:
+                    raise MemoryResponseError(
+                        f"unsupported two-stage semantic role: {raw_role}",
+                        category="unsupported_enum",
+                    )
+                if normalized_role.value not in normalized_roles:
+                    normalized_roles.append(normalized_role.value)
+            item["semantic_role_candidates"] = normalized_roles
+            if normalized_roles and "semantic_role" not in item:
+                item["semantic_role"] = normalized_roles[0]
+            repairs.append("semantic_role_candidates_normalized")
         role = _normalize_semantic_role(item.get("semantic_role"))
         if role is not None:
             if item.get("semantic_role") != role.value:
@@ -1076,8 +1375,64 @@ def _normalize_detailed_claim(item: dict[str, Any], *, index: int) -> dict[str, 
         value = claim.pop(source, None)
         if value is not None:
             payload[source] = value
+    _normalize_role_sensitive_payload(
+        claim,
+        payload,
+        evidence_spans=evidence,
+    )
     claim["payload"] = payload
     return claim
+
+
+def _normalize_role_sensitive_payload(
+    claim: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    evidence_spans: list[str],
+) -> None:
+    """Apply only registered metric/state aliases at the Stage 2 boundary.
+
+    This is intentionally narrower than the full production normalizer.  It
+    repairs provider vocabulary drift while refusing to invent an unregistered
+    dimension or value.
+    """
+
+    kind = _normalize_coarse_kind(claim.get("kind"))
+    evidence_text = " ".join(evidence_spans)
+    if kind == MemoryKind.INTERACTION_PATTERN:
+        raw_metric = payload.get("metric") or payload.get("metric_hint")
+        metric = normalize_interaction_metric(raw_metric)
+        if metric not in INTERACTION_PATTERN_DIMENSIONS:
+            predicate_metric = normalize_interaction_metric(
+                claim.get("predicate") or claim.get("raw_predicate")
+            )
+            metric = (
+                predicate_metric
+                if predicate_metric in INTERACTION_PATTERN_DIMENSIONS
+                else None
+            )
+        if metric is None:
+            detected = detect_evidence_dimensions(evidence_text) & INTERACTION_PATTERN_DIMENSIONS
+            if len(detected) == 1:
+                metric = next(iter(detected))
+        if metric is not None:
+            payload["metric"] = metric
+        # metric_hint is transport vocabulary, not a persisted semantic field.
+        payload.pop("metric_hint", None)
+    elif kind == MemoryKind.RELATIONSHIP_STATE:
+        dimension = normalize_state_dimension(
+            payload.get("state_dimension") or claim.get("state_dimension")
+        )
+        value = normalize_state_value(
+            dimension,
+            payload.get("state_value") or claim.get("state_value"),
+        )
+        if dimension is not None:
+            payload["state_dimension"] = dimension
+            claim["state_dimension"] = dimension
+        if value is not None:
+            payload["state_value"] = value
+            claim["state_value"] = value
 
 
 def _normalize_coarse_kind(value: object) -> MemoryKind | None:
@@ -1096,12 +1451,17 @@ def _normalize_semantic_role(value: object) -> SemanticRole | None:
         return SemanticRole(normalized)
     except ValueError:
         aliases = {
+            # Keep the legacy ``state`` spelling parse-compatible; the router
+            # maps both legacy STATE_ASSERTION and new STATE_UPDATE to State.
             "state": SemanticRole.STATE_ASSERTION,
-            "state_update": SemanticRole.ATTRIBUTE_UPDATE,
+            "state_update": SemanticRole.STATE_UPDATE,
             "context": SemanticRole.CONTEXTUAL_COMPLETION,
-            "enrichment": SemanticRole.ATTRIBUTE_UPDATE,
-            "update": SemanticRole.ATTRIBUTE_UPDATE,
-            "refinement": SemanticRole.REFINEMENT_CANDIDATE,
+            "enrichment": SemanticRole.ATTRIBUTE_COMPLETION,
+            "attribute": SemanticRole.ATTRIBUTE_COMPLETION,
+            "update": SemanticRole.STATE_UPDATE,
+            "pattern": SemanticRole.PATTERN_EXTRACTION,
+            "belief": SemanticRole.BELIEF_EXTRACTION,
+            "standalone": SemanticRole.NEW_PROPOSITION,
         }
         return aliases.get(normalized)
 
@@ -1217,6 +1577,8 @@ def _fallback_reason_code(exc: Exception, *, stage: str) -> str:
             return "STAGE2_EMPTY_CLAIMS"
         if category in {"schema_validation", "unsupported_enum", "semantic_gate_contract"}:
             return f"{prefix}_SCHEMA_ERROR"
+        if category == "semantic_role_mismatch":
+            return f"{prefix}_ROLE_MISMATCH"
         if category in {"atomicity_validation", "semantic_validation"}:
             return "ATOMIC_EXTRACTION_VALIDATION_ERROR"
     if normalized_stage == "detailed" and isinstance(exc, ValueError):

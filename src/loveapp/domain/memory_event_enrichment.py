@@ -10,6 +10,7 @@ from loveapp.domain.memory import MemoryItem, MemoryKind, MemoryStatus
 from loveapp.domain.memory_dimensions import (
     infer_interaction_event_type,
     is_conflict_interaction_event,
+    normalize_event_severity,
     normalize_interaction_event_cause,
     normalize_interaction_event_type,
     validate_interaction_event_payload,
@@ -116,15 +117,10 @@ class GenericEventEnrichment(BaseModel):
             self.value = dict(value)
             return self
         if self.field == EventEnrichmentField.SEVERITY:
-            if not (
-                isinstance(value, int)
-                and not isinstance(value, bool)
-                and 1 <= value <= 5
-            ) and not (
-                isinstance(value, str)
-                and value.casefold().strip() in {"low", "moderate", "high", "severe"}
-            ):
+            normalized = normalize_event_severity(value)
+            if normalized is None:
                 raise ValueError("severity enrichment must be 1..5 or a bounded label")
+            self.value = normalized
             return self
         if self.field == EventEnrichmentField.EMOTION and isinstance(value, list):
             if not value or any(not isinstance(item, str) or not item.strip() for item in value):
@@ -362,4 +358,5 @@ __all__ = [
     "GenericEventEnrichment",
     "apply_conflict_event_enrichment",
     "apply_event_enrichment",
+    "normalize_event_severity",
 ]

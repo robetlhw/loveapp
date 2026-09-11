@@ -2809,6 +2809,13 @@ def _record_event_enrichment_trace(
                         for memory_id, reason in resolution.rejected_candidates
                     ]
                 ),
+                "candidate_scores_json": json.dumps(
+                    [
+                        {"memory_id": memory_id, "score": score}
+                        for memory_id, score in resolution.candidate_scores
+                    ]
+                ),
+                "temporal_disambiguation_applied": resolution.temporal_disambiguation_applied,
                 "selected_target_memory_id": (
                     resolution.target.id if resolution.target is not None else None
                 ),

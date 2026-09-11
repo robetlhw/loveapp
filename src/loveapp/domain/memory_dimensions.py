@@ -778,6 +778,39 @@ def normalize_interaction_metric(value: object) -> str | None:
     return INTERACTION_METRIC_ALIASES.get(normalized, normalized)
 
 
+def normalize_event_severity(value: object) -> int | str | None:
+    """Map bounded raw severity labels to the canonical Event vocabulary."""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 1 <= value <= 5 else None
+    if not isinstance(value, str):
+        return None
+    normalized = value.casefold().strip()
+    if normalized.isdigit():
+        numeric = int(normalized)
+        return numeric if 1 <= numeric <= 5 else None
+    aliases = {
+        "轻微": "low",
+        "较轻": "low",
+        "low": "low",
+        "一般": "moderate",
+        "中等": "moderate",
+        "比较严重": "moderate",
+        "medium": "moderate",
+        "moderate": "moderate",
+        "严重": "high",
+        "特别严重": "high",
+        "很严重": "high",
+        "high": "high",
+        "非常严重": "severe",
+        "极其严重": "severe",
+        "severe": "severe",
+    }
+    return aliases.get(normalized)
+
+
 def normalize_interaction_event_payload(
     payload: Mapping[str, object],
     *,
@@ -831,6 +864,10 @@ def normalize_interaction_event_payload(
 
     if "cause" in normalized:
         normalized["cause"] = normalize_interaction_event_cause(normalized["cause"])
+    if "severity" in normalized:
+        canonical_severity = normalize_event_severity(normalized["severity"])
+        if canonical_severity is not None:
+            normalized["severity"] = canonical_severity
 
     if "participants" not in normalized:
         for alias in ("actors", "involved_participants", "involved_people"):
@@ -992,20 +1029,8 @@ def validate_interaction_event_payload(
             raise ValueError("interaction_event cause description must be non-empty text")
 
     severity = payload.get("severity")
-    if severity is not None:
-        valid_numeric = (
-            isinstance(severity, int)
-            and not isinstance(severity, bool)
-            and 1 <= severity <= 5
-        )
-        valid_text = isinstance(severity, str) and severity.casefold().strip() in {
-            "low",
-            "moderate",
-            "high",
-            "severe",
-        }
-        if not valid_numeric and not valid_text:
-            raise ValueError("interaction_event severity must be 1..5 or a bounded label")
+    if severity is not None and normalize_event_severity(severity) is None:
+        raise ValueError("interaction_event severity must be 1..5 or a bounded label")
 
     custom_attributes = payload.get("custom_attributes")
     if custom_attributes is not None:

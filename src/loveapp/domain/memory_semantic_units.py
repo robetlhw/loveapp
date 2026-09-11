@@ -14,6 +14,7 @@ from loveapp.domain.memory import (
     MemoryKind,
     MemoryPerspective,
 )
+from loveapp.domain.memory_dimensions import normalize_event_severity
 
 
 class AttributeNamespace(StrEnum):
@@ -112,6 +113,15 @@ class EnrichmentDraft(BaseModel):
             raise ValueError("generic enrichment is limited to interaction_event")
         if _contains_write_authority(self.target_semantic_hint):
             raise ValueError("enrichment hints cannot contain write authority")
+        if self.attribute_name == "severity":
+            raw_value = self.value
+            canonical_value = normalize_event_severity(raw_value)
+            if canonical_value is not None:
+                if raw_value != canonical_value:
+                    hint = dict(self.target_semantic_hint)
+                    hint.setdefault("raw_severity", str(raw_value))
+                    self.target_semantic_hint = hint
+                self.value = canonical_value
         return self
 
 

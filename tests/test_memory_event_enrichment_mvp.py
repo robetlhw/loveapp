@@ -159,6 +159,36 @@ def test_semantic_cardinality_is_checked_before_field_compatibility() -> None:
     assert resolution.compatible_candidate_ids == ()
 
 
+def test_explicit_temporal_hint_can_separate_candidates_without_top_one_fallback() -> None:
+    yesterday = _event(
+        "yesterday",
+        source_message_id="shared-source",
+    ).model_copy(update={"occurred_at": datetime(2026, 9, 9, 12, tzinfo=UTC)})
+    today = _event(
+        "today",
+        source_message_id="shared-source",
+    ).model_copy(update={"occurred_at": datetime(2026, 9, 10, 12, tzinfo=UTC)})
+    draft = _draft("emotion", "anger", evidence="昨天她特别生气").model_copy(
+        update={"temporal_hint": "yesterday"}
+    )
+
+    resolution = resolve_event_enrichment(
+        draft,
+        current_text="昨天她特别生气",
+        conversation_history=[_message("shared-source")],
+        existing_memories=[yesterday, today],
+        user_id="u",
+        relationship_id="r",
+    )
+
+    assert resolution.resolved
+    assert resolution.target is not None
+    assert resolution.target.id == "yesterday"
+    assert resolution.temporal_disambiguation_applied is True
+    assert dict(resolution.candidate_scores)["yesterday"] == 1.0
+    assert dict(resolution.candidate_scores)["today"] == 0.0
+
+
 @pytest.mark.parametrize(
     ("memories", "expected_reason"),
     [
