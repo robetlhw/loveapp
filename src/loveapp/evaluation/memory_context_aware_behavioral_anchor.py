@@ -294,6 +294,14 @@ def _normalize_claim(claim: AtomicClaim) -> dict[str, Any]:
         "evidence": list(claim.evidence_spans),
         "raw": claim.model_dump(mode="json"),
         "proposition_origin": payload.get("proposition_origin", "uncertain"),
+        "relation_hint": lineage.get("relation_hint", "none"),
+        "operation_hint": lineage.get("operation_hint", "unknown"),
+        "occurrence_group": lineage.get(
+            "occurrence_group", lineage.get("same_occurrence_group")
+        ),
+        "answered_questions": lineage.get(
+            "answered_questions", lineage.get("answered_pending_questions", [])
+        ),
     }
 
 
@@ -320,6 +328,16 @@ def _normalize_unit(unit: object) -> dict[str, Any]:
             "evidence": unit.evidence_span,
             "raw": unit.model_dump(mode="json"),
             "proposition_origin": "uncertain",
+            "relation_hint": (unit.provenance.relation_hint.value if unit.provenance else "none"),
+            "operation_hint": (
+                unit.provenance.operation_hint.value if unit.provenance else "enrich_like"
+            ),
+            "occurrence_group": (
+                unit.provenance.occurrence_group if unit.provenance else None
+            ),
+            "answered_questions": (
+                list(unit.provenance.answered_questions) if unit.provenance else []
+            ),
         }
     if isinstance(unit, RefinementDraft):
         return {
@@ -341,6 +359,16 @@ def _normalize_unit(unit: object) -> dict[str, Any]:
             "evidence": unit.evidence_span,
             "raw": unit.model_dump(mode="json"),
             "proposition_origin": "uncertain",
+            "relation_hint": (unit.provenance.relation_hint.value if unit.provenance else "none"),
+            "operation_hint": (
+                unit.provenance.operation_hint.value if unit.provenance else "refine_like"
+            ),
+            "occurrence_group": (
+                unit.provenance.occurrence_group if unit.provenance else None
+            ),
+            "answered_questions": (
+                list(unit.provenance.answered_questions) if unit.provenance else []
+            ),
         }
     if isinstance(unit, NewMemoryDraft):
         return _normalize_claim(unit.to_atomic_claim())
@@ -490,6 +518,27 @@ def _stage1_origin_index(
     return by_id, by_evidence
 
 
+def _stage1_hint_rows(stage1_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Expose decomposer hints to evaluation without changing persistence."""
+
+    return [
+        {
+            key: row.get(key)
+            for key in (
+                "proposition_id",
+                "relation_hint",
+                "operation_hint",
+                "occurrence_group",
+                "same_occurrence_group",
+                "answered_questions",
+                "answered_pending_questions",
+            )
+            if key in row
+        }
+        for row in stage1_rows
+    ]
+
+
 def _attach_stage1_origins(
     observed: list[dict[str, Any]],
     stage1_rows: list[dict[str, Any]],
@@ -605,6 +654,12 @@ def _row_matches(expected: dict[str, Any], row: dict[str, Any]) -> tuple[bool, l
             )
         elif field in {"is_new_occurrence", "is_contextual_completion", "is_refinement"}:
             matched = any(bool(row.get(field)) is bool(option) for option in options)
+        elif field == "answered_questions":
+            actual_questions = row.get(field) or []
+            expected_questions = value if isinstance(value, list) else [value]
+            matched = set(str(item) for item in actual_questions) == set(
+                str(item) for item in expected_questions
+            )
         else:
             matched = any(
                 row.get(field) == option
@@ -833,6 +888,7 @@ async def evaluate_context_aware_behavioral_anchor(
                     "expected_semantics": expected,
                     "observed_semantics": observed,
                     "stage1_propositions": semantic_origin_rows,
+                    "stage1_semantic_hints": _stage1_hint_rows(semantic_origin_rows),
                     "semantic_matches": matches,
                     "missing_expected": missing,
                     "extra_observed": extra,
@@ -845,6 +901,7 @@ async def evaluate_context_aware_behavioral_anchor(
                     "context_pair_id": case.get("context_pair_id"),
                     "resolution_expectation": case.get("resolution_expectation"),
                     "resolution": shadow,
+                    "resolution_ok": resolution_ok,
                     "resolution_failure": resolution_failure,
                     "ambiguity_safe": ambiguity_ok,
                     "gate": {
@@ -989,6 +1046,10 @@ def _build_metrics(rows: list[dict[str, Any]], scored: list[dict[str, Any]]) -> 
             "pattern_metric",
             "perspective",
             "proposition_origin",
+            "relation_hint",
+            "operation_hint",
+            "occurrence_group",
+            "answered_questions",
         )
     }
     categories = defaultdict(int)
@@ -1017,6 +1078,10 @@ def _build_metrics(rows: list[dict[str, Any]], scored: list[dict[str, Any]]) -> 
         "semantic_unit_segmentation_accuracy": ratio(len(unit_correct), len(unit_expected)),
         "semantic_role_accuracy": field_accuracy["semantic_role"],
         "proposition_origin_accuracy": field_accuracy["proposition_origin"],
+        "relation_hint_accuracy": field_accuracy["relation_hint"],
+        "operation_hint_accuracy": field_accuracy["operation_hint"],
+        "occurrence_group_accuracy": field_accuracy["occurrence_group"],
+        "answered_questions_accuracy": field_accuracy["answered_questions"],
         "question_answer_alignment_accuracy": ratio(
             sum(row["passed"] for row in context_aligned), len(context_aligned)
         ),
@@ -1040,6 +1105,30 @@ def _build_metrics(rows: list[dict[str, Any]], scored: list[dict[str, Any]]) -> 
                 if row["expected_semantics"].get("unit_count", 0) > 1
             ),
             sum(row["expected_semantics"].get("unit_count", 0) > 1 for row in scored),
+        ),
+        "event_composition_accuracy": ratio(
+            sum(
+                bool(row.get("passed"))
+                for row in scored
+                if "event_composition" in row["expected_semantics"]
+            ),
+            sum("event_composition" in row["expected_semantics"] for row in scored),
+        ),
+        "state_projection_consistency": ratio(
+            sum(
+                bool(row.get("passed"))
+                for row in scored
+                if "state_projection" in row["expected_semantics"]
+            ),
+            sum("state_projection" in row["expected_semantics"] for row in scored),
+        ),
+        "resolver_accuracy": ratio(
+            sum(
+                bool(row.get("resolution_ok"))
+                for row in scored
+                if row.get("resolution_expectation")
+            ),
+            sum(bool(row.get("resolution_expectation")) for row in scored),
         ),
         "new_event_safety_accuracy": ratio(
             sum(

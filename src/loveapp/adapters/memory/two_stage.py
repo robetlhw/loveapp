@@ -23,6 +23,7 @@ from loveapp.application.memory_repair import (
     MemoryResponseError,
     parse_memory_response,
 )
+from loveapp.application.memory_retrieval import HybridMemoryRetriever
 from loveapp.domain.memory import (
     AtomicExtraction,
     CoarseExtraction,
@@ -36,7 +37,9 @@ from loveapp.domain.memory import (
     MemoryKind,
     MemoryPerspective,
     MemorySemanticGateReason,
+    OperationHint,
     PropositionOrigin,
+    RelationHint,
     SemanticRole,
     StoredMessage,
     canonical_semantic_role,
@@ -74,7 +77,7 @@ from .stage2_routing import (
     route_instruction,
 )
 
-_TWO_STAGE_PROMPT_VERSION = "memory-semantic-ontology-v1.3"
+_TWO_STAGE_PROMPT_VERSION = "memory-semantic-ontology-v1.4"
 
 
 class TwoStageMemoryExtractor:
@@ -100,6 +103,7 @@ class TwoStageMemoryExtractor:
         thinking: str | None = None,
         fallback: MemoryExtractor | None = None,
         client: Any | None = None,
+        candidate_retriever: HybridMemoryRetriever | None = None,
     ) -> None:
         self._model = model
         self._tier = tier
@@ -108,6 +112,7 @@ class TwoStageMemoryExtractor:
         self._thinking = thinking
         self._fallback = fallback
         self._role_router = SemanticRoleRouter()
+        self._candidate_retriever = candidate_retriever or HybridMemoryRetriever()
         # The diagnostic snapshot is intentionally kept on the opt-in
         # extractor rather than persisted in the Memory domain.  Evaluation
         # harnesses can inspect it after each call without changing the Store
@@ -180,6 +185,13 @@ class TwoStageMemoryExtractor:
                 "semantic_units": [],
                 "routes": [],
             },
+            "retrieval": {
+                "called": False,
+                "failed": False,
+                "limit": 5,
+                "candidate_ids": [],
+                "candidates": [],
+            },
             "fallback": {
                 "triggered": False,
                 "stage": None,
@@ -208,14 +220,35 @@ class TwoStageMemoryExtractor:
                     gate_reason=_negative_gate_reason(coarse.gate_reason),
                 )
             else:
+                retrieved_memories = await self._retrieve_candidates(
+                    text,
+                    existing_memories,
+                    reference_time=reference_time,
+                )
+                stage2_context = ConversationContext.from_turn(
+                    text,
+                    conversation_history=conversation_history,
+                    pending_memory_context=pending_memory_context,
+                    pending_questions=(
+                        list(conversation_context.pending_questions)
+                        if conversation_context is not None
+                        else None
+                    ),
+                    active_topic=(
+                        conversation_context.active_topic
+                        if conversation_context is not None
+                        else None
+                    ),
+                    relevant_memories=retrieved_memories,
+                )
                 current_stage = "detailed"
                 extraction = await self._extract_detailed(
                     text,
                     reference_time=reference_time,
-                    existing_memories=existing_memories,
+                    existing_memories=retrieved_memories,
                     conversation_history=conversation_history,
                     pending_memory_context=pending_memory_context,
-                    conversation_context=conversation_context,
+                    conversation_context=stage2_context,
                     coarse=coarse,
                     trace=trace,
                     attempts=attempts,
@@ -283,6 +316,53 @@ class TwoStageMemoryExtractor:
                     details["error"] = str(exc)[:1000]
                     details["elapsed_ms"] = (perf_counter() - started) * 1000
             return AtomicExtraction()
+
+    async def _retrieve_candidates(
+        self,
+        text: str,
+        existing_memories: list[MemoryItem],
+        *,
+        reference_time: datetime,
+    ) -> list[MemoryItem]:
+        """Provide a bounded, read-only candidate set to Stage 2.
+
+        Retrieval is deliberately advisory.  The returned rows are only
+        serialized into the Stage 2 context; target selection remains a
+        downstream resolver responsibility.
+        """
+
+        try:
+            retrieved = await self._candidate_retriever.retrieve(
+                existing_memories,
+                query=text,
+                limit=5,
+                reference_time=reference_time,
+                preserve_candidates=True,
+            )
+        except Exception as exc:  # pragma: no cover - defensive provider boundary
+            self._last_diagnostic["retrieval"] = {
+                "called": True,
+                "failed": True,
+                "error": str(exc)[:500],
+                "candidate_ids": [],
+                "limit": 5,
+            }
+            return []
+        self._last_diagnostic["retrieval"] = {
+            "called": True,
+            "failed": False,
+            "limit": 5,
+            "candidate_ids": [result.item.id for result in retrieved],
+            "candidates": [
+                {
+                    "memory_id": result.item.id,
+                    "rank": index,
+                    "scores": result.score.as_dict(),
+                }
+                for index, result in enumerate(retrieved, start=1)
+            ],
+        }
+        return [result.item for result in retrieved]
 
     async def _extract_coarse(
         self,
@@ -586,6 +666,10 @@ def _build_coarse_prompt(
             "semantic_role_routing",
             "candidate_memory_kind_hint",
             "proposition_origin_classification",
+            "relation_hint",
+            "occurrence_grouping",
+            "operation_hint",
+            "answered_question_alignment",
             "attributes_hint",
         ],
         "stage1_must_not_decide": [
@@ -605,12 +689,16 @@ def _build_coarse_prompt(
                 "proposition_origin",
                 "epistemic_status",
                 "perspective",
+                "occurrence_group",
                 "same_occurrence_group",
+                "relation_hint",
+                "operation_hint",
                 "candidate_kind",
                 "candidate_kinds",
                 "attributes_hint",
                 "temporal_hint",
                 "target_field_hint",
+                "answered_questions",
                 "answered_pending_questions",
                 "confidence",
             ],
@@ -623,7 +711,10 @@ def _build_coarse_prompt(
             "uncertain",
         ],
         "context_is_read_only": True,
-        "answered_pending_questions": "open question IDs only; never memory IDs",
+        "answered_questions": "open question IDs only; never memory IDs",
+        "answered_pending_questions": "legacy alias for answered_questions",
+        "relation_hints": [hint.value for hint in RelationHint],
+        "operation_hints": [hint.value for hint in OperationHint],
         "semantic_roles": [role.value for role in CANONICAL_SEMANTIC_ROLES],
         "epistemic_statuses": [
             "observed",
@@ -689,7 +780,12 @@ def _build_detailed_prompt(
                     "proposition_origin",
                     "epistemic_status",
                     "perspective",
+                    "occurrence_group",
                     "same_occurrence_group",
+                    "relation_hint",
+                    "operation_hint",
+                    "answered_questions",
+                    "answered_pending_questions",
                 ],
                 "context_is_read_only": True,
                 "forbidden_outputs": [
@@ -728,8 +824,16 @@ def _route_prompt_payload(
             proposition.epistemic_status, "value", proposition.epistemic_status
         ),
         "perspective": getattr(proposition, "perspective", None),
-        "same_occurrence_group": getattr(proposition, "same_occurrence_group", None),
-        "answered_pending_questions": list(proposition.answered_pending_questions),
+        "occurrence_group": getattr(
+            proposition, "occurrence_group", getattr(proposition, "same_occurrence_group", None)
+        ),
+        "relation_hint": getattr(proposition.relation_hint, "value", proposition.relation_hint),
+        "operation_hint": getattr(
+            proposition.operation_hint, "value", proposition.operation_hint
+        ),
+        "answered_questions": list(
+            getattr(proposition, "answered_questions", proposition.answered_pending_questions)
+        ),
         "attributes_hint": list(getattr(proposition, "attributes_hint", [])),
         "instruction": route_instruction(route.selected_route),
     }
@@ -822,8 +926,8 @@ def _validate_coarse_context(
     answered = list(
         dict.fromkeys(
             [
-                *coarse.answered_pending_questions,
-                *(qid for item in coarse.propositions for qid in item.answered_pending_questions),
+                *coarse.answered_questions,
+                *(qid for item in coarse.propositions for qid in item.answered_questions),
             ]
         )
     )
@@ -832,6 +936,7 @@ def _validate_coarse_context(
             "answered_pending_questions must reference open conversation questions",
             category="schema_validation",
         )
+    coarse.answered_questions = answered
     coarse.answered_pending_questions = answered
 
 
@@ -881,7 +986,7 @@ def _matched_propositions(
     # evidence, especially a weaker epistemic claim. Preserve all candidates.
     matches = evidence_matches
     if len(matches) > 1:
-        groups = {item.same_occurrence_group for item in matches}
+        groups = {item.occurrence_group for item in matches}
         if not all(groups) or len(groups) != 1:
             raise MemoryResponseError(
                 "multiple propositions require one explicit same_occurrence_group",
@@ -900,8 +1005,8 @@ def _matched_propositions(
                 "occurrence grouping can only combine new event propositions",
                 category="routing_abstention",
             )
-    group = unit.get("same_occurrence_group")
-    if group and (not matches or any(item.same_occurrence_group != group for item in matches)):
+    group = unit.get("occurrence_group", unit.get("same_occurrence_group"))
+    if group and (not matches or any(item.occurrence_group != group for item in matches)):
         raise MemoryResponseError(
             "occurrence group differs from Stage 1", category="routing_abstention"
         )
@@ -955,6 +1060,11 @@ def _inherit_proposition_semantics(unit: dict[str, Any], coarse: CoarseExtractio
     # Provider provenance is not authoritative. Rebuild it from validated Stage 1.
     unit.pop("provenance", None)
     unit.pop("same_occurrence_group", None)
+    unit.pop("occurrence_group", None)
+    unit.pop("relation_hint", None)
+    unit.pop("operation_hint", None)
+    unit.pop("answered_questions", None)
+    unit.pop("answered_pending_questions", None)
     unit.pop("proposition_ids", None)
     unit.pop("proposition_id", None)
     if not matches:
@@ -976,9 +1086,11 @@ def _inherit_proposition_semantics(unit: dict[str, Any], coarse: CoarseExtractio
         proposition_ids=[item.proposition_id for item in matches],
         semantic_roles=roles,
         epistemic_status=epistemic,
-        same_occurrence_group=matches[0].same_occurrence_group,
-        answered_pending_questions=list(
-            dict.fromkeys(qid for item in matches for qid in item.answered_pending_questions)
+        relation_hint=matches[0].relation_hint,
+        operation_hint=matches[0].operation_hint,
+        occurrence_group=matches[0].occurrence_group,
+        answered_questions=list(
+            dict.fromkeys(qid for item in matches for qid in item.answered_questions)
         ),
     )
     is_new = unit.get("semantic_type", "new_memory") == "new_memory"
@@ -1138,7 +1250,7 @@ def _validate_stage2_role_contract(
 
 
 _COARSE_SYSTEM_PROMPT = """
-你是 LoveApp Memory V1.3 的 Stage 1 语义拆分器。只输出一个 JSON 对象：
+你是 LoveApp Memory V1.4 的 Stage 1 语义分解器。只输出一个 JSON 对象：
 {"should_extract": true, "gate_reason": "STABLE_FACT", "propositions": [], "discarded_spans": []}
 gate_reason 必须严格使用以下大写枚举之一：STABLE_FACT、PREFERENCE、INTERACTION_PATTERN、
 RELATIONSHIP_STATE、RELATIONSHIP_CHANGE、PARTIAL_CHANGE、USER_BELIEF、PLANNED_EVENT、
@@ -1174,7 +1286,7 @@ answered_pending_questions 只填写 context 中 open question_id，可在根或
 
 
 _DETAILED_SYSTEM_PROMPT = """
-你是 LoveApp Memory V1.3 的 Stage 2 结构化提取器。只输出一个 JSON 对象：
+你是 LoveApp Memory V1.4 的 Stage 2 结构化提取器。只输出一个 JSON 对象：
 {"semantic_units": [], "discarded_spans": []}
 一次响应处理全部 Stage 1 propositions。semantic_units 只能包含以下三种对象：
 1) new_memory：必须包含 semantic_type、claim_id、kind、subject、raw_predicate、predicate、
@@ -1234,6 +1346,11 @@ Context-aware Stage 1 contract:
 - Decompose the message into semantic_units/propositions; do not split solely on punctuation.
 - Classify proposition_origin as one of answer_to_question, spontaneous_disclosure,
   follow_up_detail, new_occurrence, or uncertain.
+- Add bounded relation_hint (none, same_event, cause, context, support, contrast, correction),
+  occurrence_group for propositions from one real-world event, and operation_hint
+  (new_like, enrich_like, refine_like, unknown). These are semantic hand-off hints only.
+- Use answered_questions for open question IDs answered by this turn; it never identifies a
+  memory row or a resolver target.
 - Include bounded attributes_hint when useful. Never emit target IDs, CREATE/ENRICH/UPDATE,
   mutation actions, or database patches.
 - If a short phrase answers a pending question, mark answer_to_question; without supporting
@@ -1245,6 +1362,8 @@ _DETAILED_SYSTEM_PROMPT += """
 Context-aware Stage 2 contract:
 - Use conversation_context, pending_questions, active_topic, relevant_memories, and the
   proposition_origin supplied by Stage 1 as read-only semantic context.
+- Treat occurrence_group, relation_hint, operation_hint, and answered_questions as validated
+  Stage 1 metadata. Do not invent or replace them with target or mutation instructions.
 - Preserve multiple semantic units from one turn. Context can explain an enrichment, but
   resolver code—not the model—selects any target and authorizes mutation.
 - A new occurrence with its own time/event evidence is new_memory, not enrichment. A phrase
@@ -1424,6 +1543,26 @@ def _coerce_coarse_payload(value: dict[str, Any]) -> tuple[dict[str, Any], list[
             if item.get("semantic_role") != role.value:
                 repairs.append("semantic_role_alias")
             item["semantic_role"] = role.value
+        # Canonical semantic hand-off hints.  These remain bounded metadata;
+        # they never authorize a resolver target or a storage mutation.
+        if "occurrence_group" not in item and "same_occurrence_group" in item:
+            item["occurrence_group"] = item["same_occurrence_group"]
+            repairs.append("occurrence_group_alias")
+        if "same_occurrence_group" not in item and "occurrence_group" in item:
+            item["same_occurrence_group"] = item["occurrence_group"]
+        if "answered_questions" not in item and "answered_pending_questions" in item:
+            item["answered_questions"] = item["answered_pending_questions"]
+            repairs.append("answered_questions_alias")
+        if "answered_pending_questions" not in item and "answered_questions" in item:
+            item["answered_pending_questions"] = item["answered_questions"]
+        relation = _normalize_relation_hint(item.get("relation_hint"))
+        if relation is None:
+            relation = RelationHint.NONE
+        item["relation_hint"] = relation.value
+        operation = _normalize_operation_hint(item.get("operation_hint"))
+        if operation is None:
+            operation = _operation_hint_from_role(role)
+        item["operation_hint"] = operation.value
         if not item.get("candidate_kinds"):
             role_value = str(item.get("semantic_role") or "").casefold()
             item["candidate_kinds"] = [
@@ -1776,7 +1915,12 @@ def _inherit_claim_hint(claim: dict[str, Any], container: dict[str, Any]) -> Non
         "semantic_role",
         "epistemic_status",
         "perspective",
+        "relation_hint",
+        "operation_hint",
+        "occurrence_group",
         "same_occurrence_group",
+        "answered_questions",
+        "answered_pending_questions",
     ):
         if field not in claim and field in container:
             claim[field] = container[field]
@@ -1984,6 +2128,55 @@ def _normalize_proposition_origin(value: object) -> PropositionOrigin | None:
         "unknown": PropositionOrigin.UNCERTAIN,
     }
     return aliases.get(normalized)
+
+
+def _normalize_relation_hint(value: object) -> RelationHint | None:
+    if isinstance(value, RelationHint):
+        return value
+    normalized = str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "same": RelationHint.SAME_EVENT,
+        "same_event": RelationHint.SAME_EVENT,
+        "cause": RelationHint.CAUSE,
+        "causal": RelationHint.CAUSE,
+        "context": RelationHint.CONTEXT,
+        "support": RelationHint.SUPPORT,
+        "contrast": RelationHint.CONTRAST,
+        "correction": RelationHint.CORRECTION,
+        "none": RelationHint.NONE,
+        "": RelationHint.NONE,
+    }
+    return aliases.get(normalized)
+
+
+def _normalize_operation_hint(value: object) -> OperationHint | None:
+    if isinstance(value, OperationHint):
+        return value
+    normalized = str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "new": OperationHint.NEW_LIKE,
+        "new_like": OperationHint.NEW_LIKE,
+        "enrich": OperationHint.ENRICH_LIKE,
+        "enrichment": OperationHint.ENRICH_LIKE,
+        "enrich_like": OperationHint.ENRICH_LIKE,
+        "refine": OperationHint.REFINE_LIKE,
+        "refinement": OperationHint.REFINE_LIKE,
+        "refine_like": OperationHint.REFINE_LIKE,
+        "unknown": OperationHint.UNKNOWN,
+        "": OperationHint.UNKNOWN,
+    }
+    return aliases.get(normalized)
+
+
+def _operation_hint_from_role(role: SemanticRole | None) -> OperationHint:
+    canonical = canonical_semantic_role(role) if role is not None else None
+    if canonical == SemanticRole.ATTRIBUTE_COMPLETION:
+        return OperationHint.ENRICH_LIKE
+    if canonical == SemanticRole.REFINEMENT:
+        return OperationHint.REFINE_LIKE
+    if canonical in {SemanticRole.NEW_PROPOSITION, SemanticRole.CORRECTION}:
+        return OperationHint.NEW_LIKE
+    return OperationHint.UNKNOWN
 
 
 def _normalize_gate_reason(

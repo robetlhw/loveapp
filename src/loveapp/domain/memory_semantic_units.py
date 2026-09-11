@@ -14,6 +14,8 @@ from loveapp.domain.memory import (
     ExtractionEpistemicStatus,
     MemoryKind,
     MemoryPerspective,
+    OperationHint,
+    RelationHint,
     SemanticRole,
 )
 from loveapp.domain.memory_dimensions import normalize_event_severity
@@ -55,10 +57,28 @@ class SemanticUnitProvenance(BaseModel):
     )
     semantic_roles: list[SemanticRole] = Field(default_factory=list, max_length=5)
     epistemic_status: ExtractionEpistemicStatus | None = None
+    relation_hint: RelationHint = RelationHint.NONE
+    operation_hint: OperationHint = OperationHint.UNKNOWN
+    occurrence_group: str | None = Field(default=None, max_length=120)
     same_occurrence_group: str | None = Field(default=None, max_length=120)
+    answered_questions: list[Annotated[str, Field(min_length=1, max_length=160)]] = Field(
+        default_factory=list, max_length=4
+    )
     answered_pending_questions: list[Annotated[str, Field(min_length=1, max_length=160)]] = Field(
         default_factory=list, max_length=4
     )
+
+    @model_validator(mode="after")
+    def synchronize_legacy_fields(self) -> SemanticUnitProvenance:
+        if self.occurrence_group is None:
+            self.occurrence_group = self.same_occurrence_group
+        if self.same_occurrence_group is None:
+            self.same_occurrence_group = self.occurrence_group
+        if not self.answered_questions:
+            self.answered_questions = list(self.answered_pending_questions)
+        if not self.answered_pending_questions:
+            self.answered_pending_questions = list(self.answered_questions)
+        return self
 
 
 class NewMemoryDraft(AtomicClaim):

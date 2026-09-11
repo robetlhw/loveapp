@@ -220,6 +220,37 @@ class SemanticRole(StrEnum):
     STATE_ASSERTION = "state_assertion"
 
 
+class RelationHint(StrEnum):
+    """Bounded semantic relation between propositions in one user turn."""
+
+    NONE = "none"
+    SAME_EVENT = "same_event"
+    CAUSE = "cause"
+    CONTEXT = "context"
+    SUPPORT = "support"
+    CONTRAST = "contrast"
+    CORRECTION = "correction"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "RelationHint | None":
+        normalized = str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+        return cls._value2member_map_.get(normalized)
+
+
+class OperationHint(StrEnum):
+    """Non-authoritative Stage 1 hint for the kind of semantic hand-off."""
+
+    NEW_LIKE = "new_like"
+    ENRICH_LIKE = "enrich_like"
+    REFINE_LIKE = "refine_like"
+    UNKNOWN = "unknown"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "OperationHint | None":
+        normalized = str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+        return cls._value2member_map_.get(normalized)
+
+
 def parse_semantic_role(value: object) -> SemanticRole:
     """Read bounded current and legacy spellings without changing their identity."""
     if isinstance(value, SemanticRole):
@@ -322,6 +353,19 @@ class CoarseProposition(BaseModel):
     )
     epistemic_status: ExtractionEpistemicStatus = ExtractionEpistemicStatus.UNCERTAIN
     perspective: str | None = Field(default=None, max_length=80)
+    relation_hint: RelationHint = RelationHint.NONE
+    occurrence_group: str | None = Field(
+        default=None,
+        max_length=120,
+        validation_alias=AliasChoices("occurrence_group", "same_occurrence_group"),
+    )
+    operation_hint: OperationHint = Field(default=OperationHint.UNKNOWN)
+    answered_questions: list[str] = Field(
+        default_factory=list,
+        max_length=4,
+        validation_alias=AliasChoices("answered_questions", "answered_pending_questions"),
+    )
+    # Legacy field names remain accepted and exposed for stored V1.3 payloads.
     same_occurrence_group: str | None = Field(default=None, max_length=120)
     answered_pending_questions: list[str] = Field(default_factory=list, max_length=4)
     attributes_hint: list[str] = Field(
@@ -354,6 +398,14 @@ class CoarseProposition(BaseModel):
         if self.semantic_role not in roles:
             roles.insert(0, self.semantic_role)
         self.semantic_role_candidates = roles[:7]
+        if self.occurrence_group is None:
+            self.occurrence_group = self.same_occurrence_group
+        if self.same_occurrence_group is None:
+            self.same_occurrence_group = self.occurrence_group
+        if not self.answered_questions:
+            self.answered_questions = list(self.answered_pending_questions)
+        if not self.answered_pending_questions:
+            self.answered_pending_questions = list(self.answered_questions)
         forbidden_keys = {
             "target_memory_id",
             "target_memory_ids",
@@ -389,7 +441,7 @@ class CoarseProposition(BaseModel):
             raise ValueError("target field hint exceeds 80 characters")
         if self.temporal_hint is not None and len(str(self.temporal_hint)) > 1000:
             raise ValueError("temporal hint exceeds semantic context budget")
-        if any(not item.strip() or len(item) > 160 for item in self.answered_pending_questions):
+        if any(not item.strip() or len(item) > 160 for item in self.answered_questions):
             raise ValueError("answered pending questions must be bounded question IDs")
         return self
 
@@ -429,6 +481,14 @@ class CoarseProposition(BaseModel):
             payload["epistemic_status"] = ExtractionEpistemicStatus(raw_epistemic).value
         if "proposition_origin" in payload:
             payload["proposition_origin"] = str(payload["proposition_origin"]).lower()
+        if "occurrence_group" not in payload and "same_occurrence_group" in payload:
+            payload["occurrence_group"] = payload["same_occurrence_group"]
+        if "same_occurrence_group" not in payload and "occurrence_group" in payload:
+            payload["same_occurrence_group"] = payload["occurrence_group"]
+        if "answered_questions" not in payload and "answered_pending_questions" in payload:
+            payload["answered_questions"] = payload["answered_pending_questions"]
+        if "answered_pending_questions" not in payload and "answered_questions" in payload:
+            payload["answered_pending_questions"] = payload["answered_questions"]
         return payload
 
     @property
@@ -523,6 +583,11 @@ class CoarseExtraction(BaseModel):
     gate_reason: MemorySemanticGateReason | None = None
     propositions: list[CoarseProposition] = Field(default_factory=list, max_length=12)
     discarded_spans: list[DiscardedSpan] = Field(default_factory=list, max_length=12)
+    answered_questions: list[str] = Field(
+        default_factory=list,
+        max_length=4,
+        validation_alias=AliasChoices("answered_questions", "answered_pending_questions"),
+    )
     answered_pending_questions: list[str] = Field(default_factory=list, max_length=4)
 
     @model_validator(mode="before")
@@ -550,7 +615,11 @@ class CoarseExtraction(BaseModel):
 
     @model_validator(mode="after")
     def fill_safe_gate_reason(self) -> "CoarseExtraction":
-        if any(not item.strip() or len(item) > 160 for item in self.answered_pending_questions):
+        if not self.answered_questions:
+            self.answered_questions = list(self.answered_pending_questions)
+        if not self.answered_pending_questions:
+            self.answered_pending_questions = list(self.answered_questions)
+        if any(not item.strip() or len(item) > 160 for item in self.answered_questions):
             raise ValueError("answered pending questions must be bounded question IDs")
         if self.gate_reason is None:
             self.gate_reason = (
@@ -603,6 +672,14 @@ def _coerce_semantic_unit_hint(value: object, *, index: int) -> dict[str, Any]:
         "unknown": PropositionOrigin.UNCERTAIN.value,
     }
     item["proposition_origin"] = origin_aliases.get(origin, origin or "uncertain")
+    if "occurrence_group" not in item and "same_occurrence_group" in item:
+        item["occurrence_group"] = item["same_occurrence_group"]
+    if "same_occurrence_group" not in item and "occurrence_group" in item:
+        item["same_occurrence_group"] = item["occurrence_group"]
+    if "answered_questions" not in item and "answered_pending_questions" in item:
+        item["answered_questions"] = item["answered_pending_questions"]
+    if "answered_pending_questions" not in item and "answered_questions" in item:
+        item["answered_pending_questions"] = item["answered_questions"]
     if "candidate_kinds" not in item:
         item["candidate_kinds"] = item.get("candidate_kind", item.get("candidate_memory_kind"))
     item.pop("candidate_kind", None)

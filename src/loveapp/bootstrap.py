@@ -265,7 +265,12 @@ def build_memory_container(
     embedding_provider = embedding_provider or build_embedding_provider(settings)
     memory_store = _build_memory_store(settings)
     memory_extractor = (
-        _build_memory_extractor(settings) if enable_extraction else NoOpMemoryExtractor()
+        _build_memory_extractor(
+            settings,
+            candidate_retriever=HybridMemoryRetriever(embedding_provider),
+        )
+        if enable_extraction
+        else NoOpMemoryExtractor()
     )
     semantic_relation_judge = _build_semantic_relation_judge(settings)
     long_tail_relation_evaluator = None
@@ -426,7 +431,11 @@ def _build_conversation_flow_state_store(settings: Settings) -> ConversationFlow
     return SQLiteConversationFlowStateStore(settings.memory_database_path)
 
 
-def _build_memory_extractor(settings: Settings):
+def _build_memory_extractor(
+    settings: Settings,
+    *,
+    candidate_retriever: HybridMemoryRetriever | None = None,
+):
     use_llm = settings.memory_extraction_provider == "llm" or (
         settings.memory_extraction_provider == "auto" and settings.llm_provider != "demo"
     )
@@ -480,6 +489,7 @@ def _build_memory_extractor(settings: Settings):
             tier="flash",
             thinking=settings.memory_extraction_thinking,
             fallback=single_stage,
+            candidate_retriever=candidate_retriever,
         )
     return single_stage
 
