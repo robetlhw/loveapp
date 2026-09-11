@@ -14,7 +14,13 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from loveapp.domain.memory import CoarseProposition, SemanticRole
+from loveapp.domain.memory import (
+    CoarseProposition,
+    ExtractionEpistemicStatus,
+    MemoryKind,
+    SemanticRole,
+    canonical_semantic_role,
+)
 
 
 class Stage2ExtractorRoute(StrEnum):
@@ -27,6 +33,15 @@ class Stage2ExtractorRoute(StrEnum):
     REFINEMENT = "refinement"
     BELIEF = "belief"
     UNCERTAIN = "uncertain"
+
+
+CANONICAL_SEMANTIC_ROLES: tuple[SemanticRole, ...] = (
+    SemanticRole.NEW_PROPOSITION,
+    SemanticRole.ATTRIBUTE_COMPLETION,
+    SemanticRole.REFINEMENT,
+    SemanticRole.CORRECTION,
+    SemanticRole.UNCERTAIN,
+)
 
 
 # A short alias is useful to callers that use the terminology from the design
@@ -48,6 +63,9 @@ class Stage2PromptRoute:
     candidate_routes: tuple[Stage2ExtractorRoute, ...]
     selected_route: Stage2ExtractorRoute
     reason: str
+    candidate_kinds: tuple[MemoryKind, ...] = ()
+    epistemic_status: ExtractionEpistemicStatus = ExtractionEpistemicStatus.UNCERTAIN
+    rejected_combinations: tuple[tuple[str, str], ...] = ()
 
     @property
     def route(self) -> Stage2ExtractorRoute:
@@ -57,6 +75,10 @@ class Stage2PromptRoute:
 
     @property
     def extractor_name(self) -> str:
+        if self.selected_route == Stage2ExtractorRoute.NEW_MEMORY and self.candidate_kinds == (
+            MemoryKind.INTERACTION_EVENT,
+        ):
+            return "NewEventExtractor"
         return {
             Stage2ExtractorRoute.NEW_MEMORY: "NewMemoryExtractor",
             Stage2ExtractorRoute.EVENT_ENRICHMENT: "EventEnrichmentExtractor",
@@ -77,6 +99,12 @@ class Stage2PromptRoute:
             "selected_route": self.selected_route.value,
             "extractor": self.extractor_name,
             "reason": self.reason,
+            "candidate_kinds": [kind.value for kind in self.candidate_kinds],
+            "epistemic_status": self.epistemic_status.value,
+            "rejected_combinations": [
+                {"semantic_role": role, "candidate_kind": kind, "reason": "incompatible_role_kind"}
+                for role, kind in self.rejected_combinations
+            ],
         }
 
 
@@ -88,6 +116,7 @@ _ROLE_TO_ROUTE: dict[SemanticRole, Stage2ExtractorRoute] = {
     SemanticRole.CONTEXTUAL_COMPLETION: Stage2ExtractorRoute.EVENT_ENRICHMENT,
     SemanticRole.ATTRIBUTE_UPDATE: Stage2ExtractorRoute.EVENT_ENRICHMENT,
     SemanticRole.REFINEMENT: Stage2ExtractorRoute.REFINEMENT,
+    SemanticRole.CORRECTION: Stage2ExtractorRoute.NEW_MEMORY,
     SemanticRole.REFINEMENT_CANDIDATE: Stage2ExtractorRoute.REFINEMENT,
     SemanticRole.STATE_UPDATE: Stage2ExtractorRoute.STATE,
     SemanticRole.STATE_ASSERTION: Stage2ExtractorRoute.STATE,
@@ -95,6 +124,40 @@ _ROLE_TO_ROUTE: dict[SemanticRole, Stage2ExtractorRoute] = {
     SemanticRole.BELIEF_EXTRACTION: Stage2ExtractorRoute.BELIEF,
     SemanticRole.UNCERTAIN: Stage2ExtractorRoute.UNCERTAIN,
 }
+
+
+def _route_for_role_and_kind(
+    role: SemanticRole,
+    kind: MemoryKind,
+    epistemic: ExtractionEpistemicStatus,
+) -> Stage2ExtractorRoute | None:
+    """Evaluate one matrix cell; never discard a role's other legal routes."""
+
+    if role in {SemanticRole.NEW_PROPOSITION, SemanticRole.CORRECTION}:
+        # Correction supplies the corrected claim to existing governance. It
+        # is neither a precision-only refinement nor a model-authorized write.
+        if epistemic == ExtractionEpistemicStatus.BELIEVED:
+            return Stage2ExtractorRoute.BELIEF
+        if kind == MemoryKind.INTERACTION_PATTERN:
+            return Stage2ExtractorRoute.PATTERN
+        if kind == MemoryKind.RELATIONSHIP_STATE:
+            return Stage2ExtractorRoute.STATE
+        return Stage2ExtractorRoute.NEW_MEMORY
+    if role == SemanticRole.ATTRIBUTE_COMPLETION:
+        return (
+            Stage2ExtractorRoute.EVENT_ENRICHMENT if kind == MemoryKind.INTERACTION_EVENT else None
+        )
+    if role == SemanticRole.REFINEMENT:
+        # Event attribute detail belongs to completion. Refinement is the
+        # existing trace-only path for making non-event propositions precise.
+        return (
+            Stage2ExtractorRoute.REFINEMENT
+            if kind not in {MemoryKind.INTERACTION_EVENT, MemoryKind.ADVICE_OUTCOME}
+            else None
+        )
+    if role == SemanticRole.UNCERTAIN:
+        return Stage2ExtractorRoute.UNCERTAIN
+    return None
 
 
 def route_semantic_role(role: SemanticRole | str | None) -> Stage2ExtractorRoute:
@@ -139,8 +202,10 @@ class SemanticRoleRouter:
                     value = SemanticRole(value)
                 except ValueError:
                     continue
-            if isinstance(value, SemanticRole) and value not in roles:
-                roles.append(value)
+            if isinstance(value, SemanticRole):
+                operation = canonical_semantic_role(value)
+                if operation not in roles:
+                    roles.append(operation)
         if not roles:
             roles = [SemanticRole.UNCERTAIN]
 
@@ -148,13 +213,20 @@ class SemanticRoleRouter:
         concrete_roles = [role for role in roles if role != SemanticRole.UNCERTAIN]
         considered_roles = concrete_roles or [SemanticRole.UNCERTAIN]
         routes: list[Stage2ExtractorRoute] = []
+        rejected: list[tuple[str, str]] = []
         for role in considered_roles:
-            route = route_semantic_role(role)
-            if route not in routes:
-                routes.append(route)
+            for kind in proposition.candidate_kinds:
+                route = _route_for_role_and_kind(role, kind, proposition.epistemic_status)
+                if route is None:
+                    rejected.append((role.value, kind.value))
+                elif route not in routes:
+                    routes.append(route)
         if len(routes) == 1:
             selected = routes[0]
-            reason = "single_semantic_role"
+            reason = "single_compatible_semantic_role" if rejected else "single_semantic_role"
+        elif len(routes) == 0:
+            selected = Stage2ExtractorRoute.UNCERTAIN
+            reason = "no_compatible_role_kind_combination"
         else:
             selected = Stage2ExtractorRoute.UNCERTAIN
             reason = "multiple_semantic_routes_fail_closed"
@@ -164,6 +236,9 @@ class SemanticRoleRouter:
             candidate_routes=tuple(routes),
             selected_route=selected,
             reason=reason,
+            candidate_kinds=tuple(proposition.candidate_kinds),
+            epistemic_status=proposition.epistemic_status,
+            rejected_combinations=tuple(rejected),
         )
 
     def route_many(self, propositions: Iterable[CoarseProposition]) -> list[Stage2PromptRoute]:
@@ -259,6 +334,7 @@ def is_new_event_occurrence(text: str, evidence_span: str | None = None) -> bool
 
 
 __all__ = [
+    "CANONICAL_SEMANTIC_ROLES",
     "ROLE_INSTRUCTIONS",
     "SemanticRoleRouter",
     "Stage2ExtractorRoute",

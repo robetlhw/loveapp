@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 from datetime import date as Date
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from loveapp.domain.date_operations import DateRequirementMatch, DateStopRequirement
 from loveapp.domain.date_plan import DatePlan
@@ -25,12 +25,24 @@ class PendingQuestion(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    id: str = Field(min_length=1, max_length=160)
-    question_type: str = Field(min_length=1, max_length=80)
+    id: str = Field(
+        min_length=1,
+        max_length=160,
+        validation_alias=AliasChoices("id", "question_id"),
+        serialization_alias="question_id",
+    )
+    question_type: str = Field(default="memory_follow_up", min_length=1, max_length=80)
     target_kind: str | None = Field(default=None, max_length=80)
     target_field: str | None = Field(default=None, max_length=80)
+    expected_answer_type: str | None = Field(default=None, max_length=80)
     status: str = Field(default="open", max_length=40)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @property
+    def question_id(self) -> str:
+        """Public contract spelling retained alongside the legacy ``id``."""
+
+        return self.id
 
 
 class PendingMemoryContext(BaseModel):
@@ -56,6 +68,7 @@ class PendingMemoryContext(BaseModel):
             question_type=self.topic or self.expected_slot or "memory_follow_up",
             target_kind=self.target_kind,
             target_field=self.target_field or self.expected_slot,
+            expected_answer_type=self.expected_slot or self.target_field,
             status=self.status,
         )
 

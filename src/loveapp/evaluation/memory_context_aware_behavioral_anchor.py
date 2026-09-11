@@ -42,6 +42,7 @@ from loveapp.domain.memory_semantic_units import (
     RefinementDraft,
 )
 from loveapp.domain.runtime_context import ConversationContext, PendingQuestion
+from loveapp.evaluation.memory_extraction_diagnostics import extraction_failure_stages
 
 REFERENCE_TIME = datetime(2026, 9, 11, 12, tzinfo=UTC)
 SUITE_NAME = "context_aware_behavioral_anchor_v0_1"
@@ -116,8 +117,7 @@ def _history(case: dict[str, Any], index: int) -> list[StoredMessage]:
             relationship_id="context-aware-relationship",
             role=MessageRole(item["role"]),
             content=str(item["content"]),
-            created_at=_parse_datetime(item.get("created_at"))
-            or base + timedelta(minutes=offset),
+            created_at=_parse_datetime(item.get("created_at")) or base + timedelta(minutes=offset),
         )
         for offset, item in enumerate(case.get("conversation_history", []))
     ]
@@ -160,10 +160,11 @@ def _pending_questions(case: dict[str, Any]) -> list[PendingQuestion]:
             continue
         questions.append(
             PendingQuestion(
-                id=str(raw.get("id", f"{case['case_id']}-q{index}")),
+                id=str(raw.get("question_id", raw.get("id", f"{case['case_id']}-q{index}"))),
                 question_type=str(raw.get("question_type", raw.get("topic", "memory_follow_up"))),
                 target_kind=raw.get("target_kind"),
                 target_field=raw.get("target_field", raw.get("field")),
+                expected_answer_type=raw.get("expected_answer_type"),
                 status=str(raw.get("status", "open")),
             )
         )
@@ -257,6 +258,10 @@ _OCCURRENCE_RE = re.compile(
 
 def _normalize_claim(claim: AtomicClaim) -> dict[str, Any]:
     payload = dict(claim.payload)
+    lineage = payload.get("extraction_provenance") or {}
+    operation = (
+        "correction" if lineage.get("semantic_roles") == ["correction"] else "new_proposition"
+    )
     event_type = normalize_interaction_event_type(payload.get("event_type"))
     if event_type is None and claim.kind == MemoryKind.INTERACTION_EVENT:
         event_type = infer_interaction_event_type(
@@ -264,10 +269,13 @@ def _normalize_claim(claim: AtomicClaim) -> dict[str, Any]:
             evidence_text=" ".join(claim.evidence_spans),
         )
     values: list[str] = []
+    attributes = payload.get("attributes")
     for key in ("value", "object", "cause", "emotion", "location", "activity_type"):
         values.extend(_flatten_values(payload.get(key, getattr(claim, key, None))))
+        if isinstance(attributes, dict):
+            values.extend(_flatten_values(attributes.get(key)))
     return {
-        "semantic_role": "new_proposition",
+        "semantic_role": operation,
         "semantic_type": "new_memory",
         "memory_kind": claim.kind.value,
         "event_type": event_type,
@@ -275,6 +283,7 @@ def _normalize_claim(claim: AtomicClaim) -> dict[str, Any]:
         "state_dimension": normalize_state_dimension(payload.get("state_dimension")),
         "subject": claim.subject,
         "perspective": _claim_perspective(claim),
+        "epistemic_status": claim.epistemic_status.value,
         "attribute": None,
         "attributes": _claim_attributes(payload),
         "values": values,
@@ -300,6 +309,7 @@ def _normalize_unit(unit: object) -> dict[str, Any]:
             "state_dimension": None,
             "subject": unit.subject_hint,
             "perspective": unit.perspective.value,
+            "epistemic_status": unit.epistemic_status.value,
             "attribute": unit.attribute_name,
             "attributes": [unit.attribute_name],
             "value": unit.value,
@@ -341,9 +351,11 @@ def _normalize_unit(unit: object) -> dict[str, Any]:
 
 def _unit_rows(extraction: Any) -> list[dict[str, Any]]:
     units = list(getattr(extraction, "semantic_units", []))
-    return [_normalize_unit(unit) for unit in units] if units else [
-        _normalize_unit(claim) for claim in extraction.claims
-    ]
+    return (
+        [_normalize_unit(unit) for unit in units]
+        if units
+        else [_normalize_unit(claim) for claim in extraction.claims]
+    )
 
 
 def _extractor_diagnostic(extractor: Any) -> dict[str, Any]:
@@ -421,9 +433,7 @@ def _resolution_expectation_passes(
     if expectation.get("allow_no_draft") and shadow.get("status") == "not_applicable":
         return True, None
     if expected_status == "resolved":
-        resolved = [
-            row for row in shadow.get("resolutions", []) if row.get("status") == "resolved"
-        ]
+        resolved = [row for row in shadow.get("resolutions", []) if row.get("status") == "resolved"]
         if len(resolved) < int(expectation.get("min_resolved", 1)):
             return False, "expected_resolved_target_missing"
         target = expectation.get("target_memory_id")
@@ -434,9 +444,7 @@ def _resolution_expectation_passes(
         if shadow.get("status") != "rejected":
             return False, "expected_fail_closed_rejection"
         reason = expectation.get("reason")
-        if reason and not any(
-            row.get("reason") == reason for row in shadow.get("resolutions", [])
-        ):
+        if reason and not any(row.get("reason") == reason for row in shadow.get("resolutions", [])):
             return False, "rejection_reason_mismatch"
     return True, None
 
@@ -499,11 +507,19 @@ def _attach_stage1_origins(
     aligned: list[dict[str, Any]] = []
     for index, row in enumerate(observed):
         item = dict(row)
-        if item.get("semantic_type") != "new_memory":
+        raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+        provenance = raw.get("provenance") or raw.get("payload", {}).get("extraction_provenance")
+        ids = provenance.get("proposition_ids", []) if isinstance(provenance, dict) else []
+        if ids and all(pid in by_id for pid in ids):
+            origins = {by_id[pid][0] for pid in ids}
+            item["proposition_origin"] = next(iter(origins)) if len(origins) == 1 else "uncertain"
+            item["proposition_origin_source"] = "stage1"
+            item["proposition_origin_proposition_ids"] = ids
+            item["proposition_origin_matched_by"] = "validated_provenance"
+            used_ids.update(ids)
             aligned.append(item)
             continue
-        raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
-        claim_id = str(raw.get("claim_id") or "").strip()
+        claim_id = str(raw.get("claim_id") or raw.get("unit_id") or "").strip()
         evidence_values = item.get("evidence")
         evidence_candidates = (
             evidence_values if isinstance(evidence_values, list) else [evidence_values]
@@ -558,8 +574,10 @@ def _value_matches(expected: object, actual: object) -> bool:
         "heavy_rain": ("大雨", "下雨特别大", "暴雨"),
         "subway": ("地铁",),
     }
-    return expected_text == actual_text or expected_text in actual_text or any(
-        _norm_text(alias) in actual_text for alias in aliases.get(expected_text, ())
+    return (
+        expected_text == actual_text
+        or expected_text in actual_text
+        or any(_norm_text(alias) in actual_text for alias in aliases.get(expected_text, ()))
     )
 
 
@@ -620,18 +638,32 @@ def _match_required(
 def _forbidden_hits(expected: dict[str, Any], observed: list[dict[str, Any]]) -> list[str]:
     hits: list[str] = []
     for forbidden in expected.get("forbidden", []):
-        if (forbidden == "enrichment" and any(
-            row.get("semantic_type") == "enrichment" for row in observed
-        )) or (forbidden == "event_enrichment" and any(
-            row.get("semantic_type") == "enrichment" for row in observed
-        )) or (forbidden == "relationship_state" and any(
-            row.get("memory_kind") == "relationship_state" for row in observed
-        )) or (forbidden == "pattern" and any(
-            row.get("memory_kind") == "interaction_pattern" for row in observed
-        )) or (forbidden == "confirmed_belief" and any(
-            row.get("perspective") == MemoryPerspective.USER_BELIEF.value
-            for row in observed
-        )):
+        if (
+            (
+                forbidden == "enrichment"
+                and any(row.get("semantic_type") == "enrichment" for row in observed)
+            )
+            or (
+                forbidden == "event_enrichment"
+                and any(row.get("semantic_type") == "enrichment" for row in observed)
+            )
+            or (
+                forbidden == "relationship_state"
+                and any(row.get("memory_kind") == "relationship_state" for row in observed)
+            )
+            or (
+                forbidden == "pattern"
+                and any(row.get("memory_kind") == "interaction_pattern" for row in observed)
+            )
+            or (
+                forbidden == "confirmed_belief"
+                and any(
+                    row.get("perspective") == MemoryPerspective.USER_BELIEF.value
+                    and row.get("epistemic_status") == "confirmed"
+                    for row in observed
+                )
+            )
+        ):
             hits.append(forbidden)
     return hits
 
@@ -646,12 +678,15 @@ def _failure_stage(
     context_expected: bool | None,
     context_used: bool,
 ) -> str | None:
+    failures = telemetry.get("failure_stages", [])
+    if failures and (missing or telemetry.get("failure_count")):
+        return failures[0]
     if not gate_ok:
         return "Stage1_gate"
     if context_expected is True and not context_used:
         return "Context_alignment"
     if telemetry.get("failure_count"):
-        return "Model_parse_failure"
+        return "TRANSPORT_OR_RUNTIME_FAILURE"
     if missing:
         fields = " ".join(field_failures)
         if "semantic_role" in fields:
@@ -710,11 +745,7 @@ async def evaluate_context_aware_behavioral_anchor(
             )
             expected_unit_count = expected.get("unit_count")
             unit_count_ok = expected_unit_count is None or len(observed) == expected_unit_count
-            if (
-                not unit_count_ok
-                and expected.get("allow_no_draft")
-                and not observed
-            ):
+            if not unit_count_ok and expected.get("allow_no_draft") and not observed:
                 unit_count_ok = True
             forbidden_hits = _forbidden_hits(expected, observed)
             expected_gate = expected.get("should_extract")
@@ -734,6 +765,11 @@ async def evaluate_context_aware_behavioral_anchor(
             if model_error:
                 telemetry["failure_count"] = telemetry["failure_count"] or 1
                 telemetry["error"] = model_error
+            telemetry["failure_stages"] = extraction_failure_stages(
+                telemetry["attempts"],
+                _extractor_diagnostic(extractor),
+                runtime_error=model_error,
+            )
             context_alignment_expected = case.get("context_alignment_expected")
             shadow = _resolve_shadow(case, observed, index)
             resolution_ok, resolution_failure = _resolution_expectation_passes(
@@ -750,15 +786,34 @@ async def evaluate_context_aware_behavioral_anchor(
                 context_used=context_used,
             )
             if primary is None and not resolution_ok:
-                primary = (
-                    "Resolver_no_target"
-                    if "target" in (resolution_failure or "")
-                    else "Resolver"
-                )
+                primary = "RESOLVER_FAILURE"
             if primary is None and not ambiguity_ok:
-                primary = "Resolver_ambiguous_target"
+                primary = "RESOLVER_FAILURE"
             if primary is None and not unit_count_ok:
-                primary = "Stage2_semantic_decomposition"
+                primary = next(iter(telemetry["failure_stages"]), "Stage2_semantic_decomposition")
+            # Keep the frozen gold and its strict score intact. Retired
+            # operation labels need human review, not a fabricated model error.
+            legacy_roles = sorted(
+                {
+                    role
+                    for required in expected.get("required", [])
+                    for role in (
+                        required.get("semantic_role", [])
+                        if isinstance(required.get("semantic_role"), list)
+                        else [required.get("semantic_role")]
+                    )
+                    if role in {"state_update", "pattern_extraction", "belief_extraction"}
+                }
+            )
+            expectation_review = bool(
+                legacy_roles
+                and primary == "Stage1_semantic_role"
+                and all(field.startswith("semantic_role[") for field in field_failures)
+                and unit_count_ok
+                and not forbidden_hits
+            )
+            if expectation_review:
+                primary = "EVALUATION_EXPECTATION"
             passed = (
                 gate_ok
                 and not missing
@@ -804,16 +859,16 @@ async def evaluate_context_aware_behavioral_anchor(
                     "extractor_diagnostic": {
                         "stage1": {
                             key: value
-                            for key, value in _extractor_diagnostic(extractor).get(
-                                "stage1", {}
-                            ).items()
+                            for key, value in _extractor_diagnostic(extractor)
+                            .get("stage1", {})
+                            .items()
                             if key not in {"raw_output"}
                         },
                         "stage2": {
                             key: value
-                            for key, value in _extractor_diagnostic(extractor).get(
-                                "stage2", {}
-                            ).items()
+                            for key, value in _extractor_diagnostic(extractor)
+                            .get("stage2", {})
+                            .items()
                             if key not in {"raw_output"}
                         },
                         "fallback": _extractor_diagnostic(extractor).get("fallback", {}),
@@ -822,6 +877,17 @@ async def evaluate_context_aware_behavioral_anchor(
                         ),
                     },
                     "primary_failure_stage": primary,
+                    "needs_review": expectation_review,
+                    "expectation_review_reason": (
+                        "retired_operation_labels:" + ",".join(legacy_roles)
+                        if expectation_review
+                        else None
+                    ),
+                    "secondary_failure_stages": [
+                        stage
+                        for stage in telemetry["failure_stages"]
+                        if primary and stage != primary
+                    ],
                     "passed": passed,
                 }
             )
@@ -881,9 +947,7 @@ def _build_metrics(rows: list[dict[str, Any]], scored: list[dict[str, Any]]) -> 
         if len(row["observed_semantics"]) == row["expected_semantics"]["unit_count"]
     ]
     enrichment_cases = [
-        row
-        for row in scored
-        if row["expected_semantics"].get("expects_enrichment") is True
+        row for row in scored if row["expected_semantics"].get("expects_enrichment") is True
     ]
     enrichment_detected = [
         row
@@ -891,20 +955,14 @@ def _build_metrics(rows: list[dict[str, Any]], scored: list[dict[str, Any]]) -> 
         if any(item.get("semantic_type") == "enrichment" for item in row["observed_semantics"])
     ]
     new_event_cases = [
-        row
-        for row in scored
-        if row["expected_semantics"].get("new_event_safety") is True
+        row for row in scored if row["expected_semantics"].get("new_event_safety") is True
     ]
     false_enrichment = [
         row
         for row in new_event_cases
         if any(item.get("semantic_type") == "enrichment" for item in row["observed_semantics"])
     ]
-    ambiguous = [
-        row
-        for row in scored
-        if row["expected_semantics"].get("ambiguous_target") is True
-    ]
+    ambiguous = [row for row in scored if row["expected_semantics"].get("ambiguous_target") is True]
     rejected_ambiguous = [
         row
         for row in ambiguous
@@ -916,16 +974,10 @@ def _build_metrics(rows: list[dict[str, Any]], scored: list[dict[str, Any]]) -> 
             sum(
                 not any(field in failure for failure in row["field_failures"])
                 for row in scored
-                if any(
-                    field in item
-                    for item in row["expected_semantics"].get("required", [])
-                )
+                if any(field in item for item in row["expected_semantics"].get("required", []))
             ),
             sum(
-                any(
-                    field in item
-                    for item in row["expected_semantics"].get("required", [])
-                )
+                any(field in item for item in row["expected_semantics"].get("required", []))
                 for row in scored
             ),
         )
@@ -943,9 +995,7 @@ def _build_metrics(rows: list[dict[str, Any]], scored: list[dict[str, Any]]) -> 
     for row in scored:
         if row.get("primary_failure_stage"):
             categories[row["primary_failure_stage"]] += 1
-    context_aligned = [
-        row for row in scored if row.get("context_alignment_expected") is not None
-    ]
+    context_aligned = [row for row in scored if row.get("context_alignment_expected") is not None]
     context_pair_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         pair_id = row.get("context_pair_id")
@@ -995,8 +1045,7 @@ def _build_metrics(rows: list[dict[str, Any]], scored: list[dict[str, Any]]) -> 
             sum(
                 not row["forbidden_hits"]
                 and not any(
-                    item.get("semantic_type") == "enrichment"
-                    for item in row["observed_semantics"]
+                    item.get("semantic_type") == "enrichment" for item in row["observed_semantics"]
                 )
                 for row in new_event_cases
             ),
@@ -1029,7 +1078,13 @@ def _build_metrics(rows: list[dict[str, Any]], scored: list[dict[str, Any]]) -> 
         "forbidden_semantic_violation_rate": ratio(
             sum(bool(row["forbidden_hits"]) for row in scored), len(scored)
         ),
-        "model_parse_failure_count": sum(row["telemetry"]["failure_count"] for row in rows),
+        "model_parse_failure_count": sum(
+            "MODEL_PARSE_FAILURE" in row["telemetry"].get("failure_stages", []) for row in rows
+        ),
+        "schema_validation_failure_count": sum(
+            "SCHEMA_VALIDATION_FAILURE" in row["telemetry"].get("failure_stages", [])
+            for row in rows
+        ),
         "primary_failure_stage_counts": dict(sorted(categories.items())),
     }
 
@@ -1043,8 +1098,7 @@ def _multi_round_consistency(rows: list[dict[str, Any]]) -> float:
     if not grouped:
         return 0.0
     consistent = sum(
-        int(all(row.get("passed") for row in group_rows))
-        for group_rows in grouped.values()
+        int(all(row.get("passed") for row in group_rows)) for group_rows in grouped.values()
     )
     return round(consistent / len(grouped), 4)
 
@@ -1149,9 +1203,7 @@ def render_context_aware_summary(report: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def compare_context_aware_runs(
-    first: dict[str, Any], second: dict[str, Any]
-) -> dict[str, Any]:
+def compare_context_aware_runs(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
     def semantic_signature(row: dict[str, Any]) -> list[dict[str, Any]]:
         fields = (
             "semantic_role",
@@ -1171,8 +1223,7 @@ def compare_context_aware_runs(
             "proposition_origin",
         )
         return [
-            {key: item.get(key) for key in fields}
-            for item in row.get("observed_semantics", [])
+            {key: item.get(key) for key in fields} for item in row.get("observed_semantics", [])
         ]
 
     left = {row["case_id"]: row for row in first.get("cases", [])}

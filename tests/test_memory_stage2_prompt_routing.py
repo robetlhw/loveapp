@@ -40,9 +40,7 @@ class _FakeCompletions:
             choices=[
                 SimpleNamespace(
                     finish_reason="stop",
-                    message=SimpleNamespace(
-                        content=json.dumps(response, ensure_ascii=False)
-                    ),
+                    message=SimpleNamespace(content=json.dumps(response, ensure_ascii=False)),
                 )
             ],
             usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
@@ -111,6 +109,7 @@ def test_all_stage1_roles_have_bounded_stage2_routes() -> None:
 def test_role_router_preserves_multiple_role_hypotheses_and_fails_closed() -> None:
     proposition = _proposition(
         SemanticRole.STATE_UPDATE,
+        kinds=[MemoryKind.RELATIONSHIP_STATE, MemoryKind.INTERACTION_PATTERN],
         role_candidates=[SemanticRole.STATE_UPDATE, SemanticRole.PATTERN_EXTRACTION],
     )
 
@@ -136,11 +135,13 @@ def test_coarse_prompt_advertises_semantic_roles_without_write_authority() -> No
     )
     contract = prompt["contract"]
 
-    assert {
-        "state_update",
-        "pattern_extraction",
-        "belief_extraction",
-    } <= set(contract["semantic_roles"])
+    assert set(contract["semantic_roles"]) == {
+        "new_proposition",
+        "attribute_completion",
+        "refinement",
+        "correction",
+        "uncertain",
+    }
     assert contract["semantic_role_candidates_allowed"] is True
     assert {"CREATE", "ENRICH", "UPDATE"} <= set(contract["stage1_must_not_decide"])
 
@@ -149,8 +150,18 @@ def test_detailed_system_prompt_contains_only_semantic_route_instructions() -> N
     routes = [
         SemanticRoleRouter().route(_proposition(SemanticRole.NEW_PROPOSITION)),
         SemanticRoleRouter().route(_proposition(SemanticRole.ATTRIBUTE_COMPLETION)),
-        SemanticRoleRouter().route(_proposition(SemanticRole.STATE_UPDATE)),
-        SemanticRoleRouter().route(_proposition(SemanticRole.PATTERN_EXTRACTION)),
+        SemanticRoleRouter().route(
+            _proposition(
+                SemanticRole.STATE_UPDATE,
+                kinds=[MemoryKind.RELATIONSHIP_STATE],
+            )
+        ),
+        SemanticRoleRouter().route(
+            _proposition(
+                SemanticRole.PATTERN_EXTRACTION,
+                kinds=[MemoryKind.INTERACTION_PATTERN],
+            )
+        ),
         SemanticRoleRouter().route(_proposition(SemanticRole.BELIEF_EXTRACTION)),
     ]
 

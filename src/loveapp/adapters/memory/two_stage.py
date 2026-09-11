@@ -26,7 +26,10 @@ from loveapp.application.memory_repair import (
 from loveapp.domain.memory import (
     AtomicExtraction,
     CoarseExtraction,
+    CoarseProposition,
     DiscardReason,
+    EpistemicStatus,
+    ExtractionEpistemicStatus,
     MemoryAttemptStatus,
     MemoryExtractionAttempt,
     MemoryItem,
@@ -36,6 +39,7 @@ from loveapp.domain.memory import (
     PropositionOrigin,
     SemanticRole,
     StoredMessage,
+    canonical_semantic_role,
 )
 from loveapp.domain.memory_dimensions import (
     INTERACTION_PATTERN_DIMENSIONS,
@@ -49,6 +53,7 @@ from loveapp.domain.memory_semantic_units import (
     NewMemoryDraft,
     RefinementDraft,
     SemanticAtomicExtraction,
+    SemanticUnitProvenance,
 )
 from loveapp.domain.runtime_context import ConversationContext, PendingMemoryContext
 from loveapp.ports.memory import MemoryAttemptCallback, MemoryExtractor
@@ -61,6 +66,7 @@ from .openai_compatible import (
     _safe_model_response_snapshot,
 )
 from .stage2_routing import (
+    CANONICAL_SEMANTIC_ROLES,
     SemanticRoleRouter,
     Stage2ExtractorRoute,
     Stage2PromptRoute,
@@ -68,7 +74,7 @@ from .stage2_routing import (
     route_instruction,
 )
 
-_TWO_STAGE_PROMPT_VERSION = "memory-event-enrichment-mvp-v1"
+_TWO_STAGE_PROMPT_VERSION = "memory-semantic-ontology-v1.3"
 
 
 class TwoStageMemoryExtractor:
@@ -146,6 +152,12 @@ class TwoStageMemoryExtractor:
         trace: TraceRecorder | None = None,
         attempt_callback: MemoryAttemptCallback | None = None,
     ) -> AtomicExtraction:
+        conversation_context = conversation_context or ConversationContext.from_turn(
+            text,
+            conversation_history=conversation_history,
+            pending_memory_context=pending_memory_context,
+            relevant_memories=existing_memories,
+        )
         attempts: list[MemoryExtractionAttempt] = []
         started = perf_counter()
         current_stage = "coarse"
@@ -214,8 +226,7 @@ class TwoStageMemoryExtractor:
                 claim.model_dump(mode="json") for claim in extraction.claims
             ]
             diagnostic["final_semantic_units"] = [
-                unit.model_dump(mode="json")
-                for unit in getattr(extraction, "semantic_units", [])
+                unit.model_dump(mode="json") for unit in getattr(extraction, "semantic_units", [])
             ]
             return extraction
         except Exception as exc:
@@ -322,6 +333,7 @@ class TwoStageMemoryExtractor:
             self._last_diagnostic["stage1"]["parse_success"] = True
             coarse_payload, repair_steps = _coerce_coarse_payload(raw_payload)
             coarse = CoarseExtraction.model_validate(coarse_payload)
+            _validate_coarse_context(coarse, text, conversation_context)
             if coarse.should_extract and not coarse.propositions:
                 raise MemoryResponseError(
                     "two-stage coarse output contains no propositions",
@@ -333,6 +345,9 @@ class TwoStageMemoryExtractor:
             self._last_diagnostic["stage1"]["propositions"] = [
                 proposition.model_dump(mode="json") for proposition in coarse.propositions
             ]
+            self._last_diagnostic["stage1"]["answered_pending_questions"] = (
+                coarse.answered_pending_questions
+            )
             details["proposition_count"] = len(coarse.propositions)
             details["should_extract"] = coarse.should_extract
             attempts.append(_build_attempt(details, started, status=MemoryAttemptStatus.COMPLETED))
@@ -373,6 +388,16 @@ class TwoStageMemoryExtractor:
             for route, proposition in zip(routes, coarse.propositions, strict=False)
         ]
         self._last_diagnostic["stage2"]["routes"] = route_payload
+        if routes and all(
+            route.selected_route == Stage2ExtractorRoute.UNCERTAIN for route in routes
+        ):
+            self._last_diagnostic["stage2"]["abstentions"] = [
+                {"proposition_id": route.proposition_id, "reason": _routing_failure(route)}
+                for route in routes
+            ]
+            return SemanticAtomicExtraction(
+                should_extract=coarse.should_extract, gate_reason=coarse.gate_reason
+            )
         prompt = _build_detailed_prompt(
             text,
             reference_time=reference_time,
@@ -418,6 +443,7 @@ class TwoStageMemoryExtractor:
             self._last_diagnostic["stage2"]["parse_success"] = True
             _reject_unsafe_detailed_keys(raw_model_payload)
             raw = _coerce_detailed_payload(raw_model_payload)
+            raw = _filter_unroutable_units(raw, coarse, self._last_diagnostic["stage2"])
             extraction, repair_steps = _parse_detailed_extraction(
                 raw,
                 source_text=text,
@@ -428,7 +454,11 @@ class TwoStageMemoryExtractor:
                 source_text=text,
                 coarse=coarse,
             )
-            if coarse.should_extract and not extraction.semantic_units:
+            if (
+                coarse.should_extract
+                and not extraction.semantic_units
+                and not self._last_diagnostic["stage2"].get("abstentions")
+            ):
                 raise MemoryResponseError(
                     "two-stage detailed output contains no valid semantic units",
                     category="empty_claims",
@@ -504,9 +534,13 @@ class TwoStageMemoryExtractor:
                     parameters = inspect.signature(extract).parameters
                 except (TypeError, ValueError):
                     parameters = {}
-                if parameters and "conversation_context" not in parameters and not any(
-                    parameter.kind == inspect.Parameter.VAR_KEYWORD
-                    for parameter in parameters.values()
+                if (
+                    parameters
+                    and "conversation_context" not in parameters
+                    and not any(
+                        parameter.kind == inspect.Parameter.VAR_KEYWORD
+                        for parameter in parameters.values()
+                    )
                 ):
                     kwargs.pop("conversation_context", None)
             return await extract(text, **kwargs), None
@@ -544,6 +578,7 @@ def _build_coarse_prompt(
     # Stage 1 sees semantic context, but not database identifiers.
     for item in context.get("existing_active_memories", []):
         item.pop("id", None)
+    _align_pending_question_payload(context)
     context["stage"] = "coarse_proposition_extraction"
     context["contract"] = {
         "stage1_responsibilities": [
@@ -568,8 +603,15 @@ def _build_coarse_prompt(
                 "evidence_span",
                 "semantic_role",
                 "proposition_origin",
+                "epistemic_status",
+                "perspective",
+                "same_occurrence_group",
+                "candidate_kind",
                 "candidate_kinds",
                 "attributes_hint",
+                "temporal_hint",
+                "target_field_hint",
+                "answered_pending_questions",
                 "confidence",
             ],
         },
@@ -581,14 +623,13 @@ def _build_coarse_prompt(
             "uncertain",
         ],
         "context_is_read_only": True,
-        "semantic_roles": [
-            "new_proposition",
-            "attribute_completion",
-            "refinement",
-            "state_update",
-            "pattern_extraction",
-            "belief_extraction",
-            "contextual_completion",
+        "answered_pending_questions": "open question IDs only; never memory IDs",
+        "semantic_roles": [role.value for role in CANONICAL_SEMANTIC_ROLES],
+        "epistemic_statuses": [
+            "observed",
+            "reported",
+            "believed",
+            "inferred",
             "uncertain",
         ],
         "semantic_role_candidates_allowed": True,
@@ -625,12 +666,13 @@ def _build_detailed_prompt(
     )
     for item in context.get("existing_active_memories", []):
         item.pop("id", None)
+    _align_pending_question_payload(context)
     context.update(
         {
             "stage": "batched_kind_aware_detailed_extraction",
             "coarse_extraction": coarse.model_dump(mode="json"),
             "stage2_route_plan": _build_route_plan(coarse),
-        "contract": {
+            "contract": {
                 "output": "SemanticAtomicExtraction",
                 "one_response_for_all_propositions": True,
                 "stage2_routes": [route.value for route in Stage2ExtractorRoute],
@@ -645,6 +687,9 @@ def _build_detailed_prompt(
                     "active_topic",
                     "relevant_memories",
                     "proposition_origin",
+                    "epistemic_status",
+                    "perspective",
+                    "same_occurrence_group",
                 ],
                 "context_is_read_only": True,
                 "forbidden_outputs": [
@@ -679,6 +724,12 @@ def _route_prompt_payload(
         "proposition_origin": getattr(
             proposition.proposition_origin, "value", proposition.proposition_origin
         ),
+        "epistemic_status": getattr(
+            proposition.epistemic_status, "value", proposition.epistemic_status
+        ),
+        "perspective": getattr(proposition, "perspective", None),
+        "same_occurrence_group": getattr(proposition, "same_occurrence_group", None),
+        "answered_pending_questions": list(proposition.answered_pending_questions),
         "attributes_hint": list(getattr(proposition, "attributes_hint", [])),
         "instruction": route_instruction(route.selected_route),
     }
@@ -706,9 +757,7 @@ def _build_detailed_system_prompt(
     active = list(dict.fromkeys(route.selected_route for route in routes))
     if not active:
         return _DETAILED_SYSTEM_PROMPT
-    instructions = "\n".join(
-        f"- {route.value}: {route_instruction(route)}" for route in active
-    )
+    instructions = "\n".join(f"- {route.value}: {route_instruction(route)}" for route in active)
     return (
         f"{_DETAILED_SYSTEM_PROMPT}\n\n"
         "本次批次启用的 Stage2 semantic routes（仅用于选择语义草稿）：\n"
@@ -735,14 +784,241 @@ def _proposition_for_unit(
         evidence = list(unit.evidence_spans)
     else:
         evidence = [unit.evidence_span]
-    for proposition in propositions:
+    matches = [
+        proposition
+        for proposition in propositions
         if any(
-            span
-            and (span in proposition.evidence_span or proposition.evidence_span in span)
+            span and (span in proposition.evidence_span or proposition.evidence_span in span)
             for span in evidence
+        )
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _align_pending_question_payload(context: dict[str, Any]) -> None:
+    for question in context.get("conversation_context", {}).get("pending_questions", []):
+        if "id" in question:
+            question["question_id"] = question.pop("id")
+
+
+def _validate_coarse_context(
+    coarse: CoarseExtraction,
+    text: str,
+    context: ConversationContext | None,
+) -> None:
+    ids = [item.proposition_id for item in coarse.propositions]
+    if len(set(ids)) != len(ids) or any(
+        item.evidence_span not in text for item in coarse.propositions
+    ):
+        raise MemoryResponseError(
+            "Stage 1 requires unique proposition IDs and current-user evidence",
+            category="schema_validation",
+        )
+    allowed = {
+        question.id
+        for question in (context.pending_questions if context else [])
+        if question.status == "open"
+    }
+    answered = list(
+        dict.fromkeys(
+            [
+                *coarse.answered_pending_questions,
+                *(qid for item in coarse.propositions for qid in item.answered_pending_questions),
+            ]
+        )
+    )
+    if not set(answered) <= allowed:
+        raise MemoryResponseError(
+            "answered_pending_questions must reference open conversation questions",
+            category="schema_validation",
+        )
+    coarse.answered_pending_questions = answered
+
+
+def _routing_failure(route: Stage2PromptRoute) -> str:
+    return "ROUTING_AMBIGUITY" if len(route.candidate_routes) > 1 else "ROUTING_ABSTENTION"
+
+
+def _matched_propositions(
+    unit: dict[str, Any],
+    coarse: CoarseExtraction,
+) -> list[CoarseProposition]:
+    index = {item.proposition_id: item for item in coarse.propositions}
+    evidence = unit.get("evidence_spans") or [unit.get("evidence_span")]
+    if isinstance(evidence, str):
+        evidence = [evidence]
+    evidence_matches = [
+        item
+        for item in coarse.propositions
+        if any(
+            isinstance(span, str)
+            and span
+            and (span in item.evidence_span or item.evidence_span in span)
+            for span in evidence
+        )
+    ]
+    explicit = unit.get("proposition_ids")
+    if explicit is not None:
+        if (
+            not isinstance(explicit, list)
+            or not explicit
+            or len(explicit) > 12
+            or any(not isinstance(pid, str) or pid not in index for pid in explicit)
         ):
-            return proposition
-    return None
+            raise MemoryResponseError(
+                "invalid Stage 1 proposition references", category="schema_validation"
+            )
+        matches = [index[pid] for pid in dict.fromkeys(explicit)]
+    else:
+        pid = unit.get("proposition_id") or unit.get("claim_id") or unit.get("unit_id")
+        matches = [index[pid]] if isinstance(pid, str) and pid in index else evidence_matches
+    if any(item not in evidence_matches for item in matches):
+        raise MemoryResponseError(
+            "proposition reference does not match the unit's evidence",
+            category="routing_abstention",
+        )
+    # A supplied ID must not hide another proposition present in the same
+    # evidence, especially a weaker epistemic claim. Preserve all candidates.
+    matches = evidence_matches
+    if len(matches) > 1:
+        groups = {item.same_occurrence_group for item in matches}
+        if not all(groups) or len(groups) != 1:
+            raise MemoryResponseError(
+                "multiple propositions require one explicit same_occurrence_group",
+                category="routing_ambiguity",
+            )
+        if (
+            unit.get("semantic_type", "new_memory") != "new_memory"
+            or unit.get("kind") != MemoryKind.INTERACTION_EVENT
+            or any(
+                item.candidate_kinds != [MemoryKind.INTERACTION_EVENT]
+                or canonical_semantic_role(item.semantic_role) != SemanticRole.NEW_PROPOSITION
+                for item in matches
+            )
+        ):
+            raise MemoryResponseError(
+                "occurrence grouping can only combine new event propositions",
+                category="routing_abstention",
+            )
+    group = unit.get("same_occurrence_group")
+    if group and (not matches or any(item.same_occurrence_group != group for item in matches)):
+        raise MemoryResponseError(
+            "occurrence group differs from Stage 1", category="routing_abstention"
+        )
+    return matches
+
+
+def _filter_unroutable_units(
+    raw: dict[str, Any],
+    coarse: CoarseExtraction,
+    diagnostic: dict[str, Any],
+) -> dict[str, Any]:
+    router = SemanticRoleRouter()
+    routes = {item.proposition_id: router.route(item) for item in coarse.propositions}
+    key = "semantic_units" if "semantic_units" in raw else "claims"
+    kept = []
+    abstentions = [
+        {"proposition_id": pid, "reason": _routing_failure(route)}
+        for pid, route in routes.items()
+        if route.selected_route == Stage2ExtractorRoute.UNCERTAIN
+    ]
+    for unit in raw.get(key, []):
+        try:
+            matches = _matched_propositions(unit, coarse)
+        except MemoryResponseError as exc:
+            if exc.category not in {"routing_ambiguity", "routing_abstention"}:
+                raise
+            abstentions.append(
+                {
+                    "unit_id": unit.get("unit_id") or unit.get("claim_id"),
+                    "reason": exc.category.upper(),
+                    "detail": str(exc),
+                }
+            )
+            continue
+        if not matches:
+            abstentions.append({"proposition_id": None, "reason": "ROUTING_ABSTENTION"})
+            continue
+        if any(
+            routes[item.proposition_id].selected_route == Stage2ExtractorRoute.UNCERTAIN
+            for item in matches
+        ):
+            continue
+        kept.append(unit)
+    if abstentions:
+        diagnostic["abstentions"] = abstentions
+    return {**raw, key: kept}
+
+
+def _inherit_proposition_semantics(unit: dict[str, Any], coarse: CoarseExtraction) -> None:
+    matches = _matched_propositions(unit, coarse)
+    # Provider provenance is not authoritative. Rebuild it from validated Stage 1.
+    unit.pop("provenance", None)
+    unit.pop("same_occurrence_group", None)
+    unit.pop("proposition_ids", None)
+    unit.pop("proposition_id", None)
+    if not matches:
+        return
+    epistemics = [
+        item.epistemic_status for item in matches if "epistemic_status" in item.model_fields_set
+    ]
+    detailed_epistemic = str(unit.get("epistemic_status") or "").casefold()
+    if detailed_epistemic in {item.value for item in ExtractionEpistemicStatus}:
+        epistemics.append(ExtractionEpistemicStatus(detailed_epistemic))
+    # The weakest evidence mode must survive a grouped event and cannot be
+    # upgraded by a more confident detailed response.
+    priority = ["inferred", "believed", "uncertain", "reported", "observed"]
+    epistemic = (
+        min(epistemics, key=lambda value: priority.index(value.value)) if epistemics else None
+    )
+    roles = list(dict.fromkeys(canonical_semantic_role(item.semantic_role) for item in matches))
+    provenance = SemanticUnitProvenance(
+        proposition_ids=[item.proposition_id for item in matches],
+        semantic_roles=roles,
+        epistemic_status=epistemic,
+        same_occurrence_group=matches[0].same_occurrence_group,
+        answered_pending_questions=list(
+            dict.fromkeys(qid for item in matches for qid in item.answered_pending_questions)
+        ),
+    )
+    is_new = unit.get("semantic_type", "new_memory") == "new_memory"
+    if is_new:
+        unit.setdefault("payload", {})["extraction_provenance"] = provenance.model_dump(mode="json")
+    else:
+        unit["provenance"] = provenance.model_dump(mode="json")
+    if unit.get("semantic_type") == "refinement":
+        return  # Trace-only refinement has no admission/persistence authority.
+    perspectives = {_storage_perspective(item.perspective) for item in matches}
+    perspectives.add(_storage_perspective(unit.get("perspective")))
+    if epistemic == ExtractionEpistemicStatus.INFERRED or "model_inferred" in perspectives:
+        unit["perspective"] = "model_inferred"
+        unit["epistemic_status"] = "hypothesis"
+    elif epistemic == ExtractionEpistemicStatus.BELIEVED or "user_belief" in perspectives:
+        unit["perspective"] = "user_belief"
+        if unit.get("epistemic_status") not in {"prediction", "hypothesis"}:
+            unit["epistemic_status"] = "uncertain"
+    else:
+        if unit.get("perspective") is not None:
+            unit["perspective"] = _storage_perspective(unit["perspective"])
+        if epistemic == ExtractionEpistemicStatus.UNCERTAIN:
+            unit["epistemic_status"] = "uncertain"
+        elif epistemic is not None:
+            unit.setdefault("epistemic_status", _storage_epistemic_status(epistemic))
+    if unit.get("epistemic_status") is not None:
+        unit["epistemic_status"] = _storage_epistemic_status(unit["epistemic_status"])
+
+
+def _storage_perspective(value: object) -> str | None:
+    normalized = str(value or "").strip().casefold()
+    return {
+        "user": "user_reported",
+        "reported": "user_reported",
+        "observed": "user_reported",
+        "belief": "user_belief",
+        "believed": "user_belief",
+        "model": "model_inferred",
+        "inferred": "model_inferred",
+    }.get(normalized, normalized or None)
 
 
 def _validate_stage2_role_contract(
@@ -773,9 +1049,7 @@ def _validate_stage2_role_contract(
             # Use the proposition span first.  Looking at the entire compound
             # message would incorrectly reject a legitimate old-event
             # enrichment that happens to share a turn with a new proposition.
-            occurrence_text = (
-                proposition.evidence_span if proposition is not None else evidence
-            )
+            occurrence_text = proposition.evidence_span if proposition is not None else evidence
             if is_new_event_occurrence(occurrence_text, evidence):
                 raise MemoryResponseError(
                     "new bounded Event occurrence cannot be an enrichment",
@@ -864,7 +1138,7 @@ def _validate_stage2_role_contract(
 
 
 _COARSE_SYSTEM_PROMPT = """
-你是 LoveApp Memory Event Enrichment MVP 的 Stage 1 语义拆分器。只输出一个 JSON 对象：
+你是 LoveApp Memory V1.3 的 Stage 1 语义拆分器。只输出一个 JSON 对象：
 {"should_extract": true, "gate_reason": "STABLE_FACT", "propositions": [], "discarded_spans": []}
 gate_reason 必须严格使用以下大写枚举之一：STABLE_FACT、PREFERENCE、INTERACTION_PATTERN、
 RELATIONSHIP_STATE、RELATIONSHIP_CHANGE、PARTIAL_CHANGE、USER_BELIEF、PLANNED_EVENT、
@@ -873,23 +1147,34 @@ SMALL_TALK、NO_MEMORY；不要填写解释句。
 每个 proposition 必须严格包含 proposition_id、evidence_span、candidate_kinds、semantic_role；
 candidate_kinds 只能使用 stable_fact、preference、interaction_event、interaction_pattern、
 advice_outcome、planned_event、action_intent、relationship_state；允许多个候选。
-semantic_role 只能是 new_proposition、attribute_completion、refinement、state_update、
-pattern_extraction、belief_extraction、contextual_completion、uncertain。可选填写
+semantic_role 只能是 new_proposition、attribute_completion、refinement、correction、uncertain。
+role 只表示操作；candidate_kind(s) 表示内容类型；epistemic_status 表示证据性质，三者正交。
+epistemic_status 使用 observed、reported、believed、inferred、uncertain；perspective 可用 USER，
+表示信息报告者，不替代 subject_hint。用户猜测必须标 believed，系统推断标 inferred。
+“我俩正在吵架”是 new_proposition + interaction_event；当前冲突由后续 State Projection 消费事件。
+“最近都是我主动联系她”是 new_proposition + interaction_pattern。
+“我感觉她可能不喜欢我”是 new_proposition + relationship_state + believed，不是客观事实。
+correction 表示明确纠正此前说法；普通随时间变化仍是 new_proposition。refinement 仅表示更具体。
+可选填写
 semantic_role_candidates/semantic_roles 保留多个语义假设；Stage 1 绝不输出 CREATE、ENRICH、UPDATE、
 target_memory_id 或任何数据库写入指令。
 先判断当前文本是否描述新的、有边界的 occurrence；“今天/又/再次/这次”出现时仍需结合
 完整事件语义判断，新的 occurrence 必须是 new_proposition。只有对已有事件属性的省略式补充才是
-attribute_completion/contextual_completion。看到“因为”不能直接判为 completion。
+attribute_completion。看到“因为”不能直接判为 completion。
 必须结合 recent_conversation：Assistant 刚问“为什么吵架/当时什么反应”，用户回答原因或情绪，
-即使句子很短也应 should_extract=true，并判 contextual_completion。已有“昨天我们吵架了”时，
+即使句子很短也应 should_extract=true，并判 attribute_completion。已有“昨天我们吵架了”时，
 “因为我迟到，她特别生气，现在已经不理我了”至少拆成旧 Event 的 cause、emotion completion，
 以及独立 relationship_state。已有“我住上海”时，“具体在浦东”是 refinement，不是 Event completion。
 严禁输出 canonical_predicate、target_memory_id、mutation_action、数据库 patch 或任何写入指令。
+可用 temporal_hint 对象/文本、target_field_hint 列表、attributes_hint。
+answered_pending_questions 只填写 context 中 open question_id，可在根或对应命题内返回。
+同一事件下多个命题使用相同 same_occurrence_group；不同日期的 occurrence 不可分在同组。
+例如“昨天我压力很大，她陪我聊了两个小时”可拆成同一 group 的背景和行为供 Stage2 组合。
 """.strip()
 
 
 _DETAILED_SYSTEM_PROMPT = """
-你是 LoveApp Memory Event Enrichment MVP 的 Stage 2 结构化提取器。只输出一个 JSON 对象：
+你是 LoveApp Memory V1.3 的 Stage 2 结构化提取器。只输出一个 JSON 对象：
 {"semantic_units": [], "discarded_spans": []}
 一次响应处理全部 Stage 1 propositions。semantic_units 只能包含以下三种对象：
 1) new_memory：必须包含 semantic_type、claim_id、kind、subject、raw_predicate、predicate、
@@ -906,8 +1191,17 @@ user_message。new_memory 的 semantic_payload 必须保留事件 value/object/a
 Event canonical attribute 仅有 cause、severity、emotion、resolution、outcome、location、
 activity_type；无法映射且明确属于旧事件的 weather 才可使用 custom namespace。
 新的 bounded occurrence 必须输出 new_memory，绝不能输出 enrichment。
-严格按 Stage 1 role 映射：new_proposition 输出 new_memory；interaction_event 的
-attribute_completion/contextual_completion 输出 enrichment；refinement 输出 refinement。
+使用 stage2_route_plan 的 role × kind × epistemic 组合，而非仅按 role 路由。
+new_proposition 与 correction 输出 new_memory，后者保留更正后的新值，交给现有 correction 治理；
+interaction_event 的 attribute_completion 输出 enrichment；非事件 refinement 输出 refinement。
+每个 claim_id/unit_id 对齐 Stage1 proposition_id。只有相同非空 same_occurrence_group 的
+事件命题才可合成一个 new_memory，并输出完整 proposition_ids 列表；不同 occurrence 不可合并。
+同一 group 中的事件背景、动作和结果应组合为同一个事件草稿，保留全部证据和属性；
+不要把同一 occurrence 的背景另存为一个独立事件。组合不产生任何数据库 target。
+保留 epistemic_status 和 perspective，不得把 believed/inferred 升级成 confirmed 客观事实。
+stable_fact 表示可核实事实，preference 表示持有者偏好；沿用已注册 preference
+domain/dimension/value。
+Event 保留 event_type，Pattern 保留 metric 和 source；user_reported 与 derived_from_events 不混用。
 一个句子可同时输出多个单位，例如旧 conflict 的 cause、emotion completion 与新的 contact state
 必须分开。已有 conflict 后的“因为我迟到了”输出 enrichment(cause)，Assistant 追问反应后的
 “特别生气”输出 enrichment(emotion)；“今天我们又吵了一架”始终输出 new_memory。
@@ -1061,11 +1355,11 @@ def _coerce_coarse_payload(value: dict[str, Any]) -> tuple[dict[str, Any], list[
         # singular candidate_memory_kind spelling. Normalize only the
         # bounded hint; it never authorizes a write.
         if "candidate_kinds" not in item:
-            kind_hint = item.pop("candidate_memory_kind", None)
+            kind_hint = item.pop("candidate_kind", None)
+            if kind_hint is None:
+                kind_hint = item.pop("candidate_memory_kind", None)
             if kind_hint is not None:
-                item["candidate_kinds"] = (
-                    kind_hint if isinstance(kind_hint, list) else [kind_hint]
-                )
+                item["candidate_kinds"] = kind_hint if isinstance(kind_hint, list) else [kind_hint]
                 repairs.append("candidate_memory_kind_alias")
         else:
             item.pop("candidate_memory_kind", None)
@@ -1151,9 +1445,15 @@ def _coerce_coarse_payload(value: dict[str, Any]) -> tuple[dict[str, Any], list[
                 else MemoryKind.STABLE_FACT.value
             ]
             repairs.append("candidate_kinds_defaulted_from_role")
-        origin = _normalize_proposition_origin(
-            item.get("proposition_origin", item.get("origin"))
-        )
+        raw_epistemic = item.get("epistemic_status")
+        if raw_epistemic is not None:
+            normalized_epistemic = _normalize_extraction_epistemic_status(raw_epistemic)
+            if normalized_epistemic is None:
+                raise MemoryResponseError(
+                    "unsupported extraction epistemic status", category="unsupported_enum"
+                )
+            item["epistemic_status"] = normalized_epistemic
+        origin = _normalize_proposition_origin(item.get("proposition_origin", item.get("origin")))
         if origin is None:
             if item.get("proposition_origin") not in (None, ""):
                 repairs.append("proposition_origin_defaulted")
@@ -1285,9 +1585,7 @@ def _coerce_detailed_payload(value: dict[str, Any]) -> dict[str, Any]:
     ]
     return {
         "claims": normalized_claims,
-        "discarded_spans": _normalize_detailed_discarded(
-            root.get("discarded_spans", [])
-        ),
+        "discarded_spans": _normalize_detailed_discarded(root.get("discarded_spans", [])),
     }
 
 
@@ -1299,6 +1597,8 @@ def _parse_detailed_extraction(
 ) -> tuple[SemanticAtomicExtraction, str]:
     semantic_payloads = raw.get("semantic_units")
     if not isinstance(semantic_payloads, list):
+        for claim in raw.get("claims", []):
+            _inherit_proposition_semantics(claim, coarse)
         parsed = parse_memory_response(
             json.dumps(raw, ensure_ascii=False),
             source_text=source_text,
@@ -1313,6 +1613,8 @@ def _parse_detailed_extraction(
         )
         return extraction, parsed.repair_steps
 
+    for unit in semantic_payloads:
+        _inherit_proposition_semantics(unit, coarse)
     raw_new_claims = [
         {key: value for key, value in payload.items() if key != "semantic_type"}
         for payload in semantic_payloads
@@ -1381,9 +1683,7 @@ def _normalize_detailed_semantic_unit(
     index: int,
 ) -> dict[str, Any]:
     unit = dict(value)
-    semantic_type = str(
-        unit.get("semantic_type") or unit.get("type") or ""
-    ).strip().casefold()
+    semantic_type = str(unit.get("semantic_type") or unit.get("type") or "").strip().casefold()
     semantic_type = {
         "new": "new_memory",
         "new_memory_draft": "new_memory",
@@ -1452,7 +1752,8 @@ def _normalize_detailed_semantic_unit(
         if "attribute_namespace" not in unit:
             unit["attribute_namespace"] = (
                 "canonical"
-                if unit.get("attribute_name") in {
+                if unit.get("attribute_name")
+                in {
                     "cause",
                     "severity",
                     "emotion",
@@ -1467,7 +1768,16 @@ def _normalize_detailed_semantic_unit(
 
 
 def _inherit_claim_hint(claim: dict[str, Any], container: dict[str, Any]) -> None:
-    for field in ("proposition_id", "kind", "candidate_kinds", "semantic_role"):
+    for field in (
+        "proposition_id",
+        "kind",
+        "candidate_kind",
+        "candidate_kinds",
+        "semantic_role",
+        "epistemic_status",
+        "perspective",
+        "same_occurrence_group",
+    ):
         if field not in claim and field in container:
             claim[field] = container[field]
 
@@ -1476,7 +1786,7 @@ def _normalize_detailed_claim(item: dict[str, Any], *, index: int) -> dict[str, 
     claim = dict(item)
     claim_id = claim.get("claim_id") or claim.get("id") or claim.get("proposition_id")
     claim["claim_id"] = str(claim_id or f"c{index}")
-    raw_kind = claim.get("kind") or claim.get("claim_type")
+    raw_kind = claim.get("kind") or claim.get("claim_type") or claim.get("candidate_kind")
     if raw_kind is None:
         candidates = claim.get("candidate_kinds")
         if isinstance(candidates, list) and candidates:
@@ -1490,6 +1800,7 @@ def _normalize_detailed_claim(item: dict[str, Any], *, index: int) -> dict[str, 
     claim["kind"] = kind.value
     claim.pop("claim_type", None)
     claim.pop("candidate_kinds", None)
+    claim.pop("candidate_kind", None)
     subject = str(claim.get("subject") or "").strip()
     if not subject:
         raise MemoryResponseError(
@@ -1566,9 +1877,7 @@ def _normalize_role_sensitive_payload(
                 claim.get("predicate") or claim.get("raw_predicate")
             )
             metric = (
-                predicate_metric
-                if predicate_metric in INTERACTION_PATTERN_DIMENSIONS
-                else None
+                predicate_metric if predicate_metric in INTERACTION_PATTERN_DIMENSIONS else None
             )
         if metric is None:
             detected = detect_evidence_dimensions(evidence_text) & INTERACTION_PATTERN_DIMENSIONS
@@ -1615,6 +1924,7 @@ def _normalize_semantic_role(value: object) -> SemanticRole | None:
             "state": SemanticRole.STATE_ASSERTION,
             "state_update": SemanticRole.STATE_UPDATE,
             "context": SemanticRole.CONTEXTUAL_COMPLETION,
+            "correction": SemanticRole.CORRECTION,
             "enrichment": SemanticRole.ATTRIBUTE_COMPLETION,
             "attribute": SemanticRole.ATTRIBUTE_COMPLETION,
             "update": SemanticRole.STATE_UPDATE,
@@ -1623,6 +1933,35 @@ def _normalize_semantic_role(value: object) -> SemanticRole | None:
             "standalone": SemanticRole.NEW_PROPOSITION,
         }
         return aliases.get(normalized)
+
+
+def _normalize_extraction_epistemic_status(value: object) -> str | None:
+    try:
+        return ExtractionEpistemicStatus(value).value
+    except ValueError:
+        return None
+
+
+def _storage_epistemic_status(value: object) -> str:
+    """Map Stage 1 evidence semantics to the frozen storage epistemic enum.
+
+    The extraction layer distinguishes observed/reported/believed/inferred;
+    the persisted contract distinguishes confirmed/uncertain/hypothesis/
+    prediction.  This compatibility mapping is deliberately one-way and does
+    not add a new database field or grant lifecycle authority to the model.
+    """
+
+    normalized = str(value or "").strip().casefold().replace("-", "_")
+    if normalized in {item.value for item in EpistemicStatus}:
+        return normalized
+    mapping = {
+        ExtractionEpistemicStatus.OBSERVED.value: EpistemicStatus.CONFIRMED.value,
+        ExtractionEpistemicStatus.REPORTED.value: EpistemicStatus.CONFIRMED.value,
+        ExtractionEpistemicStatus.BELIEVED.value: EpistemicStatus.UNCERTAIN.value,
+        ExtractionEpistemicStatus.INFERRED.value: EpistemicStatus.HYPOTHESIS.value,
+        ExtractionEpistemicStatus.UNCERTAIN.value: EpistemicStatus.UNCERTAIN.value,
+    }
+    return mapping.get(normalized, EpistemicStatus.UNCERTAIN.value)
 
 
 def _normalize_proposition_origin(value: object) -> PropositionOrigin | None:

@@ -91,6 +91,30 @@ class EpistemicStatus(StrEnum):
     PREDICTION = "prediction"
 
 
+class ExtractionEpistemicStatus(StrEnum):
+    """Semantic evidence mode, distinct from persisted certainty/lifecycle."""
+
+    OBSERVED = "observed"
+    REPORTED = "reported"
+    BELIEVED = "believed"
+    INFERRED = "inferred"
+    UNCERTAIN = "uncertain"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "ExtractionEpistemicStatus | None":
+        normalized = str(value or "").strip().casefold().replace("-", "_")
+        aliases = {
+            "fact": "reported",
+            "confirmed": "reported",
+            "report": "reported",
+            "belief": "believed",
+            "user_belief": "believed",
+            "hypothesis": "inferred",
+            "prediction": "inferred",
+        }
+        return cls._value2member_map_.get(aliases.get(normalized, normalized))
+
+
 class MemoryStatus(StrEnum):
     PROPOSED = "proposed"
     CONFIRMED = "confirmed"
@@ -177,11 +201,16 @@ class SemanticRole(StrEnum):
     NEW_PROPOSITION = "new_proposition"
     ATTRIBUTE_COMPLETION = "attribute_completion"
     REFINEMENT = "refinement"
+    CORRECTION = "correction"
+    UNCERTAIN = "uncertain"
+
+    # Legacy Stage-1 role values remain parseable for stored diagnostics and
+    # old provider responses.  New prompts never advertise them, and the
+    # router resolves new propositions using candidate kind + epistemic layer.
     STATE_UPDATE = "state_update"
     PATTERN_EXTRACTION = "pattern_extraction"
     BELIEF_EXTRACTION = "belief_extraction"
     CONTEXTUAL_COMPLETION = "contextual_completion"
-    UNCERTAIN = "uncertain"
 
     # Legacy Stage-1 values remain parseable for stored diagnostics and model
     # responses produced by the previous prompt contract.
@@ -189,6 +218,51 @@ class SemanticRole(StrEnum):
     ATTRIBUTE_UPDATE = "attribute_update"
     REFINEMENT_CANDIDATE = "refinement_candidate"
     STATE_ASSERTION = "state_assertion"
+
+
+def parse_semantic_role(value: object) -> SemanticRole:
+    """Read bounded current and legacy spellings without changing their identity."""
+    if isinstance(value, SemanticRole):
+        return value
+    normalized = str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "new": SemanticRole.NEW_PROPOSITION,
+        "standalone": SemanticRole.NEW_PROPOSITION,
+        "standalone_proposition": SemanticRole.STANDALONE_PROPOSITION,
+        "new_occurrence": SemanticRole.NEW_PROPOSITION,
+        "attribute": SemanticRole.ATTRIBUTE_COMPLETION,
+        "enrichment": SemanticRole.ATTRIBUTE_COMPLETION,
+        "context": SemanticRole.CONTEXTUAL_COMPLETION,
+        "contextual_completion": SemanticRole.CONTEXTUAL_COMPLETION,
+        "correction": SemanticRole.CORRECTION,
+        "state": SemanticRole.STATE_UPDATE,
+        "state_update": SemanticRole.STATE_UPDATE,
+        "state_assertion": SemanticRole.STATE_ASSERTION,
+        "pattern": SemanticRole.PATTERN_EXTRACTION,
+        "pattern_extraction": SemanticRole.PATTERN_EXTRACTION,
+        "belief": SemanticRole.BELIEF_EXTRACTION,
+        "belief_extraction": SemanticRole.BELIEF_EXTRACTION,
+        "refinement_candidate": SemanticRole.REFINEMENT_CANDIDATE,
+        "attribute_update": SemanticRole.ATTRIBUTE_UPDATE,
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+    return SemanticRole(normalized)
+
+
+def canonical_semantic_role(value: SemanticRole) -> SemanticRole:
+    """Translate legacy labels into an operation, leaving kind/epistemics separate."""
+
+    return {
+        SemanticRole.STATE_UPDATE: SemanticRole.NEW_PROPOSITION,
+        SemanticRole.STATE_ASSERTION: SemanticRole.NEW_PROPOSITION,
+        SemanticRole.STANDALONE_PROPOSITION: SemanticRole.NEW_PROPOSITION,
+        SemanticRole.PATTERN_EXTRACTION: SemanticRole.NEW_PROPOSITION,
+        SemanticRole.BELIEF_EXTRACTION: SemanticRole.NEW_PROPOSITION,
+        SemanticRole.CONTEXTUAL_COMPLETION: SemanticRole.ATTRIBUTE_COMPLETION,
+        SemanticRole.ATTRIBUTE_UPDATE: SemanticRole.ATTRIBUTE_COMPLETION,
+        SemanticRole.REFINEMENT_CANDIDATE: SemanticRole.REFINEMENT,
+    }.get(value, value)
 
 
 class PropositionOrigin(StrEnum):
@@ -223,7 +297,7 @@ class CoarseProposition(BaseModel):
     candidate_kinds: list[MemoryKind] = Field(
         min_length=1,
         max_length=5,
-        validation_alias=AliasChoices("candidate_kinds", "candidate_memory_kind"),
+        validation_alias=AliasChoices("candidate_kinds", "candidate_kind", "candidate_memory_kind"),
     )
     semantic_role: SemanticRole = Field(
         default=SemanticRole.NEW_PROPOSITION,
@@ -246,6 +320,10 @@ class CoarseProposition(BaseModel):
         default=PropositionOrigin.UNCERTAIN,
         validation_alias=AliasChoices("proposition_origin", "origin"),
     )
+    epistemic_status: ExtractionEpistemicStatus = ExtractionEpistemicStatus.UNCERTAIN
+    perspective: str | None = Field(default=None, max_length=80)
+    same_occurrence_group: str | None = Field(default=None, max_length=120)
+    answered_pending_questions: list[str] = Field(default_factory=list, max_length=4)
     attributes_hint: list[str] = Field(
         default_factory=list,
         max_length=12,
@@ -255,9 +333,9 @@ class CoarseProposition(BaseModel):
             "attributes",
         ),
     )
-    target_field_hint: str | None = Field(default=None, max_length=80)
+    target_field_hint: str | list[str] | None = None
     subject_hint: str | None = Field(default=None, max_length=80)
-    temporal_hint: str | None = Field(default=None, max_length=160)
+    temporal_hint: str | dict[str, str] | None = None
     target_semantic_hint: dict[str, Any] | None = None
     confidence: float = Field(default=0.7, ge=0, le=1)
     reason: str | None = Field(default=None, max_length=500)
@@ -283,24 +361,75 @@ class CoarseProposition(BaseModel):
             "mutation_action",
             "db_action",
             "write_action",
+            "supersedes_id",
+            "db_patch",
+            "canonical_predicate",
         }
 
         def contains_forbidden(value: object) -> bool:
             if isinstance(value, dict):
                 return any(
-                    str(key).casefold() in forbidden_keys
-                    or contains_forbidden(item)
+                    str(key).casefold() in forbidden_keys or contains_forbidden(item)
                     for key, item in value.items()
                 )
             if isinstance(value, (list, tuple)):
                 return any(contains_forbidden(item) for item in value)
             return False
 
-        if contains_forbidden(self.target_semantic_hint):
+        if contains_forbidden([self.target_semantic_hint, self.temporal_hint]):
             raise ValueError(
                 "coarse semantic hints cannot contain database targets or mutation commands"
             )
+        if isinstance(self.target_field_hint, list):
+            if len(self.target_field_hint) > 12 or any(
+                not item.strip() or len(item) > 80 for item in self.target_field_hint
+            ):
+                raise ValueError("target field hints must be bounded field names")
+        elif self.target_field_hint is not None and len(self.target_field_hint) > 80:
+            raise ValueError("target field hint exceeds 80 characters")
+        if self.temporal_hint is not None and len(str(self.temporal_hint)) > 1000:
+            raise ValueError("temporal hint exceeds semantic context budget")
+        if any(not item.strip() or len(item) > 160 for item in self.answered_pending_questions):
+            raise ValueError("answered pending questions must be bounded question IDs")
         return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_contract_aliases(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        payload = dict(value)
+        for alias in ("candidate_kind", "candidate_memory_kind"):
+            if alias in payload:
+                payload.setdefault("candidate_kinds", payload.pop(alias))
+        kinds = payload.get("candidate_kinds")
+        if isinstance(kinds, str):
+            payload["candidate_kinds"] = [kinds]
+        raw_roles = payload.get(
+            "semantic_role_candidates",
+            payload.get("semantic_roles", payload.get("role_candidates", [])),
+        )
+        raw_primary = payload.get("semantic_role", payload.get("role"))
+        legacy_roles = [raw_primary, *(raw_roles if isinstance(raw_roles, list) else [])]
+        if "epistemic_status" not in payload and any(
+            str(role).lower() in {"belief", "belief_extraction"} for role in legacy_roles
+        ):
+            payload["epistemic_status"] = "believed"
+        if raw_primary is not None:
+            payload["semantic_role"] = parse_semantic_role(raw_primary).value
+        payload.pop("role", None)
+        for alias in ("semantic_roles", "role_candidates"):
+            payload.pop(alias, None)
+        if isinstance(raw_roles, list) and raw_roles:
+            payload["semantic_role_candidates"] = [
+                parse_semantic_role(role).value for role in raw_roles
+            ]
+        raw_epistemic = payload.get("epistemic_status")
+        if raw_epistemic is not None:
+            payload["epistemic_status"] = ExtractionEpistemicStatus(raw_epistemic).value
+        if "proposition_origin" in payload:
+            payload["proposition_origin"] = str(payload["proposition_origin"]).lower()
+        return payload
 
     @property
     def semantic_roles(self) -> list[SemanticRole]:
@@ -394,6 +523,7 @@ class CoarseExtraction(BaseModel):
     gate_reason: MemorySemanticGateReason | None = None
     propositions: list[CoarseProposition] = Field(default_factory=list, max_length=12)
     discarded_spans: list[DiscardedSpan] = Field(default_factory=list, max_length=12)
+    answered_pending_questions: list[str] = Field(default_factory=list, max_length=4)
 
     @model_validator(mode="before")
     @classmethod
@@ -420,6 +550,8 @@ class CoarseExtraction(BaseModel):
 
     @model_validator(mode="after")
     def fill_safe_gate_reason(self) -> "CoarseExtraction":
+        if any(not item.strip() or len(item) > 160 for item in self.answered_pending_questions):
+            raise ValueError("answered pending questions must be bounded question IDs")
         if self.gate_reason is None:
             self.gate_reason = (
                 MemorySemanticGateReason.COMPOUND_MEMORY
@@ -453,9 +585,13 @@ def _coerce_semantic_unit_hint(value: object, *, index: int) -> dict[str, Any]:
     if "proposition_origin" not in item:
         item["proposition_origin"] = item.get("origin") or "uncertain"
     item.pop("origin", None)
-    origin = str(item.get("proposition_origin") or "").strip().casefold().replace(
-        "-", "_"
-    ).replace(" ", "_")
+    origin = (
+        str(item.get("proposition_origin") or "")
+        .strip()
+        .casefold()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
     origin_aliases = {
         "answer": PropositionOrigin.ANSWER_TO_QUESTION.value,
         "question_answer": PropositionOrigin.ANSWER_TO_QUESTION.value,
@@ -468,7 +604,8 @@ def _coerce_semantic_unit_hint(value: object, *, index: int) -> dict[str, Any]:
     }
     item["proposition_origin"] = origin_aliases.get(origin, origin or "uncertain")
     if "candidate_kinds" not in item:
-        item["candidate_kinds"] = item.get("candidate_memory_kind")
+        item["candidate_kinds"] = item.get("candidate_kind", item.get("candidate_memory_kind"))
+    item.pop("candidate_kind", None)
     item.pop("candidate_memory_kind", None)
     if isinstance(item.get("candidate_kinds"), str):
         item["candidate_kinds"] = [item["candidate_kinds"]]
@@ -488,7 +625,8 @@ def _coerce_semantic_unit_hint(value: object, *, index: int) -> dict[str, Any]:
         role = str(item.get("semantic_role") or "").casefold()
         item["candidate_kinds"] = [
             "interaction_event"
-            if role in {
+            if role
+            in {
                 "attribute_completion",
                 "contextual_completion",
                 "new_proposition",
@@ -512,6 +650,7 @@ def _normalize_semantic_role_hint(value: object) -> str:
         "attribute": SemanticRole.ATTRIBUTE_COMPLETION.value,
         "enrichment": SemanticRole.ATTRIBUTE_COMPLETION.value,
         "context": SemanticRole.CONTEXTUAL_COMPLETION.value,
+        "correction": SemanticRole.CORRECTION.value,
         "state": SemanticRole.STATE_UPDATE.value,
         "pattern": SemanticRole.PATTERN_EXTRACTION.value,
         "belief": SemanticRole.BELIEF_EXTRACTION.value,
@@ -711,14 +850,12 @@ def _normalize_memory_input(value: object) -> object:
     # the payload contract without changing legacy temporal parsing.
     event_time_payload: object = None
     kind_hint = normalized.get("kind") or normalized.get("memory_kind")
-    time_is_legacy_kind = (
-        isinstance(time_alias, str)
-        and time_alias.casefold().strip() in {item.value for item in TimeKind}
-    )
+    time_is_legacy_kind = isinstance(time_alias, str) and time_alias.casefold().strip() in {
+        item.value for item in TimeKind
+    }
     if (
         isinstance(kind_hint, str)
-        and kind_hint.casefold().strip()
-        in {"interaction_event", "event", "interaction_episode"}
+        and kind_hint.casefold().strip() in {"interaction_event", "event", "interaction_episode"}
         and time_alias is not None
         and not isinstance(time_alias, dict)
         and not time_is_legacy_kind
@@ -1098,11 +1235,10 @@ class MemoryCandidate(BaseModel):
             and self.epistemic_status == EpistemicStatus.CONFIRMED
         ):
             self.epistemic_status = EpistemicStatus.UNCERTAIN
-        elif (
-            self.perspective == MemoryPerspective.MODEL_INFERRED
-            and self.epistemic_status
-            in {EpistemicStatus.CONFIRMED, EpistemicStatus.UNCERTAIN}
-        ):
+        elif self.perspective == MemoryPerspective.MODEL_INFERRED and self.epistemic_status in {
+            EpistemicStatus.CONFIRMED,
+            EpistemicStatus.UNCERTAIN,
+        }:
             self.epistemic_status = EpistemicStatus.HYPOTHESIS
         _synchronize_memory_evolution_metadata(self, mirror_payload=True)
         return self
@@ -1176,11 +1312,10 @@ class AtomicClaim(BaseModel):
             and self.epistemic_status == EpistemicStatus.CONFIRMED
         ):
             self.epistemic_status = EpistemicStatus.UNCERTAIN
-        elif (
-            self.perspective == MemoryPerspective.MODEL_INFERRED
-            and self.epistemic_status
-            in {EpistemicStatus.CONFIRMED, EpistemicStatus.UNCERTAIN}
-        ):
+        elif self.perspective == MemoryPerspective.MODEL_INFERRED and self.epistemic_status in {
+            EpistemicStatus.CONFIRMED,
+            EpistemicStatus.UNCERTAIN,
+        }:
             self.epistemic_status = EpistemicStatus.HYPOTHESIS
         # AtomicClaim is the raw extraction boundary.  Populate typed fields
         # from provider payload aliases without adding deterministic defaults
@@ -1255,22 +1390,16 @@ class AtomicExtraction(BaseModel):
         if not fields_present:
             return self
         if self.should_extract is None or self.gate_reason is None:
-            raise ValueError(
-                "should_extract and gate_reason must be provided together"
-            )
+            raise ValueError("should_extract and gate_reason must be provided together")
         negative_reasons = {
             MemorySemanticGateReason.TRANSIENT,
             MemorySemanticGateReason.SMALL_TALK,
             MemorySemanticGateReason.NO_MEMORY,
         }
         if self.should_extract and self.gate_reason in negative_reasons:
-            raise ValueError(
-                "should_extract=true requires a memory-positive gate_reason"
-            )
+            raise ValueError("should_extract=true requires a memory-positive gate_reason")
         if not self.should_extract and self.gate_reason not in negative_reasons:
-            raise ValueError(
-                "should_extract=false requires a non-memory gate_reason"
-            )
+            raise ValueError("should_extract=false requires a non-memory gate_reason")
         return self
 
 

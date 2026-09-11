@@ -11,8 +11,10 @@ from loveapp.domain.memory import (
     AtomicClaim,
     AtomicExtraction,
     EpistemicStatus,
+    ExtractionEpistemicStatus,
     MemoryKind,
     MemoryPerspective,
+    SemanticRole,
 )
 from loveapp.domain.memory_dimensions import normalize_event_severity
 
@@ -43,17 +45,48 @@ def _contains_write_authority(value: object) -> bool:
     return False
 
 
+class SemanticUnitProvenance(BaseModel):
+    """Bounded Stage-1 lineage; occurrence/question IDs are never Store targets."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    proposition_ids: list[Annotated[str, Field(min_length=1, max_length=80)]] = Field(
+        default_factory=list, max_length=12
+    )
+    semantic_roles: list[SemanticRole] = Field(default_factory=list, max_length=5)
+    epistemic_status: ExtractionEpistemicStatus | None = None
+    same_occurrence_group: str | None = Field(default=None, max_length=120)
+    answered_pending_questions: list[Annotated[str, Field(min_length=1, max_length=160)]] = Field(
+        default_factory=list, max_length=4
+    )
+
+
 class NewMemoryDraft(AtomicClaim):
     """A new proposition with a lossless adapter to the frozen claim contract."""
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     semantic_type: Literal["new_memory"] = "new_memory"
+    provenance: SemanticUnitProvenance | None = None
     payload: dict[str, Any] = Field(default_factory=dict, exclude=True)
     semantic_payload: dict[str, Any] = Field(
         default_factory=dict,
         validation_alias=AliasChoices("semantic_payload", "payload"),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def flatten_temporal_object(cls, value: object) -> object:
+        # AtomicClaim accepts a legacy payload alias named provenance. The
+        # draft's typed Stage-1 lineage must survive that compatibility parser.
+        if not isinstance(value, dict):
+            return super().flatten_temporal_object(value)
+        raw = dict(value)
+        provenance = raw.pop("provenance", None)
+        normalized = super().flatten_temporal_object(raw)
+        if provenance is not None:
+            normalized["provenance"] = provenance
+        return normalized
 
     @model_validator(mode="after")
     def synchronize_semantic_payload(self) -> NewMemoryDraft:
@@ -61,13 +94,12 @@ class NewMemoryDraft(AtomicClaim):
         return self
 
     def to_atomic_claim(self) -> AtomicClaim:
+        payload = dict(self.semantic_payload)
+        if self.provenance is not None:
+            payload["extraction_provenance"] = self.provenance.model_dump(mode="json")
         return AtomicClaim.model_validate(
             {
-                name: (
-                    self.semantic_payload
-                    if name == "payload"
-                    else getattr(self, name)
-                )
+                name: (payload if name == "payload" else getattr(self, name))
                 for name in AtomicClaim.model_fields
                 if name in self.model_fields_set or name == "payload"
             }
@@ -78,6 +110,7 @@ class NewMemoryDraft(AtomicClaim):
         return cls.model_validate(
             {
                 "semantic_type": "new_memory",
+                "provenance": claim.payload.get("extraction_provenance"),
                 **claim.model_dump(
                     mode="python",
                     exclude_unset=True,
@@ -95,6 +128,7 @@ class EnrichmentDraft(BaseModel):
 
     semantic_type: Literal["enrichment"] = "enrichment"
     unit_id: str = Field(min_length=1, max_length=80)
+    provenance: SemanticUnitProvenance | None = None
     target_kind: MemoryKind
     target_semantic_hint: dict[str, Any] = Field(default_factory=dict)
     attribute_namespace: AttributeNamespace
@@ -132,6 +166,7 @@ class RefinementDraft(BaseModel):
 
     semantic_type: Literal["refinement"] = "refinement"
     unit_id: str = Field(min_length=1, max_length=80)
+    provenance: SemanticUnitProvenance | None = None
     target_kind: MemoryKind
     target_semantic_hint: dict[str, Any] = Field(default_factory=dict)
     raw_predicate: str = Field(min_length=1, max_length=120)
@@ -167,9 +202,7 @@ class SemanticAtomicExtraction(AtomicExtraction):
             if isinstance(unit, NewMemoryDraft)
         ]
         if not self.semantic_units and self.claims:
-            self.semantic_units = [
-                NewMemoryDraft.from_atomic_claim(claim) for claim in self.claims
-            ]
+            self.semantic_units = [NewMemoryDraft.from_atomic_claim(claim) for claim in self.claims]
             new_claims = list(self.claims)
         if self.should_extract is False and self.semantic_units:
             raise ValueError("should_extract=false cannot contain semantic units")
@@ -188,4 +221,5 @@ __all__ = [
     "NewMemoryDraft",
     "RefinementDraft",
     "SemanticAtomicExtraction",
+    "SemanticUnitProvenance",
 ]
