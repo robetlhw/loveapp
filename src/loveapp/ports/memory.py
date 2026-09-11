@@ -28,7 +28,7 @@ from loveapp.domain.memory_write import (
     MemoryWriteBatchResult,
 )
 from loveapp.domain.relationship_plan import PlanStatus, RelationshipPlan
-from loveapp.domain.runtime_context import PendingMemoryContext
+from loveapp.domain.runtime_context import ConversationContext, PendingMemoryContext
 from loveapp.ports.observability import TraceRecorder
 
 MemoryAttemptCallback = Callable[[MemoryExtractionAttempt], None]
@@ -267,6 +267,7 @@ class MemoryExtractor(Protocol):
         existing_memories: list[MemoryItem],
         conversation_history: list[StoredMessage],
         pending_memory_context: PendingMemoryContext | None = None,
+        conversation_context: ConversationContext | None = None,
         trace: TraceRecorder | None = None,
         attempt_callback: MemoryAttemptCallback | None = None,
     ) -> AtomicExtraction: ...

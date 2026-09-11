@@ -1,7 +1,8 @@
+from datetime import UTC, datetime
 from datetime import date as Date
-from datetime import datetime
+from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from loveapp.domain.date_operations import DateRequirementMatch, DateStopRequirement
 from loveapp.domain.date_plan import DatePlan
@@ -13,6 +14,23 @@ from loveapp.domain.enums import (
     TaskType,
     TransportMode,
 )
+
+
+class PendingQuestion(BaseModel):
+    """A bounded Assistant question that the current user turn may answer.
+
+    This is deliberately a semantic context object.  It does not identify a
+    database row and it cannot authorize an enrichment or state mutation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=160)
+    question_type: str = Field(min_length=1, max_length=80)
+    target_kind: str | None = Field(default=None, max_length=80)
+    target_field: str | None = Field(default=None, max_length=80)
+    status: str = Field(default="open", max_length=40)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class PendingMemoryContext(BaseModel):
@@ -29,6 +47,198 @@ class PendingMemoryContext(BaseModel):
     status: str = Field(default="open", max_length=40)
     created_turn: str = Field(min_length=1, max_length=160)
     expires_after_turns: int = Field(default=2, ge=1, le=4)
+
+    def to_pending_question(self) -> PendingQuestion:
+        """Project the legacy pending-memory object into the new context API."""
+
+        return PendingQuestion(
+            id=self.pending_slot_id or f"pending:{self.created_turn}",
+            question_type=self.topic or self.expected_slot or "memory_follow_up",
+            target_kind=self.target_kind,
+            target_field=self.target_field or self.expected_slot,
+            status=self.status,
+        )
+
+
+class ConversationContext(BaseModel):
+    """Bounded context supplied to semantic extraction for one user turn."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    previous_assistant_message: str | None = Field(default=None, max_length=4000)
+    previous_user_message: str | None = Field(default=None, max_length=4000)
+    pending_questions: list[PendingQuestion] = Field(default_factory=list, max_length=4)
+    active_topic: str | None = Field(default=None, max_length=120)
+    current_user_message: str = Field(min_length=1, max_length=4000)
+    # Serialized, read-only context cards keep this model independent from the
+    # Memory domain and avoid a circular import with MemoryItem.
+    relevant_memories: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
+
+    @classmethod
+    def from_turn(
+        cls,
+        current_user_message: str,
+        *,
+        conversation_history: list[Any] | tuple[Any, ...] = (),
+        pending_memory_context: PendingMemoryContext | None = None,
+        pending_questions: list[PendingQuestion] | None = None,
+        active_topic: str | None = None,
+        relevant_memories: list[Any] | tuple[Any, ...] = (),
+    ) -> "ConversationContext":
+        """Build a bounded context snapshot without inferring a mutation."""
+
+        history = list(conversation_history)
+        previous_assistant = next(
+            (
+                str(message.content).strip()[:4000]
+                for message in reversed(history)
+                if _message_role(message) == "assistant" and str(message.content).strip()
+            ),
+            None,
+        )
+        previous_user = next(
+            (
+                str(message.content).strip()[:4000]
+                for message in reversed(history)
+                if _message_role(message) == "user" and str(message.content).strip()
+            ),
+            None,
+        )
+        questions = list(pending_questions or [])
+        if pending_memory_context is not None and pending_memory_context.memory_relevant:
+            questions.insert(0, pending_memory_context.to_pending_question())
+        deduplicated_questions: list[PendingQuestion] = []
+        seen_question_ids: set[str] = set()
+        for question in questions:
+            if question.id in seen_question_ids:
+                continue
+            seen_question_ids.add(question.id)
+            deduplicated_questions.append(question)
+        memory_cards = [_memory_context_card(item) for item in relevant_memories]
+        inferred_topic = active_topic
+        if inferred_topic is None and pending_memory_context is not None:
+            inferred_topic = pending_memory_context.topic
+        return cls(
+            previous_assistant_message=previous_assistant,
+            previous_user_message=previous_user,
+            pending_questions=deduplicated_questions[:4],
+            active_topic=inferred_topic,
+            current_user_message=str(current_user_message).strip()[:4000],
+            relevant_memories=memory_cards[:20],
+        )
+
+
+class ConversationContextManager:
+    """Small context assembler kept separate from extraction authorization."""
+
+    def build(
+        self,
+        current_user_message: str,
+        *,
+        conversation_history: list[Any] | tuple[Any, ...] = (),
+        pending_memory_context: PendingMemoryContext | None = None,
+        pending_questions: list[PendingQuestion] | None = None,
+        active_topic: str | None = None,
+        relevant_memories: list[Any] | tuple[Any, ...] = (),
+    ) -> ConversationContext:
+        return ConversationContext.from_turn(
+            current_user_message,
+            conversation_history=conversation_history,
+            pending_memory_context=pending_memory_context,
+            pending_questions=pending_questions,
+            active_topic=active_topic,
+            relevant_memories=relevant_memories,
+        )
+
+
+def build_conversation_context(
+    current_user_message: str,
+    *,
+    conversation_history: list[Any] | tuple[Any, ...] = (),
+    pending_memory_context: PendingMemoryContext | None = None,
+    pending_questions: list[PendingQuestion] | None = None,
+    active_topic: str | None = None,
+    relevant_memories: list[Any] | tuple[Any, ...] = (),
+) -> ConversationContext:
+    """Functional facade for callers that do not need a manager instance."""
+
+    return ConversationContext.from_turn(
+        current_user_message,
+        conversation_history=conversation_history,
+        pending_memory_context=pending_memory_context,
+        pending_questions=pending_questions,
+        active_topic=active_topic,
+        relevant_memories=relevant_memories,
+    )
+
+
+def _message_role(message: Any) -> str:
+    role = getattr(message, "role", None)
+    return str(getattr(role, "value", role) or "").casefold()
+
+
+def _memory_context_card(item: Any) -> dict[str, Any]:
+    if isinstance(item, dict):
+        value = dict(item)
+    else:
+        model_dump = getattr(item, "model_dump", None)
+        if callable(model_dump):
+            try:
+                value = model_dump(mode="json")
+            except TypeError:
+                value = model_dump()
+            if not isinstance(value, dict):
+                value = {"summary": str(value)}
+        else:
+            value = {"summary": str(getattr(item, "summary", item))}
+
+    # A context card is descriptive only.  In particular, never expose
+    # storage identifiers or mutation-shaped fields to either extraction
+    # stage.  The resolver receives authoritative MemoryItems separately.
+    allowed = {
+        "kind",
+        "subject",
+        "summary",
+        "evidence_spans",
+        "time_kind",
+        "occurred_at",
+        "period_start",
+        "period_end",
+        "expires_at",
+        "perspective",
+        "epistemic_status",
+        "status",
+        "predicate_type",
+        "canonical_predicate",
+        "custom_predicate",
+        "state_dimension",
+        "state_value",
+        "payload",
+    }
+    card = {key: value[key] for key in allowed if key in value}
+    return _strip_context_authority(card)
+
+
+def _strip_context_authority(value: Any) -> Any:
+    forbidden = {
+        "id",
+        "memory_id",
+        "target_memory_id",
+        "target_memory_ids",
+        "mutation_action",
+        "db_patch",
+        "write_action",
+        "supersedes_id",
+    }
+    if isinstance(value, dict):
+        return {
+            key: _strip_context_authority(child)
+            for key, child in value.items()
+            if str(key).casefold() not in forbidden
+        }
+    if isinstance(value, list):
+        return [_strip_context_authority(child) for child in value]
+    return value
 
 
 class DatePlanRuntimeContext(BaseModel):

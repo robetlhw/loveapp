@@ -26,7 +26,7 @@ from loveapp.domain.memory import (
 )
 from loveapp.domain.memory_predicates import CANONICAL_PREDICATES
 from loveapp.domain.memory_verification import ClaimVerification
-from loveapp.domain.runtime_context import PendingMemoryContext
+from loveapp.domain.runtime_context import ConversationContext, PendingMemoryContext
 from loveapp.ports.memory import MemoryAttemptCallback
 from loveapp.ports.observability import TraceRecorder
 
@@ -72,6 +72,7 @@ class OpenAICompatibleMemoryExtractor:
         existing_memories: list[MemoryItem],
         conversation_history: list[StoredMessage],
         pending_memory_context: PendingMemoryContext | None = None,
+        conversation_context: ConversationContext | None = None,
         trace: TraceRecorder | None = None,
         attempt_callback: MemoryAttemptCallback | None = None,
     ) -> AtomicExtraction:
@@ -81,6 +82,7 @@ class OpenAICompatibleMemoryExtractor:
             existing_memories=existing_memories,
             conversation_history=conversation_history,
             pending_memory_context=pending_memory_context,
+            conversation_context=conversation_context,
             trace=trace,
             attempt_callback=attempt_callback,
             attempt_number=1,
@@ -100,6 +102,7 @@ class OpenAICompatibleMemoryExtractor:
         existing_memories: list[MemoryItem],
         conversation_history: list[StoredMessage],
         pending_memory_context: PendingMemoryContext | None = None,
+        conversation_context: ConversationContext | None = None,
         trace: TraceRecorder | None,
         attempt_callback: MemoryAttemptCallback | None,
         attempt_number: int,
@@ -115,6 +118,7 @@ class OpenAICompatibleMemoryExtractor:
                     existing_memories,
                     conversation_history,
                     pending_memory_context,
+                    conversation_context=conversation_context,
                 ),
             },
         ]
@@ -380,6 +384,7 @@ class TieredMemoryExtractor:
         existing_memories: list[MemoryItem],
         conversation_history: list[StoredMessage],
         pending_memory_context: PendingMemoryContext | None = None,
+        conversation_context: ConversationContext | None = None,
         trace: TraceRecorder | None = None,
         attempt_callback: MemoryAttemptCallback | None = None,
     ) -> AtomicExtraction:
@@ -391,6 +396,7 @@ class TieredMemoryExtractor:
                 existing_memories=existing_memories,
                 conversation_history=conversation_history,
                 pending_memory_context=pending_memory_context,
+                conversation_context=conversation_context,
                 trace=trace,
                 attempt_callback=flash_attempts.append,
                 attempt_number=1,
@@ -425,6 +431,7 @@ class TieredMemoryExtractor:
                 existing_memories=existing_memories,
                 conversation_history=conversation_history,
                 pending_memory_context=pending_memory_context,
+                conversation_context=conversation_context,
                 trace=trace,
                 attempt_callback=attempt_callback,
                 fallback_extraction=None,
@@ -474,6 +481,7 @@ class TieredMemoryExtractor:
             existing_memories=existing_memories,
             conversation_history=conversation_history,
             pending_memory_context=pending_memory_context,
+            conversation_context=conversation_context,
             trace=trace,
             attempt_callback=attempt_callback,
             fallback_extraction=flash_extraction,
@@ -488,6 +496,7 @@ class TieredMemoryExtractor:
         existing_memories: list[MemoryItem],
         conversation_history: list[StoredMessage],
         pending_memory_context: PendingMemoryContext | None,
+        conversation_context: ConversationContext | None,
         trace: TraceRecorder | None,
         attempt_callback: MemoryAttemptCallback | None,
         fallback_extraction: AtomicExtraction | None,
@@ -501,6 +510,7 @@ class TieredMemoryExtractor:
                 existing_memories=existing_memories,
                 conversation_history=conversation_history,
                 pending_memory_context=pending_memory_context,
+                conversation_context=conversation_context,
                 trace=trace,
                 attempt_callback=strong_attempts.append,
                 attempt_number=2,
@@ -602,7 +612,15 @@ def _build_prompt(
     existing_memories: list[MemoryItem],
     conversation_history: list[StoredMessage],
     pending_memory_context: PendingMemoryContext | None = None,
+    *,
+    conversation_context: ConversationContext | None = None,
 ) -> str:
+    effective_context = conversation_context or ConversationContext.from_turn(
+        text,
+        conversation_history=conversation_history,
+        pending_memory_context=pending_memory_context,
+        relevant_memories=existing_memories,
+    )
     payload = {
         "reference_time": reference_time.isoformat(),
         "user_message": text,
@@ -620,6 +638,7 @@ def _build_prompt(
                 else None
             ),
         },
+        "conversation_context": effective_context.model_dump(mode="json"),
         "existing_active_memories": [
             {
                 "id": item.id,

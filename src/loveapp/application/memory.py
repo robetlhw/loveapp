@@ -94,7 +94,7 @@ from loveapp.domain.relationship_plan import (
     memory_with_plan,
     suppressed_plan_ids_for_text,
 )
-from loveapp.domain.runtime_context import PendingMemoryContext
+from loveapp.domain.runtime_context import ConversationContext, PendingMemoryContext
 from loveapp.ports.embeddings import EmbeddingProvider
 from loveapp.ports.memory import MemoryExtractor, MemoryStore, StrongClaimVerifier
 from loveapp.ports.observability import TraceRecorder
@@ -377,6 +377,21 @@ class MemoryService:
         )
         if reconciled_ids:
             active = [item for item in active if item.id not in reconciled_ids]
+        # Build one bounded, read-only context snapshot for the extraction
+        # stages.  Context helps the model interpret why this turn is being
+        # uttered; it does not contain mutation authority or target ids.
+        context_memories = select_context_memories(
+            active,
+            query=text,
+            limit=20,
+            reference_time=now,
+        )
+        conversation_context = ConversationContext.from_turn(
+            text,
+            conversation_history=conversation_history,
+            pending_memory_context=gate_decision.pending_memory_context,
+            relevant_memories=context_memories,
+        )
         contextual_event = resolve_contextual_relationship_event(
             text,
             conversation_history,
@@ -438,12 +453,7 @@ class MemoryService:
                 extraction_invoked = True
                 extraction_kwargs = {
                     "reference_time": self._clock(),
-                    "existing_memories": select_context_memories(
-                        active,
-                        query=text,
-                        limit=20,
-                        reference_time=now,
-                    ),
+                    "existing_memories": context_memories,
                     "conversation_history": conversation_history,
                     "trace": trace,
                 }
@@ -462,6 +472,8 @@ class MemoryService:
                     extraction_kwargs["pending_memory_context"] = (
                         effective_pending_context
                     )
+                if _supports_keyword(self._extractor.extract, "conversation_context"):
+                    extraction_kwargs["conversation_context"] = conversation_context
                 extraction = await self._extractor.extract(text, **extraction_kwargs)
             except asyncio.CancelledError:
                 await self._finish_extraction_run(
@@ -2441,10 +2453,19 @@ class NoOpMemoryExtractor:
         reference_time: datetime,
         existing_memories: list[MemoryItem],
         conversation_history: list[StoredMessage],
+        conversation_context: ConversationContext | None = None,
         trace: TraceRecorder | None = None,
         attempt_callback=None,
     ) -> AtomicExtraction:
-        del text, reference_time, existing_memories, conversation_history, trace, attempt_callback
+        del (
+            text,
+            reference_time,
+            existing_memories,
+            conversation_history,
+            conversation_context,
+            trace,
+            attempt_callback,
+        )
         return AtomicExtraction()
 
 

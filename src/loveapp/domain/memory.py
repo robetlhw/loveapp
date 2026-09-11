@@ -191,6 +191,20 @@ class SemanticRole(StrEnum):
     STATE_ASSERTION = "state_assertion"
 
 
+class PropositionOrigin(StrEnum):
+    """Why the current semantic proposition was uttered."""
+
+    ANSWER_TO_QUESTION = "answer_to_question"
+    SPONTANEOUS_DISCLOSURE = "spontaneous_disclosure"
+    FOLLOW_UP_DETAIL = "follow_up_detail"
+    NEW_OCCURRENCE = "new_occurrence"
+    UNCERTAIN = "uncertain"
+
+
+# Descriptive alias used by some callers of the context-aware contract.
+SemanticPropositionOrigin = PropositionOrigin
+
+
 class CoarseProposition(BaseModel):
     """A recall-oriented proposition hint emitted by Stage 1 extraction.
 
@@ -201,9 +215,20 @@ class CoarseProposition(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     proposition_id: str = Field(min_length=1, max_length=80)
-    evidence_span: str = Field(min_length=1, max_length=1000)
-    candidate_kinds: list[MemoryKind] = Field(min_length=1, max_length=5)
-    semantic_role: SemanticRole = SemanticRole.NEW_PROPOSITION
+    evidence_span: str = Field(
+        min_length=1,
+        max_length=1000,
+        validation_alias=AliasChoices("evidence_span", "text", "source_span"),
+    )
+    candidate_kinds: list[MemoryKind] = Field(
+        min_length=1,
+        max_length=5,
+        validation_alias=AliasChoices("candidate_kinds", "candidate_memory_kind"),
+    )
+    semantic_role: SemanticRole = Field(
+        default=SemanticRole.NEW_PROPOSITION,
+        validation_alias=AliasChoices("semantic_role", "role"),
+    )
     # Stage 1 may retain more than one semantic hypothesis.  The singular
     # ``semantic_role`` remains the backwards-compatible primary hint; this
     # additive field lets Stage 2 see ambiguity instead of inheriting a
@@ -215,6 +240,19 @@ class CoarseProposition(BaseModel):
             "semantic_role_candidates",
             "semantic_roles",
             "role_candidates",
+        ),
+    )
+    proposition_origin: PropositionOrigin = Field(
+        default=PropositionOrigin.UNCERTAIN,
+        validation_alias=AliasChoices("proposition_origin", "origin"),
+    )
+    attributes_hint: list[str] = Field(
+        default_factory=list,
+        max_length=12,
+        validation_alias=AliasChoices(
+            "attributes_hint",
+            "attribute_hints",
+            "attributes",
         ),
     )
     target_field_hint: str | None = Field(default=None, max_length=80)
@@ -357,6 +395,29 @@ class CoarseExtraction(BaseModel):
     propositions: list[CoarseProposition] = Field(default_factory=list, max_length=12)
     discarded_spans: list[DiscardedSpan] = Field(default_factory=list, max_length=12)
 
+    @model_validator(mode="before")
+    @classmethod
+    def accept_semantic_units_alias(cls, value: object) -> object:
+        """Accept the context-aware Stage-1 ``semantic_units`` spelling.
+
+        The persisted and downstream contract remains ``propositions``.  The
+        conversion only adds semantic hints and never turns them into a write
+        decision.
+        """
+
+        if not isinstance(value, dict) or "propositions" in value:
+            return value
+        units = value.get("semantic_units")
+        if not isinstance(units, list):
+            return value
+        payload = dict(value)
+        payload.pop("semantic_units", None)
+        payload["propositions"] = [
+            _coerce_semantic_unit_hint(unit, index=index)
+            for index, unit in enumerate(units, start=1)
+        ]
+        return payload
+
     @model_validator(mode="after")
     def fill_safe_gate_reason(self) -> "CoarseExtraction":
         if self.gate_reason is None:
@@ -366,6 +427,97 @@ class CoarseExtraction(BaseModel):
                 else MemorySemanticGateReason.NO_MEMORY
             )
         return self
+
+    @property
+    def semantic_units(self) -> list[CoarseProposition]:
+        """Context-aware alias for the normalized proposition list."""
+
+        return list(self.propositions)
+
+
+def _coerce_semantic_unit_hint(value: object, *, index: int) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"semantic unit {index} must be an object")
+    item = dict(value)
+    item.setdefault("proposition_id", item.get("id") or f"p{index}")
+    item.pop("id", None)
+    if "evidence_span" not in item:
+        item["evidence_span"] = item.get("text") or item.get("source_span")
+    item.pop("text", None)
+    item.pop("source_span", None)
+    if "semantic_role" not in item:
+        item["semantic_role"] = item.get("role") or item.get("semantic_type")
+    item.pop("role", None)
+    item.pop("semantic_type", None)
+    item["semantic_role"] = _normalize_semantic_role_hint(item.get("semantic_role"))
+    if "proposition_origin" not in item:
+        item["proposition_origin"] = item.get("origin") or "uncertain"
+    item.pop("origin", None)
+    origin = str(item.get("proposition_origin") or "").strip().casefold().replace(
+        "-", "_"
+    ).replace(" ", "_")
+    origin_aliases = {
+        "answer": PropositionOrigin.ANSWER_TO_QUESTION.value,
+        "question_answer": PropositionOrigin.ANSWER_TO_QUESTION.value,
+        "spontaneous": PropositionOrigin.SPONTANEOUS_DISCLOSURE.value,
+        "follow_up": PropositionOrigin.FOLLOW_UP_DETAIL.value,
+        "detail": PropositionOrigin.FOLLOW_UP_DETAIL.value,
+        "new": PropositionOrigin.NEW_OCCURRENCE.value,
+        "occurrence": PropositionOrigin.NEW_OCCURRENCE.value,
+        "unknown": PropositionOrigin.UNCERTAIN.value,
+    }
+    item["proposition_origin"] = origin_aliases.get(origin, origin or "uncertain")
+    if "candidate_kinds" not in item:
+        item["candidate_kinds"] = item.get("candidate_memory_kind")
+    item.pop("candidate_memory_kind", None)
+    if isinstance(item.get("candidate_kinds"), str):
+        item["candidate_kinds"] = [item["candidate_kinds"]]
+    if isinstance(item.get("candidate_kinds"), list):
+        item["candidate_kinds"] = [
+            _normalize_memory_kind_alias(kind) for kind in item["candidate_kinds"]
+        ]
+    if "attributes_hint" not in item:
+        item["attributes_hint"] = item.get("attribute_hints", item.get("attributes"))
+    item.pop("attribute_hints", None)
+    item.pop("attributes", None)
+    if isinstance(item.get("attributes_hint"), str):
+        item["attributes_hint"] = [item["attributes_hint"]]
+    if item.get("attributes_hint") is None:
+        item["attributes_hint"] = []
+    if not item.get("candidate_kinds"):
+        role = str(item.get("semantic_role") or "").casefold()
+        item["candidate_kinds"] = [
+            "interaction_event"
+            if role in {
+                "attribute_completion",
+                "contextual_completion",
+                "new_proposition",
+                "new_occurrence",
+            }
+            else "interaction_pattern"
+            if role == "pattern_extraction"
+            else "relationship_state"
+            if role in {"state_update", "belief_extraction"}
+            else "stable_fact"
+        ]
+    return item
+
+
+def _normalize_semantic_role_hint(value: object) -> str:
+    normalized = str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "new": SemanticRole.NEW_PROPOSITION.value,
+        "new_occurrence": SemanticRole.NEW_PROPOSITION.value,
+        "standalone": SemanticRole.NEW_PROPOSITION.value,
+        "attribute": SemanticRole.ATTRIBUTE_COMPLETION.value,
+        "enrichment": SemanticRole.ATTRIBUTE_COMPLETION.value,
+        "context": SemanticRole.CONTEXTUAL_COMPLETION.value,
+        "state": SemanticRole.STATE_UPDATE.value,
+        "pattern": SemanticRole.PATTERN_EXTRACTION.value,
+        "belief": SemanticRole.BELIEF_EXTRACTION.value,
+        "uncertain": SemanticRole.UNCERTAIN.value,
+    }
+    return aliases.get(normalized, normalized or SemanticRole.UNCERTAIN.value)
 
 
 # Transitional aliases keep the contract easy to consume without creating a

@@ -8,6 +8,7 @@ resolution and lifecycle governance remain downstream Python code.
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 from contextlib import nullcontext
@@ -32,6 +33,7 @@ from loveapp.domain.memory import (
     MemoryKind,
     MemoryPerspective,
     MemorySemanticGateReason,
+    PropositionOrigin,
     SemanticRole,
     StoredMessage,
 )
@@ -48,7 +50,7 @@ from loveapp.domain.memory_semantic_units import (
     RefinementDraft,
     SemanticAtomicExtraction,
 )
-from loveapp.domain.runtime_context import PendingMemoryContext
+from loveapp.domain.runtime_context import ConversationContext, PendingMemoryContext
 from loveapp.ports.memory import MemoryAttemptCallback, MemoryExtractor
 from loveapp.ports.observability import TraceRecorder
 
@@ -140,6 +142,7 @@ class TwoStageMemoryExtractor:
         existing_memories: list[MemoryItem],
         conversation_history: list[StoredMessage],
         pending_memory_context: PendingMemoryContext | None = None,
+        conversation_context: ConversationContext | None = None,
         trace: TraceRecorder | None = None,
         attempt_callback: MemoryAttemptCallback | None = None,
     ) -> AtomicExtraction:
@@ -183,6 +186,7 @@ class TwoStageMemoryExtractor:
                 existing_memories=existing_memories,
                 conversation_history=conversation_history,
                 pending_memory_context=pending_memory_context,
+                conversation_context=conversation_context,
                 trace=trace,
                 attempts=attempts,
             )
@@ -199,6 +203,7 @@ class TwoStageMemoryExtractor:
                     existing_memories=existing_memories,
                     conversation_history=conversation_history,
                     pending_memory_context=pending_memory_context,
+                    conversation_context=conversation_context,
                     coarse=coarse,
                     trace=trace,
                     attempts=attempts,
@@ -238,6 +243,7 @@ class TwoStageMemoryExtractor:
                 existing_memories=existing_memories,
                 conversation_history=conversation_history,
                 pending_memory_context=pending_memory_context,
+                conversation_context=conversation_context,
                 trace=trace,
                 attempt_callback=fallback_attempts.append,
             )
@@ -275,6 +281,7 @@ class TwoStageMemoryExtractor:
         existing_memories: list[MemoryItem],
         conversation_history: list[StoredMessage],
         pending_memory_context: PendingMemoryContext | None,
+        conversation_context: ConversationContext | None,
         trace: TraceRecorder | None,
         attempts: list[MemoryExtractionAttempt],
     ) -> CoarseExtraction:
@@ -284,6 +291,7 @@ class TwoStageMemoryExtractor:
             existing_memories=existing_memories,
             conversation_history=conversation_history,
             pending_memory_context=pending_memory_context,
+            conversation_context=conversation_context,
         )
         details: dict[str, Any] = {
             "model": self._model,
@@ -354,6 +362,7 @@ class TwoStageMemoryExtractor:
         existing_memories: list[MemoryItem],
         conversation_history: list[StoredMessage],
         pending_memory_context: PendingMemoryContext | None,
+        conversation_context: ConversationContext | None,
         coarse: CoarseExtraction,
         trace: TraceRecorder | None,
         attempts: list[MemoryExtractionAttempt],
@@ -370,6 +379,7 @@ class TwoStageMemoryExtractor:
             existing_memories=existing_memories,
             conversation_history=conversation_history,
             pending_memory_context=pending_memory_context,
+            conversation_context=conversation_context,
             coarse=coarse,
         )
         details: dict[str, Any] = {
@@ -488,7 +498,18 @@ class TwoStageMemoryExtractor:
         if self._fallback is None:
             return None, None
         try:
-            return await self._fallback.extract(text, **kwargs), None
+            extract = self._fallback.extract
+            if "conversation_context" in kwargs:
+                try:
+                    parameters = inspect.signature(extract).parameters
+                except (TypeError, ValueError):
+                    parameters = {}
+                if parameters and "conversation_context" not in parameters and not any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters.values()
+                ):
+                    kwargs.pop("conversation_context", None)
+            return await extract(text, **kwargs), None
         except Exception as exc:
             return AtomicExtraction(), exc
 
@@ -508,6 +529,7 @@ def _build_coarse_prompt(
     existing_memories: list[MemoryItem],
     conversation_history: list[StoredMessage],
     pending_memory_context: PendingMemoryContext | None,
+    conversation_context: ConversationContext | None = None,
 ) -> str:
     context = json.loads(
         _build_prompt(
@@ -516,6 +538,7 @@ def _build_coarse_prompt(
             existing_memories,
             conversation_history,
             pending_memory_context,
+            conversation_context=conversation_context,
         )
     )
     # Stage 1 sees semantic context, but not database identifiers.
@@ -527,6 +550,8 @@ def _build_coarse_prompt(
             "proposition_decomposition",
             "semantic_role_routing",
             "candidate_memory_kind_hint",
+            "proposition_origin_classification",
+            "attributes_hint",
         ],
         "stage1_must_not_decide": [
             "CREATE",
@@ -536,6 +561,26 @@ def _build_coarse_prompt(
             "mutation_action",
         ],
         "candidate_kinds_are_hints": True,
+        "semantic_units": {
+            "description": "bounded semantic handoff; normalized to propositions downstream",
+            "fields": [
+                "proposition_id",
+                "evidence_span",
+                "semantic_role",
+                "proposition_origin",
+                "candidate_kinds",
+                "attributes_hint",
+                "confidence",
+            ],
+        },
+        "proposition_origins": [
+            "answer_to_question",
+            "spontaneous_disclosure",
+            "follow_up_detail",
+            "new_occurrence",
+            "uncertain",
+        ],
+        "context_is_read_only": True,
         "semantic_roles": [
             "new_proposition",
             "attribute_completion",
@@ -565,6 +610,7 @@ def _build_detailed_prompt(
     existing_memories: list[MemoryItem],
     conversation_history: list[StoredMessage],
     pending_memory_context: PendingMemoryContext | None,
+    conversation_context: ConversationContext | None = None,
     coarse: CoarseExtraction,
 ) -> str:
     context = json.loads(
@@ -574,6 +620,7 @@ def _build_detailed_prompt(
             existing_memories,
             conversation_history,
             pending_memory_context,
+            conversation_context=conversation_context,
         )
     )
     for item in context.get("existing_active_memories", []):
@@ -583,7 +630,7 @@ def _build_detailed_prompt(
             "stage": "batched_kind_aware_detailed_extraction",
             "coarse_extraction": coarse.model_dump(mode="json"),
             "stage2_route_plan": _build_route_plan(coarse),
-            "contract": {
+        "contract": {
                 "output": "SemanticAtomicExtraction",
                 "one_response_for_all_propositions": True,
                 "stage2_routes": [route.value for route in Stage2ExtractorRoute],
@@ -592,6 +639,14 @@ def _build_detailed_prompt(
                     "enrichment",
                     "refinement",
                 ],
+                "context_fields": [
+                    "conversation_context",
+                    "pending_questions",
+                    "active_topic",
+                    "relevant_memories",
+                    "proposition_origin",
+                ],
+                "context_is_read_only": True,
                 "forbidden_outputs": [
                     "target_memory_id",
                     "target_memory_ids",
@@ -621,6 +676,10 @@ def _route_prompt_payload(
         "subject_hint": proposition.subject_hint,
         "temporal_hint": proposition.temporal_hint,
         "target_field_hint": proposition.target_field_hint,
+        "proposition_origin": getattr(
+            proposition.proposition_origin, "value", proposition.proposition_origin
+        ),
+        "attributes_hint": list(getattr(proposition, "attributes_hint", [])),
         "instruction": route_instruction(route.selected_route),
     }
 
@@ -870,6 +929,35 @@ enrichment(attribute_name=resolution,value=reconciled)，不要凭空创建 reco
 所有 route 都不得输出 target_memory_id、mutation_action 或数据库 patch。
 """.strip()
 
+# Keep the long-standing Chinese contract above intact while making the new
+# context-aware hand-off explicit for providers that key on English field
+# names.  This is guidance only: no line grants target or write authority.
+_COARSE_SYSTEM_PROMPT += """
+
+Context-aware Stage 1 contract:
+- Read conversation_context as read-only context (previous messages, pending_questions,
+  active_topic, and relevant_memories) to understand why the user says this now.
+- Decompose the message into semantic_units/propositions; do not split solely on punctuation.
+- Classify proposition_origin as one of answer_to_question, spontaneous_disclosure,
+  follow_up_detail, new_occurrence, or uncertain.
+- Include bounded attributes_hint when useful. Never emit target IDs, CREATE/ENRICH/UPDATE,
+  mutation actions, or database patches.
+- If a short phrase answers a pending question, mark answer_to_question; without supporting
+  context, remain uncertain rather than inventing an enrichment target.
+""".strip()
+
+_DETAILED_SYSTEM_PROMPT += """
+
+Context-aware Stage 2 contract:
+- Use conversation_context, pending_questions, active_topic, relevant_memories, and the
+  proposition_origin supplied by Stage 1 as read-only semantic context.
+- Preserve multiple semantic units from one turn. Context can explain an enrichment, but
+  resolver code—not the model—selects any target and authorizes mutation.
+- A new occurrence with its own time/event evidence is new_memory, not enrichment. A phrase
+  answering a pending question may be an enrichment candidate only when the context supports it.
+- Never emit target_memory_id(s), mutation_action, supersedes_id, or db_patch.
+""".strip()
+
 
 _COARSE_KIND_ALIASES: dict[str, MemoryKind] = {
     "fact": MemoryKind.STABLE_FACT,
@@ -938,6 +1026,12 @@ def _coerce_coarse_payload(value: dict[str, Any]) -> tuple[dict[str, Any], list[
     repairs: list[str] = []
     should_extract = bool(payload.get("should_extract"))
     raw_props = payload.get("propositions")
+    # The context-aware Stage 1 contract calls these semantic_units.  Keep
+    # the persisted/downstream spelling as propositions while accepting the
+    # additive hand-off shape at this adapter boundary.
+    if not isinstance(raw_props, list) and isinstance(payload.get("semantic_units"), list):
+        raw_props = payload.pop("semantic_units")
+        repairs.append("semantic_units_alias")
     if not isinstance(raw_props, list):
         raw_props = []
         payload["propositions"] = raw_props
@@ -951,6 +1045,10 @@ def _coerce_coarse_payload(value: dict[str, Any]) -> tuple[dict[str, Any], list[
                 category="schema_validation",
             )
         item = dict(raw)
+        if "proposition_id" not in item and item.get("id") is not None:
+            item["proposition_id"] = str(item["id"])
+            repairs.append("proposition_id_alias")
+        item.pop("id", None)
         if "proposition_id" not in item:
             item["proposition_id"] = f"p{index}"
             repairs.append("proposition_id_alias")
@@ -969,6 +1067,11 @@ def _coerce_coarse_payload(value: dict[str, Any]) -> tuple[dict[str, Any], list[
                     kind_hint if isinstance(kind_hint, list) else [kind_hint]
                 )
                 repairs.append("candidate_memory_kind_alias")
+        else:
+            item.pop("candidate_memory_kind", None)
+        if "candidate_kinds" in item and isinstance(item["candidate_kinds"], str):
+            item["candidate_kinds"] = [item["candidate_kinds"]]
+            repairs.append("candidate_kinds_scalar")
         if "candidate_kinds" in item and isinstance(item["candidate_kinds"], list):
             kinds: list[str] = []
             for raw_kind in item["candidate_kinds"]:
@@ -983,7 +1086,12 @@ def _coerce_coarse_payload(value: dict[str, Any]) -> tuple[dict[str, Any], list[
             if kinds:
                 item["candidate_kinds"] = kinds
                 valid_kind_values = {member.value for member in MemoryKind}
-                if any(str(kind) not in valid_kind_values for kind in raw["candidate_kinds"]):
+                raw_kind_values = raw.get("candidate_kinds", raw.get("candidate_memory_kind"))
+                if isinstance(raw_kind_values, str):
+                    raw_kind_values = [raw_kind_values]
+                if isinstance(raw_kind_values, list) and any(
+                    str(kind) not in valid_kind_values for kind in raw_kind_values
+                ):
                     repairs.append("candidate_kind_alias")
         raw_role_candidates = None
         for alias in ("semantic_role_candidates", "semantic_roles", "role_candidates"):
@@ -1012,11 +1120,62 @@ def _coerce_coarse_payload(value: dict[str, Any]) -> tuple[dict[str, Any], list[
             if normalized_roles and "semantic_role" not in item:
                 item["semantic_role"] = normalized_roles[0]
             repairs.append("semantic_role_candidates_normalized")
+        if "semantic_role" not in item and item.get("role") is not None:
+            item["semantic_role"] = item.pop("role")
+            repairs.append("semantic_role_alias")
+        else:
+            item.pop("role", None)
         role = _normalize_semantic_role(item.get("semantic_role"))
         if role is not None:
             if item.get("semantic_role") != role.value:
                 repairs.append("semantic_role_alias")
             item["semantic_role"] = role.value
+        if not item.get("candidate_kinds"):
+            role_value = str(item.get("semantic_role") or "").casefold()
+            item["candidate_kinds"] = [
+                MemoryKind.INTERACTION_EVENT.value
+                if role_value
+                in {
+                    SemanticRole.ATTRIBUTE_COMPLETION.value,
+                    SemanticRole.CONTEXTUAL_COMPLETION.value,
+                    SemanticRole.NEW_PROPOSITION.value,
+                }
+                else MemoryKind.INTERACTION_PATTERN.value
+                if role_value == SemanticRole.PATTERN_EXTRACTION.value
+                else MemoryKind.RELATIONSHIP_STATE.value
+                if role_value
+                in {
+                    SemanticRole.STATE_UPDATE.value,
+                    SemanticRole.BELIEF_EXTRACTION.value,
+                }
+                else MemoryKind.STABLE_FACT.value
+            ]
+            repairs.append("candidate_kinds_defaulted_from_role")
+        origin = _normalize_proposition_origin(
+            item.get("proposition_origin", item.get("origin"))
+        )
+        if origin is None:
+            if item.get("proposition_origin") not in (None, ""):
+                repairs.append("proposition_origin_defaulted")
+            origin = PropositionOrigin.UNCERTAIN
+        item["proposition_origin"] = origin.value
+        item.pop("origin", None)
+        attributes = item.get("attributes_hint", item.get("attribute_hints"))
+        if attributes is None:
+            attributes = item.get("attributes")
+        if attributes is not None:
+            if isinstance(attributes, str):
+                attributes = [attributes]
+            if isinstance(attributes, list):
+                item["attributes_hint"] = [
+                    str(attribute).strip()[:80]
+                    for attribute in attributes
+                    if str(attribute).strip()
+                ][:12]
+            else:
+                item.pop("attributes_hint", None)
+            item.pop("attribute_hints", None)
+            item.pop("attributes", None)
         for alias in ("source_span", "text"):
             item.pop(alias, None)
         for forbidden in (
@@ -1464,6 +1623,28 @@ def _normalize_semantic_role(value: object) -> SemanticRole | None:
             "standalone": SemanticRole.NEW_PROPOSITION,
         }
         return aliases.get(normalized)
+
+
+def _normalize_proposition_origin(value: object) -> PropositionOrigin | None:
+    if isinstance(value, PropositionOrigin):
+        return value
+    normalized = str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "answer": PropositionOrigin.ANSWER_TO_QUESTION,
+        "answer_to_question": PropositionOrigin.ANSWER_TO_QUESTION,
+        "question_answer": PropositionOrigin.ANSWER_TO_QUESTION,
+        "spontaneous": PropositionOrigin.SPONTANEOUS_DISCLOSURE,
+        "spontaneous_disclosure": PropositionOrigin.SPONTANEOUS_DISCLOSURE,
+        "follow_up": PropositionOrigin.FOLLOW_UP_DETAIL,
+        "follow_up_detail": PropositionOrigin.FOLLOW_UP_DETAIL,
+        "detail": PropositionOrigin.FOLLOW_UP_DETAIL,
+        "new": PropositionOrigin.NEW_OCCURRENCE,
+        "new_occurrence": PropositionOrigin.NEW_OCCURRENCE,
+        "occurrence": PropositionOrigin.NEW_OCCURRENCE,
+        "uncertain": PropositionOrigin.UNCERTAIN,
+        "unknown": PropositionOrigin.UNCERTAIN,
+    }
+    return aliases.get(normalized)
 
 
 def _normalize_gate_reason(
