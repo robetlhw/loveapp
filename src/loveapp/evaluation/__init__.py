@@ -8,6 +8,24 @@ from loveapp.evaluation.memory_admission_v1 import (
     render_memory_admission_strong_review_audit,
     render_memory_admission_v1_report,
 )
+from loveapp.evaluation.memory_context_aware_behavioral_anchor import (
+    DEFAULT_BASELINE_PATH as DEFAULT_CONTEXT_AWARE_BASELINE_PATH,
+)
+from loveapp.evaluation.memory_context_aware_behavioral_anchor import (
+    DEFAULT_DATASET_PATH as DEFAULT_CONTEXT_AWARE_BEHAVIORAL_ANCHOR_PATH,
+)
+from loveapp.evaluation.memory_context_aware_behavioral_anchor import (
+    DEFAULT_OUTPUT_DIR as DEFAULT_CONTEXT_AWARE_OUTPUT_DIR,
+)
+from loveapp.evaluation.memory_context_aware_behavioral_anchor import (
+    compare_context_aware_runs,
+    evaluate_context_aware_behavioral_anchor,
+    load_context_aware_cases,
+    render_context_aware_summary,
+    write_context_aware_artifacts,
+    write_context_aware_baseline,
+    write_run_comparison,
+)
 from loveapp.evaluation.memory_extraction_v1 import (
     evaluate_memory_extraction_v1,
     render_memory_extraction_v1_report,
@@ -203,6 +221,9 @@ from loveapp.evaluation.routing import (
 )
 
 __all__ = [
+    "DEFAULT_CONTEXT_AWARE_BASELINE_PATH",
+    "DEFAULT_CONTEXT_AWARE_BEHAVIORAL_ANCHOR_PATH",
+    "DEFAULT_CONTEXT_AWARE_OUTPUT_DIR",
     "ERROR_ATTRIBUTION_CATEGORIES",
     "FROZEN_METADATA_FILTER_CONFIG",
     "PHASE32_SCHEMA_VERSION",
@@ -240,6 +261,7 @@ __all__ = [
     "build_phase321_conditional_ablation",
     "build_router_safety_router",
     "calculate_phase321_repeatability_metrics",
+    "compare_context_aware_runs",
     "compare_hard_soft_metadata_reports",
     "compare_memory_longtail_write_v2_reports",
     "compare_memory_longtail_write_v2_semantic_remediation",
@@ -247,6 +269,7 @@ __all__ = [
     "compare_metadata_filter_reports",
     "compare_oracle_and_e2e",
     "compare_phase32_reports",
+    "evaluate_context_aware_behavioral_anchor",
     "evaluate_contextual_rewrite",
     "evaluate_contextual_rewrite_v1",
     "evaluate_dateplan",
@@ -287,6 +310,7 @@ __all__ = [
     "evaluate_rag_v2",
     "evaluate_router_safety",
     "evaluate_routing_conversations",
+    "load_context_aware_cases",
     "load_contextual_rewrite_eval_markdown",
     "load_memory_lifecycle_v1_cases",
     "load_memory_longtail_write_v1_cases",
@@ -304,6 +328,7 @@ __all__ = [
     "phase32_dry_run",
     "phase321_call_budget",
     "phase321_output_paths",
+    "render_context_aware_summary",
     "render_contextual_rewrite_report",
     "render_dateplan_report",
     "render_longtail_baseline_report",
@@ -352,6 +377,8 @@ __all__ = [
     "validate_rag_v2_dataset",
     "validate_router_challenge_dataset",
     "validate_router_safety_dataset",
+    "write_context_aware_artifacts",
+    "write_context_aware_baseline",
     "write_metadata_filter_comparison",
     "write_phase31_findings",
     "write_phase31_report",
@@ -361,5 +388,6 @@ __all__ = [
     "write_phase321_reports",
     "write_rag_report",
     "write_router_safety_report",
+    "write_run_comparison",
     "write_sweep_report",
 ]
