@@ -8,6 +8,13 @@ from loveapp.evaluation.memory_admission_v1 import (
     render_memory_admission_strong_review_audit,
     render_memory_admission_v1_report,
 )
+from loveapp.evaluation.memory_architecture_vnext import (
+    VNEXT_BENCHMARK_VIEW_VERSION,
+    evaluate_memory_architecture_vnext,
+    project_memory_benchmark_case,
+    render_memory_architecture_vnext_report,
+    write_memory_architecture_vnext_report,
+)
 from loveapp.evaluation.memory_benchmark_v1 import (
     evaluate_memory_benchmark_v1,
     load_memory_benchmark_v1_cases,
@@ -240,6 +247,7 @@ __all__ = [
     "ROUTER_PHASE31_ERROR_CATEGORIES",
     "ROUTER_SAFETY_BRANCHES",
     "ROUTER_SAFETY_ERROR_ATTRIBUTION_CATEGORIES",
+    "VNEXT_BENCHMARK_VIEW_VERSION",
     "ContextualRewriteCase",
     "FixtureSemanticCorrector",
     "FixtureSemanticRelationJudge",
@@ -282,6 +290,7 @@ __all__ = [
     "evaluate_live_routing_conversations",
     "evaluate_memory_admission_integration",
     "evaluate_memory_admission_v1",
+    "evaluate_memory_architecture_vnext",
     "evaluate_memory_benchmark_v1",
     "evaluate_memory_extraction_v1",
     "evaluate_memory_foundation",
@@ -335,6 +344,7 @@ __all__ = [
     "phase32_dry_run",
     "phase321_call_budget",
     "phase321_output_paths",
+    "project_memory_benchmark_case",
     "render_context_aware_summary",
     "render_contextual_rewrite_report",
     "render_dateplan_report",
@@ -344,6 +354,7 @@ __all__ = [
     "render_memory_admission_policy_review",
     "render_memory_admission_strong_review_audit",
     "render_memory_admission_v1_report",
+    "render_memory_architecture_vnext_report",
     "render_memory_benchmark_v1_report",
     "render_memory_extraction_v1_report",
     "render_memory_gate_v2_report",
@@ -387,6 +398,7 @@ __all__ = [
     "validate_router_safety_dataset",
     "write_context_aware_artifacts",
     "write_context_aware_baseline",
+    "write_memory_architecture_vnext_report",
     "write_metadata_filter_comparison",
     "write_phase31_findings",
     "write_phase31_report",

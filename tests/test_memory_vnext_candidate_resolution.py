@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 
 from loveapp.application.memory_target_resolution import CandidateGenerator, TargetResolver
+from loveapp.core.timing import ExecutionTrace
 from loveapp.domain.memory import MemoryItem, MemoryKind, MemoryStatus, TimeKind
 from loveapp.domain.memory_architecture_vnext import (
     CandidateSource,
@@ -123,3 +124,54 @@ def test_pending_binding_can_resolve_one_target_without_authorizing_write() -> N
     assert resolution.status == ResolutionStatus.RESOLVED
     assert resolution.target_memory_id == event.id
     assert resolution.resolution_evidence == ["pending_question_binding"]
+
+
+def test_expired_event_is_not_a_vnext_target_when_reference_time_is_supplied() -> None:
+    expired = _event("expired").model_copy(
+        update={"expires_at": NOW.replace(hour=11)}
+    )
+    generated = CandidateGenerator().generate(
+        draft=_detail(),
+        current_text="because of money",
+        existing_memories=[expired],
+        reference_time=NOW,
+    )
+    resolution = TargetResolver().resolve(draft=_detail(), generated=generated)
+    assert generated.candidates == []
+    assert resolution.status == ResolutionStatus.UNRESOLVED
+    assert resolution.reason == "no_semantic_candidates"
+
+
+def test_candidate_trace_keeps_provenance_and_resolution_inputs() -> None:
+    event = _event("event-1")
+    generated = CandidateGenerator().generate(
+        draft=_detail(),
+        current_text="because of money",
+        existing_memories=[event],
+    )
+    trace = generated.as_trace()
+    assert trace["candidate_details"][0]["memory_id"] == event.id
+    assert trace["candidate_details"][0]["hard_filter_result"] == "accepted"
+
+
+def test_pending_binding_trace_is_explicit_and_keeps_target_out_of_model_candidates() -> None:
+    event = _event("event-1")
+    recorder = ExecutionTrace()
+    pending = PendingQuestion(
+        question_id="q1",
+        assistant_message_id="assistant-1",
+        target_memory_id=event.id,
+        target_kind=MemoryKind.INTERACTION_EVENT.value,
+        expected_field="cause",
+    )
+    CandidateGenerator().generate(
+        draft=_detail(),
+        current_text="because of money",
+        existing_memories=[event],
+        pending_question=pending,
+        trace=recorder,
+    )
+    record = next(item for item in recorder.records if item.name == "memory_pending_binding")
+    assert record.details["question_id"] == "q1"
+    assert record.details["target_in_scope"] is True
+    assert record.details["field_matches"] is True

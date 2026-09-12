@@ -4,7 +4,7 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from loveapp.domain.advice import (
     AdviceGenerationAttempt,
@@ -43,15 +43,22 @@ from loveapp.domain.memory import (
     memory_dedupe_key,
     utc_now,
 )
+from loveapp.domain.memory_architecture_vnext import (
+    EventDetail,
+    EventDetailDraft,
+    WriteOperation,
+)
 from loveapp.domain.memory_context import select_context_memories
 from loveapp.domain.memory_dimensions import (
     is_relationship_interaction_subject,
+    normalize_interaction_event_type,
     normalize_state_dimension,
     normalize_state_value,
 )
 from loveapp.domain.memory_epistemics import is_epistemically_confirmed
 from loveapp.domain.memory_event_enrichment import (
     ConflictEventEnrichment,
+    EventEnrichmentField,
     GenericEventEnrichment,
 )
 from loveapp.domain.memory_lifecycle import (
@@ -140,6 +147,8 @@ from .memory_retrieval import (
     resolve_memory_retrieval_mode,
 )
 from .memory_semantic_relations import LongTailRelationShadowEvaluator
+from .memory_target_resolution import CandidateGenerator, TargetResolver
+from .memory_write_policy import decide_event_detail_write
 from .relationship_events import (
     build_contextual_relationship_candidate,
     build_pending_confession_candidate,
@@ -200,6 +209,8 @@ class MemoryService:
             token_budget=context_token_budget,
         )
         self._memory_context_builder = MemoryContextBuilder()
+        self._vnext_candidate_generator = CandidateGenerator()
+        self._vnext_target_resolver = TargetResolver()
         self._long_tail_relation_evaluator = long_tail_relation_evaluator
         set_store_clock = getattr(store, "set_clock", None)
         if callable(set_store_clock):
@@ -462,16 +473,11 @@ class MemoryService:
                 if _supports_keyword(self._extractor.extract, "attempt_callback"):
                     extraction_kwargs["attempt_callback"] = attempts.append
                 effective_pending_context = gate_decision.pending_memory_context
-                if (
-                    effective_pending_context is not None
-                    and _supports_keyword(
-                        self._extractor.extract,
-                        "pending_memory_context",
-                    )
+                if effective_pending_context is not None and _supports_keyword(
+                    self._extractor.extract,
+                    "pending_memory_context",
                 ):
-                    extraction_kwargs["pending_memory_context"] = (
-                        effective_pending_context
-                    )
+                    extraction_kwargs["pending_memory_context"] = effective_pending_context
                 if _supports_keyword(self._extractor.extract, "conversation_context"):
                     extraction_kwargs["conversation_context"] = conversation_context
                 extraction = await self._extractor.extract(text, **extraction_kwargs)
@@ -553,7 +559,7 @@ class MemoryService:
         active_ids = {item.id for item in active}
         semantic_units = list(getattr(extraction, "semantic_units", []))
         enrichment_retrieved_candidates: list[MemoryItem] = []
-        if any(isinstance(unit, EnrichmentDraft) for unit in semantic_units):
+        if any(isinstance(unit, EnrichmentDraft | EventDetailDraft) for unit in semantic_units):
             try:
                 retrieved = await self._memory_retriever.retrieve(
                     active,
@@ -575,8 +581,139 @@ class MemoryService:
         audit_only: list[MemoryAuditDraft] = []
         conflict_event_enrichments: list[ConflictEventEnrichment] = []
         event_enrichments: list[GenericEventEnrichment] = []
+        event_details: list[EventDetail] = []
         for unit in semantic_units:
-            if isinstance(unit, EnrichmentDraft):
+            if isinstance(unit, EventDetailDraft):
+                _record_event_detail_semantic_trace(trace, unit)
+                generated = self._vnext_candidate_generator.generate(
+                    draft=unit,
+                    current_text=text,
+                    existing_memories=active,
+                    conversation_history=conversation_history,
+                    retrieved_candidates=enrichment_retrieved_candidates,
+                    pending_memory_context=gate_decision.pending_memory_context,
+                    user_id=message.user_id,
+                    relationship_id=message.relationship_id,
+                    reference_time=now,
+                    trace=trace,
+                )
+                resolution = self._vnext_target_resolver.resolve(
+                    draft=unit,
+                    generated=generated,
+                    pending_memory_context=gate_decision.pending_memory_context,
+                    trace=trace,
+                )
+                target = next(
+                    (item for item in active if item.id == resolution.target_memory_id),
+                    None,
+                )
+                policy_draft = unit
+                if target is not None and not unit.event_type_constraint:
+                    target_event_type = normalize_interaction_event_type(
+                        target.payload.get("event_type")
+                    )
+                    if target_event_type is not None:
+                        policy_draft = unit.model_copy(
+                            update={"event_type_constraint": target_event_type}
+                        )
+                detail = None
+                if target is not None and resolution.target_memory_id == target.id:
+                    try:
+                        detail = EventDetail(
+                            id=_event_detail_id(
+                                source_message_id=message.id,
+                                target_memory_id=target.id,
+                                unit_id=unit.unit_id,
+                            ),
+                            parent_event_id=target.id,
+                            detail_type=unit.detail_type,
+                            value=unit.value,
+                            evidence_span=unit.evidence_span,
+                            source_message_id=message.id,
+                            source_proposition_id=unit.source_proposition_id,
+                            perspective=unit.perspective,
+                            epistemic_status=unit.epistemic_status,
+                            created_at=message.created_at,
+                        )
+                    except (TypeError, ValueError) as exc:
+                        _record_event_detail_write_failure_trace(trace, unit, str(exc))
+                write_decision = decide_event_detail_write(
+                    policy_draft,
+                    resolution,
+                    detail=detail,
+                    trace=trace,
+                )
+                if write_decision.operation == WriteOperation.ATTACH_DETAIL:
+                    if write_decision.detail is not None:
+                        event_details.append(write_decision.detail)
+                    _record_event_detail_store_trace(
+                        trace,
+                        operation=write_decision.operation.value,
+                        target_memory_id=write_decision.target_memory_id,
+                        detail_id=(
+                            write_decision.detail.id if write_decision.detail is not None else None
+                        ),
+                        status="planned",
+                    )
+                elif write_decision.operation == WriteOperation.ENRICH_CORE:
+                    enrichment = _event_detail_to_core_enrichment(
+                        policy_draft,
+                        target=target,
+                    )
+                    if enrichment is not None:
+                        event_enrichments.append(enrichment)
+                        _record_event_detail_store_trace(
+                            trace,
+                            operation=write_decision.operation.value,
+                            target_memory_id=write_decision.target_memory_id,
+                            detail_id=None,
+                            status="planned_core_enrichment",
+                        )
+                    else:
+                        write_decision = write_decision.model_copy(
+                            update={
+                                "operation": WriteOperation.NOOP,
+                                "reason": (
+                                    "core event detail could not be converted to a typed enrichment"
+                                ),
+                            }
+                        )
+                if write_decision.operation in {
+                    WriteOperation.CLARIFY,
+                    WriteOperation.NOOP,
+                }:
+                    result.rejected_by_policy += 1
+                    if write_decision.operation == WriteOperation.CLARIFY:
+                        _record_event_detail_clarification_trace(
+                            trace,
+                            write_decision,
+                        )
+                    audit_only.append(
+                        MemoryAuditDraft(
+                            relation=ClaimRelation.UNCERTAIN,
+                            decision=AdmissionDecision.REJECT,
+                            target_memory_ids=(
+                                list(resolution.candidate_ids)
+                                if write_decision.target_memory_id is None
+                                else [write_decision.target_memory_id]
+                            ),
+                            rule_name=(
+                                "vnext_event_detail_clarify"
+                                if write_decision.operation == WriteOperation.CLARIFY
+                                else "vnext_event_detail_no_op"
+                            ),
+                            score_breakdown={
+                                "semantic_type": "event_detail",
+                                "resolution_status": resolution.status.value,
+                                "resolution_reason": resolution.reason,
+                                "write_operation": write_decision.operation.value,
+                            },
+                            evidence=[unit.evidence_span],
+                            reason=write_decision.reason,
+                            mutation_action=MutationAction.REJECT,
+                        )
+                    )
+            elif isinstance(unit, EnrichmentDraft):
                 enrichment_resolution = resolve_event_enrichment(
                     unit,
                     current_text=text,
@@ -602,9 +739,7 @@ class MemoryService:
                     MemoryAuditDraft(
                         relation=ClaimRelation.UNCERTAIN,
                         decision=AdmissionDecision.REJECT,
-                        target_memory_ids=list(
-                            enrichment_resolution.semantic_candidate_ids
-                        ),
+                        target_memory_ids=list(enrichment_resolution.semantic_candidate_ids),
                         rule_name="event_enrichment_no_op",
                         score_breakdown={
                             "semantic_type": "enrichment",
@@ -804,9 +939,7 @@ class MemoryService:
                 text,
                 conflict=conflict,
                 corroborating_evidence_count=(
-                    pattern_evidence_links.linked_event_count
-                    if pattern_evidence_links.valid
-                    else 0
+                    pattern_evidence_links.linked_event_count if pattern_evidence_links.valid else 0
                 ),
                 policies=self._admission_policies,
                 governed_transition_eligibility=governed_transition_eligibility,
@@ -1099,9 +1232,7 @@ class MemoryService:
                             candidate_index=candidate_index,
                             relation=ClaimRelation.UNCERTAIN,
                             decision=decision,
-                            target_memory_ids=list(
-                                conflict_enrichment.semantic_candidate_ids
-                            ),
+                            target_memory_ids=list(conflict_enrichment.semantic_candidate_ids),
                             rule_name="conflict_event_enrichment_no_op",
                             admission_score=assessment.score,
                             score_breakdown={
@@ -1110,9 +1241,7 @@ class MemoryService:
                                 "resolution_reason": conflict_enrichment.reason,
                             },
                             raw_predicate=enriched_candidate.raw_predicate,
-                            canonical_predicate=(
-                                enriched_candidate.canonical_predicate
-                            ),
+                            canonical_predicate=(enriched_candidate.canonical_predicate),
                             extractor_model=enriched_candidate.extractor_model,
                             verifier_model=enriched_candidate.verifier_model,
                             prompt_version=enriched_candidate.prompt_version,
@@ -1135,20 +1264,15 @@ class MemoryService:
                     compared_memory_ids=[item.id for item in active],
                     strong_called=strong_called,
                     strong_compared_memory_ids=strong_compared_memory_ids,
-                    relation=enriched_candidate.claim_relation
-                    or ClaimRelation.UNCERTAIN,
+                    relation=enriched_candidate.claim_relation or ClaimRelation.UNCERTAIN,
                     relation_rule=(
                         "enrich_conflict_event_cause"
                         if conflict_enrichment.resolved
                         else "conflict_event_enrichment_no_op"
                     ),
                     relation_reason=conflict_enrichment.reason,
-                    relation_target_memory_ids=list(
-                        conflict_enrichment.semantic_candidate_ids
-                    ),
-                    planned_action=(
-                        "enrich" if conflict_enrichment.resolved else "no_op"
-                    ),
+                    relation_target_memory_ids=list(conflict_enrichment.semantic_candidate_ids),
+                    planned_action=("enrich" if conflict_enrichment.resolved else "no_op"),
                     planned_target_memory_ids=(
                         [conflict_enrichment.target.id]
                         if conflict_enrichment.target is not None
@@ -1279,8 +1403,7 @@ class MemoryService:
                     source_event_operation_indexes=in_batch_event_links.get(index, []),
                     mutation_action=(
                         MutationAction.LINK
-                        if in_batch_event_links.get(index)
-                        and relation != ClaimRelation.UPDATE
+                        if in_batch_event_links.get(index) and relation != ClaimRelation.UPDATE
                         else infer_mutation_action(
                             relation,
                             rule_name=rule_name,
@@ -1353,6 +1476,7 @@ class MemoryService:
                 or contextual_updates
                 or conflict_event_enrichments
                 or event_enrichments
+                or event_details
             ):
                 committed = await self.store.commit_memory_batch(
                     user_id=message.user_id,
@@ -1363,6 +1487,7 @@ class MemoryService:
                         contextual_updates=contextual_updates,
                         conflict_event_enrichments=conflict_event_enrichments,
                         event_enrichments=event_enrichments,
+                        event_details=event_details,
                         status_updates=status_updates,
                         plan_updates=plan_updates,
                         audit_only=audit_only,
@@ -1381,6 +1506,15 @@ class MemoryService:
                 )
                 result.saved.extend(consolidated_saved)
                 result.contextual_updated_memory_ids.extend(committed.updated_memory_ids)
+                if event_details:
+                    _record_event_detail_store_trace(
+                        trace,
+                        operation="batch_commit",
+                        target_memory_id=None,
+                        detail_id=None,
+                        status="committed",
+                        detail_ids=[detail.id for detail in committed.saved_event_details],
+                    )
                 await self._project_relationship_stage(
                     message.user_id,
                     message.relationship_id,
@@ -1511,13 +1645,13 @@ class MemoryService:
                     trigger_id=trigger.id,
                     status=("committed" if committed.saved else "rejected"),
                     pattern_memory_ids=[item.item.id for item in committed.saved],
-                        evidence_ids=(
+                    evidence_ids=(
                         list(governed.operation.candidate.payload.get("evidence_ids") or [])
                         if governed.operation is not None
-                            else []
-                        ),
-                        phase="consolidation",
-                    )
+                        else []
+                    ),
+                    phase="consolidation",
+                )
             except Exception as exc:
                 # Consolidation is a non-destructive secondary write.  A
                 # detector or persistence failure must never roll back the
@@ -2578,9 +2712,8 @@ def _evaluate_gate(
         }
         if _supports_keyword(evaluate, "active_task"):
             kwargs["active_task"] = active_task
-        if (
-            pending_memory_context is not None
-            and _supports_keyword(evaluate, "pending_memory_context")
+        if pending_memory_context is not None and _supports_keyword(
+            evaluate, "pending_memory_context"
         ):
             kwargs["pending_memory_context"] = pending_memory_context
         return evaluate(text, **kwargs)
@@ -2614,9 +2747,7 @@ def _apply_semantic_gate_decision(
     semantic_units = list(getattr(extraction, "semantic_units", []))
     extracted_any = bool(extraction.claims or semantic_units)
     contract_violation = not extraction.should_extract and extracted_any
-    extraction_warning = (
-        "empty_claims" if extraction.should_extract and not extracted_any else None
-    )
+    extraction_warning = "empty_claims" if extraction.should_extract and not extracted_any else None
     return decision.model_copy(
         update={
             "should_extract": (
@@ -2796,9 +2927,7 @@ def _record_conflict_event_enrichment_trace(
                 "candidate_index": candidate_index,
                 "enrichment_probe": resolution.detected,
                 "enrichment_type": "conflict_cause",
-                "semantic_candidate_ids_json": json.dumps(
-                    list(resolution.semantic_candidate_ids)
-                ),
+                "semantic_candidate_ids_json": json.dumps(list(resolution.semantic_candidate_ids)),
                 "rejected_candidates_json": json.dumps(
                     [
                         {"memory_id": memory_id, "reason": reason}
@@ -2810,9 +2939,7 @@ def _record_conflict_event_enrichment_trace(
                 ),
                 "antecedent_message_id": resolution.antecedent_message_id,
                 "cause_category": resolution.cause_category,
-                "resolution_status": (
-                    "resolved" if resolution.resolved else "no_op"
-                ),
+                "resolution_status": ("resolved" if resolution.resolved else "no_op"),
                 "resolution_reason": resolution.reason,
             }
         )
@@ -2834,9 +2961,7 @@ def _record_event_enrichment_trace(
                     draft.attribute_namespace.value if draft is not None else None
                 ),
                 "attribute_name": draft.attribute_name if draft is not None else None,
-                "semantic_candidate_ids_json": json.dumps(
-                    list(resolution.semantic_candidate_ids)
-                ),
+                "semantic_candidate_ids_json": json.dumps(list(resolution.semantic_candidate_ids)),
                 "compatible_candidate_ids_json": json.dumps(
                     list(resolution.compatible_candidate_ids)
                 ),
@@ -2865,6 +2990,138 @@ def _record_event_enrichment_trace(
                 "planned_action": "enrich" if resolution.resolved else "reject",
             }
         )
+
+
+def _record_event_detail_semantic_trace(
+    trace: TraceRecorder | None,
+    draft: EventDetailDraft,
+) -> None:
+    if trace is None:
+        return
+    with trace.measure("memory_event_detail_semantic") as details:
+        details.update(
+            {
+                "semantic_type": draft.semantic_type,
+                "unit_id": draft.unit_id,
+                "event_type_constraint": draft.event_type_constraint,
+                "detail_type": draft.detail_type,
+                "evidence_span": draft.evidence_span,
+                "source_proposition_id": draft.source_proposition_id,
+                "context_source_question_ids": list(draft.context_source_question_ids),
+                "subject_hint": draft.subject_hint,
+                "reference_hints": dict(draft.reference_hints),
+                "perspective": draft.perspective.value,
+                "epistemic_status": draft.epistemic_status.value,
+                "confidence": draft.confidence,
+            }
+        )
+
+
+def _record_event_detail_write_failure_trace(
+    trace: TraceRecorder | None,
+    draft: EventDetailDraft,
+    reason: str,
+) -> None:
+    if trace is None:
+        return
+    with trace.measure("memory_write_policy") as details:
+        details.update(
+            {
+                "operation": WriteOperation.NOOP.value,
+                "target_memory_id": None,
+                "has_event_detail": False,
+                "clarification_required": False,
+                "reason": "event detail validation failed",
+                "detail_type": draft.detail_type,
+                "validation_error": reason[:500],
+            }
+        )
+
+
+def _record_event_detail_clarification_trace(
+    trace: TraceRecorder | None,
+    decision,
+) -> None:
+    if trace is None:
+        return
+    clarification = decision.clarification
+    with trace.measure("memory_clarification_required") as details:
+        details.update(
+            {
+                "reason": decision.reason,
+                "field": clarification.field if clarification is not None else None,
+                "candidate_memory_ids": (
+                    list(clarification.candidate_memory_ids) if clarification is not None else []
+                ),
+                "question": clarification.question if clarification is not None else None,
+            }
+        )
+
+
+def _record_event_detail_store_trace(
+    trace: TraceRecorder | None,
+    *,
+    operation: str,
+    target_memory_id: str | None,
+    detail_id: str | None,
+    status: str,
+    detail_ids: list[str] | None = None,
+) -> None:
+    if trace is None:
+        return
+    with trace.measure("memory_event_detail_store") as details:
+        details.update(
+            {
+                "operation": operation,
+                "target_memory_id": target_memory_id,
+                "detail_id": detail_id,
+                "detail_ids": list(detail_ids or ([] if detail_id is None else [detail_id])),
+                "status": status,
+            }
+        )
+
+
+def _event_detail_id(
+    *,
+    source_message_id: str,
+    target_memory_id: str,
+    unit_id: str,
+) -> str:
+    """Create a stable detail identity for source-message idempotency."""
+
+    return str(
+        uuid5(
+            NAMESPACE_URL,
+            f"loveapp:event-detail:{source_message_id}:{target_memory_id}:{unit_id}",
+        )
+    )
+
+
+def _event_detail_to_core_enrichment(
+    draft: EventDetailDraft,
+    *,
+    target: MemoryItem | None,
+) -> GenericEventEnrichment | None:
+    if target is None or not target.source_message_id:
+        return None
+    try:
+        field = EventEnrichmentField(draft.detail_type)
+    except ValueError:
+        return None
+    if field == EventEnrichmentField.CUSTOM:
+        return None
+    try:
+        return GenericEventEnrichment(
+            target_memory_id=target.id,
+            antecedent_message_id=target.source_message_id,
+            evidence_span=draft.evidence_span,
+            field=field,
+            value=draft.value,
+            confidence=draft.confidence,
+            reason="vnext_event_detail_core_field",
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def _record_event_pattern_consolidation_trace(
@@ -2980,10 +3237,9 @@ def _event_can_support_state(
     state: MemoryCandidate,
 ) -> bool:
     same_subject = event.subject.casefold() == state.subject.casefold()
-    interaction_scope = (
-        is_relationship_interaction_subject(event.subject)
-        and is_relationship_interaction_subject(state.subject)
-    )
+    interaction_scope = is_relationship_interaction_subject(
+        event.subject
+    ) and is_relationship_interaction_subject(state.subject)
     if not same_subject and not interaction_scope:
         return False
     dimension = (state.state_dimension or "").casefold()
@@ -3113,8 +3369,7 @@ def _validate_claim_verification(
         raise ValueError("claim verifier returned an unregistered canonical predicate")
     expected_dimension = _verifier_state_dimension(spec.state_dimension) or spec.state_dimension
     verified_dimension = (
-        _verifier_state_dimension(verification.state_dimension)
-        or verification.state_dimension
+        _verifier_state_dimension(verification.state_dimension) or verification.state_dimension
     )
     if verification.state_dimension is not None and verified_dimension != expected_dimension:
         raise ValueError("claim verifier returned an incompatible state dimension")

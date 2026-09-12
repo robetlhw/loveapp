@@ -22,8 +22,10 @@ from loveapp.domain.memory_architecture_vnext import (
     ResolutionStatus,
     TargetResolution,
 )
+from loveapp.domain.memory_dimensions import normalize_interaction_event_type
 from loveapp.domain.memory_semantic_units import EnrichmentDraft
 from loveapp.domain.runtime_context import PendingMemoryContext, PendingQuestion
+from loveapp.ports.observability import TraceRecorder
 
 
 class CandidateGenerator:
@@ -41,6 +43,8 @@ class CandidateGenerator:
         pending_memory_context: PendingMemoryContext | None = None,
         user_id: str | None = None,
         relationship_id: str | None = None,
+        reference_time: datetime | None = None,
+        trace: TraceRecorder | None = None,
     ) -> CandidateGenerationResult:
         memories = [
             item
@@ -48,6 +52,11 @@ class CandidateGenerator:
             if isinstance(item, MemoryItem)
             and item.kind == MemoryKind.INTERACTION_EVENT
             and item.status in {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}
+            and (
+                reference_time is None
+                or item.expires_at is None
+                or _is_after(item.expires_at, reference_time)
+            )
             and (user_id is None or item.user_id == user_id)
             and (relationship_id is None or item.relationship_id == relationship_id)
         ]
@@ -62,6 +71,18 @@ class CandidateGenerator:
         event_type_hint = _event_type_hint(draft)
         subject_hint = _subject_hint(draft)
         field_hint = _field_hint(draft)
+        _record_pending_binding_trace(
+            trace,
+            pending=pending,
+            target_in_scope=(
+                pending is not None
+                and bool(pending.target_memory_id)
+                and pending.target_memory_id in by_id
+            ),
+            field_matches=(
+                pending is not None and _pending_field_matches(pending, field_hint)
+            ),
+        )
 
         def add(
             item: MemoryItem,
@@ -136,8 +157,7 @@ class CandidateGenerator:
         structured = [
             item
             for item in memories
-            if _event_type_matches(item, event_type_hint)
-            and _subject_matches(item, subject_hint)
+            if _event_type_matches(item, event_type_hint) and _subject_matches(item, subject_hint)
         ]
         if structured and (event_type_hint or subject_hint or pending is not None):
             for item in structured:
@@ -162,7 +182,7 @@ class CandidateGenerator:
                 by_id[item.id],
                 CandidateSource.VECTOR_FALLBACK,
                 signals={"retrieval_match": True},
-                score=float(score) if isinstance(score, (int, float)) else None,
+                score=float(score) if isinstance(score, int | float) else None,
             )
 
         ordered = sorted(
@@ -184,7 +204,7 @@ class CandidateGenerator:
             or CandidateSource.RECENT_EVENT_CONTEXT in channels
             or CandidateSource.STRUCTURED_LOOKUP in channels
         )
-        return CandidateGenerationResult(
+        result = CandidateGenerationResult(
             candidates=ordered[:20],
             channels_used=sorted(channels, key=lambda source: source.value),
             candidate_set_complete=complete,
@@ -194,6 +214,10 @@ class CandidateGenerator:
                 else "vector_fallback_only_or_no_candidate_channel"
             ),
         )
+        if trace is not None:
+            with trace.measure("memory_candidate_generation") as details:
+                details.update(result.as_trace())
+        return result
 
 
 class TargetResolver:
@@ -206,13 +230,14 @@ class TargetResolver:
         generated: CandidateGenerationResult,
         pending_question: PendingQuestion | None = None,
         pending_memory_context: PendingMemoryContext | None = None,
+        trace: TraceRecorder | None = None,
     ) -> TargetResolution:
         pending = pending_question
         if pending is None and pending_memory_context is not None:
             pending = pending_memory_context.to_pending_question()
 
         candidates = list(generated.candidates)
-        candidate_ids = [candidate.memory_id for candidate in candidates]
+        candidate_ids = [candidate.memory_id for candidate in candidates[:8]]
 
         # A bound target is an explicit application-level reference. It is
         # allowed to win over other candidates, but only after active/event
@@ -228,20 +253,24 @@ class TargetResolver:
                 None,
             )
             if bound is not None and _compatible(draft, bound.memory):
-                return TargetResolution(
+                result = TargetResolution(
                     status=ResolutionStatus.RESOLVED,
                     target_memory_id=bound.memory_id,
                     candidate_ids=candidate_ids,
                     resolution_evidence=["pending_question_binding"],
                     reason="application_bound_pending_target",
                 )
+                _record_resolution_trace(trace, result)
+                return result
 
         if not candidates:
-            return TargetResolution(
+            result = TargetResolution(
                 status=ResolutionStatus.UNRESOLVED,
                 candidate_ids=[],
                 reason="no_semantic_candidates",
             )
+            _record_resolution_trace(trace, result)
+            return result
         if len(candidates) > 1:
             clarification = ClarificationRequired(
                 reason="ambiguous_semantic_target",
@@ -249,30 +278,36 @@ class TargetResolver:
                 candidate_memory_ids=candidate_ids,
                 question="Which interaction event does this detail describe?",
             )
-            return TargetResolution(
+            result = TargetResolution(
                 status=ResolutionStatus.AMBIGUOUS,
                 candidate_ids=candidate_ids,
                 reason="ambiguous_semantic_target",
                 clarification=clarification,
             )
+            _record_resolution_trace(trace, result)
+            return result
 
         candidate = candidates[0]
         if not generated.candidate_set_complete:
-            return TargetResolution(
+            result = TargetResolution(
                 status=ResolutionStatus.UNRESOLVED,
                 candidate_ids=candidate_ids,
                 resolution_evidence=["vector_fallback_only"],
                 reason="candidate_set_not_complete",
             )
+            _record_resolution_trace(trace, result)
+            return result
         rejection = _compatibility_reason(draft, candidate.memory)
         if rejection is not None:
-            return TargetResolution(
+            result = TargetResolution(
                 status=ResolutionStatus.UNRESOLVED,
                 candidate_ids=candidate_ids,
                 resolution_evidence=[rejection],
                 reason=rejection,
             )
-        return TargetResolution(
+            _record_resolution_trace(trace, result)
+            return result
+        result = TargetResolution(
             status=ResolutionStatus.RESOLVED,
             target_memory_id=candidate.memory_id,
             candidate_ids=candidate_ids,
@@ -283,13 +318,54 @@ class TargetResolver:
             ],
             reason="unique_semantic_candidate",
         )
+        _record_resolution_trace(trace, result)
+        return result
+
+
+def _record_resolution_trace(
+    trace: TraceRecorder | None,
+    resolution: TargetResolution,
+) -> None:
+    if trace is not None:
+        with trace.measure("memory_target_resolution") as details:
+            details.update(resolution.as_trace())
+
+
+def _record_pending_binding_trace(
+    trace: TraceRecorder | None,
+    *,
+    pending: PendingQuestion | None,
+    target_in_scope: bool,
+    field_matches: bool,
+) -> None:
+    """Expose binding provenance without passing authority to extraction."""
+
+    if trace is None:
+        return
+    with trace.measure("memory_pending_binding") as details:
+        details.update(
+            {
+                "present": pending is not None,
+                "question_id": pending.id if pending is not None else None,
+                "assistant_message_id": (
+                    pending.assistant_message_id if pending is not None else None
+                ),
+                "status": pending.status if pending is not None else None,
+                "target_memory_id": pending.target_memory_id if pending is not None else None,
+                "target_in_scope": target_in_scope,
+                "field_matches": field_matches,
+                "is_open": pending.is_open if pending is not None else False,
+            }
+        )
 
 
 def _event_type_hint(draft: EventDetailDraft | EnrichmentDraft) -> str | None:
     if isinstance(draft, EventDetailDraft):
-        return _normalized_text(draft.event_type_constraint)
-    raw = draft.target_semantic_hint.get("event_type")
-    return _normalized_text(raw)
+        raw = draft.event_type_constraint
+    else:
+        raw = draft.target_semantic_hint.get("event_type")
+    normalized = normalize_interaction_event_type(raw)
+    return normalized or _normalized_text(raw)
 
 
 def _subject_hint(draft: EventDetailDraft | EnrichmentDraft) -> str | None:
@@ -310,8 +386,11 @@ def _pending_field_matches(pending: PendingQuestion, field: str | None) -> bool:
 def _event_type_matches(item: MemoryItem, expected: str | None) -> bool:
     if not expected:
         return True
-    actual = str(item.payload.get("event_type") or "").strip().casefold()
-    return actual == expected.casefold()
+    actual = normalize_interaction_event_type(item.payload.get("event_type"))
+    if actual is None:
+        actual = str(item.payload.get("event_type") or "").strip().casefold()
+    expected_value = normalize_interaction_event_type(expected) or expected.casefold()
+    return actual == expected_value
 
 
 def _subject_matches(item: MemoryItem, expected: str | None) -> bool:
@@ -394,6 +473,17 @@ def _parse_date(value: str) -> date | None:
         return date.fromisoformat(value.strip().replace("/", "-"))
     except ValueError:
         return None
+
+
+def _is_after(value: datetime, reference_time: datetime) -> bool:
+    """Compare expiry values without failing on mixed naive/aware datetimes."""
+
+    expires_at = value
+    if expires_at.tzinfo is None and reference_time.tzinfo is not None:
+        expires_at = expires_at.replace(tzinfo=reference_time.tzinfo)
+    elif expires_at.tzinfo is not None and reference_time.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=None)
+    return expires_at > reference_time
 
 
 def _normalize_subject(value: str) -> str:

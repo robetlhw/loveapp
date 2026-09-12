@@ -86,6 +86,40 @@ class CandidateGenerationResult(BaseModel):
         self.channels_used = list(dict.fromkeys(self.channels_used))
         return self
 
+    def as_trace(self) -> dict[str, object]:
+        """Return a bounded, ID-only diagnostic payload for observability."""
+
+        return {
+            "candidate_memory_ids": [candidate.memory_id for candidate in self.candidates[:20]],
+            "candidate_details": [
+                {
+                    "memory_id": candidate.memory_id,
+                    "sources": [source.value for source in candidate.sources],
+                    "signals": dict(candidate.signals),
+                    "hard_filter_result": candidate.hard_filter_result,
+                    "rank": candidate.rank,
+                    "score": candidate.score,
+                    "event_type_match": candidate.signals.get("event_type_match"),
+                    "subject_match": candidate.signals.get("subject_match"),
+                    "temporal_match": candidate.signals.get("temporal_match"),
+                    "explicit_reference_match": candidate.signals.get("explicit_reference_match"),
+                    "pending_binding_match": candidate.signals.get("pending_binding_match"),
+                    "vector_score": candidate.score,
+                }
+                for candidate in self.candidates[:20]
+            ],
+            "candidate_sources": {
+                candidate.memory_id: [source.value for source in candidate.sources]
+                for candidate in self.candidates[:20]
+            },
+            "candidate_signals": {
+                candidate.memory_id: dict(candidate.signals) for candidate in self.candidates[:20]
+            },
+            "channels_used": [source.value for source in self.channels_used],
+            "candidate_set_complete": self.candidate_set_complete,
+            "reason": self.reason,
+        }
+
 
 class ClarificationRequired(BaseModel):
     """Safe application-layer result when target identity is ambiguous."""
@@ -123,6 +157,16 @@ class TargetResolution(BaseModel):
             raise ValueError("clarification is only valid for ambiguous resolution")
         return self
 
+    def as_trace(self) -> dict[str, object]:
+        return {
+            "status": self.status.value,
+            "target_memory_id": self.target_memory_id,
+            "candidate_ids": list(self.candidate_ids),
+            "resolution_evidence": list(self.resolution_evidence),
+            "reason": self.reason,
+            "clarification_required": self.clarification is not None,
+        }
+
 
 class EventDetail(BaseModel):
     """Lightweight detail attached to one InteractionEvent, not a Core kind."""
@@ -156,10 +200,14 @@ class WriteDecision(BaseModel):
 
     @model_validator(mode="after")
     def validate_write_boundary(self) -> WriteDecision:
-        if self.operation in {
-            WriteOperation.ENRICH_CORE,
-            WriteOperation.ATTACH_DETAIL,
-        } and not self.target_memory_id:
+        if (
+            self.operation
+            in {
+                WriteOperation.ENRICH_CORE,
+                WriteOperation.ATTACH_DETAIL,
+            }
+            and not self.target_memory_id
+        ):
             raise ValueError("targeted write decisions require a target_memory_id")
         if self.operation == WriteOperation.ATTACH_DETAIL and self.detail is None:
             raise ValueError("attach_detail decisions require an EventDetail")
@@ -168,6 +216,15 @@ class WriteDecision(BaseModel):
         if self.operation != WriteOperation.CLARIFY and self.clarification is not None:
             raise ValueError("clarification is only valid for clarify decisions")
         return self
+
+    def as_trace(self) -> dict[str, object]:
+        return {
+            "operation": self.operation.value,
+            "target_memory_id": self.target_memory_id,
+            "has_event_detail": self.detail is not None,
+            "clarification_required": self.clarification is not None,
+            "reason": self.reason,
+        }
 
 
 __all__ = [

@@ -80,6 +80,7 @@ from loveapp.evaluation import (
     evaluate_live_routing_conversations,
     evaluate_memory_admission_integration,
     evaluate_memory_admission_v1,
+    evaluate_memory_architecture_vnext,
     evaluate_memory_benchmark_v1,
     evaluate_memory_extraction_v1,
     evaluate_memory_foundation,
@@ -113,6 +114,7 @@ from loveapp.evaluation import (
     render_memory_admission_policy_review,
     render_memory_admission_strong_review_audit,
     render_memory_admission_v1_report,
+    render_memory_architecture_vnext_report,
     render_memory_benchmark_v1_report,
     render_memory_extraction_v1_report,
     render_memory_gate_v2_report,
@@ -2819,6 +2821,46 @@ def memory_benchmark_v1_eval(
         "Cases: "
         f"{report['case_count']} | Smoke pass rate: "
         f"{report['metrics']['production_claim_smoke_pass_rate']}"
+    )
+
+
+@eval_app.command("memory-architecture-vnext")
+def memory_architecture_vnext_eval(
+    dataset: Annotated[
+        Path, typer.Option("--dataset", help="Frozen Memory Benchmark V1 JSONL path.")
+    ] = Path("evals/memory/benchmark_v1.jsonl"),
+    output: Annotated[
+        Path, typer.Option("--output", help="VNext contract report JSON path.")
+    ] = Path(".data/evals/memory_architecture_vnext_report.json"),
+    case: Annotated[str | None, typer.Option("--case", help="Run one BM-xxx case.")] = None,
+    profile: Annotated[
+        str | None,
+        typer.Option("--profile", help="Benchmark profile: original, expansion, or merged."),
+    ] = None,
+) -> None:
+    """Project the frozen benchmark into the VNext responsibility layers."""
+    try:
+        report = evaluate_memory_architecture_vnext(
+            dataset,
+            case_id=case,
+            profile=profile,
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        markdown_path = output.with_suffix(".md")
+        markdown_path.write_text(
+            render_memory_architecture_vnext_report(report),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        console.print(f"[red]Memory Architecture VNext evaluation failed: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]VNext contract report saved:[/green] {output}")
+    console.print(f"Markdown report saved: {markdown_path}")
+    console.print(
+        "Cases: "
+        f"{report['case_count']} | Stage1 positive: "
+        f"{report['metrics']['semantic_understanding']['stage1_positive_case_count']}"
     )
 
 
