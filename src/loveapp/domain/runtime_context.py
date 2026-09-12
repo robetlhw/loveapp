@@ -67,6 +67,9 @@ class PendingMemoryContext(BaseModel):
     expected_slot: str | None = Field(default=None, max_length=80)
     topic: str | None = Field(default=None, max_length=80)
     pending_slot_id: str | None = Field(default=None, max_length=160)
+    assistant_message_id: str | None = Field(default=None, max_length=160)
+    # Application-owned binding; excluded from model-facing context payloads.
+    target_memory_id: str | None = Field(default=None, max_length=160, exclude=True)
     target_kind: str | None = Field(default=None, max_length=80)
     event_type: str | None = Field(default=None, max_length=80)
     target_field: str | None = Field(default=None, max_length=80)
@@ -84,8 +87,8 @@ class PendingMemoryContext(BaseModel):
             target_field=self.target_field or self.expected_slot,
             expected_answer_type=self.expected_slot or self.target_field,
             status=self.status,
-            assistant_message_id=self.created_turn,
-            target_memory_id=None,
+            assistant_message_id=self.assistant_message_id or self.created_turn,
+            target_memory_id=self.target_memory_id,
             event_type=self.event_type,
             expected_field=self.target_field or self.expected_slot,
             created_turn=self.created_turn,

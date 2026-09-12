@@ -53,6 +53,7 @@ from loveapp.domain.memory_dimensions import (
 )
 from loveapp.domain.memory_semantic_units import (
     EnrichmentDraft,
+    EventDetailDraft,
     NewMemoryDraft,
     RefinementDraft,
     SemanticAtomicExtraction,
@@ -870,7 +871,7 @@ def _build_detailed_system_prompt(
 
 
 def _proposition_for_unit(
-    unit: NewMemoryDraft | EnrichmentDraft | RefinementDraft,
+    unit: NewMemoryDraft | EnrichmentDraft | EventDetailDraft | RefinementDraft,
     coarse: CoarseExtraction,
 ) -> Any | None:
     """Match a detailed unit to its Stage 1 proposition by id or evidence."""
@@ -1369,6 +1370,11 @@ Context-aware Stage 2 contract:
 - A new occurrence with its own time/event evidence is new_memory, not enrichment. A phrase
   answering a pending question may be an enrichment candidate only when the context supports it.
 - Never emit target_memory_id(s), mutation_action, supersedes_id, or db_patch.
+- For a soft attribute or incidental observation, emit an event_detail unit
+  with detail_type, value, event_type_constraint, and the exact raw
+  evidence_span. event_detail must never contain a target memory ID or a write
+  operation. Target resolution and the choice between core enrichment and an
+  attached detail happen in Python.
 """.strip()
 
 
@@ -1778,7 +1784,7 @@ def _parse_detailed_extraction(
         )
 
     claims = iter(parsed.extraction.claims)
-    units: list[NewMemoryDraft | EnrichmentDraft | RefinementDraft] = []
+    units: list[NewMemoryDraft | EnrichmentDraft | EventDetailDraft | RefinementDraft] = []
     for payload in semantic_payloads:
         semantic_type = payload.get("semantic_type")
         if semantic_type == "new_memory":
@@ -1787,6 +1793,8 @@ def _parse_detailed_extraction(
         unit = (
             EnrichmentDraft.model_validate(payload)
             if semantic_type == "enrichment"
+            else EventDetailDraft.model_validate(payload)
+            if semantic_type == "event_detail"
             else RefinementDraft.model_validate(payload)
         )
         if unit.evidence_span not in source_text:
@@ -1830,6 +1838,8 @@ def _normalize_detailed_semantic_unit(
         "attribute_completion": "enrichment",
         "enrichment_draft": "enrichment",
         "refinement_draft": "refinement",
+        "event_detail_draft": "event_detail",
+        "detail": "event_detail",
     }.get(semantic_type, semantic_type)
     unit.pop("type", None)
     if semantic_type == "new_memory":
@@ -1840,6 +1850,45 @@ def _normalize_detailed_semantic_unit(
             "semantic_type": "new_memory",
             **_normalize_detailed_claim(unit, index=index),
         }
+    if semantic_type == "event_detail":
+        unit["semantic_type"] = semantic_type
+        unit["unit_id"] = str(
+            unit.get("unit_id")
+            or unit.pop("draft_id", None)
+            or unit.pop("proposition_id", None)
+            or f"u{index}"
+        )
+        if "detail_type" not in unit:
+            unit["detail_type"] = unit.pop("attribute_name", None) or unit.pop("field", None)
+        if "event_type_constraint" not in unit:
+            event_type_hint = unit.pop("event_type_hint", None)
+            if event_type_hint is None:
+                event_type_hint = unit.pop("event_type", None)
+            if isinstance(event_type_hint, str) and event_type_hint.strip():
+                unit["event_type_constraint"] = event_type_hint.strip()
+        if "evidence_span" not in unit:
+            evidence_spans = unit.pop("evidence_spans", None)
+            if isinstance(evidence_spans, list) and len(evidence_spans) == 1:
+                unit["evidence_span"] = evidence_spans[0]
+        if "source_proposition_id" not in unit and unit.get("proposition_id"):
+            unit["source_proposition_id"] = unit.pop("proposition_id")
+        if "context_source_question_ids" not in unit:
+            question_ids = unit.pop("answered_questions", None)
+            if question_ids is None:
+                question_ids = unit.pop("answered_pending_questions", None)
+            if isinstance(question_ids, list):
+                unit["context_source_question_ids"] = question_ids
+        if "reference_hints" not in unit:
+            hints = unit.pop("target_semantic_hint", None)
+            if isinstance(hints, dict):
+                unit["reference_hints"] = {
+                    str(key): str(value)
+                    for key, value in hints.items()
+                    if str(key) not in {"target_memory_id", "target_memory_ids"}
+                }
+        unit.pop("target_kind", None)
+        unit.pop("attribute_namespace", None)
+        return unit
     if semantic_type not in {"enrichment", "refinement"}:
         raise MemoryResponseError(
             f"unsupported two-stage semantic type: {semantic_type}",

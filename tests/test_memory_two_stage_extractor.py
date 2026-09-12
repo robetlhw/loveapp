@@ -8,7 +8,11 @@ from pydantic import SecretStr, ValidationError
 from loveapp.adapters.memory.two_stage import TwoStageMemoryExtractor, _fallback_reason_code
 from loveapp.core.timing import ExecutionTrace
 from loveapp.domain.memory import MemoryKind, MemorySemanticGateReason
-from loveapp.domain.memory_semantic_units import EnrichmentDraft, NewMemoryDraft
+from loveapp.domain.memory_semantic_units import (
+    EnrichmentDraft,
+    EventDetailDraft,
+    NewMemoryDraft,
+)
 
 
 class _FakeCompletions:
@@ -459,6 +463,54 @@ async def test_two_stage_native_semantic_units_preserve_new_memory_and_enrichmen
         "attribute_name"
     ] == "cause"
     assert len(completions.calls) == 2
+    await extractor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_two_stage_native_event_detail_is_semantic_only() -> None:
+    extractor, _ = _fake_extractor(
+        [
+            {
+                "should_extract": True,
+                "gate_reason": "COMPOUND_MEMORY",
+                "propositions": [
+                    {
+                        "proposition_id": "p1",
+                        "evidence_span": "she was happy",
+                        "candidate_kinds": ["interaction_event"],
+                        "semantic_role": "attribute_completion",
+                    }
+                ],
+                "discarded_spans": [],
+            },
+            {
+                "semantic_units": [
+                    {
+                        "semantic_type": "event_detail",
+                        "unit_id": "d1",
+                        "event_type_constraint": "shared_activity",
+                        "detail_type": "emotion",
+                        "value": "happy",
+                        "evidence_span": "she was happy",
+                    }
+                ],
+                "discarded_spans": [],
+            },
+        ]
+    )
+
+    result = await extractor.extract(
+        "Yesterday she was happy",
+        reference_time=datetime(2026, 9, 10, tzinfo=UTC),
+        existing_memories=[],
+        conversation_history=[],
+    )
+
+    assert result.claims == []
+    assert isinstance(result.semantic_units[0], EventDetailDraft)  # type: ignore[attr-defined]
+    detail = result.semantic_units[0]
+    assert detail.evidence_span == "she was happy"  # type: ignore[union-attr]
+    assert "target_memory_id" not in detail.model_dump()  # type: ignore[union-attr]
     await extractor.aclose()
 
 

@@ -22,7 +22,7 @@ from loveapp.domain.memory_architecture_vnext import (
     WriteDecision,
     WriteOperation,
 )
-from loveapp.domain.runtime_context import PendingQuestion
+from loveapp.domain.runtime_context import PendingMemoryContext, PendingQuestion
 
 NOW = datetime(2026, 9, 12, 12, tzinfo=UTC)
 
@@ -87,6 +87,22 @@ def test_pending_question_supports_conversation_binding_metadata() -> None:
     assert question.question_id == "q1"
     assert question.is_open
     assert question.target_memory_id == "event-1"
+
+
+def test_legacy_pending_context_projects_binding_without_exposing_target_to_model() -> None:
+    pending = PendingMemoryContext(
+        previous_assistant_question="Why did you argue?",
+        expected_slot="cause",
+        target_kind=MemoryKind.INTERACTION_EVENT.value,
+        event_type="conflict",
+        target_field="cause",
+        target_memory_id="event-1",
+        assistant_message_id="assistant-1",
+        created_turn="turn-1",
+    )
+    question = pending.to_pending_question()
+    assert question.target_memory_id == "event-1"
+    assert "target_memory_id" not in pending.model_dump(mode="json")
 
 
 def test_candidate_requires_identity_and_retains_channel_provenance() -> None:

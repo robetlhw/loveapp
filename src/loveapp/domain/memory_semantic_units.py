@@ -179,6 +179,38 @@ class EnrichmentDraft(BaseModel):
         return self
 
 
+class EventDetailDraft(BaseModel):
+    """A semantic Event detail with no target or storage authority."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    semantic_type: Literal["event_detail"] = "event_detail"
+    unit_id: str = Field(min_length=1, max_length=80)
+    event_type_constraint: str | None = Field(default=None, max_length=80)
+    detail_type: str = Field(pattern=r"^[a-z][a-z0-9_]*$", max_length=80)
+    value: str | int | float | bool | dict[str, str] | list[str]
+    evidence_span: str = Field(min_length=1, max_length=1000)
+    source_proposition_id: str | None = Field(default=None, max_length=80)
+    context_source_question_ids: list[str] = Field(default_factory=list, max_length=4)
+    temporal_hint: str | None = Field(default=None, max_length=160)
+    subject_hint: str | None = Field(default=None, max_length=80)
+    reference_hints: dict[str, str] = Field(default_factory=dict, max_length=8)
+    provenance: SemanticUnitProvenance | None = None
+    perspective: MemoryPerspective = MemoryPerspective.USER_REPORTED
+    epistemic_status: EpistemicStatus = EpistemicStatus.CONFIRMED
+    confidence: float = Field(default=0.8, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_semantic_boundary(self) -> EventDetailDraft:
+        if _contains_write_authority(self.model_dump(mode="python")):
+            raise ValueError("event detail drafts cannot contain write authority")
+        if self.event_type_constraint is not None and not self.event_type_constraint.strip():
+            raise ValueError("event detail event_type_constraint cannot be blank")
+        if any(not question_id.strip() for question_id in self.context_source_question_ids):
+            raise ValueError("event detail question IDs cannot be blank")
+        return self
+
+
 class RefinementDraft(BaseModel):
     """A trace-only proposal to make one existing proposition more precise."""
 
@@ -204,7 +236,7 @@ class RefinementDraft(BaseModel):
 
 
 type ExtractedSemanticUnit = Annotated[
-    NewMemoryDraft | EnrichmentDraft | RefinementDraft,
+    NewMemoryDraft | EnrichmentDraft | EventDetailDraft | RefinementDraft,
     Field(discriminator="semantic_type"),
 ]
 
@@ -237,6 +269,7 @@ class SemanticAtomicExtraction(AtomicExtraction):
 __all__ = [
     "AttributeNamespace",
     "EnrichmentDraft",
+    "EventDetailDraft",
     "ExtractedSemanticUnit",
     "NewMemoryDraft",
     "RefinementDraft",
