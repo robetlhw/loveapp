@@ -6,6 +6,7 @@ import pytest
 from pydantic import SecretStr
 
 from loveapp.adapters.memory.two_stage import TwoStageMemoryExtractor
+from loveapp.core.timing import ExecutionTrace
 from loveapp.domain.memory import MemoryKind, MemorySemanticGateReason
 from loveapp.domain.memory_semantic_units import EnrichmentDraft, NewMemoryDraft
 
@@ -106,6 +107,63 @@ async def test_two_stage_uses_one_coarse_and_one_batched_detailed_call() -> None
         completions.calls[1]["messages"][1]["content"]  # type: ignore[index]
     )
     assert "target_memory_id" not in detailed_payload["coarse_extraction"]
+
+    await extractor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_nested_route_trace_does_not_trigger_stage2_fallback() -> None:
+    extractor, completions = _fake_extractor(
+        [
+            {
+                "should_extract": True,
+                "gate_reason": "INTERACTION_PATTERN",
+                "propositions": [
+                    {
+                        "proposition_id": "p1",
+                        "evidence_span": "回复越来越慢",
+                        "candidate_kinds": ["interaction_pattern"],
+                        "semantic_role": "new_proposition",
+                    }
+                ],
+                "discarded_spans": [],
+            },
+            {
+                "claims": [
+                    {
+                        "claim_id": "c1",
+                        "kind": "interaction_pattern",
+                        "subject": "relationship",
+                        "predicate": "response_latency",
+                        "summary": "回复越来越慢",
+                        "evidence_spans": ["回复越来越慢"],
+                        "payload": {"metric": "response_engagement", "direction": "worsening"},
+                    }
+                ],
+                "discarded_spans": [],
+            },
+        ]
+    )
+    trace = ExecutionTrace()
+
+    result = await extractor.extract(
+        "回复越来越慢",
+        reference_time=datetime(2026, 9, 10, tzinfo=UTC),
+        existing_memories=[],
+        conversation_history=[],
+        trace=trace,
+    )
+
+    assert len(completions.calls) == 2
+    assert len(result.claims) == 1
+    assert extractor.last_diagnostic["final_extractor_used"] == "two_stage_native"
+    assert extractor.last_diagnostic["fallback"]["triggered"] is False
+    detailed_trace = next(
+        record for record in trace.snapshot() if record.name == "memory_two_stage_detailed"
+    )
+    assert detailed_trace.details["routes"][0]["selected_route"] == "pattern"
+    # The nested details must remain JSON serializable for ConversationTurnResult.
+    detailed_trace.model_dump_json()
 
     await extractor.aclose()
 

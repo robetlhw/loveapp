@@ -4,6 +4,8 @@ from contextlib import contextmanager
 from time import perf_counter
 from typing import Any
 
+from pydantic import JsonValue
+
 from loveapp.domain.observability import StepTiming, TimingEvent, TimingStatus
 
 TimingCallback = Callable[[TimingEvent], None]
@@ -17,7 +19,7 @@ class ExecutionTrace:
         self._background_tasks: set[asyncio.Task] = set()
         self._active_steps: dict[
             int,
-            tuple[str, float, float, dict[str, str | int | float | bool | None]],
+            tuple[str, float, float, dict[str, JsonValue]],
         ] = {}
 
     def create_task(
@@ -50,10 +52,10 @@ class ExecutionTrace:
     def measure(
         self,
         name: str,
-    ) -> Iterator[dict[str, str | int | float | bool | None]]:
+    ) -> Iterator[dict[str, JsonValue]]:
         started = perf_counter()
         offset_ms = (started - self._origin) * 1000
-        details: dict[str, str | int | float | bool | None] = {}
+        details: dict[str, JsonValue] = {}
         step_id = id(details)
         self._active_steps[step_id] = (name, started, offset_ms, details)
         self._emit(TimingEvent(name=name, phase="started"))

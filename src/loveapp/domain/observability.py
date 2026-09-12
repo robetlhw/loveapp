@@ -1,6 +1,6 @@
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, JsonValue
 
 
 class TimingStatus(StrEnum):
@@ -15,7 +15,10 @@ class StepTiming(BaseModel):
     started_offset_ms: float = Field(ge=0)
     status: TimingStatus = TimingStatus.COMPLETED
     error: str | None = None
-    details: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+    # Trace details are diagnostic JSON, not a scalar-only metric map.  Some
+    # stages (for example two-stage extraction routing) need bounded nested
+    # lists and objects to remain observable without changing domain writes.
+    details: dict[str, JsonValue] = Field(default_factory=dict)
 
 
 class TimingEvent(BaseModel):

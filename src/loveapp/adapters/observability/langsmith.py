@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -8,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import dotenv_values
-from pydantic import SecretStr
+from pydantic import JsonValue, SecretStr
 
 from loveapp.ports.observability import TraceDetails
 
@@ -121,9 +122,26 @@ def _run_type(name: str) -> str:
     )
 
 
-def _safe_metadata(values: Mapping[str, object]) -> dict[str, str | int | float | bool | None]:
-    return {
-        str(key): value
-        for key, value in values.items()
-        if value is None or isinstance(value, (str, int, float, bool))
-    }
+def _safe_metadata(values: Mapping[str, object]) -> dict[str, JsonValue]:
+    """Keep scalar metadata native and encode nested diagnostics losslessly.
+
+    LangSmith metadata has historically been treated as scalar-only in this
+    adapter.  Nested trace details are valid for the local ExecutionTrace but
+    must not be silently discarded when this optional sink is enabled, so
+    JSON-compatible containers are stored as bounded JSON strings.
+    """
+
+    result: dict[str, JsonValue] = {}
+    for key, value in values.items():
+        if value is None or isinstance(value, (str, int, float, bool)):
+            result[str(key)] = value
+        elif isinstance(value, (list, dict)):
+            try:
+                result[str(key)] = json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            except (TypeError, ValueError):
+                continue
+    return result

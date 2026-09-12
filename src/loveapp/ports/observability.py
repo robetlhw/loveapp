@@ -1,7 +1,9 @@
 from contextlib import AbstractContextManager
 from typing import Protocol
 
-TraceDetails = dict[str, str | int | float | bool | None]
+from pydantic import JsonValue
+
+TraceDetails = dict[str, JsonValue]
 
 
 class TraceRecorder(Protocol):

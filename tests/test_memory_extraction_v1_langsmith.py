@@ -136,6 +136,31 @@ def test_langsmith_recorder_maps_details_to_span(monkeypatch: Any) -> None:
     assert trace_arguments[0]["run_type"] == "llm"
 
 
+def test_langsmith_recorder_preserves_nested_details_as_json(monkeypatch: Any) -> None:
+    run = SimpleNamespace(metadata={}, outputs=None)
+    run.end = lambda *, outputs: setattr(run, "outputs", outputs)
+
+    @contextmanager
+    def fake_context(**_: Any):
+        yield
+
+    @contextmanager
+    def fake_trace(*_: Any, **__: Any):
+        yield run
+
+    monkeypatch.setattr("langsmith.run_helpers.tracing_context", fake_context)
+    monkeypatch.setattr("langsmith.run_helpers.trace", fake_trace)
+    recorder = LangSmithTraceRecorder(enabled=True, client=object())
+
+    with recorder.measure("memory_two_stage_detailed") as details:
+        details["routes"] = [{"selected_route": "pattern", "candidate_routes": ["pattern"]}]
+
+    assert run.metadata["routes"] == (
+        '[{"selected_route":"pattern","candidate_routes":["pattern"]}]'
+    )
+    assert run.outputs["telemetry"]["routes"] == run.metadata["routes"]
+
+
 def test_dataset_sync_reuses_dataset_and_stable_example_ids() -> None:
     client = _FakeLangSmithClient()
 
