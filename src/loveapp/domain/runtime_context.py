@@ -36,6 +36,16 @@ class PendingQuestion(BaseModel):
     target_field: str | None = Field(default=None, max_length=80)
     expected_answer_type: str | None = Field(default=None, max_length=80)
     status: str = Field(default="open", max_length=40)
+    # Conversation binding metadata is produced by application code when the
+    # Assistant asks a question.  It is not semantic extraction authority.
+    assistant_message_id: str | None = Field(default=None, max_length=160)
+    # Application code may use this binding during resolution, but it must
+    # never be serialized into the read-only extractor context.
+    target_memory_id: str | None = Field(default=None, max_length=160, exclude=True)
+    event_type: str | None = Field(default=None, max_length=80)
+    expected_field: str | None = Field(default=None, max_length=80)
+    created_turn: str | None = Field(default=None, max_length=160)
+    expires_after_turns: int = Field(default=2, ge=1, le=8)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     @property
@@ -43,6 +53,10 @@ class PendingQuestion(BaseModel):
         """Public contract spelling retained alongside the legacy ``id``."""
 
         return self.id
+
+    @property
+    def is_open(self) -> bool:
+        return self.status.casefold() == "open"
 
 
 class PendingMemoryContext(BaseModel):
@@ -70,6 +84,12 @@ class PendingMemoryContext(BaseModel):
             target_field=self.target_field or self.expected_slot,
             expected_answer_type=self.expected_slot or self.target_field,
             status=self.status,
+            assistant_message_id=self.created_turn,
+            target_memory_id=None,
+            event_type=self.event_type,
+            expected_field=self.target_field or self.expected_slot,
+            created_turn=self.created_turn,
+            expires_after_turns=self.expires_after_turns,
         )
 
 
