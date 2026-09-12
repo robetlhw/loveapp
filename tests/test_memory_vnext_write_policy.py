@@ -137,3 +137,58 @@ async def test_event_detail_store_is_scoped_and_not_a_core_memory(
     )
     assert [item.id for item in memories] == [saved.item.id]
     await store.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+async def test_event_detail_can_be_committed_through_memory_write_batch(
+    store_kind: str,
+    tmp_path: Path,
+) -> None:
+    if store_kind == "memory":
+        store: MemoryStore = InMemoryMemoryStore()
+    else:
+        store = SQLiteMemoryStore(tmp_path / "batch.db")
+    await store.add_message(
+        user_id="user",
+        relationship_id="relationship",
+        role=MessageRole.USER,
+        content="We went out",
+        message_id="message-1",
+        conversation_id="conversation-1",
+    )
+    saved = await store.save_memory(
+        user_id="user",
+        relationship_id="relationship",
+        source_message_id="message-1",
+        status=MemoryStatus.CONFIRMED,
+        candidate=MemoryCandidate(
+            kind=MemoryKind.INTERACTION_EVENT,
+            subject="relationship",
+            summary="We went out",
+            original_text="We went out",
+            evidence_spans=["We went out"],
+            time_kind=TimeKind.POINT,
+            occurred_at=NOW,
+            payload={"event_type": "shared_activity"},
+        ),
+    )
+    from loveapp.domain.memory_architecture_vnext import EventDetail
+    from loveapp.domain.memory_write import MemoryWriteBatch
+
+    detail = EventDetail(
+        id="detail-batch",
+        parent_event_id=saved.item.id,
+        detail_type="emotion",
+        value="happy",
+        evidence_span="she was happy",
+        source_message_id="message-1",
+        created_at=NOW,
+    )
+    result = await store.commit_memory_batch(
+        user_id="user",
+        relationship_id="relationship",
+        batch=MemoryWriteBatch(source_message_id="message-1", event_details=[detail]),
+    )
+    assert result.saved_event_details == [detail]
+    await store.aclose()

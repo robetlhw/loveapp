@@ -617,10 +617,15 @@ class InMemoryMemoryStore:
             for plan_id, item in self._relationship_plans.items()
         }
         audit_snapshot = dict(self._transition_audits)
+        detail_snapshot = {
+            detail_id: detail.model_copy(deep=True)
+            for detail_id, detail in self._event_details.items()
+        }
         try:
             saved: list[MemorySaveResult] = []
             updated_memory_ids: list[str] = []
             audits: list[MemoryTransitionAudit] = []
+            saved_event_details: list[EventDetail] = []
             for operation in batch.operations:
                 candidate = operation.candidate.model_copy(update={"supersedes_id": None})
                 result = await self.save_memory(
@@ -800,6 +805,15 @@ class InMemoryMemoryStore:
                 self._transition_audits[audit.id] = audit
                 audits.append(audit.model_copy(deep=True))
 
+            for detail in batch.event_details:
+                saved_event_details.append(
+                    await self.create_event_detail(
+                        user_id=user_id,
+                        relationship_id=relationship_id,
+                        detail=detail,
+                    )
+                )
+
             for update in batch.plan_updates:
                 source_event_memory_id = (
                     saved[update.candidate_index].item.id
@@ -950,11 +964,13 @@ class InMemoryMemoryStore:
                 saved=saved,
                 updated_memory_ids=updated_memory_ids,
                 audits=committed_audits,
+                saved_event_details=saved_event_details,
             )
         except Exception:
             self._memories = memory_snapshot
             self._relationship_plans = plan_snapshot
             self._transition_audits = audit_snapshot
+            self._event_details = detail_snapshot
             raise
 
     async def get_memory(self, memory_id: str, user_id: str) -> MemoryItem | None:

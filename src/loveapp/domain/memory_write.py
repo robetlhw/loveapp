@@ -13,6 +13,7 @@ from loveapp.domain.memory import (
     MutationAction,
     utc_now,
 )
+from loveapp.domain.memory_architecture_vnext import EventDetail
 from loveapp.domain.memory_event_enrichment import (
     ConflictEventEnrichment,
     GenericEventEnrichment,
@@ -99,6 +100,7 @@ class MemoryWriteBatch(BaseModel):
         default_factory=list
     )
     event_enrichments: list[GenericEventEnrichment] = Field(default_factory=list)
+    event_details: list[EventDetail] = Field(default_factory=list, max_length=20)
     status_updates: list[MemoryStatusUpdate] = Field(default_factory=list)
     plan_updates: list[RelationshipPlanStatusUpdate] = Field(default_factory=list)
     audit_only: list[MemoryAuditDraft] = Field(default_factory=list)
@@ -141,6 +143,7 @@ class MemoryWriteBatchResult(BaseModel):
     saved: list[MemorySaveResult] = Field(default_factory=list)
     updated_memory_ids: list[str] = Field(default_factory=list)
     audits: list[MemoryTransitionAudit] = Field(default_factory=list)
+    saved_event_details: list[EventDetail] = Field(default_factory=list)
 
 
 def resolve_operation_target_ids(

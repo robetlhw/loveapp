@@ -864,6 +864,7 @@ class SQLiteMemoryStore:
             results: list[MemorySaveResult] = []
             updated_memory_ids: list[str] = []
             implicit_audits: list[MemoryTransitionAudit] = []
+            saved_event_details: list[EventDetail] = []
             for operation in batch.operations:
                 candidate = normalize_candidate_predicate(operation.candidate).model_copy(
                     update={"supersedes_id": None}
@@ -1146,6 +1147,60 @@ class SQLiteMemoryStore:
                 await _insert_transition_audit(connection, audit)
                 implicit_audits.append(audit)
 
+            for detail in batch.event_details:
+                parent = await _fetchone(
+                    connection,
+                    """
+                    SELECT id, kind, status FROM memory_items
+                    WHERE id = ? AND user_id = ? AND relationship_id = ?
+                    """,
+                    (detail.parent_event_id, user_id, relationship_id),
+                )
+                if (
+                    parent is None
+                    or parent["kind"] != MemoryKind.INTERACTION_EVENT.value
+                    or parent["status"]
+                    not in {MemoryStatus.PROPOSED.value, MemoryStatus.CONFIRMED.value}
+                ):
+                    raise ValueError("event detail parent must be an active interaction event")
+                existing_detail = await _fetchone(
+                    connection,
+                    "SELECT * FROM event_details WHERE id = ?",
+                    (detail.id,),
+                )
+                if existing_detail is not None:
+                    current_detail = _row_to_event_detail(existing_detail)
+                    if current_detail != detail:
+                        raise ValueError("event detail id already belongs to another detail")
+                    saved_event_details.append(current_detail)
+                    continue
+                await connection.execute(
+                    """
+                    INSERT INTO event_details (
+                        id, user_id, relationship_id, parent_event_id, detail_type,
+                        value_json, evidence_span, source_message_id,
+                        source_proposition_id, perspective, epistemic_status,
+                        created_at, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        detail.id,
+                        user_id,
+                        relationship_id,
+                        detail.parent_event_id,
+                        detail.detail_type,
+                        _dump_json(detail.value),
+                        detail.evidence_span,
+                        detail.source_message_id,
+                        detail.source_proposition_id,
+                        detail.perspective.value,
+                        detail.epistemic_status.value,
+                        _dump_datetime(detail.created_at),
+                        detail.status.value,
+                    ),
+                )
+                saved_event_details.append(detail)
+
             for update in batch.plan_updates:
                 source_event_memory_id = (
                     results[update.candidate_index].item.id
@@ -1317,6 +1372,7 @@ class SQLiteMemoryStore:
                 saved=refreshed,
                 updated_memory_ids=updated_memory_ids,
                 audits=audits,
+                saved_event_details=saved_event_details,
             )
         except Exception:
             await connection.rollback()
