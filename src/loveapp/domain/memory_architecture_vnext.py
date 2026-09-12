@@ -15,7 +15,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from loveapp.domain.memory import EpistemicStatus, MemoryItem, MemoryKind, MemoryPerspective
-from loveapp.domain.memory_semantic_units import SemanticUnitProvenance
+from loveapp.domain.memory_semantic_units import EventDetailDraft
 
 
 class CandidateSource(StrEnum):
@@ -50,60 +50,6 @@ class EventDetailStatus(StrEnum):
     REJECTED = "rejected"
 
 
-def _contains_write_authority(value: object) -> bool:
-    forbidden = {
-        "target_memory_id",
-        "target_memory_ids",
-        "mutation",
-        "mutation_action",
-        "supersedes_id",
-        "db_action",
-        "db_patch",
-        "write_action",
-        "operation",
-    }
-    if isinstance(value, dict):
-        return any(
-            str(key).casefold() in forbidden or _contains_write_authority(child)
-            for key, child in value.items()
-        )
-    if isinstance(value, (list, tuple)):
-        return any(_contains_write_authority(child) for child in value)
-    return False
-
-
-class EventDetailDraft(BaseModel):
-    """Semantic detail extracted from a proposition, without a write target."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    semantic_type: Literal["event_detail"] = "event_detail"
-    unit_id: str = Field(min_length=1, max_length=80)
-    event_type_constraint: str | None = Field(default=None, max_length=80)
-    detail_type: str = Field(pattern=r"^[a-z][a-z0-9_]*$", max_length=80)
-    value: str | int | float | bool | dict[str, str] | list[str]
-    evidence_span: str = Field(min_length=1, max_length=1000)
-    source_proposition_id: str | None = Field(default=None, max_length=80)
-    context_source_question_ids: list[str] = Field(default_factory=list, max_length=4)
-    temporal_hint: str | None = Field(default=None, max_length=160)
-    subject_hint: str | None = Field(default=None, max_length=80)
-    reference_hints: dict[str, str] = Field(default_factory=dict, max_length=8)
-    provenance: SemanticUnitProvenance | None = None
-    perspective: MemoryPerspective = MemoryPerspective.USER_REPORTED
-    epistemic_status: EpistemicStatus = EpistemicStatus.CONFIRMED
-    confidence: float = Field(default=0.8, ge=0, le=1)
-
-    @model_validator(mode="after")
-    def validate_semantic_boundary(self) -> EventDetailDraft:
-        if _contains_write_authority(self.model_dump(mode="python")):
-            raise ValueError("event detail drafts cannot contain write authority")
-        if self.event_type_constraint is not None and not self.event_type_constraint.strip():
-            raise ValueError("event detail event_type_constraint cannot be blank")
-        if any(not question_id.strip() for question_id in self.context_source_question_ids):
-            raise ValueError("event detail question IDs cannot be blank")
-        return self
-
-
 class Candidate(BaseModel):
     """A candidate plus the channels and signals that produced it."""
 
@@ -122,6 +68,22 @@ class Candidate(BaseModel):
         if self.memory.id != self.memory_id:
             raise ValueError("candidate memory_id must match memory.id")
         self.sources = list(dict.fromkeys(self.sources))
+        return self
+
+
+class CandidateGenerationResult(BaseModel):
+    """Candidate set plus whether deterministic channels covered the scope."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidates: list[Candidate] = Field(default_factory=list, max_length=20)
+    channels_used: list[CandidateSource] = Field(default_factory=list, max_length=5)
+    candidate_set_complete: bool = False
+    reason: str = Field(default="candidate_generation_completed", max_length=240)
+
+    @model_validator(mode="after")
+    def normalize_channels(self) -> CandidateGenerationResult:
+        self.channels_used = list(dict.fromkeys(self.channels_used))
         return self
 
 
@@ -210,6 +172,7 @@ class WriteDecision(BaseModel):
 
 __all__ = [
     "Candidate",
+    "CandidateGenerationResult",
     "CandidateSource",
     "ClarificationRequired",
     "EventDetail",
