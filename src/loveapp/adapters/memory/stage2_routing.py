@@ -316,6 +316,11 @@ _EVENT_PREDICATE_PATTERN = re.compile(
     r"\b(?:argu|fight|quarrel|conflict|date|met|went|occurrence)\w*\b)",
     re.IGNORECASE,
 )
+_OLD_EVENT_COMPLETION_PATTERN = re.compile(
+    r"(?:补充|那次|上次|当时|之前|前面|该次|"
+    r"\b(?:supplement|that\s+(?:event|time)|previous|earlier)\b)",
+    re.IGNORECASE,
+)
 
 
 def is_new_event_occurrence(text: str, evidence_span: str | None = None) -> bool:
@@ -326,6 +331,12 @@ def is_new_event_occurrence(text: str, evidence_span: str | None = None) -> bool
         for value in (text, evidence_span or "")
         if isinstance(value, str) and value.strip()
     )
+    # A bounded date/event phrase can occur while explicitly referring back
+    # to an earlier occurrence (for example, “补充昨天那次吵架的原因”).  The
+    # old-event reference is semantic evidence for enrichment and must not be
+    # rejected merely because it repeats the historical Event vocabulary.
+    if _OLD_EVENT_COMPLETION_PATTERN.search(haystack):
+        return False
     return bool(
         haystack
         and _NEW_TIME_MARKER_PATTERN.search(haystack)

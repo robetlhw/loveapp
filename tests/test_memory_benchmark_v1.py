@@ -314,6 +314,67 @@ def test_summary_separates_stage2_health_and_fallback_reasons():
     assert report["model_stage2_schema_error_count"] == 0
 
 
+def test_summary_reports_explicit_checkpoint_false_enrichment() -> None:
+    quality = dict(
+        gate_checks=[],
+        stage1_checks=[],
+        claim_checks=[],
+        operation_checks=[],
+        claim_memory_bindings={"c1": "target"},
+        passed=False,
+        primary_failure_stage=None,
+    )
+    expected = {
+        "sub_operations": [
+            {
+                "turn_id": "t1",
+                "operation": "CREATE",
+                "target": {"ref": None},
+                "fields": [],
+            },
+            {
+                "turn_id": "t2",
+                "operation": "ENRICH",
+                "target": {"ref": "c1"},
+                "fields": [{"path": "payload.cause"}],
+            },
+        ]
+    }
+    rows = [
+        {
+            "category": "enrichment",
+            "expected": expected,
+            "quality": quality,
+            "turns": [
+                {
+                    "turn_id": "t1",
+                    "write_batches": [
+                        {"batch": {"event_enrichments": [{"target_memory_id": "target"}]}}
+                    ],
+                },
+                {
+                    "turn_id": "t2",
+                    "write_batches": [
+                        {
+                            "batch": {
+                                "event_enrichments": [
+                                    {"target_memory_id": "target", "field": "cause"}
+                                ]
+                            }
+                        }
+                    ],
+                },
+            ],
+        }
+    ]
+
+    report = summarize(rows)
+
+    assert report["actual_enrichment_count"] == 2
+    assert report["false_enrichment_count"] == 1
+    assert report["false_enrichment_rate"] == 0.5
+
+
 @pytest.mark.asyncio
 async def test_capture_is_transparent_and_resets_stale_diagnostic():
     class Extractor:

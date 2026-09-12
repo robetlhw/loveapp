@@ -537,6 +537,71 @@ def percentile(values: list[float], fraction: float) -> float | None:
     )
 
 
+def _enrichment_entries(turn: dict[str, Any]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for write in turn.get("write_batches", []):
+        batch = write.get("batch", {}) if isinstance(write, dict) else {}
+        for key in ("event_enrichments", "conflict_event_enrichments"):
+            values = batch.get(key, []) if isinstance(batch, dict) else []
+            if isinstance(values, list):
+                entries.extend(value for value in values if isinstance(value, dict))
+    return entries
+
+
+def _false_enrichment_stats(rows: list[dict[str, Any]]) -> tuple[int, int]:
+    """Count only enrichment writes contradicting an explicit checkpoint.
+
+    The benchmark intentionally scores explicit checkpoints while replaying
+    every user turn. Turns without an operation checkpoint are therefore not
+    treated as false positives merely because the model produced a legitimate
+    unscored enrichment. A write is false only when an explicit CREATE/NOOP
+    checkpoint forbids enrichment, or when an explicit ENRICH checkpoint has a
+    different target or field.
+    """
+
+    actual_count = 0
+    false_count = 0
+    for row in rows:
+        expected_steps = (row.get("expected") or {}).get("sub_operations", [])
+        mapping = (row.get("quality") or {}).get("claim_memory_bindings", {})
+        for turn in row.get("turns", []):
+            entries = _enrichment_entries(turn)
+            if not entries:
+                continue
+            steps = [
+                step
+                for step in expected_steps
+                if isinstance(step, dict) and step.get("turn_id") == turn.get("turn_id")
+            ]
+            if not steps:
+                continue
+            actual_count += len(entries)
+            enrich_steps = [step for step in steps if step.get("operation") == "ENRICH"]
+            expected_targets = {
+                mapping.get(step.get("target", {}).get("ref"))
+                for step in enrich_steps
+                if isinstance(step.get("target"), dict)
+            }
+            expected_targets.discard(None)
+            expected_fields = {
+                str(field.get("path", "")).rsplit(".", 1)[-1]
+                for step in enrich_steps
+                for field in step.get("fields", [])
+                if isinstance(field, dict) and field.get("path")
+            }
+            for entry in entries:
+                target_id = entry.get("target_memory_id")
+                field = entry.get("field")
+                if enrich_steps:
+                    target_ok = target_id in expected_targets
+                    field_ok = not expected_fields or field in expected_fields
+                    if not target_ok or not field_ok:
+                        false_count += 1
+                else:
+                    false_count += 1
+    return actual_count, false_count
+
+
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     quality = [row["quality"] for row in rows]
     scored = [row for row in rows if not row.get("review_reason")]
@@ -573,6 +638,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         fallback = turn.get("diagnostic", {}).get("fallback", {})
         if fallback.get("triggered"):
             fallback_reasons[str(fallback.get("reason_code") or "UNKNOWN_ERROR")] += 1
+    actual_enrichment_count, false_enrichment_count = _false_enrichment_stats(rows)
     metrics: dict[str, Any] = dict(
         completed_cases=len(rows),
         completed_user_turns=len(turns),
@@ -648,6 +714,9 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         primary_failures=dict(
             Counter(q["primary_failure_stage"] for q in quality if q["primary_failure_stage"])
         ),
+        actual_enrichment_count=actual_enrichment_count,
+        false_enrichment_count=false_enrichment_count,
+        false_enrichment_rate=ratio(false_enrichment_count, actual_enrichment_count),
     )
     metrics["fallback_turn_rate"] = ratio(metrics["fallback_turn_count"], len(extracted))
     metrics["model_usage_scope"] = (

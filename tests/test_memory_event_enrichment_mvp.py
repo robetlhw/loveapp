@@ -284,6 +284,19 @@ def test_new_bounded_occurrence_cannot_enrich_an_old_event(text: str) -> None:
     assert resolution.reason == "new_event_occurrence_requires_create"
 
 
+def test_new_occurrence_with_cause_word_still_requires_create() -> None:
+    text = "今天我们又吵架了，原因是钱的问题"
+    resolution = resolve_event_enrichment(
+        _draft("cause", {"category": "financial_values"}, evidence=text),
+        current_text=text,
+        conversation_history=[_message()],
+        existing_memories=[_event()],
+    )
+
+    assert not resolution.resolved
+    assert resolution.reason == "new_event_occurrence_requires_create"
+
+
 def test_state_and_pattern_rows_are_not_generic_enrichment_targets() -> None:
     non_events = [
         _event("state").model_copy(update={"kind": MemoryKind.RELATIONSHIP_STATE}),
@@ -449,6 +462,40 @@ def test_pending_slot_with_multiple_events_fails_closed() -> None:
 
     assert not resolution.resolved
     assert resolution.reason == "ambiguous_semantic_event_antecedent"
+
+
+def test_retrieved_event_candidate_can_bind_when_latest_user_turn_is_not_target() -> None:
+    target = _event("retrieved", source_message_id="old-source")
+    latest = _message("latest", "我还想补充上一件事")
+    resolution = resolve_event_enrichment(
+        _draft("emotion", "anger"),
+        current_text="她当时特别生气",
+        conversation_history=[latest],
+        existing_memories=[target],
+        retrieved_candidates=[target],
+    )
+
+    assert resolution.resolved
+    assert resolution.target is not None and resolution.target.id == target.id
+    assert resolution.semantic_candidate_ids == (target.id,)
+    assert resolution.compatible_candidate_ids == (target.id,)
+
+
+def test_retrieved_event_candidates_preserve_ambiguity_before_compatibility() -> None:
+    first = _event("retrieved-1", source_message_id="old-source-1")
+    second = _event("retrieved-2", source_message_id="old-source-2")
+    resolution = resolve_event_enrichment(
+        _draft("severity", "severe"),
+        current_text="她当时特别生气",
+        conversation_history=[_message("latest", "我还想补充上一件事")],
+        existing_memories=[first, second],
+        retrieved_candidates=[first, second],
+    )
+
+    assert not resolution.resolved
+    assert resolution.reason == "ambiguous_semantic_event_antecedent"
+    assert set(resolution.semantic_candidate_ids) == {first.id, second.id}
+    assert resolution.compatible_candidate_ids == ()
 
 
 def test_new_memory_draft_round_trips_atomic_claim_without_loss() -> None:

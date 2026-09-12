@@ -58,6 +58,7 @@ class EventEnrichmentResolution:
     reason: str = "unresolved_event_enrichment"
     semantic_candidate_ids: tuple[str, ...] = ()
     compatible_candidate_ids: tuple[str, ...] = ()
+    retrieved_candidate_ids: tuple[str, ...] = ()
     rejected_candidates: tuple[tuple[str, str], ...] = ()
     candidate_scores: tuple[tuple[str, float], ...] = ()
     temporal_disambiguation_applied: bool = False
@@ -106,6 +107,7 @@ def resolve_event_enrichment(
     current_text: str,
     conversation_history: Iterable,
     existing_memories: Iterable[MemoryItem],
+    retrieved_candidates: Iterable[MemoryItem] = (),
     user_id: str | None = None,
     relationship_id: str | None = None,
     pending_memory_context: PendingMemoryContext | None = None,
@@ -118,7 +120,13 @@ def resolve_event_enrichment(
     reference into a falsely unique write target.
     """
 
-    base = {"draft": draft}
+    retrieved_candidates = tuple(retrieved_candidates)
+    base = {
+        "draft": draft,
+        "retrieved_candidate_ids": tuple(
+            item.id for item in retrieved_candidates if isinstance(item, MemoryItem)
+        ),
+    }
     if draft.target_kind != MemoryKind.INTERACTION_EVENT:
         return EventEnrichmentResolution(**base, reason="unsupported_enrichment_target_kind")
     if draft.evidence_span not in current_text:
@@ -160,6 +168,13 @@ def resolve_event_enrichment(
         if item.kind == MemoryKind.INTERACTION_EVENT
         and _is_context_linked(item, antecedent_id)
     ]
+    retrieved = [
+        item
+        for item in retrieved_candidates
+        if item in scoped
+        and item.kind == MemoryKind.INTERACTION_EVENT
+        and item.status in {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}
+    ]
     pending_linked = bool(
         pending_memory_context is not None
         and pending_memory_context.memory_relevant
@@ -169,9 +184,17 @@ def resolve_event_enrichment(
         )
         == draft.attribute_name
     )
+    # Source/context links remain authoritative when present.  Otherwise use
+    # the bounded production retrieval set as semantic evidence.  Retrieval is
+    # deliberately not treated as a mutation authorization: cardinality is
+    # checked before any EventType/field compatibility guard, and ties fail
+    # closed.  The pending-slot fallback retains the historical behavior for
+    # callers that do not provide retrieval results.
     semantic_candidates = (
         context_linked
         if context_linked
+        else retrieved
+        if retrieved
         else [item for item in scoped if item.kind == MemoryKind.INTERACTION_EVENT]
         if pending_linked
         else []

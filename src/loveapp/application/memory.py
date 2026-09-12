@@ -551,6 +551,22 @@ class MemoryService:
             extraction_run_id=extraction_run.id,
         )
         active_ids = {item.id for item in active}
+        semantic_units = list(getattr(extraction, "semantic_units", []))
+        enrichment_retrieved_candidates: list[MemoryItem] = []
+        if any(isinstance(unit, EnrichmentDraft) for unit in semantic_units):
+            try:
+                retrieved = await self._memory_retriever.retrieve(
+                    active,
+                    query=text,
+                    limit=5,
+                    reference_time=now,
+                    preserve_candidates=True,
+                )
+                enrichment_retrieved_candidates = [result.item for result in retrieved]
+            except Exception:
+                # Retrieval is advisory; the resolver still has its existing
+                # source/context and pending-slot paths when unavailable.
+                enrichment_retrieved_candidates = []
         prepared: list[MemoryCandidate] = []
         prepared_statuses: list[MemoryStatus] = []
         relation_resolutions = []
@@ -559,7 +575,6 @@ class MemoryService:
         audit_only: list[MemoryAuditDraft] = []
         conflict_event_enrichments: list[ConflictEventEnrichment] = []
         event_enrichments: list[GenericEventEnrichment] = []
-        semantic_units = list(getattr(extraction, "semantic_units", []))
         for unit in semantic_units:
             if isinstance(unit, EnrichmentDraft):
                 enrichment_resolution = resolve_event_enrichment(
@@ -567,6 +582,7 @@ class MemoryService:
                     current_text=text,
                     conversation_history=conversation_history,
                     existing_memories=existing,
+                    retrieved_candidates=enrichment_retrieved_candidates,
                     user_id=message.user_id,
                     relationship_id=message.relationship_id,
                     pending_memory_context=gate_decision.pending_memory_context,
@@ -2823,6 +2839,9 @@ def _record_event_enrichment_trace(
                 ),
                 "compatible_candidate_ids_json": json.dumps(
                     list(resolution.compatible_candidate_ids)
+                ),
+                "retrieved_candidate_ids_json": json.dumps(
+                    list(resolution.retrieved_candidate_ids)
                 ),
                 "rejected_candidates_json": json.dumps(
                     [
