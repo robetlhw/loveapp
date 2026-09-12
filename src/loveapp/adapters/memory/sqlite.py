@@ -37,6 +37,7 @@ from loveapp.domain.memory import (
     normalize_candidate_predicate,
     utc_now,
 )
+from loveapp.domain.memory_architecture_vnext import EventDetail, EventDetailStatus
 from loveapp.domain.memory_context import attach_memories, select_context_memories
 from loveapp.domain.memory_dimensions import merge_interaction_pattern_provenance
 from loveapp.domain.memory_event_enrichment import (
@@ -1336,6 +1337,113 @@ class SQLiteMemoryStore:
         finally:
             await connection.close()
 
+    async def create_event_detail(
+        self,
+        *,
+        user_id: str,
+        relationship_id: str,
+        detail: EventDetail,
+    ) -> EventDetail:
+        await self.initialize()
+        connection = await self._open_connection()
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            parent = await _fetchone(
+                connection,
+                """
+                SELECT id, kind, status FROM memory_items
+                WHERE id = ? AND user_id = ? AND relationship_id = ?
+                """,
+                (detail.parent_event_id, user_id, relationship_id),
+            )
+            if (
+                parent is None
+                or parent["kind"] != MemoryKind.INTERACTION_EVENT.value
+                or parent["status"]
+                not in {MemoryStatus.PROPOSED.value, MemoryStatus.CONFIRMED.value}
+            ):
+                raise ValueError("event detail parent must be an active interaction event")
+            existing = await _fetchone(
+                connection,
+                "SELECT * FROM event_details WHERE id = ?",
+                (detail.id,),
+            )
+            if existing is not None:
+                current = _row_to_event_detail(existing)
+                if current != detail:
+                    raise ValueError("event detail id already belongs to another detail")
+                await connection.commit()
+                return current
+            await connection.execute(
+                """
+                INSERT INTO event_details (
+                    id, user_id, relationship_id, parent_event_id, detail_type,
+                    value_json, evidence_span, source_message_id,
+                    source_proposition_id, perspective, epistemic_status,
+                    created_at, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    detail.id,
+                    user_id,
+                    relationship_id,
+                    detail.parent_event_id,
+                    detail.detail_type,
+                    _dump_json(detail.value),
+                    detail.evidence_span,
+                    detail.source_message_id,
+                    detail.source_proposition_id,
+                    detail.perspective.value,
+                    detail.epistemic_status.value,
+                    _dump_datetime(detail.created_at),
+                    detail.status.value,
+                ),
+            )
+            await connection.commit()
+            return detail
+        except Exception:
+            await connection.rollback()
+            raise
+        finally:
+            await connection.close()
+
+    async def list_event_details(
+        self,
+        *,
+        user_id: str,
+        relationship_id: str,
+        parent_event_id: str,
+        include_inactive: bool = False,
+        limit: int = 100,
+    ) -> list[EventDetail]:
+        await self.initialize()
+        clauses = [
+            "user_id = ?",
+            "relationship_id = ?",
+            "parent_event_id = ?",
+        ]
+        values: list[str | int] = [user_id, relationship_id, parent_event_id]
+        if not include_inactive:
+            clauses.append("status = ?")
+            values.append(EventDetailStatus.ACTIVE.value)
+        values.append(max(limit, 0))
+        connection = await self._open_connection()
+        try:
+            cursor = await connection.execute(
+                f"""
+                SELECT * FROM event_details
+                WHERE {" AND ".join(clauses)}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                values,
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            return [_row_to_event_detail(row) for row in rows]
+        finally:
+            await connection.close()
+
     async def list_memories(
         self,
         *,
@@ -1495,6 +1603,10 @@ class SQLiteMemoryStore:
                 (memory_id, user_id),
             )
             await connection.execute(
+                "DELETE FROM event_details WHERE parent_event_id = ? AND user_id = ?",
+                (memory_id, user_id),
+            )
+            await connection.execute(
                 "DELETE FROM memory_items WHERE id = ? AND user_id = ?",
                 (memory_id, user_id),
             )
@@ -1528,6 +1640,10 @@ class SQLiteMemoryStore:
                     "DELETE FROM memory_items WHERE user_id = ?",
                     (user_id,),
                 )
+                await connection.execute(
+                    "DELETE FROM event_details WHERE user_id = ?",
+                    (user_id,),
+                )
                 await connection.execute("DELETE FROM messages WHERE user_id = ?", (user_id,))
                 await connection.execute(
                     "DELETE FROM conversations WHERE user_id = ?",
@@ -1541,6 +1657,10 @@ class SQLiteMemoryStore:
                 )
                 cursor = await connection.execute(
                     "DELETE FROM memory_items WHERE user_id = ? AND relationship_id = ?",
+                    (user_id, relationship_id),
+                )
+                await connection.execute(
+                    "DELETE FROM event_details WHERE user_id = ? AND relationship_id = ?",
                     (user_id, relationship_id),
                 )
                 await connection.execute(
@@ -3177,6 +3297,22 @@ def _row_to_memory(row: aiosqlite.Row) -> MemoryItem:
     return normalize_candidate_predicate(item)
 
 
+def _row_to_event_detail(row: aiosqlite.Row) -> EventDetail:
+    return EventDetail(
+        id=row["id"],
+        parent_event_id=row["parent_event_id"],
+        detail_type=row["detail_type"],
+        value=json.loads(row["value_json"]),
+        evidence_span=row["evidence_span"],
+        source_message_id=row["source_message_id"],
+        source_proposition_id=row["source_proposition_id"],
+        perspective=row["perspective"],
+        epistemic_status=row["epistemic_status"],
+        created_at=_load_datetime(row["created_at"]),
+        status=row["status"],
+    )
+
+
 def _row_to_relationship_plan(row: aiosqlite.Row) -> RelationshipPlan:
     return RelationshipPlan(
         plan_id=row["plan_id"],
@@ -3597,6 +3733,30 @@ CREATE TABLE IF NOT EXISTS memory_items (
     CHECK (confidence BETWEEN 0 AND 1)
 );
 
+CREATE TABLE IF NOT EXISTS event_details (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    relationship_id TEXT NOT NULL,
+    parent_event_id TEXT NOT NULL,
+    detail_type TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    evidence_span TEXT NOT NULL,
+    source_message_id TEXT NOT NULL,
+    source_proposition_id TEXT,
+    perspective TEXT NOT NULL,
+    epistemic_status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    FOREIGN KEY (user_id, relationship_id)
+        REFERENCES relationships(user_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_event_id) REFERENCES memory_items(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_message_id) REFERENCES messages(id) ON DELETE CASCADE,
+    CHECK (status IN ('active', 'superseded', 'rejected'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_details_parent
+    ON event_details(user_id, relationship_id, parent_event_id, status, created_at);
+
 CREATE TABLE IF NOT EXISTS relationship_plans (
     plan_id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
@@ -3705,5 +3865,5 @@ CREATE INDEX IF NOT EXISTS idx_memory_extraction_runs_scope
 CREATE INDEX IF NOT EXISTS idx_memory_transition_audit_scope
     ON memory_transition_audit(user_id, relationship_id, created_at);
 
-PRAGMA user_version = 9;
+PRAGMA user_version = 10;
 """

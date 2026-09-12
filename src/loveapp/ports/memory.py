@@ -20,6 +20,7 @@ from loveapp.domain.memory import (
     MessageRole,
     StoredMessage,
 )
+from loveapp.domain.memory_architecture_vnext import EventDetail
 from loveapp.domain.memory_semantic_relation import SemanticRelationProposal
 from loveapp.domain.memory_verification import ClaimVerification
 from loveapp.domain.memory_write import (
@@ -158,6 +159,24 @@ class MemoryStore(Protocol):
         relationship_id: str,
         batch: MemoryWriteBatch,
     ) -> MemoryWriteBatchResult: ...
+
+    async def create_event_detail(
+        self,
+        *,
+        user_id: str,
+        relationship_id: str,
+        detail: EventDetail,
+    ) -> EventDetail: ...
+
+    async def list_event_details(
+        self,
+        *,
+        user_id: str,
+        relationship_id: str,
+        parent_event_id: str,
+        include_inactive: bool = False,
+        limit: int = 100,
+    ) -> list[EventDetail]: ...
 
     async def get_memory(self, memory_id: str, user_id: str) -> MemoryItem | None: ...
 

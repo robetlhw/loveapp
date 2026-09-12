@@ -29,6 +29,7 @@ from loveapp.domain.memory import (
     normalize_candidate_predicate,
     utc_now,
 )
+from loveapp.domain.memory_architecture_vnext import EventDetail, EventDetailStatus
 from loveapp.domain.memory_context import attach_memories, select_context_memories
 from loveapp.domain.memory_dimensions import merge_interaction_pattern_provenance
 from loveapp.domain.memory_event_enrichment import (
@@ -66,6 +67,7 @@ class InMemoryMemoryStore:
         self._relationship_plans: dict[str, RelationshipPlan] = {}
         self._advice_logical_turns: dict[str, AdviceLogicalTurn] = {}
         self._advice_generation_attempts: dict[str, AdviceGenerationAttemptRecord] = {}
+        self._event_details: dict[str, EventDetail] = {}
 
     def set_clock(self, clock: Callable[[], datetime]) -> None:
         self._clock = clock
@@ -961,6 +963,56 @@ class InMemoryMemoryStore:
             return None
         return item.model_copy(deep=True)
 
+    async def create_event_detail(
+        self,
+        *,
+        user_id: str,
+        relationship_id: str,
+        detail: EventDetail,
+    ) -> EventDetail:
+        parent = self._memories.get(detail.parent_event_id)
+        if (
+            parent is None
+            or parent.user_id != user_id
+            or parent.relationship_id != relationship_id
+            or parent.kind != MemoryKind.INTERACTION_EVENT
+            or parent.status not in {MemoryStatus.PROPOSED, MemoryStatus.CONFIRMED}
+        ):
+            raise ValueError("event detail parent must be an active interaction event")
+        existing = self._event_details.get(detail.id)
+        if existing is not None:
+            if existing != detail:
+                raise ValueError("event detail id already belongs to another detail")
+            return existing.model_copy(deep=True)
+        self._event_details[detail.id] = detail.model_copy(deep=True)
+        return detail.model_copy(deep=True)
+
+    async def list_event_details(
+        self,
+        *,
+        user_id: str,
+        relationship_id: str,
+        parent_event_id: str,
+        include_inactive: bool = False,
+        limit: int = 100,
+    ) -> list[EventDetail]:
+        parent = self._memories.get(parent_event_id)
+        if (
+            parent is None
+            or parent.user_id != user_id
+            or parent.relationship_id != relationship_id
+            or parent.kind != MemoryKind.INTERACTION_EVENT
+        ):
+            return []
+        details = [
+            detail
+            for detail in self._event_details.values()
+            if detail.parent_event_id == parent_event_id
+            and (include_inactive or detail.status == EventDetailStatus.ACTIVE)
+        ]
+        details.sort(key=lambda detail: (detail.created_at, detail.id), reverse=True)
+        return [detail.model_copy(deep=True) for detail in details[: max(limit, 0)]]
+
     async def list_memories(
         self,
         *,
@@ -1056,6 +1108,13 @@ class InMemoryMemoryStore:
         ]
         for plan_id in linked_plan_ids:
             del self._relationship_plans[plan_id]
+        detail_ids = [
+            detail_id
+            for detail_id, detail in self._event_details.items()
+            if detail.parent_event_id == memory_id
+        ]
+        for detail_id in detail_ids:
+            del self._event_details[detail_id]
         del self._memories[memory_id]
         if source_message_id and not any(
             memory.source_message_id == source_message_id for memory in self._memories.values()
@@ -1072,6 +1131,14 @@ class InMemoryMemoryStore:
         ]
         for memory_id in ids:
             del self._memories[memory_id]
+        memory_id_set = set(ids)
+        detail_ids = [
+            detail_id
+            for detail_id, detail in self._event_details.items()
+            if detail.parent_event_id in memory_id_set
+        ]
+        for detail_id in detail_ids:
+            del self._event_details[detail_id]
         plan_ids = [
             plan.plan_id
             for plan in self._relationship_plans.values()
@@ -1136,6 +1203,13 @@ class InMemoryMemoryStore:
             ]
             for item_id in scoped_ids:
                 del collection[item_id]
+        detail_ids = [
+            detail_id
+            for detail_id, detail in self._event_details.items()
+            if detail.parent_event_id not in self._memories
+        ]
+        for detail_id in detail_ids:
+            del self._event_details[detail_id]
         attempt_ids = [
             attempt_id
             for attempt_id, attempt in self._advice_generation_attempts.items()
