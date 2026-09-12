@@ -85,6 +85,7 @@ def case(
     questions: dict[int, str] | None = None,
     negative: list[int] | None = None,
     review: str | None = None,
+    stage1_role_overrides: dict[int, str] | None = None,
 ) -> dict[str, Any]:
     conversation = []
     for index, text in enumerate(texts, 1):
@@ -105,11 +106,14 @@ def case(
             dict(
                 turn_id=row["source_turn_id"],
                 evidence_span=span,
-                semantic_role={
-                    "new_memory": "new_proposition",
-                    "enrichment": "attribute_completion",
-                    "refinement": "refinement",
-                }[row["semantic_type"]],
+                semantic_role=(stage1_role_overrides or {}).get(
+                    int(row["source_turn_id"][1:]),
+                    {
+                        "new_memory": "new_proposition",
+                        "enrichment": "attribute_completion",
+                        "refinement": "refinement",
+                    }[row["semantic_type"]],
+                ),
             )
         )
     if steps is None:
@@ -272,7 +276,18 @@ def build_cases() -> list[dict[str, Any]]:
                 step(2, "REFINE", target="c1", refs=["c2"]),
             ]
             op = "REFINE"
-        rows.append(case(n, "stable_fact", name, texts, claims, operations, operation=op))
+        rows.append(
+            case(
+                n,
+                "stable_fact",
+                name,
+                texts,
+                claims,
+                operations,
+                operation=op,
+                stage1_role_overrides={2: "correction"} if n == 5 else None,
+            )
+        )
 
     preferences = [
         ("食物偏好", ["我喜欢吃火锅。"], "preference.food.cuisine", ["火锅", "hotpot"]),

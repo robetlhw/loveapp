@@ -14,7 +14,7 @@ from typing import Any
 
 from loveapp.evaluation.memory_benchmark_v1 import MemoryBenchmarkCase
 
-SCORING_VERSION = "checkpoint-v2"
+SCORING_VERSION = "checkpoint-v3"
 ACTIVE = {"confirmed", "proposed"}
 CLOSED = {"superseded", "expired", "rejected"}
 
@@ -554,6 +554,25 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     positive = [item for item in gates if item["expected"]]
     negative = [item for item in gates if not item["expected"]]
     extracted = [turn for turn in turns if turn.get("extractor_called")]
+    stage2_turns = [
+        turn
+        for turn in extracted
+        if bool(turn.get("diagnostic", {}).get("stage2", {}).get("called"))
+    ]
+    stage2_claims = [
+        claim
+        for claim in claims
+        if any(turn.get("turn_id") == claim["turn_id"] for turn in stage2_turns)
+    ]
+    stage2_claim_ids = {claim["claim_id"] for claim in stage2_claims}
+    stage2_claim_checks = [
+        check for check in claims if check["claim_id"] in stage2_claim_ids
+    ]
+    fallback_reasons = Counter()
+    for turn in extracted:
+        fallback = turn.get("diagnostic", {}).get("fallback", {})
+        if fallback.get("triggered"):
+            fallback_reasons[str(fallback.get("reason_code") or "UNKNOWN_ERROR")] += 1
     metrics: dict[str, Any] = dict(
         completed_cases=len(rows),
         completed_user_turns=len(turns),
@@ -584,6 +603,43 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             turn.get("diagnostic", {}).get("final_extractor_used") == "two_stage_native"
             for turn in extracted
         ),
+        native_two_stage_turn_rate=ratio(
+            sum(
+                turn.get("diagnostic", {}).get("final_extractor_used") == "two_stage_native"
+                for turn in extracted
+            ),
+            len(extracted),
+        ),
+        stage2_called_turn_count=len(stage2_turns),
+        stage2_parse_success_count=sum(
+            bool(turn.get("diagnostic", {}).get("stage2", {}).get("parse_success"))
+            for turn in stage2_turns
+        ),
+        stage2_validation_success_count=sum(
+            bool(turn.get("diagnostic", {}).get("stage2", {}).get("validation_success"))
+            for turn in stage2_turns
+        ),
+        stage2_parse_success_rate=ratio(
+            sum(
+                bool(turn.get("diagnostic", {}).get("stage2", {}).get("parse_success"))
+                for turn in stage2_turns
+            ),
+            len(stage2_turns),
+        ),
+        stage2_validation_success_rate=ratio(
+            sum(
+                bool(turn.get("diagnostic", {}).get("stage2", {}).get("validation_success"))
+                for turn in stage2_turns
+            ),
+            len(stage2_turns),
+        ),
+        stage2_contract_recall=ratio(
+            sum(item["matched"] for item in stage2_claim_checks),
+            len(stage2_claim_checks),
+        ),
+        fallback_by_reason=dict(fallback_reasons),
+        trace_schema_error_count=fallback_reasons.get("TRACE_SCHEMA_ERROR", 0),
+        model_stage2_schema_error_count=fallback_reasons.get("STAGE2_SCHEMA_ERROR", 0),
         model_latency_p50_ms=percentile([item["duration_ms"] for item in attempts], 0.5),
         model_latency_p95_ms=percentile([item["duration_ms"] for item in attempts], 0.95),
         prompt_tokens=sum(item.get("prompt_tokens") or 0 for item in attempts),

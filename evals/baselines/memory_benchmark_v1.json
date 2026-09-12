@@ -1,9 +1,10 @@
 {
   "evaluation": "memory-benchmark-v1",
+  "mode": "contract_smoke",
   "dataset": "evals\\memory\\benchmark_v1.jsonl",
-  "dataset_sha256": "782dab6803e8f462834133d80464a58d7ea4c028b4b56b101a30fc2accc0e91d",
-  "case_filter": null,
+  "dataset_sha256": "a6761e94c7ac407270edf060c04914a9071e9cd7052d6167e96cd6f79c6f6462",
   "case_count": 100,
+  "user_turn_count": 649,
   "category_counts": {
     "stable_fact": 20,
     "preference": 15,
@@ -21,1210 +22,1188 @@
   "contract_valid": true,
   "metrics": {
     "schema_validity": 1.0,
-    "production_claim_smoke_pass_rate": 1.0,
-    "model_quality_evaluated": false
+    "model_quality_evaluated": false,
+    "production_claim_smoke_pass_rate": 1.0
   },
-  "evaluation_boundary": "This run validates the frozen golden contract and exercises normalization and admission on expected claims. It does not call an LLM or claim extraction, resolver, lifecycle, or pattern accuracy.",
   "cases": [
     {
       "id": "BM-001",
-      "category": "stable_fact",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "propose",
+          "predicate": "profile.identity",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-002",
-      "category": "stable_fact",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "propose",
+          "predicate": "profile.occupation",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-003",
-      "category": "stable_fact",
-      "operation": "REFINE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "propose",
+          "predicate": "profile.residence",
+          "error": null
+        },
+        {
+          "claim_id": "c2",
+          "decision": "propose",
+          "predicate": "profile.residence",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-004",
-      "category": "stable_fact",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "has_sister",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-005",
-      "category": "stable_fact",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "propose",
+          "predicate": "profile.birthday",
+          "error": null
+        },
+        {
+          "claim_id": "c2",
+          "decision": "propose",
+          "predicate": "profile.birthday",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-006",
-      "category": "stable_fact",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "education",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-007",
-      "category": "stable_fact",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "owns_pet",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-008",
-      "category": "stable_fact",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "pet_name",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-009",
-      "category": "stable_fact",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "hometown",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-010",
-      "category": "stable_fact",
-      "operation": "REFINE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "propose",
+          "predicate": "profile.occupation",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-011",
-      "category": "stable_fact",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "driving_license",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-012",
-      "category": "stable_fact",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "commute",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-013",
-      "category": "stable_fact",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "household",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-014",
-      "category": "stable_fact",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "age",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-015",
-      "category": "stable_fact",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "employer_type",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-016",
-      "category": "stable_fact",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "languages",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-017",
-      "category": "stable_fact",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "siblings",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-018",
-      "category": "stable_fact",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "propose",
+          "predicate": "profile.contact_method",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-019",
-      "category": "stable_fact",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "propose",
+          "predicate": "profile.residence",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-020",
-      "category": "stable_fact",
-      "operation": "NOOP",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 0,
-        "total": 0,
-        "errors": []
-      }
+      "production_claim_smoke": []
     },
     {
       "id": "BM-021",
-      "category": "preference",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "confirm",
+          "predicate": "preference.food.cuisine",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-022",
-      "category": "preference",
-      "operation": "REFINE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "confirm",
+          "predicate": "preference.food.cuisine",
+          "error": null
+        },
+        {
+          "claim_id": "c2",
+          "decision": "confirm",
+          "predicate": "preference.food.cuisine",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-023",
-      "category": "preference",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "preference.hobby.activity",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-024",
-      "category": "preference",
-      "operation": "REFINE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "preference.hobby.activity",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-025",
-      "category": "preference",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "confirm",
+          "predicate": "preference.lifestyle.habit",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-026",
-      "category": "preference",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "confirm",
+          "predicate": "preference.environment.noise",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-027",
-      "category": "preference",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "confirm",
+          "predicate": "preference.activity.type",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-028",
-      "category": "preference",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "food_ingredient",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-029",
-      "category": "preference",
-      "operation": "REFINE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "food_taste",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-030",
-      "category": "preference",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "confirm",
+          "predicate": "preference.activity.type",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-031",
-      "category": "preference",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "confirm",
+          "predicate": "preference.lifestyle.habit",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-032",
-      "category": "preference",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "planning_style",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-033",
-      "category": "preference",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "pet_preference",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-034",
-      "category": "preference",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "confirm",
+          "predicate": "preference.activity.type",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-035",
-      "category": "preference",
-      "operation": "REFINE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "confirm",
+          "predicate": "preference.food.spiciness",
+          "error": null
+        },
+        {
+          "claim_id": "c2",
+          "decision": "confirm",
+          "predicate": "preference.food.spiciness",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-036",
-      "category": "event",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conflict",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-037",
-      "category": "event",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.support",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-038",
-      "category": "event",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.milestone",
+          "error": null
+        },
+        {
+          "claim_id": "c2",
+          "decision": "strong_review",
+          "predicate": "event.shared_activity",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-039",
-      "category": "event",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.shared_activity",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-040",
-      "category": "event",
-      "operation": "CREATE",
-      "length_class": "short",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conversation",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-041",
-      "category": "event",
-      "operation": "CREATE",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.shared_activity",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-042",
-      "category": "event",
-      "operation": "CREATE",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.support",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-043",
-      "category": "event",
-      "operation": "CREATE",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conflict",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-044",
-      "category": "event",
-      "operation": "CREATE",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.shared_activity",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-045",
-      "category": "event",
-      "operation": "CREATE",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.milestone",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-046",
-      "category": "event",
-      "operation": "CREATE",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "propose",
+          "predicate": "partner_visit",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-047",
-      "category": "event",
-      "operation": "CREATE",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "social_circle_integration",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-048",
-      "category": "event",
-      "operation": "CREATE",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conversation",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-049",
-      "category": "event",
-      "operation": "CREATE",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.support",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-050",
-      "category": "event",
-      "operation": "CREATE",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.date",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-051",
-      "category": "event",
-      "operation": "CREATE",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conversation",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-052",
-      "category": "event",
-      "operation": "CREATE",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.reconciliation",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-053",
-      "category": "event",
-      "operation": "CREATE",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conversation",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-054",
-      "category": "event",
-      "operation": "CREATE",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.affection_expression",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-055",
-      "category": "event",
-      "operation": "NOOP",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 0,
-        "total": 0,
-        "errors": []
-      }
+      "production_claim_smoke": []
     },
     {
       "id": "BM-056",
-      "category": "enrichment",
-      "operation": "ENRICH",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conflict",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-057",
-      "category": "enrichment",
-      "operation": "ENRICH",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conflict",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-058",
-      "category": "enrichment",
-      "operation": "ENRICH",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conflict",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-059",
-      "category": "enrichment",
-      "operation": "ENRICH",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conflict",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-060",
-      "category": "enrichment",
-      "operation": "CREATE",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 2,
-        "total": 2,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conflict",
+          "error": null
+        },
+        {
+          "claim_id": "c2",
+          "decision": "strong_review",
+          "predicate": "event.conflict",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-061",
-      "category": "enrichment",
-      "operation": "ENRICH",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.support",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-062",
-      "category": "enrichment",
-      "operation": "ENRICH",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.shared_activity",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-063",
-      "category": "enrichment",
-      "operation": "ENRICH",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.shared_activity",
+          "error": null
+        },
+        {
+          "claim_id": "c2",
+          "decision": "strong_review",
+          "predicate": "repeat_travel_intent",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-064",
-      "category": "enrichment",
-      "operation": "ENRICH",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.shared_activity",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-065",
-      "category": "enrichment",
-      "operation": "MIXED",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 3,
-        "total": 3,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conflict",
+          "error": null
+        },
+        {
+          "claim_id": "c3",
+          "decision": "strong_review",
+          "predicate": "partner_understanding",
+          "error": null
+        },
+        {
+          "claim_id": "c4",
+          "decision": "strong_review",
+          "predicate": "event.conflict",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-066",
-      "category": "enrichment",
-      "operation": "ENRICH",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conflict",
+          "error": null
+        },
+        {
+          "claim_id": "c2",
+          "decision": "strong_review",
+          "predicate": "event.conflict",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-067",
-      "category": "enrichment",
-      "operation": "ENRICH",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conflict",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-068",
-      "category": "enrichment",
-      "operation": "ENRICH",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conflict",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-069",
-      "category": "enrichment",
-      "operation": "ENRICH",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.shared_activity",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-070",
-      "category": "enrichment",
-      "operation": "ENRICH",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conflict",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-071",
-      "category": "pattern",
-      "operation": "PROJECT",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conversation",
+          "error": null
+        },
+        {
+          "claim_id": "c2",
+          "decision": "strong_review",
+          "predicate": "event.conversation",
+          "error": null
+        },
+        {
+          "claim_id": "c3",
+          "decision": "strong_review",
+          "predicate": "event.conversation",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-072",
-      "category": "pattern",
-      "operation": "PROJECT",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conversation",
+          "error": null
+        },
+        {
+          "claim_id": "c2",
+          "decision": "strong_review",
+          "predicate": "event.conversation",
+          "error": null
+        },
+        {
+          "claim_id": "c3",
+          "decision": "strong_review",
+          "predicate": "event.conversation",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-073",
-      "category": "pattern",
-      "operation": "PROJECT",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conflict",
+          "error": null
+        },
+        {
+          "claim_id": "c2",
+          "decision": "strong_review",
+          "predicate": "event.conflict",
+          "error": null
+        },
+        {
+          "claim_id": "c3",
+          "decision": "strong_review",
+          "predicate": "event.conflict",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-074",
-      "category": "pattern",
-      "operation": "PROJECT",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.support",
+          "error": null
+        },
+        {
+          "claim_id": "c2",
+          "decision": "strong_review",
+          "predicate": "event.support",
+          "error": null
+        },
+        {
+          "claim_id": "c3",
+          "decision": "strong_review",
+          "predicate": "event.support",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-075",
-      "category": "pattern",
-      "operation": "PROJECT",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.shared_activity",
+          "error": null
+        },
+        {
+          "claim_id": "c2",
+          "decision": "strong_review",
+          "predicate": "event.shared_activity",
+          "error": null
+        },
+        {
+          "claim_id": "c3",
+          "decision": "strong_review",
+          "predicate": "event.shared_activity",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-076",
-      "category": "pattern",
-      "operation": "PROJECT",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conversation",
+          "error": null
+        },
+        {
+          "claim_id": "c2",
+          "decision": "strong_review",
+          "predicate": "event.conversation",
+          "error": null
+        },
+        {
+          "claim_id": "c3",
+          "decision": "strong_review",
+          "predicate": "event.conversation",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-077",
-      "category": "pattern",
-      "operation": "PROJECT",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conversation",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-078",
-      "category": "pattern",
-      "operation": "PROJECT",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.reconciliation",
+          "error": null
+        },
+        {
+          "claim_id": "c2",
+          "decision": "strong_review",
+          "predicate": "event.reconciliation",
+          "error": null
+        },
+        {
+          "claim_id": "c3",
+          "decision": "strong_review",
+          "predicate": "event.reconciliation",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-079",
-      "category": "pattern",
-      "operation": "PROJECT",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.support",
+          "error": null
+        },
+        {
+          "claim_id": "c2",
+          "decision": "strong_review",
+          "predicate": "event.support",
+          "error": null
+        },
+        {
+          "claim_id": "c3",
+          "decision": "strong_review",
+          "predicate": "event.support",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-080",
-      "category": "pattern",
-      "operation": "NOOP",
-      "length_class": "medium",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 0,
-        "total": 0,
-        "errors": []
-      }
+      "production_claim_smoke": []
     },
     {
       "id": "BM-081",
-      "category": "state",
-      "operation": "PROJECT",
-      "length_class": "long",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conflict",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-082",
-      "category": "state",
-      "operation": "PROJECT",
-      "length_class": "long",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conflict",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-083",
-      "category": "state",
-      "operation": "PROJECT",
-      "length_class": "long",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": []
     },
     {
       "id": "BM-084",
-      "category": "state",
-      "operation": "PROJECT",
-      "length_class": "long",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": []
     },
     {
       "id": "BM-085",
-      "category": "state",
-      "operation": "PROJECT",
-      "length_class": "long",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": []
     },
     {
       "id": "BM-086",
-      "category": "state",
-      "operation": "PROJECT",
-      "length_class": "long",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": []
     },
     {
       "id": "BM-087",
-      "category": "state",
-      "operation": "PROJECT",
-      "length_class": "long",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": []
     },
     {
       "id": "BM-088",
-      "category": "state",
-      "operation": "PROJECT",
-      "length_class": "long",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": []
     },
     {
       "id": "BM-089",
-      "category": "state",
-      "operation": "PROJECT",
-      "length_class": "long",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "event.conflict",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-090",
-      "category": "state",
-      "operation": "NOOP",
-      "length_class": "long",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 0,
-        "total": 0,
-        "errors": []
-      }
+      "production_claim_smoke": []
     },
     {
       "id": "BM-091",
-      "category": "long_tail",
-      "operation": "CREATE",
-      "length_class": "long",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "social_circle_integration",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-092",
-      "category": "long_tail",
-      "operation": "CREATE",
-      "length_class": "long",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "commitment_alignment",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-093",
-      "category": "long_tail",
-      "operation": "CREATE",
-      "length_class": "long",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "reporting_boundary",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-094",
-      "category": "long_tail",
-      "operation": "CREATE",
-      "length_class": "long",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "expectation_gap",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-095",
-      "category": "long_tail",
-      "operation": "CREATE",
-      "length_class": "long",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "communication_style",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-096",
-      "category": "long_tail",
-      "operation": "CREATE",
-      "length_class": "long",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "disclosure_boundary",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-097",
-      "category": "long_tail",
-      "operation": "CREATE",
-      "length_class": "long",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "pet_medical_decision_boundary",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-098",
-      "category": "long_tail",
-      "operation": "CREATE",
-      "length_class": "long",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "coauthorship_credit",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-099",
-      "category": "long_tail",
-      "operation": "CREATE",
-      "length_class": "long",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 1,
-        "total": 1,
-        "errors": []
-      }
+      "production_claim_smoke": [
+        {
+          "claim_id": "c1",
+          "decision": "strong_review",
+          "predicate": "location_sharing_boundary",
+          "error": null
+        }
+      ]
     },
     {
       "id": "BM-100",
-      "category": "long_tail",
-      "operation": "NOOP",
-      "length_class": "long",
-      "schema_valid": true,
-      "production_claim_smoke": {
-        "passed": 0,
-        "total": 0,
-        "errors": []
-      }
+      "production_claim_smoke": []
     }
   ]
 }

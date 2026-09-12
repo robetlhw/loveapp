@@ -2264,6 +2264,8 @@ def _reject_unsafe_detailed_keys(value: object) -> None:
 
 
 def _failure_category(exc: Exception) -> str:
+    if _is_trace_schema_error(exc):
+        return "trace_schema"
     if isinstance(exc, MemoryResponseError):
         return exc.category
     if isinstance(exc, ValidationError):
@@ -2278,6 +2280,8 @@ def _fallback_reason_code(exc: Exception, *, stage: str) -> str:
     if normalized_stage not in {"coarse", "detailed"}:
         return "UNKNOWN_ERROR"
     prefix = "STAGE1" if normalized_stage == "coarse" else "STAGE2"
+    if _is_trace_schema_error(exc):
+        return "TRACE_SCHEMA_ERROR"
     if isinstance(exc, ValidationError):
         return f"{prefix}_SCHEMA_ERROR"
     if isinstance(exc, MemoryResponseError):
@@ -2299,6 +2303,18 @@ def _fallback_reason_code(exc: Exception, *, stage: str) -> str:
             return "UNSUPPORTED_OUTPUT"
         return "STAGE2_SCHEMA_ERROR"
     return f"{prefix}_CALL_ERROR"
+
+
+def _is_trace_schema_error(exc: Exception) -> bool:
+    """Recognize validation raised while materializing an ExecutionTrace row.
+
+    Model payload validation uses the extractor's own response models.  The
+    trace boundary is the only validation error with a ``StepTiming`` title;
+    keeping this distinction prevents instrumentation failures from being
+    reported as model schema failures.
+    """
+
+    return isinstance(exc, ValidationError) and getattr(exc, "title", None) == "StepTiming"
 
 
 def _build_attempt(

@@ -294,6 +294,10 @@ def render_report(report: dict[str, Any]) -> str:
     lines += [
         "",
         f"Primary failure counts：`{report['metrics']['primary_failures']}`。",
+        f"Fallback by reason：`{report['metrics'].get('fallback_by_reason', {})}`。",
+        f"Trace schema errors：`{report['metrics'].get('trace_schema_error_count', 0)}`；"
+        "model Stage2 schema errors："
+        f"`{report['metrics'].get('model_stage2_schema_error_count', 0)}`。",
         "最早失败按会话先后及阶段顺序定位；经过某阶段不算失败。",
         "",
         "## 逐 Case",

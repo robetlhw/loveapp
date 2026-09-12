@@ -3,9 +3,9 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
-from loveapp.adapters.memory.two_stage import TwoStageMemoryExtractor
+from loveapp.adapters.memory.two_stage import TwoStageMemoryExtractor, _fallback_reason_code
 from loveapp.core.timing import ExecutionTrace
 from loveapp.domain.memory import MemoryKind, MemorySemanticGateReason
 from loveapp.domain.memory_semantic_units import EnrichmentDraft, NewMemoryDraft
@@ -166,6 +166,22 @@ async def test_nested_route_trace_does_not_trigger_stage2_fallback() -> None:
     detailed_trace.model_dump_json()
 
     await extractor.aclose()
+
+
+def test_trace_schema_failure_has_distinct_fallback_reason() -> None:
+    captured = ValidationError.from_exception_data(
+        "StepTiming",
+        [
+            {
+                "type": "string_type",
+                "loc": ("details", "routes"),
+                "input": [],
+                "ctx": {},
+            }
+        ],
+    )
+
+    assert _fallback_reason_code(captured, stage="detailed") == "TRACE_SCHEMA_ERROR"
 
 
 @pytest.mark.asyncio

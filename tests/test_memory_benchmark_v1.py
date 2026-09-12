@@ -274,6 +274,46 @@ def test_percentile_uses_nearest_rank_and_attempts_are_not_trace_double_counted(
     assert report["total_tokens"] == 10
 
 
+def test_summary_separates_stage2_health_and_fallback_reasons():
+    quality = dict(
+        gate_checks=[],
+        stage1_checks=[],
+        claim_checks=[],
+        operation_checks=[],
+        passed=True,
+        primary_failure_stage=None,
+    )
+    turns = [
+        {
+            "turn_id": "t1",
+            "extractor_called": True,
+            "diagnostic": {
+                "stage2": {"called": True, "parse_success": True, "validation_success": True},
+                "final_extractor_used": "two_stage_native",
+                "fallback": {"triggered": False},
+            },
+        },
+        {
+            "turn_id": "t2",
+            "extractor_called": True,
+            "diagnostic": {
+                "stage2": {"called": True, "parse_success": True, "validation_success": False},
+                "final_extractor_used": "single_stage_fallback",
+                "fallback": {"triggered": True, "reason_code": "TRACE_SCHEMA_ERROR"},
+            },
+        },
+    ]
+
+    report = summarize([dict(category="stable_fact", quality=quality, turns=turns)])
+
+    assert report["stage2_called_turn_count"] == 2
+    assert report["stage2_parse_success_rate"] == 1.0
+    assert report["stage2_validation_success_rate"] == 0.5
+    assert report["fallback_by_reason"] == {"TRACE_SCHEMA_ERROR": 1}
+    assert report["trace_schema_error_count"] == 1
+    assert report["model_stage2_schema_error_count"] == 0
+
+
 @pytest.mark.asyncio
 async def test_capture_is_transparent_and_resets_stale_diagnostic():
     class Extractor:

@@ -1,22 +1,12 @@
-# Memory Benchmark V1 Report
+# Memory Benchmark V1 — contract validation
 
-- Dataset: `evals\memory\benchmark_v1.jsonl`
-- Cases: `100`
-- Contract valid: `True`
-- Schema validity: `1.0`
-- Production claim smoke pass rate: `1.0`
-- Model quality evaluated: `False` (contract/smoke mode)
+Dataset: `evals\memory\benchmark_v1.jsonl`
+SHA256: `a6761e94c7ac407270edf060c04914a9071e9cd7052d6167e96cd6f79c6f6462`
 
-## Coverage
+Cases: 100; user turns: 649
+Categories: {'stable_fact': 20, 'preference': 15, 'event': 20, 'enrichment': 15, 'pattern': 10, 'state': 10, 'long_tail': 10}
+Lengths: {'short': 40, 'medium': 40, 'long': 20}
 
-- Categories: `{"enrichment": 15, "event": 20, "long_tail": 10, "pattern": 10, "preference": 15, "stable_fact": 20, "state": 10}`
-- Length classes: `{"long": 20, "medium": 40, "short": 40}`
-
-## Boundary
-
-This run validates the frozen golden contract and exercises normalization and admission on expected claims. It does not call an LLM or claim extraction, resolver, lifecycle, or pattern accuracy.
-
-## Data Structure Notes
-
-The source document's short example is illustrative but underspecified. The frozen contract adds `schema_version`, `scenario`, `difficulty`, `length_class`, typed `conversation`, and typed expected stage/operation and mutation sections.
-`operation` is bounded to CREATE, ENRICH, REFINE, UPDATE, MERGE, PROJECT, MIXED, NOOP, or REJECT. Mixed cases use typed `sub_operations`; target selectors and mutation actions are separately typed so a semantic operation cannot silently imply an arbitrary patch.
+Model quality evaluated: **False**. These are structure and domain smoke checks.
+The smoke rate measures execution without exceptions, not semantic correctness or admission.
+For measured extraction/resolver/lifecycle quality, use the separate live report.
