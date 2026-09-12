@@ -358,9 +358,15 @@ def score_case(case: MemoryBenchmarkCase, turns: list[dict[str, Any]]) -> dict[s
                     for key, row in before.items()
                 )
         elif op.operation == "ENRICH":
+            field_path_ok = bool(target) and all(
+                _field(target or {}, field.path) is not None for field in op.fields
+            )
+            field_value_ok = fields_ok
             checks = dict(
                 target=target_ok,
-                fields=fields_ok,
+                field_path=field_path_ok,
+                field_value=field_value_ok,
+                fields=field_path_ok and field_value_ok,
                 target_retained=bool(target)
                 and target.get("status") in ACTIVE
                 and target_id in before,
@@ -548,6 +554,141 @@ def _enrichment_entries(turn: dict[str, Any]) -> list[dict[str, Any]]:
     return entries
 
 
+def _trace_details(turn: dict[str, Any], name: str) -> list[dict[str, Any]]:
+    """Return decoded records for one production trace stage."""
+
+    result: list[dict[str, Any]] = []
+    for record in turn.get("trace", []):
+        if not isinstance(record, dict) or record.get("name") != name:
+            continue
+        details = record.get("details", {})
+        if not isinstance(details, dict):
+            continue
+        decoded = dict(details)
+        for key, value in details.items():
+            if key.endswith("_json") and isinstance(value, str):
+                try:
+                    decoded[key[:-5]] = json.loads(value)
+                except (TypeError, ValueError):
+                    decoded[key[:-5]] = []
+        result.append(decoded)
+    return result
+
+
+def _enrichment_checkpoint_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Flatten ENRICH checkpoints into explainable retrieval/resolver scores."""
+
+    checkpoints: list[dict[str, Any]] = []
+    for row in rows:
+        quality = row.get("quality") or {}
+        for operation in quality.get("operation_checks", []):
+            if operation.get("operation") != "ENRICH":
+                continue
+            turn_id = operation.get("turn_id")
+            turn = next(
+                (item for item in row.get("turns", []) if item.get("turn_id") == turn_id),
+                {},
+            )
+            traces = _trace_details(turn, "memory_event_enrichment")
+            expected_target = operation.get("target_memory_id")
+            retrieved_ids: list[str] = []
+            semantic_ids: list[str] = []
+            compatible_ids: list[str] = []
+            selected_ids: list[str] = []
+            reasons: list[str] = []
+            for trace in traces:
+                for key, destination in (
+                    ("retrieved_candidate_ids", retrieved_ids),
+                    ("semantic_candidate_ids", semantic_ids),
+                    ("compatible_candidate_ids", compatible_ids),
+                ):
+                    values = trace.get(key, [])
+                    if isinstance(values, list):
+                        destination.extend(str(value) for value in values if value)
+                selected = trace.get("selected_target_memory_id")
+                if selected:
+                    selected_ids.append(str(selected))
+                reason = trace.get("resolution_reason")
+                if reason:
+                    reasons.append(str(reason))
+            retrieved_ids = list(dict.fromkeys(retrieved_ids))
+            semantic_ids = list(dict.fromkeys(semantic_ids))
+            compatible_ids = list(dict.fromkeys(compatible_ids))
+            selected_ids = list(dict.fromkeys(selected_ids))
+            target_retrieved = bool(expected_target and expected_target in retrieved_ids)
+            checkpoints.append(
+                {
+                    "case_id": row.get("id"),
+                    "turn_id": turn_id,
+                    "target_memory_id": expected_target,
+                    "target_retrieved": target_retrieved,
+                    "retrieved_rank": (
+                        retrieved_ids.index(expected_target) + 1
+                        if expected_target in retrieved_ids
+                        else None
+                    ),
+                    "retrieved_candidate_ids": retrieved_ids,
+                    "semantic_candidate_ids": semantic_ids,
+                    "compatible_candidate_ids": compatible_ids,
+                    "selected_target_ids": selected_ids,
+                    "resolver_target": bool(operation.get("checks", {}).get("target")),
+                    "field_path": bool(operation.get("checks", {}).get("field_path")),
+                    "field_value": bool(operation.get("checks", {}).get("field_value")),
+                    "patch_fields": bool(operation.get("checks", {}).get("fields")),
+                    "passed": bool(operation.get("passed")),
+                    "resolution_reasons": reasons,
+                    "case_primary_failure_stage": quality.get("primary_failure_stage"),
+                    "checkpoint_failure_stage": (
+                        None
+                        if operation.get("passed")
+                        else "Retrieval"
+                        if not target_retrieved
+                        else "Resolver"
+                        if not operation.get("checks", {}).get("target")
+                        else "Enrichment"
+                    ),
+                }
+            )
+    return checkpoints
+
+
+def _contains_any(text: str, patterns: tuple[str, ...]) -> bool:
+    lowered = text.casefold()
+    return any(pattern.casefold() in lowered for pattern in patterns)
+
+
+def _stratified_metrics(rows: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        value = str(row.get(key) or "unknown")
+        groups.setdefault(value, []).append(row)
+    result: dict[str, dict[str, Any]] = {}
+    for value, group in groups.items():
+        operations = [
+            operation
+            for row in group
+            for operation in (row.get("quality") or {}).get("operation_checks", [])
+        ]
+        enrich = [operation for operation in operations if operation.get("operation") == "ENRICH"]
+        result[value] = {
+            "case_count": len(group),
+            "passed_case_count": sum(
+                bool((row.get("quality") or {}).get("passed")) for row in group
+            ),
+            "pass_rate": ratio(
+                sum(bool((row.get("quality") or {}).get("passed")) for row in group), len(group)
+            ),
+            "enrichment_checkpoint_count": len(enrich),
+            "enrichment_target_accuracy": ratio(
+                sum(bool(item.get("checks", {}).get("target")) for item in enrich), len(enrich)
+            ),
+            "enrichment_patch_accuracy": ratio(
+                sum(bool(item.get("checks", {}).get("fields")) for item in enrich), len(enrich)
+            ),
+        }
+    return result
+
+
 def _false_enrichment_stats(rows: list[dict[str, Any]]) -> tuple[int, int]:
     """Count only enrichment writes contradicting an explicit checkpoint.
 
@@ -624,21 +765,78 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         for turn in extracted
         if bool(turn.get("diagnostic", {}).get("stage2", {}).get("called"))
     ]
-    stage2_claims = [
-        claim
-        for claim in claims
-        if any(turn.get("turn_id") == claim["turn_id"] for turn in stage2_turns)
-    ]
-    stage2_claim_ids = {claim["claim_id"] for claim in stage2_claims}
-    stage2_claim_checks = [
-        check for check in claims if check["claim_id"] in stage2_claim_ids
-    ]
+    # Claim IDs are scoped to a case. Match stage2 health within each row so
+    # repeated c1/c2 IDs from other cases cannot contaminate this denominator.
+    stage2_claim_checks = []
+    for row in rows:
+        stage2_turn_ids = {
+            turn.get("turn_id")
+            for turn in row.get("turns", [])
+            if bool(turn.get("diagnostic", {}).get("stage2", {}).get("called"))
+        }
+        stage2_claim_checks.extend(
+            check
+            for check in (row.get("quality") or {}).get("claim_checks", [])
+            if check.get("turn_id") in stage2_turn_ids
+        )
     fallback_reasons = Counter()
     for turn in extracted:
         fallback = turn.get("diagnostic", {}).get("fallback", {})
         if fallback.get("triggered"):
             fallback_reasons[str(fallback.get("reason_code") or "UNKNOWN_ERROR")] += 1
     actual_enrichment_count, false_enrichment_count = _false_enrichment_stats(rows)
+    enrichment_checkpoints = _enrichment_checkpoint_rows(rows)
+    retrieved_enrichment = [item for item in enrichment_checkpoints if item["target_memory_id"]]
+    retrieved_hits = [item for item in retrieved_enrichment if item["target_retrieved"]]
+    ambiguity_cases = [
+        row
+        for row in rows
+        if _contains_any(
+            f"{row.get('scenario', '')} {row.get('failure_mode', '')}",
+            ("ambiguous", "模糊", "歧义"),
+        )
+    ]
+    ambiguity_operations = [
+        operation
+        for row in ambiguity_cases
+        for operation in (row.get("quality") or {}).get("operation_checks", [])
+        if operation.get("operation") == "NOOP"
+    ]
+    occurrence_cases = [
+        row
+        for row in rows
+        if _contains_any(
+            f"{row.get('scenario', '')} {row.get('failure_mode', '')}",
+            ("new occurrence", "new event", "新冲突", "新活动", "另一场", "new shared"),
+        )
+    ]
+    mixed_cases = [
+        row
+        for row in rows
+        if (row.get("expected") or {}).get("operation") == "MIXED"
+    ]
+    enrichment_units = [
+        item
+        for item in units
+        if str(item.get("expected", {}).get("semantic_role", ""))
+        in {"attribute_completion", "contextual_completion"}
+    ]
+    # Enrichment claim IDs (c1/c2/...) are also local to each case. Keep the
+    # expected semantic type and observed check in the same row.
+    enrichment_claim_checks = []
+    for row in rows:
+        enrichment_claim_ids = {
+            claim.get("claim_id")
+            for claim in ((row.get("expected") or {}).get("stage2", {}) or {}).get(
+                "claims", []
+            )
+            if claim.get("semantic_type") == "enrichment"
+        }
+        enrichment_claim_checks.extend(
+            item
+            for item in (row.get("quality") or {}).get("claim_checks", [])
+            if item.get("claim_id") in enrichment_claim_ids
+        )
     metrics: dict[str, Any] = dict(
         completed_cases=len(rows),
         completed_user_turns=len(turns),
@@ -717,6 +915,62 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         actual_enrichment_count=actual_enrichment_count,
         false_enrichment_count=false_enrichment_count,
         false_enrichment_rate=ratio(false_enrichment_count, actual_enrichment_count),
+        enrichment_checkpoint_count=len(enrichment_checkpoints),
+        enrichment_intent_recall=ratio(
+            sum(item["passed"] for item in enrichment_units), len(enrichment_units)
+        ),
+        stage2_enrichment_contract_recall=ratio(
+            sum(item["matched"] for item in enrichment_claim_checks),
+            len(enrichment_claim_checks),
+        ),
+        target_retrieval_count=len(retrieved_enrichment),
+        target_retrieval_hit_at_1=ratio(
+            sum(item.get("retrieved_rank") == 1 for item in retrieved_enrichment),
+            len(retrieved_enrichment),
+        ),
+        target_retrieval_hit_at_3=ratio(
+            sum(
+                item.get("retrieved_rank") is not None and item["retrieved_rank"] <= 3
+                for item in retrieved_enrichment
+            ),
+            len(retrieved_enrichment),
+        ),
+        target_retrieval_hit_at_5=ratio(
+            sum(
+                item.get("retrieved_rank") is not None and item["retrieved_rank"] <= 5
+                for item in retrieved_enrichment
+            ),
+            len(retrieved_enrichment),
+        ),
+        resolver_accuracy_given_target_retrieved=ratio(
+            sum(item["resolver_target"] for item in retrieved_hits), len(retrieved_hits)
+        ),
+        enrichment_field_accuracy=ratio(
+            sum(item["field_path"] for item in enrichment_checkpoints),
+            len(enrichment_checkpoints),
+        ),
+        enrichment_value_accuracy=ratio(
+            sum(item["field_value"] for item in enrichment_checkpoints),
+            len(enrichment_checkpoints),
+        ),
+        ambiguous_abstention_case_count=len(ambiguity_cases),
+        ambiguous_abstention_accuracy=ratio(
+            sum(bool(operation.get("passed")) for operation in ambiguity_operations),
+            len(ambiguity_operations),
+        ),
+        new_occurrence_case_count=len(occurrence_cases),
+        new_occurrence_separation_accuracy=ratio(
+            sum(bool((row.get("quality") or {}).get("passed")) for row in occurrence_cases),
+            len(occurrence_cases),
+        ),
+        mixed_operation_case_count=len(mixed_cases),
+        mixed_operation_accuracy=ratio(
+            sum(bool((row.get("quality") or {}).get("passed")) for row in mixed_cases),
+            len(mixed_cases),
+        ),
+        enrichment_checkpoint_details=enrichment_checkpoints,
+        by_length=_stratified_metrics(rows, "length_class"),
+        by_difficulty=_stratified_metrics(rows, "difficulty"),
     )
     metrics["fallback_turn_rate"] = ratio(metrics["fallback_turn_count"], len(extracted))
     metrics["model_usage_scope"] = (

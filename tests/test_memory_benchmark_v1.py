@@ -27,6 +27,10 @@ from loveapp.evaluation.memory_benchmark_v1 import (
 )
 
 DATASET = Path("evals/memory/benchmark_v1.jsonl")
+EXPANSION_DATASET = Path(
+    "evals/memory/memory_enrichment_benchmark_v1_expansion_BM101_180.jsonl"
+)
+MERGED_DATASET = Path("evals/memory/memory_benchmark_v1_plus_enrichment_180.jsonl")
 
 
 @pytest.fixture
@@ -91,6 +95,83 @@ def test_offline_contract_smoke_does_not_claim_model_quality():
     report = evaluate_memory_benchmark_v1(DATASET)
     assert report["mode"] == "contract_smoke"
     assert report["metrics"]["model_quality_evaluated"] is False
+
+
+def test_expansion_and_merged_profiles_validate_without_changing_original_contract() -> None:
+    expansion = load_memory_benchmark_v1_cases(EXPANSION_DATASET)
+    merged = load_memory_benchmark_v1_cases(MERGED_DATASET)
+
+    assert len(expansion) == 80
+    assert [case.id for case in expansion] == [f"BM-{n:03d}" for n in range(101, 181)]
+    assert len(merged) == 180
+    assert [case.id for case in merged] == [f"BM-{n:03d}" for n in range(1, 181)]
+
+
+def test_expansion_detailed_summary_reports_retrieval_and_stratified_metrics() -> None:
+    quality = dict(
+        gate_checks=[],
+        stage1_checks=[
+            {
+                "expected": {"semantic_role": "attribute_completion"},
+                "passed": True,
+                "proposition_found": True,
+            }
+        ],
+        claim_checks=[{"claim_id": "c2", "matched": True}],
+        operation_checks=[
+            {
+                "turn_id": "t2",
+                "operation": "ENRICH",
+                "target_memory_id": "m1",
+                "checks": {
+                    "target": True,
+                    "field_path": True,
+                    "field_value": True,
+                    "fields": True,
+                },
+                "passed": True,
+            }
+        ],
+        claim_memory_bindings={"c1": "m1"},
+        passed=True,
+        primary_failure_stage=None,
+    )
+    row = {
+        "id": "BM-101",
+        "category": "enrichment",
+        "length_class": "short",
+        "difficulty": "easy",
+        "expected": {
+            "stage2": {"claims": [{"claim_id": "c2", "semantic_type": "enrichment"}]}
+        },
+        "quality": quality,
+        "turns": [
+            {
+                "turn_id": "t2",
+                "trace": [
+                    {
+                        "name": "memory_event_enrichment",
+                        "details": {
+                            "retrieved_candidate_ids_json": '["m1", "m2"]',
+                            "semantic_candidate_ids_json": '["m1"]',
+                            "compatible_candidate_ids_json": '["m1"]',
+                            "selected_target_memory_id": "m1",
+                            "resolution_reason": "unique_context_linked_event",
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+    report = summarize([row])
+
+    assert report["enrichment_checkpoint_count"] == 1
+    assert report["target_retrieval_hit_at_1"] == 1.0
+    assert report["resolver_accuracy_given_target_retrieved"] == 1.0
+    assert report["enrichment_field_accuracy"] == 1.0
+    assert report["by_length"]["short"]["pass_rate"] == 1.0
+    assert report["by_difficulty"]["easy"]["enrichment_target_accuracy"] == 1.0
 
 
 def test_loader_rejects_duplicate_ids(tmp_path, cases):
@@ -312,6 +393,88 @@ def test_summary_separates_stage2_health_and_fallback_reasons():
     assert report["fallback_by_reason"] == {"TRACE_SCHEMA_ERROR": 1}
     assert report["trace_schema_error_count"] == 1
     assert report["model_stage2_schema_error_count"] == 0
+
+
+def test_summary_scopes_stage2_claim_health_to_each_case():
+    quality = dict(
+        gate_checks=[],
+        stage1_checks=[],
+        operation_checks=[],
+        passed=True,
+        primary_failure_stage=None,
+    )
+    rows = [
+        {
+            "category": "enrichment",
+            "quality": dict(
+                quality,
+                claim_checks=[
+                    {"claim_id": "c1", "turn_id": "t1", "matched": True},
+                    {"claim_id": "c2", "turn_id": "t2", "matched": False},
+                ],
+            ),
+            "turns": [
+                {"turn_id": "t1", "diagnostic": {"stage2": {"called": True}}},
+                {"turn_id": "t2", "diagnostic": {"stage2": {"called": False}}},
+            ],
+        },
+        {
+            "category": "enrichment",
+            "quality": dict(
+                quality,
+                claim_checks=[
+                    {"claim_id": "c1", "turn_id": "t1", "matched": False},
+                    {"claim_id": "c2", "turn_id": "t2", "matched": True},
+                ],
+            ),
+            "turns": [
+                {"turn_id": "t1", "diagnostic": {"stage2": {"called": False}}},
+                {"turn_id": "t2", "diagnostic": {"stage2": {"called": True}}},
+            ],
+        },
+    ]
+
+    report = summarize(rows)
+
+    assert report["stage2_contract_recall"] == 1.0
+
+
+def test_summary_scopes_enrichment_claim_health_to_each_case():
+    quality = dict(
+        gate_checks=[],
+        stage1_checks=[],
+        operation_checks=[],
+        passed=True,
+        primary_failure_stage=None,
+    )
+    rows = [
+        {
+            "category": "enrichment",
+            "expected": {
+                "stage2": {"claims": [{"claim_id": "c2", "semantic_type": "enrichment"}]}
+            },
+            "quality": dict(
+                quality,
+                claim_checks=[{"claim_id": "c2", "turn_id": "t1", "matched": True}],
+            ),
+            "turns": [],
+        },
+        {
+            "category": "enrichment",
+            "expected": {
+                "stage2": {"claims": [{"claim_id": "c2", "semantic_type": "new_memory"}]}
+            },
+            "quality": dict(
+                quality,
+                claim_checks=[{"claim_id": "c2", "turn_id": "t1", "matched": False}],
+            ),
+            "turns": [],
+        },
+    ]
+
+    report = summarize(rows)
+
+    assert report["stage2_enrichment_contract_recall"] == 1.0
 
 
 def test_summary_reports_explicit_checkpoint_false_enrichment() -> None:

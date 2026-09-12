@@ -8,6 +8,11 @@ from loveapp.evaluation.memory_admission_v1 import (
     render_memory_admission_strong_review_audit,
     render_memory_admission_v1_report,
 )
+from loveapp.evaluation.memory_benchmark_v1 import (
+    evaluate_memory_benchmark_v1,
+    load_memory_benchmark_v1_cases,
+    render_memory_benchmark_v1_report,
+)
 from loveapp.evaluation.memory_context_aware_behavioral_anchor import (
     DEFAULT_BASELINE_PATH as DEFAULT_CONTEXT_AWARE_BASELINE_PATH,
 )
@@ -277,6 +282,7 @@ __all__ = [
     "evaluate_live_routing_conversations",
     "evaluate_memory_admission_integration",
     "evaluate_memory_admission_v1",
+    "evaluate_memory_benchmark_v1",
     "evaluate_memory_extraction_v1",
     "evaluate_memory_foundation",
     "evaluate_memory_gate_v2",
@@ -312,6 +318,7 @@ __all__ = [
     "evaluate_routing_conversations",
     "load_context_aware_cases",
     "load_contextual_rewrite_eval_markdown",
+    "load_memory_benchmark_v1_cases",
     "load_memory_lifecycle_v1_cases",
     "load_memory_longtail_write_v1_cases",
     "load_memory_longtail_write_v2_dataset",
@@ -337,6 +344,7 @@ __all__ = [
     "render_memory_admission_policy_review",
     "render_memory_admission_strong_review_audit",
     "render_memory_admission_v1_report",
+    "render_memory_benchmark_v1_report",
     "render_memory_extraction_v1_report",
     "render_memory_gate_v2_report",
     "render_memory_lifecycle_integration_diagnostic",

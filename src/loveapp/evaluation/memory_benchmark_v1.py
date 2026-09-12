@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, model_validator
 
 from loveapp.application.memory_admission import assess_memory_admission
 from loveapp.domain.memory import EvidenceExplicitness, MemoryCandidate, MemoryKind, SemanticRole
@@ -22,6 +23,8 @@ EXPECTED_CATEGORY_COUNTS = dict(
 )
 EXPECTED_LENGTH_COUNTS = dict(short=40, medium=40, long=20)
 LENGTH_RANGES = {"short": (1, 3), "medium": (5, 10), "long": (20, 30)}
+EXPANSION_LENGTH_RANGES = {"short": (1, 4), "medium": (3, 10), "long": (6, 30)}
+BenchmarkProfile = Literal["original", "expansion", "merged"]
 Operation = Literal["CREATE", "ENRICH", "REFINE", "UPDATE", "MERGE", "PROJECT", "PRESERVE", "NOOP"]
 
 
@@ -144,12 +147,14 @@ class MemoryBenchmarkCase(StrictModel):
     notes: str = ""
 
     @model_validator(mode="after")
-    def validate_case(self) -> MemoryBenchmarkCase:
+    def validate_case(self, info: ValidationInfo) -> MemoryBenchmarkCase:
         turns = {turn.turn_id: turn for turn in self.conversation}
         if len(turns) != len(self.conversation):
             raise ValueError("duplicate turn_id")
         users = {key: turn.content for key, turn in turns.items() if turn.role == "user"}
-        lower, upper = LENGTH_RANGES[self.length_class]
+        profile = str((info.context or {}).get("length_profile", "original"))
+        ranges = EXPANSION_LENGTH_RANGES if profile == "expansion" else LENGTH_RANGES
+        lower, upper = ranges[self.length_class]
         if not lower <= len(users) <= upper:
             raise ValueError("length_class counts USER turns, not assistant padding")
         if any("\ufffd" in turn.content for turn in self.conversation):
@@ -188,35 +193,89 @@ class MemoryBenchmarkCase(StrictModel):
 
 
 def load_memory_benchmark_v1_cases(
-    path: Path, *, require_complete: bool = True
+    path: Path, *, require_complete: bool = True, profile: BenchmarkProfile | None = None
 ) -> list[MemoryBenchmarkCase]:
     try:
         content = path.read_text(encoding="utf-8-sig")
         if "\ufffd" in content:
             raise ValueError("Unicode replacement character")
-        cases = [
-            MemoryBenchmarkCase.model_validate_json(line)
+        raw_cases = [
+            json.loads(line)
             for line in content.splitlines()
             if line.strip()
+        ]
+        ids = [str(case.get("id", "")) for case in raw_cases]
+        if profile is None:
+            numbers = {
+                int(case_id[3:])
+                for case_id in ids
+                if case_id.startswith("BM-") and case_id[3:].isdigit()
+            }
+            if numbers and min(numbers) >= 101:
+                profile = "expansion"
+            elif numbers and max(numbers) > 100:
+                profile = "merged"
+            else:
+                profile = "original"
+        cases = [
+            MemoryBenchmarkCase.model_validate(
+                raw_case,
+                context={
+                    "length_profile": (
+                        "expansion"
+                        if profile == "expansion"
+                        or (profile == "merged" and str(raw_case.get("id", ""))[3:].isdigit()
+                            and int(str(raw_case.get("id", ""))[3:]) >= 101)
+                        else "original"
+                    )
+                },
+            )
+            for raw_case in raw_cases
         ]
     except ValueError as exc:
         raise BenchmarkSchemaError(str(exc)) from exc
     if not cases or len({case.id for case in cases}) != len(cases):
         raise BenchmarkSchemaError("dataset empty or duplicate case id")
     if require_complete:
-        if [case.id for case in cases] != [f"BM-{n:03d}" for n in range(1, 101)]:
-            raise BenchmarkSchemaError("expected BM-001..BM-100")
-        if Counter(case.category for case in cases) != EXPECTED_CATEGORY_COUNTS:
+        if profile == "original":
+            expected_ids = [f"BM-{n:03d}" for n in range(1, 101)]
+            expected_categories = EXPECTED_CATEGORY_COUNTS
+            expected_lengths = EXPECTED_LENGTH_COUNTS
+        elif profile == "expansion":
+            expected_ids = [f"BM-{n:03d}" for n in range(101, 181)]
+            expected_categories = {"enrichment": 80}
+            expected_lengths = {"short": 28, "medium": 32, "long": 20}
+        else:
+            expected_ids = [f"BM-{n:03d}" for n in range(1, 181)]
+            expected_categories = {
+                "stable_fact": 20,
+                "preference": 15,
+                "event": 20,
+                "enrichment": 95,
+                "pattern": 10,
+                "state": 10,
+                "long_tail": 10,
+            }
+            expected_lengths = {"short": 68, "medium": 72, "long": 40}
+        if [case.id for case in cases] != expected_ids:
+            raise BenchmarkSchemaError(f"expected {expected_ids[0]}..{expected_ids[-1]}")
+        if Counter(case.category for case in cases) != expected_categories:
             raise BenchmarkSchemaError("category quotas differ")
-        if Counter(case.length_class for case in cases) != EXPECTED_LENGTH_COUNTS:
+        if Counter(case.length_class for case in cases) != expected_lengths:
             raise BenchmarkSchemaError("length quotas differ")
     return cases
 
 
 def evaluate_memory_benchmark_v1(
-    path: Path, *, case_id: str | None = None, require_complete: bool = True
+    path: Path,
+    *,
+    case_id: str | None = None,
+    require_complete: bool = True,
+    profile: BenchmarkProfile | None = None,
 ) -> dict[str, Any]:
-    cases = load_memory_benchmark_v1_cases(path, require_complete=require_complete)
+    cases = load_memory_benchmark_v1_cases(
+        path, require_complete=require_complete, profile=profile
+    )
     cases = [case for case in cases if case_id is None or case.id == case_id]
     if not cases:
         raise ValueError(f"unknown Benchmark V1 case: {case_id}")

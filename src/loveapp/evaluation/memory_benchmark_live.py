@@ -150,6 +150,8 @@ async def replay_case(
         id=case.id,
         category=case.category,
         scenario=case.scenario,
+        failure_mode=case.failure_mode,
+        difficulty=case.difficulty,
         length_class=case.length_class,
         review_reason=case.review_reason,
         fingerprint=fingerprint,
@@ -246,12 +248,14 @@ async def replay_case(
 
 
 def render_report(report: dict[str, Any]) -> str:
+    profile = str(report.get("benchmark_profile") or "auto")
     lines = [
-        "# Memory Benchmark V1 — 全量真实模型评测",
+        f"# Memory Benchmark V1 — {profile} 真实模型评测",
         "",
         f"开始：`{report['started_at']}`；结束：`{report.get('completed_at', '未完成')}`。",
         "",
         f"数据 SHA256：`{report['dataset_sha256']}`",
+        f"数据集：`{report['dataset']}`；Profile：`{profile}`。",
         "",
         f"评分版本：`{SCORING_VERSION}`；冻结 fingerprint：`{report['fingerprint']}`。",
         "",
@@ -272,8 +276,14 @@ def render_report(report: dict[str, Any]) -> str:
         "| 指标 | 结果 |",
         "|---|---:|",
     ]
+    if report.get("report_recalculated_at"):
+        lines[lines.index("## 指标"):lines.index("## 指标")] = [
+            "统计报告在模型 replay 完成后基于持久化 trace 重算；未重新发起模型请求。",
+            f"重算时间：`{report['report_recalculated_at']}`。",
+            "",
+        ]
     for key, value in report["metrics"].items():
-        if not isinstance(value, dict):
+        if not isinstance(value, (dict, list)):
             lines.append(f"| {key} | {value if value is not None else 'N/A'} |")
     lines += [
         "",
@@ -300,10 +310,100 @@ def render_report(report: dict[str, Any]) -> str:
         f"`{report['metrics'].get('model_stage2_schema_error_count', 0)}`。",
         "最早失败按会话先后及阶段顺序定位；经过某阶段不算失败。",
         "",
+        "## 分层指标",
+        "",
+        "### 按长度",
+        "",
+        "| 长度 | Case | 通过 | 通过率 | ENRICH checkpoints | Target | Patch |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for name, values in report["metrics"].get("by_length", {}).items():
+        pass_rate = values["pass_rate"] if values["pass_rate"] is not None else "N/A"
+        target_accuracy = (
+            values["enrichment_target_accuracy"]
+            if values["enrichment_target_accuracy"] is not None
+            else "N/A"
+        )
+        patch_accuracy = (
+            values["enrichment_patch_accuracy"]
+            if values["enrichment_patch_accuracy"] is not None
+            else "N/A"
+        )
+        lines.append(
+            f"| {name} | {values['case_count']} | {values['passed_case_count']} | "
+            f"{pass_rate} | {values['enrichment_checkpoint_count']} | "
+            f"{target_accuracy} | {patch_accuracy} |"
+        )
+    lines += [
+        "",
+        "### 按难度",
+        "",
+        "| 难度 | Case | 通过 | 通过率 | ENRICH checkpoints | Target | Patch |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for name, values in report["metrics"].get("by_difficulty", {}).items():
+        pass_rate = values["pass_rate"] if values["pass_rate"] is not None else "N/A"
+        target_accuracy = (
+            values["enrichment_target_accuracy"]
+            if values["enrichment_target_accuracy"] is not None
+            else "N/A"
+        )
+        patch_accuracy = (
+            values["enrichment_patch_accuracy"]
+            if values["enrichment_patch_accuracy"] is not None
+            else "N/A"
+        )
+        lines.append(
+            f"| {name} | {values['case_count']} | {values['passed_case_count']} | "
+            f"{pass_rate} | {values['enrichment_checkpoint_count']} | "
+            f"{target_accuracy} | {patch_accuracy} |"
+        )
+    lines += [
+        "",
+        "## 失败归因",
+        "",
+        "| Primary stage | Case 数 |",
+        "|---|---:|",
+    ]
+    for stage, count in sorted(report["metrics"].get("primary_failures", {}).items()):
+        lines.append(f"| {stage} | {count} |")
+    lines += [
+        "",
+        f"Fallback by reason：`{report['metrics'].get('fallback_by_reason', {})}`。",
+        "Primary failure 是首个实际阻断 checkpoint 的阶段；仅调用某阶段不计为该阶段失败。",
+        "",
+        "## ENRICH Checkpoint 明细",
+        "",
+        (
+            "| Case | Turn | Expected target | Retrieved rank | Candidates | Semantic | "
+            "Compatible | Selected | Resolver | Field path | Field value | Patch | "
+            "Result | Checkpoint failure | Reason |"
+        ),
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|",
+    ]
+    for item in report["metrics"].get("enrichment_checkpoint_details", []):
+        reasons = ", ".join(item.get("resolution_reasons", [])) or "—"
+        lines.append(
+            f"| {item.get('case_id', '—')} | {item.get('turn_id', '—')} | "
+            f"{'yes' if item.get('target_memory_id') else 'no'} | "
+            f"{item.get('retrieved_rank') if item.get('retrieved_rank') is not None else '—'} | "
+            f"{len(item.get('retrieved_candidate_ids', []))} | "
+            f"{len(item.get('semantic_candidate_ids', []))} | "
+            f"{len(item.get('compatible_candidate_ids', []))} | "
+            f"{len(item.get('selected_target_ids', []))} | "
+            f"{'yes' if item.get('resolver_target') else 'no'} | "
+            f"{'yes' if item.get('field_path') else 'no'} | "
+            f"{'yes' if item.get('field_value') else 'no'} | "
+            f"{'yes' if item.get('patch_fields') else 'no'} | "
+            f"{'PASS' if item.get('passed') else 'FAIL'} | "
+            f"{item.get('checkpoint_failure_stage') or '—'} | {reasons.replace('|', '/') } |"
+        )
+    lines += [
+        "",
         "## 逐 Case",
         "",
-        "| Case | 用户轮 | 结果 | 最早失败 | 原因 |",
-        "|---|---:|---|---|---|",
+        "| Case | 难度 | 长度 | 用户轮 | 结果 | 最早失败 | 原因 |",
+        "|---|---|---|---:|---|---|---|",
     ]
     for row in report["cases"]:
         q = row["quality"]
@@ -311,7 +411,8 @@ def render_report(report: dict[str, Any]) -> str:
             "|", "/"
         )
         lines.append(
-            f"| {row['id']} | {len(row['turns'])} | {q['classification']} | "
+            f"| {row['id']} | {row.get('difficulty', '—')} | {row.get('length_class', '—')} | "
+            f"{len(row['turns'])} | {q['classification']} | "
             f"{q['primary_failure_stage'] or '—'} | {reason} |"
         )
     lines += [
@@ -327,6 +428,11 @@ def render_report(report: dict[str, Any]) -> str:
         "本次数据和评分规则在模型调用前冻结，未修改生产 Memory 或 Prompt 来提升成绩。",
         "",
     ]
+    warnings = report.get("dataset_warnings", [])
+    if warnings:
+        lines += ["## 数据一致性警告", ""]
+        lines.extend(f"- {warning}" for warning in warnings)
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -353,7 +459,11 @@ def _code_digest() -> str:
 
 async def run(args: argparse.Namespace) -> dict[str, Any]:
     dataset_bytes = args.dataset.read_bytes()
-    cases = load_memory_benchmark_v1_cases(args.dataset)
+    cases = load_memory_benchmark_v1_cases(
+        args.dataset,
+        require_complete=not args.allow_incomplete,
+        profile=args.profile,
+    )
     wanted = set(args.case or [])
     if wanted - {case.id for case in cases}:
         raise ValueError("unknown --case")
@@ -402,6 +512,8 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         configuration=configuration,
         concurrency=args.concurrency,
         selected_case_ids=[case.id for case in cases],
+        benchmark_profile=args.profile or "auto",
+        require_complete=not args.allow_incomplete,
         expected_user_turns=sum(
             turn.role == "user" for case in cases for turn in case.conversation
         ),
@@ -494,6 +606,16 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--case", action="append")
     result.add_argument("--concurrency", type=int, default=4, choices=range(1, 9))
     result.add_argument("--resume", action="store_true")
+    result.add_argument(
+        "--profile",
+        choices=("original", "expansion", "merged"),
+        help="Benchmark contract profile; omitted profiles are inferred from case IDs.",
+    )
+    result.add_argument(
+        "--allow-incomplete",
+        action="store_true",
+        help="Run a valid subset without requiring the profile's complete ID/quota set.",
+    )
     result.add_argument(
         "--fail-on-error", action="store_true", help="Nonzero if any strict checkpoint fails."
     )
