@@ -1,0 +1,1230 @@
+{
+  "evaluation": "memory-benchmark-v1",
+  "dataset": "evals\\memory\\benchmark_v1.jsonl",
+  "dataset_sha256": "782dab6803e8f462834133d80464a58d7ea4c028b4b56b101a30fc2accc0e91d",
+  "case_filter": null,
+  "case_count": 100,
+  "category_counts": {
+    "stable_fact": 20,
+    "preference": 15,
+    "event": 20,
+    "enrichment": 15,
+    "pattern": 10,
+    "state": 10,
+    "long_tail": 10
+  },
+  "length_counts": {
+    "short": 40,
+    "medium": 40,
+    "long": 20
+  },
+  "contract_valid": true,
+  "metrics": {
+    "schema_validity": 1.0,
+    "production_claim_smoke_pass_rate": 1.0,
+    "model_quality_evaluated": false
+  },
+  "evaluation_boundary": "This run validates the frozen golden contract and exercises normalization and admission on expected claims. It does not call an LLM or claim extraction, resolver, lifecycle, or pattern accuracy.",
+  "cases": [
+    {
+      "id": "BM-001",
+      "category": "stable_fact",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-002",
+      "category": "stable_fact",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-003",
+      "category": "stable_fact",
+      "operation": "REFINE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-004",
+      "category": "stable_fact",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-005",
+      "category": "stable_fact",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-006",
+      "category": "stable_fact",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-007",
+      "category": "stable_fact",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-008",
+      "category": "stable_fact",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-009",
+      "category": "stable_fact",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-010",
+      "category": "stable_fact",
+      "operation": "REFINE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-011",
+      "category": "stable_fact",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-012",
+      "category": "stable_fact",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-013",
+      "category": "stable_fact",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-014",
+      "category": "stable_fact",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-015",
+      "category": "stable_fact",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-016",
+      "category": "stable_fact",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-017",
+      "category": "stable_fact",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-018",
+      "category": "stable_fact",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-019",
+      "category": "stable_fact",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-020",
+      "category": "stable_fact",
+      "operation": "NOOP",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 0,
+        "total": 0,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-021",
+      "category": "preference",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-022",
+      "category": "preference",
+      "operation": "REFINE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-023",
+      "category": "preference",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-024",
+      "category": "preference",
+      "operation": "REFINE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-025",
+      "category": "preference",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-026",
+      "category": "preference",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-027",
+      "category": "preference",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-028",
+      "category": "preference",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-029",
+      "category": "preference",
+      "operation": "REFINE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-030",
+      "category": "preference",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-031",
+      "category": "preference",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-032",
+      "category": "preference",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-033",
+      "category": "preference",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-034",
+      "category": "preference",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-035",
+      "category": "preference",
+      "operation": "REFINE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-036",
+      "category": "event",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-037",
+      "category": "event",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-038",
+      "category": "event",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-039",
+      "category": "event",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-040",
+      "category": "event",
+      "operation": "CREATE",
+      "length_class": "short",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-041",
+      "category": "event",
+      "operation": "CREATE",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-042",
+      "category": "event",
+      "operation": "CREATE",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-043",
+      "category": "event",
+      "operation": "CREATE",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-044",
+      "category": "event",
+      "operation": "CREATE",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-045",
+      "category": "event",
+      "operation": "CREATE",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-046",
+      "category": "event",
+      "operation": "CREATE",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-047",
+      "category": "event",
+      "operation": "CREATE",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-048",
+      "category": "event",
+      "operation": "CREATE",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-049",
+      "category": "event",
+      "operation": "CREATE",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-050",
+      "category": "event",
+      "operation": "CREATE",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-051",
+      "category": "event",
+      "operation": "CREATE",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-052",
+      "category": "event",
+      "operation": "CREATE",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-053",
+      "category": "event",
+      "operation": "CREATE",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-054",
+      "category": "event",
+      "operation": "CREATE",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-055",
+      "category": "event",
+      "operation": "NOOP",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 0,
+        "total": 0,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-056",
+      "category": "enrichment",
+      "operation": "ENRICH",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-057",
+      "category": "enrichment",
+      "operation": "ENRICH",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-058",
+      "category": "enrichment",
+      "operation": "ENRICH",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-059",
+      "category": "enrichment",
+      "operation": "ENRICH",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-060",
+      "category": "enrichment",
+      "operation": "CREATE",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 2,
+        "total": 2,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-061",
+      "category": "enrichment",
+      "operation": "ENRICH",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-062",
+      "category": "enrichment",
+      "operation": "ENRICH",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-063",
+      "category": "enrichment",
+      "operation": "ENRICH",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-064",
+      "category": "enrichment",
+      "operation": "ENRICH",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-065",
+      "category": "enrichment",
+      "operation": "MIXED",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 3,
+        "total": 3,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-066",
+      "category": "enrichment",
+      "operation": "ENRICH",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-067",
+      "category": "enrichment",
+      "operation": "ENRICH",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-068",
+      "category": "enrichment",
+      "operation": "ENRICH",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-069",
+      "category": "enrichment",
+      "operation": "ENRICH",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-070",
+      "category": "enrichment",
+      "operation": "ENRICH",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-071",
+      "category": "pattern",
+      "operation": "PROJECT",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-072",
+      "category": "pattern",
+      "operation": "PROJECT",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-073",
+      "category": "pattern",
+      "operation": "PROJECT",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-074",
+      "category": "pattern",
+      "operation": "PROJECT",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-075",
+      "category": "pattern",
+      "operation": "PROJECT",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-076",
+      "category": "pattern",
+      "operation": "PROJECT",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-077",
+      "category": "pattern",
+      "operation": "PROJECT",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-078",
+      "category": "pattern",
+      "operation": "PROJECT",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-079",
+      "category": "pattern",
+      "operation": "PROJECT",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-080",
+      "category": "pattern",
+      "operation": "NOOP",
+      "length_class": "medium",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 0,
+        "total": 0,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-081",
+      "category": "state",
+      "operation": "PROJECT",
+      "length_class": "long",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-082",
+      "category": "state",
+      "operation": "PROJECT",
+      "length_class": "long",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-083",
+      "category": "state",
+      "operation": "PROJECT",
+      "length_class": "long",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-084",
+      "category": "state",
+      "operation": "PROJECT",
+      "length_class": "long",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-085",
+      "category": "state",
+      "operation": "PROJECT",
+      "length_class": "long",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-086",
+      "category": "state",
+      "operation": "PROJECT",
+      "length_class": "long",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-087",
+      "category": "state",
+      "operation": "PROJECT",
+      "length_class": "long",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-088",
+      "category": "state",
+      "operation": "PROJECT",
+      "length_class": "long",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-089",
+      "category": "state",
+      "operation": "PROJECT",
+      "length_class": "long",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-090",
+      "category": "state",
+      "operation": "NOOP",
+      "length_class": "long",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 0,
+        "total": 0,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-091",
+      "category": "long_tail",
+      "operation": "CREATE",
+      "length_class": "long",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-092",
+      "category": "long_tail",
+      "operation": "CREATE",
+      "length_class": "long",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-093",
+      "category": "long_tail",
+      "operation": "CREATE",
+      "length_class": "long",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-094",
+      "category": "long_tail",
+      "operation": "CREATE",
+      "length_class": "long",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-095",
+      "category": "long_tail",
+      "operation": "CREATE",
+      "length_class": "long",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-096",
+      "category": "long_tail",
+      "operation": "CREATE",
+      "length_class": "long",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-097",
+      "category": "long_tail",
+      "operation": "CREATE",
+      "length_class": "long",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-098",
+      "category": "long_tail",
+      "operation": "CREATE",
+      "length_class": "long",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-099",
+      "category": "long_tail",
+      "operation": "CREATE",
+      "length_class": "long",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 1,
+        "total": 1,
+        "errors": []
+      }
+    },
+    {
+      "id": "BM-100",
+      "category": "long_tail",
+      "operation": "NOOP",
+      "length_class": "long",
+      "schema_valid": true,
+      "production_claim_smoke": {
+        "passed": 0,
+        "total": 0,
+        "errors": []
+      }
+    }
+  ]
+}
